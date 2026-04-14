@@ -6,10 +6,10 @@
 
 ## 현재 상태
 
-- **현재 Phase**: Phase 4.0 완료, Phase 5.0 (Thinking & Memory) 시작 예정
+- **현재 Phase**: Phase 5.0 완료, Phase 6.0 (Training Pipeline) 시작 예정
 - **마지막 업데이트**: 2026-04-14
 - **브랜치**: main
-- **총 테스트**: 124개 (전부 통과)
+- **총 테스트**: 236개 (전부 통과)
 
 ---
 
@@ -127,12 +127,31 @@
 
 ---
 
+## Phase 5.0: Thinking & Memory (완료)
+
+### v0.7.0 — Thinking Engine + Memory System (2026-04-14)
+**커밋**: `47a715f`
+
+- Thinking Engine (core/thinking/ 6모듈):
+  - ComplexityAssessor (키워드+증폭패턴 → 0.0~1.0)
+  - ThinkingStrategy 4종 (DIRECT/HIDDEN_COT/SELF_REFLECT/MULTI_AGENT)
+  - HiddenCoTEngine (2-pass), SelfReflectionEngine (3-pass)
+  - ThinkingOrchestrator (복잡도→전략→실행→캐시)
+  - ThinkingCache (SHA-256, LRU, TTL)
+- Memory System (core/memory/ 6모듈):
+  - MemoryType 5종, MemoryEntry, DECAY_HALF_LIFE
+  - ShortTermMemory (Redis/인메모리), LongTermMemory (PG+pgvector/인메모리)
+  - MemoryManager (턴 생명주기), ImportanceAssessor, MemoryDecayManager
+- 236개 테스트 통과 (신규 112개)
+
+---
+
 ## 다음 세션 시작 시 참고
 
-1. **Phase 0.5~4.0 완료** — 부트스트랩, 모델, 24개 도구, 오케스트레이터, 보안/권한 전부 구현
-2. **다음**: Phase 5.0 (Thinking & Memory) — ThinkingEngine, MemorySystem, SystemPrompt
-3. 사양서 참조: Ch.11 (Thinking Engine), Ch.12 (Memory System)
-4. Phase 6.0 (Training) 이후 Phase 7.0 (CLI/Web), Phase 8.0 (통합)
+1. **Phase 0.5~5.0 완료** — core/ 엔진 전체 구현 완료
+2. **다음**: Phase 6.0 (Training Pipeline) — QLoRA 학습, 데이터 수집, 평가
+3. 사양서 참조: Ch.18 (Training Pipeline)
+4. Phase 7.0 (CLI/Web), Phase 8.0 (통합 테스트)
 5. GPU 서버: 192.168.22.28, DB: 192.168.10.39
-6. 현재 ruff 클린, 124개 테스트 전부 통과
-7. 이 세션에서 Phase 0.5~4.0까지 완료 — 핵심 엔진 대부분 구현됨
+6. 현재 ruff 클린, 236개 테스트 전부 통과
+7. 이 세션에서 Phase 0.5~5.0까지 완료 — **core/ 엔진 전체 구현 완료**
