@@ -6,11 +6,11 @@
 
 ## 현재 상태
 
-- **현재 Phase**: Phase 7.0 완료, Phase 8.0 (Integration & Polish) 시작 예정
-- **마지막 업데이트**: 2026-04-14
+- **현재 Phase**: Phase 8.0 완료 — 통합 테스트 + 폴리싱
+- **마지막 업데이트**: 2026-04-15
 - **브랜치**: main
-- **총 테스트**: 288개 (전부 통과)
-- **전체 파일**: ~140개 Python 모듈
+- **총 테스트**: 352개 (전부 통과) — 단위 288 + 통합 64
+- **전체 파일**: ~145개 Python 모듈
 
 ---
 
@@ -164,14 +164,40 @@
 
 ---
 
+## Phase 8.0: Integration & Polish (완료)
+
+### v0.9.0 — 통합 테스트 64개 + 모듈 간 연결 검증 (2026-04-15)
+
+- **conftest.py 확장**:
+  - EnhancedMockModelProvider — tool_calls 시뮬레이션 가능한 ModelProvider mock
+  - MockResponse dataclass — 응답 시나리오 정의 (text, tool_calls, stop_reason)
+  - basic_tools, tool_use_context fixture 추가
+- **tests/integration/test_full_pipeline.py** (22개 테스트):
+  - TestQueryLoopIntegration: query_loop → tool → response 풀 플로우 (5개)
+  - TestToolChainIntegration: 다중 도구 체인 실행 (2개)
+  - TestSecurityIntegration: PathGuard + CommandFilter + PermissionPipeline (11개)
+  - TestThinkingIntegration: 복잡도 평가 → 전략 선택 → 캐시 (4개)
+  - TestMemoryIntegration: ShortTerm + LongTerm + Manager 인메모리 폴백 (4개)
+- **tests/integration/test_training_integration.py** (12개 테스트):
+  - BootstrapGenerator: JSONL 생성, 7:3 비율, seed 결정성 (4개)
+  - DataCollector: PII 마스킹 (email/phone), 민감 경로 필터링 (5개)
+  - CheckpointManager: 목록 조회, activate/rollback (httpx mock) (3개)
+- **tests/integration/test_web_integration.py** (9개 테스트):
+  - 7개 엔드포인트: health, chat, stream(SSE), sessions, tools, models, metrics
+- **tests/integration/test_airgap_integration.py** (16개 테스트):
+  - IntegrityVerifier: compute_hash, verify_file/directory, generate_manifest (12개)
+  - AirGapPrep: generate_manifest, verify_manifest (4개)
+- 352개 테스트 통과 (기존 288 + 신규 64)
+
+---
+
 ## 다음 세션 시작 시 참고
 
-1. **Phase 0.5~7.0 완료** — 모든 기능 모듈 구현 완료
-2. **다음**: Phase 8.0 (Integration & Polish)
-   - E2E 통합 테스트 (전체 query_loop → tool → result 시나리오)
-   - 성능 최적화
-   - 모듈 간 연결 검증
-   - 사양서 Ch.22.6 통합 테스트 계획 참조
+1. **Phase 0.5~8.0 완료** — 전체 시스템 구현 + 통합 테스트 완료
+2. **추가 가능 작업**:
+   - 실 GPU 서버(192.168.22.28) 연결 후 E2E 테스트
+   - 성능 벤치마크 (사양서 Ch.22.4 Success Metrics)
+   - Soak Test (24시간 연속 추론, 100-Turn 대화, 모델 스왑 스트레스)
+   - LoRA Phase 1 Bootstrap 학습 실행
 3. GPU 서버: 192.168.22.28, DB: 192.168.10.39
-4. ruff 클린, 288개 테스트 전부 통과
-5. **이 세션에서 Phase 0.5~7.0까지 한번에 완료** — 전체 시스템 구현
+4. ruff 클린, 352개 테스트 전부 통과
