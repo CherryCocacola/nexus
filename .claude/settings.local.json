@@ -1,0 +1,30 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ping -n 2 -w 2000 192.168.22.28)",
+      "Bash(ping -n 2 -w 2000 192.168.10.39)",
+      "Bash(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=yes idino@192.168.22.28 \"echo SSH_OK\")",
+      "Bash(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=yes idino@192.168.10.39 \"echo SSH_OK\")",
+      "Bash(choco list:*)",
+      "Bash(where sshpass:*)",
+      "Bash(pacman -Q sshpass)",
+      "Bash(pacman -S --noconfirm sshpass)",
+      "Bash(/usr/bin/pacman -S --noconfirm sshpass)",
+      "Read(//mingw64/**)",
+      "Read(//usr/**)",
+      "Bash(ls /git-bash.exe)",
+      "Read(//c/Program Files/Git/**)",
+      "Bash(curl:*)",
+      "Bash(chmod +x ~/sshpass.exe)",
+      "Bash(~/sshpass.exe -V)",
+      "Bash(~/sshpass.exe:*)",
+      "Bash(SSHPASS=\"dkdlelsh@12\" ~/sshpass.exe:*)",
+      "Bash(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 idino@192.168.22.28 \"echo SSH_OK\")",
+      "Bash(echo \"EXIT_CODE=$?\")",
+      "Bash(echo \"EXIT=$?\")",
+      "Bash(python -c \"import paramiko; print\\('paramiko OK'\\)\")",
+      "Bash(pip install:*)",
+      "Bash(python:*)"
+    ]
+  }
+}

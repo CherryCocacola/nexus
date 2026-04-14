@@ -1,0 +1,117 @@
+# =============================================================================
+# Project Nexus — 도구 매핑 설정 (44→24)
+# Claude Code 44개 도구 중 에어갭 환경에서 사용 가능한 24개만 활성화
+# =============================================================================
+
+tool_configuration:
+  mode: "airgap"        # "online" | "airgap"
+  version: "1.0"
+
+  active_tools:
+    # ── 파일 시스템 (8개) ──
+    - name: "Read"
+      enabled: true
+      max_file_size_mb: 50
+      allowed_extensions: ["*"]
+    - name: "Write"
+      enabled: true
+      require_permission: true
+    - name: "Edit"
+      enabled: true
+      require_permission: true
+    - name: "MultiEdit"
+      enabled: true
+      require_permission: true
+    - name: "Bash"
+      enabled: true
+      require_permission: true
+      timeout_seconds: 120
+      blocked_commands:
+        - "curl"
+        - "wget"
+        - "ssh"
+        - "scp"
+        - "nc"
+        - "ncat"
+    - name: "Glob"
+      enabled: true
+    - name: "Grep"
+      enabled: true
+      max_results: 1000
+    - name: "LS"
+      enabled: true
+
+    # ── 노트북 (2개) ──
+    - name: "NotebookRead"
+      enabled: true
+    - name: "NotebookEdit"
+      enabled: true
+
+    # ── Git 로컬 전용 (6개) ──
+    - name: "GitLog"
+      enabled: true
+    - name: "GitDiff"
+      enabled: true
+    - name: "GitCommit"
+      enabled: true
+      require_permission: true
+    - name: "GitStatus"
+      enabled: true
+    - name: "GitBranch"
+      enabled: true
+    - name: "GitCheckout"
+      enabled: true
+      require_permission: true
+
+    # ── Docker 로컬 전용 (2개) ──
+    - name: "DockerBuild"
+      enabled: true
+      require_permission: true
+    - name: "DockerRun"
+      enabled: true
+      require_permission: true
+
+    # ── 태스크 관리 (3개) ──
+    - name: "TodoRead"
+      enabled: true
+    - name: "TodoWrite"
+      enabled: true
+    - name: "Task"
+      enabled: true
+
+    # ── 에이전트 (1개) ──
+    - name: "Agent"
+      enabled: true
+      max_sub_agents: 3
+
+    # ── 메모리 (2개) ──
+    - name: "MemoryRead"
+      enabled: true
+    - name: "MemoryWrite"
+      enabled: true
+
+  disabled_tools:
+    - name: "WebFetch"
+      reason: "인터넷 접근 필요"
+    - name: "WebSearch"
+      reason: "인터넷 접근 필요"
+    - name: "GitPush"
+      reason: "원격 저장소 필요"
+    - name: "GitPull"
+      reason: "원격 저장소 필요"
+    - name: "GitPR"
+      reason: "GitHub API 필요"
+    - name: "GitIssue"
+      reason: "GitHub API 필요"
+    - name: "DockerPush"
+      reason: "원격 레지스트리 필요"
+    - name: "MCP_*"
+      reason: "외부 MCP 서버 필요"
+    - name: "Analytics_*"
+      reason: "텔레메트리 엔드포인트 필요"
+
+  network_guard:
+    blocked_domains: ["*"]
+    blocked_ports: [80, 443, 8080, 22, 3128]
+    allowed_localhost: true
+    monitor_outbound: true

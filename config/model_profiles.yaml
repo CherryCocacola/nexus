@@ -1,0 +1,180 @@
+# =============================================================================
+# Project Nexus — GPU 티어별 모델 프로필
+# Ch.4.1 GPUTierConfig 기반, GPU VRAM에 따라 자동 선택
+# =============================================================================
+
+profiles:
+  # ── RTX 5090 (32GB) — 기본 타겟 ──
+  rtx5090:
+    tier: "rtx5090"
+    concurrent_models: false   # Primary/Auxiliary 동시 로딩 불가, hot-swap 사용
+    notes: "INT4 양자화 필수. Primary↔Auxiliary 전환 시 hot-swap."
+    primary:
+      name: "gemma-4-31b-it"
+      path: "./models/gemma-4-31b-it"
+      quantization: "awq"      # 4-bit AWQ
+      dtype: "float16"
+      max_model_len: 4096
+      gpu_memory_utilization: 0.80
+      max_num_seqs: 1
+      enable_lora: true
+      max_lora_rank: 32
+      max_loras: 2
+      enforce_eager: true      # CUDA graph 비활성화 (VRAM 절약)
+    auxiliary:
+      name: "exaone-7.8b"
+      path: "./models/exaone-7.8b"
+      quantization: "awq"
+      dtype: "float16"
+      max_model_len: 4096
+      gpu_memory_utilization: 0.80
+      max_num_seqs: 2
+      enable_lora: true
+      max_lora_rank: 32
+      enforce_eager: true
+    embedding:
+      name: "multilingual-e5-large"
+      path: "./models/e5-large"
+      dimension: 1024
+      max_batch_size: 64
+      device: "cuda:0"
+      vram_gb: 0.7
+    training:
+      method: "qlora"
+      lora_rank: 16
+      lora_alpha: 32
+      batch_size: 1
+      gradient_accumulation_steps: 8
+      gradient_checkpointing: true
+      max_seq_length: 2048
+
+  # ── H100 (80GB) ──
+  h100:
+    tier: "h100"
+    concurrent_models: false   # 58+32>80GB, hot-swap 필요
+    notes: "BF16 풀 프리시전. Primary↔Auxiliary hot-swap."
+    primary:
+      name: "gemma-4-31b-it"
+      path: "./models/gemma-4-31b-it"
+      quantization: "none"
+      dtype: "bfloat16"
+      max_model_len: 8192
+      gpu_memory_utilization: 0.85
+      max_num_seqs: 4
+      enable_lora: true
+      max_lora_rank: 64
+      max_loras: 4
+      enforce_eager: false
+    auxiliary:
+      name: "exaone-32b"
+      path: "./models/exaone-32b"
+      quantization: "none"
+      dtype: "bfloat16"
+      max_model_len: 8192
+      gpu_memory_utilization: 0.85
+      max_num_seqs: 4
+      enable_lora: true
+      max_lora_rank: 64
+    embedding:
+      name: "multilingual-e5-large"
+      path: "./models/e5-large"
+      dimension: 1024
+      max_batch_size: 64
+      device: "cuda:0"
+      vram_gb: 0.7
+    training:
+      method: "lora"
+      lora_rank: 64
+      lora_alpha: 128
+      batch_size: 4
+      gradient_accumulation_steps: 4
+      gradient_checkpointing: false
+      max_seq_length: 4096
+
+  # ── H200 (141GB) ──
+  h200:
+    tier: "h200"
+    concurrent_models: true    # 58+32<141GB, 동시 로딩 가능
+    notes: "Primary + Auxiliary 동시 로딩. 최대 성능."
+    primary:
+      name: "gemma-4-31b-it"
+      path: "./models/gemma-4-31b-it"
+      quantization: "none"
+      dtype: "bfloat16"
+      max_model_len: 16384
+      gpu_memory_utilization: 0.90
+      max_num_seqs: 8
+      enable_lora: true
+      max_lora_rank: 128
+      max_loras: 8
+      enforce_eager: false
+    auxiliary:
+      name: "exaone-32b"
+      path: "./models/exaone-32b"
+      quantization: "none"
+      dtype: "bfloat16"
+      max_model_len: 16384
+      gpu_memory_utilization: 0.90
+      max_num_seqs: 4
+      enable_lora: true
+      max_lora_rank: 128
+    embedding:
+      name: "multilingual-e5-large"
+      path: "./models/e5-large"
+      dimension: 1024
+      max_batch_size: 64
+      device: "cuda:0"
+      vram_gb: 0.7
+    training:
+      method: "lora"
+      lora_rank: 128
+      lora_alpha: 256
+      batch_size: 8
+      gradient_accumulation_steps: 2
+      gradient_checkpointing: false
+      max_seq_length: 8192
+
+  # ── Multi-GPU (2+ GPUs) ──
+  multi_gpu:
+    tier: "multi_gpu"
+    concurrent_models: true
+    notes: "Tensor parallelism. Full fine-tune 가능."
+    primary:
+      name: "gemma-4-31b-it"
+      path: "./models/gemma-4-31b-it"
+      quantization: "none"
+      dtype: "bfloat16"
+      max_model_len: 32768
+      gpu_memory_utilization: 0.90
+      max_num_seqs: 16
+      tensor_parallel_size: 2
+      enable_lora: true
+      max_lora_rank: 128
+      max_loras: 8
+      enforce_eager: false
+    auxiliary:
+      name: "exaone-32b"
+      path: "./models/exaone-32b"
+      quantization: "none"
+      dtype: "bfloat16"
+      max_model_len: 32768
+      gpu_memory_utilization: 0.90
+      max_num_seqs: 8
+      tensor_parallel_size: 2
+      enable_lora: true
+      max_lora_rank: 128
+    embedding:
+      name: "multilingual-e5-large"
+      path: "./models/e5-large"
+      dimension: 1024
+      max_batch_size: 64
+      device: "cuda:0"
+      vram_gb: 0.7
+    training:
+      method: "lora"
+      lora_rank: 128
+      lora_alpha: 256
+      batch_size: 16
+      gradient_accumulation_steps: 1
+      gradient_checkpointing: false
+      max_seq_length: 16384

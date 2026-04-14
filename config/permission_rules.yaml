@@ -1,0 +1,103 @@
+# =============================================================================
+# Project Nexus — 권한 규칙 설정
+# Ch.8 Permission System 5계층 파이프라인 기반
+# =============================================================================
+
+permission:
+  # 기본 권한 모드 (7가지 중 택 1)
+  # DEFAULT | ACCEPT_EDITS | BYPASS_PERMISSIONS | DONT_ASK | PLAN | AUTO | BUBBLE
+  default_mode: "DEFAULT"
+
+  # ── Layer 1: Deny Rules (도구 자체를 제거 — 모델이 호출 불가) ──
+  deny_rules:
+    # 에어갭 환경에서 비활성화된 도구
+    - tool: "WebFetch"
+      reason: "에어갭: 외부 네트워크 접근 금지"
+    - tool: "WebSearch"
+      reason: "에어갭: 외부 네트워크 접근 금지"
+
+  # ── Layer 2: 도구별 세부 권한 ──
+  file_permissions:
+    # 보호 경로 (읽기/쓰기 모두 차단)
+    protected_paths:
+      - "/etc/shadow"
+      - "/etc/passwd"
+      - "~/.ssh/"
+      - "~/.gnupg/"
+      - "**/.env"
+      - "**/.env.local"
+      - "**/.env.production"
+      - "**/credentials.json"
+      - "**/secrets.yaml"
+
+    # 읽기 전용 경로 (쓰기 차단)
+    read_only_paths:
+      - "/etc/"
+      - "/usr/"
+      - "/bin/"
+      - "/sbin/"
+
+  bash_permissions:
+    # 위험 명령어 패턴 (차단)
+    dangerous_patterns:
+      - pattern: 'rm\s+-rf\s+/'
+        severity: "critical"
+        reason: "루트 파일시스템 삭제"
+      - pattern: ':()\s*\{\s*:\|:&\s*\};:'
+        severity: "critical"
+        reason: "포크 폭탄"
+      - pattern: 'dd\s+if=/dev/zero'
+        severity: "critical"
+        reason: "디스크 와이프"
+      - pattern: 'mkfs\.'
+        severity: "critical"
+        reason: "파일시스템 포맷"
+      - pattern: 'chmod\s+777'
+        severity: "high"
+        reason: "과도한 권한 부여"
+      - pattern: 'curl|wget|nc|ncat'
+        severity: "high"
+        reason: "에어갭: 네트워크 명령 차단"
+
+    # 안전 명령어 (허용 목록)
+    safe_commands:
+      - "ls"
+      - "cat"
+      - "head"
+      - "tail"
+      - "grep"
+      - "find"
+      - "wc"
+      - "echo"
+      - "pwd"
+      - "whoami"
+      - "date"
+      - "git"
+      - "python"
+      - "pytest"
+      - "ruff"
+      - "mypy"
+      - "pip list"
+
+  # ── Layer 3: 모드별 도구 카테고리 동작 ──
+  # PermissionMode × ToolCategory → PermissionBehavior
+  # (코드에서 MODE_BEHAVIOR_MAP으로 구현)
+
+  # ── Layer 4: Hook 기반 권한 ──
+  hook_permissions:
+    enabled: true
+    # Hook이 BLOCK 반환 시 Layer 3 건너뛰기
+
+  # ── Layer 5: 최종 모드 보정 ──
+  context_resolution:
+    # BYPASS 모드: ASK → ALLOW 변환
+    # PLAN 모드: 쓰기 ASK → DENY 변환
+    enabled: true
+
+# 감사 로그 설정
+audit:
+  enabled: true
+  log_file: "logs/audit.log"
+  max_size_mb: 10
+  rotation_count: 5
+  log_format: "jsonl"

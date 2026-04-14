@@ -1,0 +1,14 @@
+-r requirements.txt
+
+# ── 테스트 ──
+pytest>=8.3.0
+pytest-asyncio>=0.24.0
+pytest-cov>=5.0.0
+pytest-timeout>=2.3.0
+
+# ── 코드 품질 ──
+ruff>=0.6.0
+mypy>=1.11.0
+
+# ── 디버깅 ──
+ipdb>=0.13.0

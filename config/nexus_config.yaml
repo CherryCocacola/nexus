@@ -1,0 +1,68 @@
+# =============================================================================
+# Project Nexus — 메인 설정 파일
+# 우선순위: CLI 인자 > 환경변수(NEXUS_ 접두사) > 이 파일 > 기본값
+# =============================================================================
+
+# GPU 서버 (Machine B) 연결 설정
+gpu_server:
+  url: "http://192.168.22.28:8000"
+  timeout_seconds: 120.0
+  max_retries: 10
+  retry_base_delay: 0.5
+  health_check_interval: 30.0
+
+# Redis (단기 메모리 / 세션 캐시)
+redis:
+  host: "192.168.10.39"
+  port: 6379
+  db: 0
+  password: ""
+  socket_timeout: 5.0
+
+# PostgreSQL + pgvector (장기 메모리)
+postgresql:
+  host: "192.168.10.39"
+  port: 5432
+  database: "nexus"
+  user: "nexus"
+  password: ""
+  min_connections: 2
+  max_connections: 10
+
+# 모델 설정
+model:
+  primary_model: "gemma-4-31b-it"
+  auxiliary_model: "exaone-7.8b"
+  embedding_model: "multilingual-e5-large"
+  max_context_tokens: 4096
+  default_temperature: 0.7
+  default_max_tokens: 4096
+
+# 세션 설정
+session:
+  sessions_dir: ".nexus/sessions"
+  max_turns: 50
+  max_budget_seconds: 300.0
+  session_ttl_hours: 24
+  transcript_enabled: true
+
+# 보안 설정
+security:
+  sandbox_enabled: true
+  sandbox_timeout_seconds: 30.0
+  max_file_size_bytes: 10485760  # 10MB
+  bash_deny_patterns:
+    - 'rm\s+-rf\s+/'
+    - ':(){ :\|:& };:'
+    - 'dd\s+if=/dev/zero'
+    - 'mkfs\.'
+    - '>\s*/dev/sd'
+
+# 운영 설정
+log_level: "INFO"
+log_file: null
+watch_files: false
+debug: false
+
+# 에어갭 모드 (외부 네트워크 차단)
+air_gap_mode: true

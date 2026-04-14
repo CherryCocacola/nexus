@@ -1,0 +1,99 @@
+# =============================================================================
+# Project Nexus — 로깅 설정
+# 형식: JSONL (구조화 로그), 10MB 로테이션
+# =============================================================================
+
+logging:
+  version: 1
+  disable_existing_loggers: false
+
+  # 로그 포맷
+  formatters:
+    jsonl:
+      # structlog 기반 JSON 라인 포맷
+      format: "json"
+      timestamp_format: "iso"
+    console:
+      format: "[%(asctime)s] %(levelname)-8s %(name)s — %(message)s"
+      datefmt: "%Y-%m-%d %H:%M:%S"
+
+  # 핸들러
+  handlers:
+    console:
+      class: "logging.StreamHandler"
+      formatter: "console"
+      level: "INFO"
+      stream: "ext://sys.stderr"
+
+    file:
+      class: "logging.handlers.RotatingFileHandler"
+      formatter: "jsonl"
+      filename: "logs/nexus.log"
+      maxBytes: 10485760       # 10MB
+      backupCount: 5
+      encoding: "utf-8"
+
+    audit:
+      class: "logging.handlers.RotatingFileHandler"
+      formatter: "jsonl"
+      filename: "logs/audit.log"
+      maxBytes: 10485760       # 10MB
+      backupCount: 5
+      encoding: "utf-8"
+
+    training:
+      class: "logging.handlers.RotatingFileHandler"
+      formatter: "jsonl"
+      filename: "logs/training.log"
+      maxBytes: 10485760       # 10MB
+      backupCount: 3
+      encoding: "utf-8"
+
+  # 로거 계층
+  loggers:
+    nexus:
+      level: "INFO"
+      handlers: ["console", "file"]
+      propagate: false
+
+    nexus.audit:
+      level: "INFO"
+      handlers: ["audit"]
+      propagate: false
+
+    nexus.training:
+      level: "INFO"
+      handlers: ["console", "training"]
+      propagate: false
+
+    nexus.model:
+      level: "INFO"
+      handlers: ["console", "file"]
+      propagate: false
+
+    nexus.tools:
+      level: "INFO"
+      handlers: ["console", "file"]
+      propagate: false
+
+    nexus.permission:
+      level: "INFO"
+      handlers: ["console", "file", "audit"]
+      propagate: false
+
+    nexus.security:
+      level: "WARNING"
+      handlers: ["console", "file", "audit"]
+      propagate: false
+
+  # 루트 로거
+  root:
+    level: "WARNING"
+    handlers: ["console"]
+
+# 에이전트 트랜스크립트
+transcript:
+  enabled: true
+  directory: ".nexus/agent_transcripts"
+  format: "jsonl"
+  max_size_mb: 10
