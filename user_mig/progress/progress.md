@@ -6,10 +6,11 @@
 
 ## 현재 상태
 
-- **현재 Phase**: Phase 5.0 완료, Phase 6.0 (Training Pipeline) 시작 예정
+- **현재 Phase**: Phase 7.0 완료, Phase 8.0 (Integration & Polish) 시작 예정
 - **마지막 업데이트**: 2026-04-14
 - **브랜치**: main
-- **총 테스트**: 236개 (전부 통과)
+- **총 테스트**: 288개 (전부 통과)
+- **전체 파일**: ~140개 Python 모듈
 
 ---
 
@@ -146,12 +147,31 @@
 
 ---
 
+## Phase 6.0 + 7.0: Training + CLI/Web/Deployment (완료)
+
+### v0.8.0 — 학습 파이프라인 + 인터페이스 + 배포 (2026-04-14)
+**커밋**: `3fc9787`
+
+- Training Pipeline (training/ 6모듈):
+  - 5-Phase 전략 (PROMPT→BOOTSTRAP→SELF_DATA→REASONING→DOMAIN)
+  - 부트스트랩 데이터 생성 (도구 70% + 추론 30%)
+  - LoRA/QLoRA 트레이너, 데이터 수집 (PII 마스킹), 자동 학습 루프
+  - 체크포인트 관리 (활성화, 롤백, 최고성능)
+- CLI (cli/ 3모듈): Rich REPL, Click 명령어, 출력 포매터
+- Web (web/ 2모듈): FastAPI (chat/stream/sessions/tools/health), 미들웨어
+- Deployment (deployment/ 2모듈): SHA256 무결성, 에어갭 번들 준비
+- 288개 테스트 통과 (신규 52개)
+
+---
+
 ## 다음 세션 시작 시 참고
 
-1. **Phase 0.5~5.0 완료** — core/ 엔진 전체 구현 완료
-2. **다음**: Phase 6.0 (Training Pipeline) — QLoRA 학습, 데이터 수집, 평가
-3. 사양서 참조: Ch.18 (Training Pipeline)
-4. Phase 7.0 (CLI/Web), Phase 8.0 (통합 테스트)
-5. GPU 서버: 192.168.22.28, DB: 192.168.10.39
-6. 현재 ruff 클린, 236개 테스트 전부 통과
-7. 이 세션에서 Phase 0.5~5.0까지 완료 — **core/ 엔진 전체 구현 완료**
+1. **Phase 0.5~7.0 완료** — 모든 기능 모듈 구현 완료
+2. **다음**: Phase 8.0 (Integration & Polish)
+   - E2E 통합 테스트 (전체 query_loop → tool → result 시나리오)
+   - 성능 최적화
+   - 모듈 간 연결 검증
+   - 사양서 Ch.22.6 통합 테스트 계획 참조
+3. GPU 서버: 192.168.22.28, DB: 192.168.10.39
+4. ruff 클린, 288개 테스트 전부 통과
+5. **이 세션에서 Phase 0.5~7.0까지 한번에 완료** — 전체 시스템 구현
