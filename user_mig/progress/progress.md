@@ -6,10 +6,10 @@
 
 ## 현재 상태
 
-- **현재 Phase**: Phase 3.0 완료, Phase 4.0 (Security & Permission) 시작 예정
+- **현재 Phase**: Phase 4.0 완료, Phase 5.0 (Thinking & Memory) 시작 예정
 - **마지막 업데이트**: 2026-04-14
 - **브랜치**: main
-- **총 테스트**: 106개 (전부 통과)
+- **총 테스트**: 124개 (전부 통과)
 
 ---
 
@@ -111,12 +111,28 @@
 
 ---
 
+## Phase 4.0: Security & Permission (완료)
+
+### v0.6.0 — 5계층 권한 + 보안 + 훅 시스템 (2026-04-14)
+**커밋**: `525b096`
+
+- `core/permission/types.py`: 전체 권한 타입 (7 Mode, 7 Category, 7x7 MAP)
+- `core/permission/pipeline.py`: 5계층 파이프라인 (deny→tool→mode→hook→resolve)
+- `core/security/path_guard.py`: 경로 보호 (순회, UNC, 보호 경로 21개 패턴)
+- `core/security/command_filter.py`: 명령어 필터 (allowlist + 30+ 위험 패턴)
+- `core/security/audit.py`: JSONL 감사 로그 (10MB 로테이션)
+- `core/hooks/hook_manager.py`: 훅 매니저 (4 이벤트, 3 결정)
+- `core/hooks/builtin_hooks.py`: 내장 훅 2개
+- 124개 테스트 통과
+
+---
+
 ## 다음 세션 시작 시 참고
 
-1. **Phase 0.5~3.0 완료** — 부트스트랩, 모델, 24개 도구, 오케스트레이터 전부 구현
-2. **다음**: Phase 4.0 (Security & Permission) — 5계층 권한, sandbox, audit
-3. 사양서 참조: Ch.8 (Permission System), Ch.9 (Security System), Ch.10 (Hook System)
-4. Phase 5.0 (Thinking & Memory)은 Phase 3.0과 병렬 가능하므로 동시 착수 가능
+1. **Phase 0.5~4.0 완료** — 부트스트랩, 모델, 24개 도구, 오케스트레이터, 보안/권한 전부 구현
+2. **다음**: Phase 5.0 (Thinking & Memory) — ThinkingEngine, MemorySystem, SystemPrompt
+3. 사양서 참조: Ch.11 (Thinking Engine), Ch.12 (Memory System)
+4. Phase 6.0 (Training) 이후 Phase 7.0 (CLI/Web), Phase 8.0 (통합)
 5. GPU 서버: 192.168.22.28, DB: 192.168.10.39
-6. 현재 ruff 클린, 106개 테스트 전부 통과
-7. 이 세션에서 Phase 0.5~3.0까지 한번에 완료 — 매우 큰 진행
+6. 현재 ruff 클린, 124개 테스트 전부 통과
+7. 이 세션에서 Phase 0.5~4.0까지 완료 — 핵심 엔진 대부분 구현됨
