@@ -171,7 +171,7 @@ class StreamEvent(BaseModel):
     type 필드로 이벤트 종류를 구분하고, 해당 필드만 사용한다.
     """
 
-    model_config = {"use_enum_values": True}
+    model_config = {"use_enum_values": True, "protected_namespaces": ()}
 
     type: StreamEventType
 

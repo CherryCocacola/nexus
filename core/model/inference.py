@@ -260,7 +260,8 @@ class LocalModelProvider(ModelProvider):
                     data_str = line[6:].strip()
                     if data_str == "[DONE]":
                         # 누적된 tool_calls 최종 yield
-                        yield from self._finalize_tool_calls(accumulated_tool_calls)
+                        for _evt in self._finalize_tool_calls(accumulated_tool_calls):
+                            yield _evt
                         yield StreamEvent(
                             type=StreamEventType.MESSAGE_STOP,
                             stop_reason=StopReason.END_TURN,
@@ -299,9 +300,10 @@ class LocalModelProvider(ModelProvider):
                     # tool_calls 증분 누적
                     if "tool_calls" in delta:
                         for tc_delta in delta["tool_calls"]:
-                            yield from self._accumulate_tool_call(
+                            for _evt in self._accumulate_tool_call(
                                 accumulated_tool_calls, tc_delta
-                            )
+                            ):
+                                yield _evt
 
                     # finish_reason 처리
                     if finish_reason:
@@ -312,9 +314,10 @@ class LocalModelProvider(ModelProvider):
                         }.get(finish_reason, StopReason.END_TURN)
 
                         if finish_reason == "tool_calls":
-                            yield from self._finalize_tool_calls(
+                            for _evt in self._finalize_tool_calls(
                                 accumulated_tool_calls
-                            )
+                            ):
+                                yield _evt
 
                         yield StreamEvent(
                             type=StreamEventType.MESSAGE_STOP,
