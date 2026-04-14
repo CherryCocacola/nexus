@@ -6,9 +6,10 @@
 
 ## 현재 상태
 
-- **현재 Phase**: Phase 0.5 완료, Phase 1.0 시작 예정
+- **현재 Phase**: Phase 3.0 완료, Phase 4.0 (Security & Permission) 시작 예정
 - **마지막 업데이트**: 2026-04-14
 - **브랜치**: main
+- **총 테스트**: 106개 (전부 통과)
 
 ---
 
@@ -31,22 +32,91 @@
 - `core/state.py` — GlobalState 싱글톤 (DAG leaf 격리, 스레드 안전 토큰 카운터)
 - `core/config.py` — NexusConfig Pydantic v2 설정 시스템 (YAML 로딩, 에어갭 검증)
 - `core/bootstrap.py` — Phase 1 초기화 (로깅, 종료 핸들러, GPU 사전연결, 플랫폼 감지)
-- `tests/unit/test_state.py` — 11개 테스트
-- `tests/unit/test_config.py` — 10개 테스트
-- ruff 클린, 전체 21개 테스트 통과
+- 21개 테스트 통과
 
 ---
 
-## Phase 1.0: Model Layer (진행 중)
+## Phase 1.0: Model Layer (완료)
 
-> GPU 감지, 추론 클라이언트, 프롬프트 포매터 구현 예정
+### v0.2.0 — 메시지 타입 + 추론 클라이언트 + GPU 감지 (2026-04-14)
+**커밋**: `35b9a2e`
+
+- `core/message.py` — 전체 타입 시스템 구현
+  - StreamEvent (17종 이벤트 타입), Message (factory method 4종)
+  - ContentBlock (TextBlock, ToolUseBlock, ToolResultBlock, ThinkingBlock)
+  - Conversation (compact_boundary 기반 컨텍스트 관리)
+  - TokenUsage (합산 연산자, vLLM prefix caching 지원)
+- `core/model/inference.py` — ModelProvider ABC + LocalModelProvider
+  - vLLM OpenAI 호환 /v1/chat/completions SSE 스트리밍
+  - Nexus Message → OpenAI message 자동 변환
+  - tool_calls 증분 누적 + 최종 완성 로직
+  - 연결 실패 시 graceful error event yield
+- `core/model/gpu_detector.py` — GPU 티어 감지
+  - GPUTier 4종 (RTX_5090, H100, H200, MULTI_GPU)
+  - 티어별 최적 설정 테이블 (양자화, 컨텍스트, 배치, LoRA)
+- `core/model/prompt_formatter.py` — 모델별 프롬프트 포매터
+  - Gemma 4 (<start_of_turn>), ExaOne ([|system|]), ChatML 폴백
+  - 도구 스키마 XML 주입
+- `core/model/model_manager.py` — Machine A 측 모델 매니저
+  - hot-swap 조율, LoRA 로드/언로드, 헬스 체크
+- 61개 테스트 통과 (신규 40개)
+
+---
+
+## Phase 2.0a: Tool System 프레임워크 + 핵심 도구 (완료)
+
+### v0.3.0 — BaseTool + Registry + Executor + 핵심 도구 8개 (2026-04-14)
+**커밋**: `995ed5a`
+
+- `core/tools/base.py` — BaseTool ABC + ToolResult + ToolUseContext
+  - fail-closed 기본값, 7개 카테고리 ~25개 멤버
+- `core/tools/registry.py` — ToolRegistry (등록, alias 조회, deny 필터, cache-stable 정렬)
+- `core/tools/executor.py` — 13단계 실행 파이프라인
+- 핵심 도구 8개:
+  - Read, Write, Edit, MultiEdit (파일 시스템)
+  - Bash (실행), Glob, Grep (검색), LS (디렉토리)
+- 82개 테스트 통과 (신규 21개)
+
+---
+
+## Phase 2.0b: 나머지 도구 16개 (완료)
+
+### v0.4.0 — 도구 24개 완성 (2026-04-14)
+**커밋**: `9fe5ba3`
+
+- `git_tools.py`: Git 도구 6개 (Log, Diff, Status, Commit, Branch, Checkout)
+- `notebook_tools.py`: Notebook 도구 2개 (Read, Edit)
+- `task_tools.py`: Task 도구 3개 (TodoRead, TodoWrite, Task)
+- `agent_tool.py`: Agent 도구 1개 (서브 에이전트 stub)
+- `memory_tools.py`: Memory 도구 2개 (인메모리 폴백)
+- `docker_tools.py`: Docker 도구 2개 (Build, Run)
+- 91개 테스트 통과
+
+---
+
+## Phase 3.0: Orchestrator (완료)
+
+### v0.5.0 — QueryLoop + 스트리밍 + 컨텍스트 관리 (2026-04-14)
+**커밋**: `c7f32d9`
+
+- `query_loop.py`: while(True) 에이전트 턴 루프
+  - 7가지 ContinueReason 전환, 4 Phase per iteration
+  - LoopState 명시적 상태 관리, max_output_tokens 에스컬레이션
+- `stream_handler.py`: StreamingToolExecutor
+  - 모델 스트리밍 중 도구 병렬 실행, Semaphore 동시성 제한
+- `context_manager.py`: 4단계 압축 파이프라인
+  - tool_result 예산, snip/micro/auto compact, 긴급 압축
+- `stop_resolver.py`: 종료/계속 판단 + 잘림 감지 휴리스틱
+- 106개 테스트 통과
 
 ---
 
 ## 다음 세션 시작 시 참고
 
-1. Phase 0.5 완료 — state, config, bootstrap 구현 및 테스트 통과
-2. Phase 1.0 대상 파일: `core/model/` 디렉토리 전체
-3. 사양서 참조: Ch.4 (라인 2979~5148), Ch.5.2 ModelProvider (라인 5549~6174)
-4. GPU 서버 주소: 192.168.22.28, DB 서버: 192.168.10.39
-5. 타겟 GPU: RTX 5090 (32GB), INT4 양자화
+1. **Phase 0.5~3.0 완료** — 부트스트랩, 모델, 24개 도구, 오케스트레이터 전부 구현
+2. **다음**: Phase 4.0 (Security & Permission) — 5계층 권한, sandbox, audit
+3. 사양서 참조: Ch.8 (Permission System), Ch.9 (Security System), Ch.10 (Hook System)
+4. Phase 5.0 (Thinking & Memory)은 Phase 3.0과 병렬 가능하므로 동시 착수 가능
+5. GPU 서버: 192.168.22.28, DB: 192.168.10.39
+6. 현재 ruff 클린, 106개 테스트 전부 통과
+7. 이 세션에서 Phase 0.5~3.0까지 한번에 완료 — 매우 큰 진행
