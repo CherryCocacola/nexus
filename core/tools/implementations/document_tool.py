@@ -31,7 +31,9 @@ from core.tools.base import (
 logger = logging.getLogger("nexus.tools.document")
 
 # 텍스트 추출 결과의 최대 문자 수 (컨텍스트 초과 방지)
-MAX_EXTRACT_CHARS = 10000
+# RTX 5090 (8192 ctx): tool_result는 ~3,000 토큰(~6,000자) 이내여야
+# 도구 스키마 + 시스템 + 메시지 + 출력 토큰이 컨텍스트에 들어간다.
+MAX_EXTRACT_CHARS = 6000
 
 
 class DocumentProcessTool(BaseTool):

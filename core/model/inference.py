@@ -262,14 +262,26 @@ class LocalModelProvider(ModelProvider):
 
                         # 컨텍스트 초과 에러 감지 → max_tokens 줄여서 재시도
                         if response.status_code == 400 and "context length" in error_body:
-                            # 에러에서 실제 input_tokens 추출
                             import re
 
                             m = re.search(r"contains at least (\d+) input", error_body)
                             if m:
                                 actual_input = int(m.group(1))
                                 new_max = self._config.max_context_tokens - actual_input - 100
-                                current_max_tokens = max(256, new_max)
+                                # 입력만으로 컨텍스트를 초과하면 재시도 불가
+                                if new_max < 256:
+                                    yield StreamEvent(
+                                        type=StreamEventType.ERROR,
+                                        error_code="CONTEXT_OVERFLOW",
+                                        message=(
+                                            f"입력({actual_input} 토큰)이 "
+                                            f"컨텍스트({self._config.max_context_tokens})를 "
+                                            f"거의 다 사용하여 응답을 생성할 수 없습니다. "
+                                            f"더 짧은 내용으로 다시 시도해 주세요."
+                                        ),
+                                    )
+                                    return
+                                current_max_tokens = new_max
                                 logger.warning(
                                     "컨텍스트 초과 → 재시도 %d/%d: "
                                     "input=%d, max_tokens=%d→%d",
