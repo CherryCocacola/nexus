@@ -6,11 +6,11 @@
 
 ## 현재 상태
 
-- **현재 Phase**: Phase 8.0 완료 — 통합 테스트 + 폴리싱
+- **현재 Phase**: Phase 8.0 완료 + TaskManager 구현 완료
 - **마지막 업데이트**: 2026-04-15
 - **브랜치**: main
-- **총 테스트**: 352개 (전부 통과) — 단위 288 + 통합 64
-- **전체 파일**: ~145개 Python 모듈
+- **총 테스트**: 380개 (전부 통과) — 단위 316 + 통합 64
+- **전체 파일**: ~147개 Python 모듈
 
 ---
 
@@ -224,14 +224,37 @@
 
 ---
 
+## TaskManager 구현 (완료)
+
+### v0.9.2 — TaskManager + task_tools 연동 (2026-04-15)
+
+- **core/task.py** (신규):
+  - TaskType (7종): LOCAL_BASH, LOCAL_AGENT, REMOTE_AGENT, TEAMMATE, WORKFLOW, MONITOR, TRAINING
+  - TaskStatus (5종): PENDING, RUNNING, COMPLETED, FAILED, KILLED
+  - TaskState (Pydantic BaseModel): id, type, status, description, progress, error_message, result
+  - TaskManager: create, run, run_background, kill, update_progress, get_active, on_complete, cleanup_old
+- **core/tools/implementations/task_tools.py** (수정):
+  - TodoRead/TodoWrite/TaskTool → TaskManager API 연동 (폴백 유지)
+  - _handle_stop() → async + TaskManager.kill() 사용
+  - killed 상태 아이콘 [K] 추가
+  - TaskState ↔ dict 변환 유틸 추가
+- **core/bootstrap.py** (수정):
+  - init_phase2()에 TaskManager 인스턴스 생성 + context.options 주입
+- **tests/unit/test_task_manager.py** (신규, 28개 테스트):
+  - TaskType/TaskStatus enum 검증 (5개)
+  - TaskManager 라이프사이클: create, run, run_background, kill, progress, callback, cleanup (18개)
+  - task_tools + TaskManager 연동 검증 (5개)
+- 380개 테스트 통과 (기존 352 + 신규 28)
+
+---
+
 ## 다음 세션 시작 시 참고
 
-1. **Phase 0.5~8.0 + TODO 연동 완료** — 전체 시스템 구현 + 통합 + 배선
+1. **Phase 0.5~8.0 + 연동 + TaskManager 완료**
 2. **추가 가능 작업**:
    - 실 GPU 서버(192.168.22.28) 연결 후 E2E 테스트
    - 성능 벤치마크 (사양서 Ch.22.4 Success Metrics)
    - Soak Test (24시간 연속 추론, 100-Turn 대화, 모델 스왑 스트레스)
    - LoRA Phase 1 Bootstrap 학습 실행
-   - TaskManager 구현 (task_tools.py 완전 연동)
 3. GPU 서버: 192.168.22.28, DB: 192.168.10.39
-4. ruff 클린, 352개 테스트 전부 통과
+4. ruff 클린, 380개 테스트 전부 통과

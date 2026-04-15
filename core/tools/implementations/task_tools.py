@@ -4,14 +4,13 @@ Task 도구 모음 — 태스크 관리 도구.
 3개의 태스크 도구를 제공한다:
   - TodoRead: 태스크 목록 조회 (읽기 전용)
   - TodoWrite: 태스크 생성/업데이트
-  - TaskTool: 태스크 관리 (create/update/list/stop)
+  - TaskTool: 태스크 관리 (create/update/list/get/stop)
 
-실제 TaskManager는 아직 구현되지 않았으므로 (Phase 3.0+),
-context.options에서 task_manager를 가져오되
-없으면 인메모리 딕셔너리 기반의 간단한 구현을 사용한다.
+TaskManager가 context.options에 주입되어 있으면 사용하고,
+없으면 인메모리 딕셔너리 기반의 폴백 구현을 사용한다.
 
-각 태스크는 고유 ID, 상태(pending/in_progress/completed/failed),
-설명, 우선순위 등의 정보를 가진다.
+왜 폴백을 유지하는가: TaskManager 없이도 기본 CRUD가 가능하여
+단위 테스트나 간단한 환경에서도 동작한다.
 """
 
 from __future__ import annotations
@@ -21,6 +20,7 @@ import time
 import uuid
 from typing import Any
 
+from core.task import TaskManager, TaskState, TaskStatus
 from core.tools.base import (
     BaseTool,
     PermissionBehavior,
@@ -31,40 +31,30 @@ from core.tools.base import (
 
 logger = logging.getLogger("nexus.tools.task")
 
-# 태스크 상태 상수
-TASK_STATUS_PENDING = "pending"
-TASK_STATUS_IN_PROGRESS = "in_progress"
-TASK_STATUS_COMPLETED = "completed"
-TASK_STATUS_FAILED = "failed"
-
-# 유효한 태스크 상태 목록
-VALID_STATUSES = {
-    TASK_STATUS_PENDING,
-    TASK_STATUS_IN_PROGRESS,
-    TASK_STATUS_COMPLETED,
-    TASK_STATUS_FAILED,
-}
-
 # 인메모리 태스크 저장소 (TaskManager가 없을 때 폴백으로 사용)
 # 키: task_id, 값: task 딕셔너리
 _fallback_tasks: dict[str, dict[str, Any]] = {}
 
 
-def _get_task_manager(context: ToolUseContext) -> Any:
+def _get_task_manager(context: ToolUseContext) -> TaskManager | None:
     """
-    context.options에서 task_manager를 가져온다.
+    context.options에서 TaskManager를 가져온다.
     없으면 None을 반환하여 인메모리 폴백을 사용하게 한다.
     """
-    return context.options.get("task_manager")
+    manager = context.options.get("task_manager")
+    if isinstance(manager, TaskManager):
+        return manager
+    return None
 
 
-def _create_task(
+def _create_fallback_task(
     description: str,
     priority: str = "medium",
-    status: str = TASK_STATUS_PENDING,
+    status: str = "pending",
 ) -> dict[str, Any]:
     """
-    새 태스크를 생성하고 인메모리 저장소에 저장한다.
+    폴백용 태스크를 생성하고 인메모리 저장소에 저장한다.
+    TaskManager가 없는 환경에서만 사용된다.
 
     Args:
         description: 태스크 설명
@@ -74,7 +64,7 @@ def _create_task(
     Returns:
         생성된 태스크 딕셔너리
     """
-    task_id = str(uuid.uuid4())[:8]  # 간결한 ID (8자)
+    task_id = str(uuid.uuid4())[:8]
     task = {
         "id": task_id,
         "description": description,
@@ -87,13 +77,30 @@ def _create_task(
     return task
 
 
+def _task_state_to_dict(task: TaskState) -> dict[str, Any]:
+    """
+    TaskState를 기존 포맷의 딕셔너리로 변환한다.
+    왜 변환하는가: _format_task()와 호환성을 유지하기 위해서다.
+    """
+    return {
+        "id": task.id,
+        "description": task.description,
+        "status": task.status.value,
+        "priority": "medium",  # TaskManager는 priority를 관리하지 않음
+        "created_at": task.start_time.timestamp(),
+        "updated_at": (task.end_time or task.start_time).timestamp(),
+    }
+
+
 def _format_task(task: dict[str, Any]) -> str:
     """태스크를 사람이 읽기 쉬운 한 줄 형식으로 변환한다."""
     status_icon = {
-        TASK_STATUS_PENDING: "[ ]",
-        TASK_STATUS_IN_PROGRESS: "[~]",
-        TASK_STATUS_COMPLETED: "[x]",
-        TASK_STATUS_FAILED: "[!]",
+        "pending": "[ ]",
+        "in_progress": "[~]",
+        "running": "[~]",  # TaskManager의 running 상태도 동일 아이콘
+        "completed": "[x]",
+        "failed": "[!]",
+        "killed": "[K]",  # 강제 종료 상태
     }.get(task["status"], "[?]")
     priority = task.get("priority", "medium")
     return f"#{task['id']} {status_icon} [{priority}] {task['description']}"
@@ -132,8 +139,8 @@ class TodoReadTool(BaseTool):
             "properties": {
                 "status_filter": {
                     "type": "string",
-                    "description": "상태 필터 (pending/in_progress/completed/failed)",
-                    "enum": ["pending", "in_progress", "completed", "failed"],
+                    "description": "상태 필터 (pending/running/completed/failed/killed)",
+                    "enum": ["pending", "running", "completed", "failed", "killed"],
                 },
             },
             "required": [],
@@ -169,10 +176,12 @@ class TodoReadTool(BaseTool):
         manager = _get_task_manager(context)
         status_filter = input_data.get("status_filter")
 
-        # TaskManager가 있으면 위임
-        # TODO(nexus): TaskManager 구현 후 연동
-        if manager and hasattr(manager, "list_tasks"):
-            tasks = manager.list_tasks(status=status_filter)
+        if manager is not None:
+            # TaskManager에서 태스크 조회
+            all_tasks = manager.get_all()
+            tasks = [_task_state_to_dict(t) for t in all_tasks]
+            if status_filter:
+                tasks = [t for t in tasks if t["status"] == status_filter]
         else:
             # 인메모리 폴백 사용
             tasks = list(_fallback_tasks.values())
@@ -242,7 +251,7 @@ class TodoWriteTool(BaseTool):
                 "status": {
                     "type": "string",
                     "description": "태스크 상태",
-                    "enum": ["pending", "in_progress", "completed", "failed"],
+                    "enum": ["pending", "in_progress", "running", "completed", "failed", "killed"],
                 },
                 "priority": {
                     "type": "string",
@@ -287,24 +296,33 @@ class TodoWriteTool(BaseTool):
 
         처리 순서:
           1. task_id 유무로 생성/업데이트 분기
-          2. 생성: 새 태스크 딕셔너리 생성 후 저장
-          3. 업데이트: 기존 태스크를 찾아 필드 수정
+          2. TaskManager가 있으면 사용, 없으면 인메모리 폴백
         """
         manager = _get_task_manager(context)
         task_id = input_data.get("task_id")
 
         if task_id:
-            # 기존 태스크 업데이트
-            # TODO(nexus): TaskManager 구현 후 연동
-            if manager and hasattr(manager, "update_task"):
-                task = manager.update_task(task_id, input_data)
+            # ── 기존 태스크 업데이트 ──
+            if manager is not None:
+                # TaskManager에서 태스크 조회 후 필드 업데이트
+                task_state = manager.tasks.get(task_id)
+                if not task_state:
+                    return ToolResult.error(f"태스크 #{task_id}을(를) 찾을 수 없습니다.")
+
+                if "description" in input_data:
+                    task_state.description = input_data["description"]
+                if "status" in input_data:
+                    try:
+                        task_state.status = TaskStatus(input_data["status"])
+                    except ValueError:
+                        pass
+                task = _task_state_to_dict(task_state)
             else:
                 # 인메모리 폴백
                 task = _fallback_tasks.get(task_id)
                 if not task:
                     return ToolResult.error(f"태스크 #{task_id}을(를) 찾을 수 없습니다.")
 
-                # 제공된 필드만 업데이트
                 if "description" in input_data:
                     task["description"] = input_data["description"]
                 if "status" in input_data:
@@ -319,15 +337,18 @@ class TodoWriteTool(BaseTool):
                 task_id=task_id,
             )
         else:
-            # 새 태스크 생성
+            # ── 새 태스크 생성 ──
             description = input_data["description"]
             priority = input_data.get("priority", "medium")
 
-            # TODO(nexus): TaskManager 구현 후 연동
-            if manager and hasattr(manager, "create_task"):
-                task = manager.create_task(description=description, priority=priority)
+            if manager is not None:
+                # TaskManager로 생성 (WORKFLOW 타입 기본)
+                tid = manager.create("local_workflow", description)
+                task_state = manager.tasks[tid]
+                task = _task_state_to_dict(task_state)
+                task["priority"] = priority  # priority는 포맷 표시용
             else:
-                task = _create_task(description=description, priority=priority)
+                task = _create_fallback_task(description=description, priority=priority)
 
             logger.info("TodoWrite: created task #%s", task["id"])
             return ToolResult.success(
@@ -393,7 +414,7 @@ class TaskTool(BaseTool):
                 "status": {
                     "type": "string",
                     "description": "태스크 상태 (update 시 사용)",
-                    "enum": ["pending", "in_progress", "completed", "failed"],
+                    "enum": ["pending", "running", "completed", "failed", "killed"],
                 },
                 "priority": {
                     "type": "string",
@@ -404,7 +425,7 @@ class TaskTool(BaseTool):
                 "status_filter": {
                     "type": "string",
                     "description": "목록 조회 시 상태 필터",
-                    "enum": ["pending", "in_progress", "completed", "failed"],
+                    "enum": ["pending", "running", "completed", "failed", "killed"],
                 },
             },
             "required": ["action"],
@@ -463,11 +484,10 @@ class TaskTool(BaseTool):
           - update: 태스크 필드 업데이트
           - list: 태스크 목록 조회
           - get: 특정 태스크 상세 조회
-          - stop: 태스크 중지 (상태를 failed로 변경)
+          - stop: 태스크 강제 종료 (TaskManager.kill() 사용)
         """
         action = input_data["action"]
 
-        # 각 action별 분기 처리
         if action == "create":
             return self._handle_create(input_data, context)
         elif action == "update":
@@ -477,7 +497,7 @@ class TaskTool(BaseTool):
         elif action == "get":
             return self._handle_get(input_data, context)
         elif action == "stop":
-            return self._handle_stop(input_data, context)
+            return await self._handle_stop(input_data, context)
         else:
             return ToolResult.error(f"알 수 없는 작업: {action}")
 
@@ -487,11 +507,13 @@ class TaskTool(BaseTool):
         priority = input_data.get("priority", "medium")
 
         manager = _get_task_manager(context)
-        # TODO(nexus): TaskManager 구현 후 연동
-        if manager and hasattr(manager, "create_task"):
-            task = manager.create_task(description=description, priority=priority)
+        if manager is not None:
+            tid = manager.create("local_workflow", description)
+            task_state = manager.tasks[tid]
+            task = _task_state_to_dict(task_state)
+            task["priority"] = priority
         else:
-            task = _create_task(description=description, priority=priority)
+            task = _create_fallback_task(description=description, priority=priority)
 
         logger.info("Task create: #%s", task["id"])
         return ToolResult.success(
@@ -504,8 +526,21 @@ class TaskTool(BaseTool):
         task_id = input_data["task_id"]
 
         manager = _get_task_manager(context)
-        if manager and hasattr(manager, "update_task"):
-            task = manager.update_task(task_id, input_data)
+        if manager is not None:
+            task_state = manager.tasks.get(task_id)
+            if not task_state:
+                return ToolResult.error(f"태스크 #{task_id}을(를) 찾을 수 없습니다.")
+
+            if "description" in input_data:
+                task_state.description = input_data["description"]
+            if "status" in input_data:
+                try:
+                    task_state.status = TaskStatus(input_data["status"])
+                except ValueError:
+                    pass
+            if "progress" in input_data:
+                manager.update_progress(task_id, float(input_data["progress"]))
+            task = _task_state_to_dict(task_state)
         else:
             task = _fallback_tasks.get(task_id)
             if not task:
@@ -530,8 +565,11 @@ class TaskTool(BaseTool):
         status_filter = input_data.get("status_filter")
 
         manager = _get_task_manager(context)
-        if manager and hasattr(manager, "list_tasks"):
-            tasks = manager.list_tasks(status=status_filter)
+        if manager is not None:
+            all_tasks = manager.get_all()
+            tasks = [_task_state_to_dict(t) for t in all_tasks]
+            if status_filter:
+                tasks = [t for t in tasks if t["status"] == status_filter]
         else:
             tasks = list(_fallback_tasks.values())
             if status_filter:
@@ -549,37 +587,60 @@ class TaskTool(BaseTool):
         task_id = input_data["task_id"]
 
         manager = _get_task_manager(context)
-        if manager and hasattr(manager, "get_task"):
-            task = manager.get_task(task_id)
-        else:
-            task = _fallback_tasks.get(task_id)
-
-        if not task:
-            return ToolResult.error(f"태스크 #{task_id}을(를) 찾을 수 없습니다.")
-
-        # 상세 정보 포맷
-        lines = [
-            f"ID:       #{task['id']}",
-            f"상태:     {task['status']}",
-            f"우선순위: {task.get('priority', 'medium')}",
-            f"설명:     {task['description']}",
-            f"생성:     {task.get('created_at', 'N/A')}",
-            f"수정:     {task.get('updated_at', 'N/A')}",
-        ]
-        return ToolResult.success("\n".join(lines), task_id=task_id)
-
-    def _handle_stop(self, input_data: dict[str, Any], context: ToolUseContext) -> ToolResult:
-        """태스크를 중지한다 (상태를 failed로 변경)."""
-        task_id = input_data["task_id"]
-
-        manager = _get_task_manager(context)
-        if manager and hasattr(manager, "stop_task"):
-            manager.stop_task(task_id)
+        if manager is not None:
+            task_state = manager.tasks.get(task_id)
+            if not task_state:
+                return ToolResult.error(f"태스크 #{task_id}을(를) 찾을 수 없습니다.")
+            # TaskState에서 상세 정보 포맷
+            lines = [
+                f"ID:       #{task_state.id}",
+                f"유형:     {task_state.type.value}",
+                f"상태:     {task_state.status.value}",
+                f"진행률:   {task_state.progress:.0%}",
+                f"설명:     {task_state.description}",
+                f"시작:     {task_state.start_time.isoformat()}",
+                f"종료:     {task_state.end_time.isoformat() if task_state.end_time else 'N/A'}",
+            ]
+            if task_state.error_message:
+                lines.append(f"에러:     {task_state.error_message}")
+            if task_state.result:
+                lines.append(f"결과:     {task_state.result[:200]}")
+            return ToolResult.success("\n".join(lines), task_id=task_id)
         else:
             task = _fallback_tasks.get(task_id)
             if not task:
                 return ToolResult.error(f"태스크 #{task_id}을(를) 찾을 수 없습니다.")
-            task["status"] = TASK_STATUS_FAILED
+
+            lines = [
+                f"ID:       #{task['id']}",
+                f"상태:     {task['status']}",
+                f"우선순위: {task.get('priority', 'medium')}",
+                f"설명:     {task['description']}",
+                f"생성:     {task.get('created_at', 'N/A')}",
+                f"수정:     {task.get('updated_at', 'N/A')}",
+            ]
+            return ToolResult.success("\n".join(lines), task_id=task_id)
+
+    async def _handle_stop(
+        self, input_data: dict[str, Any], context: ToolUseContext
+    ) -> ToolResult:
+        """
+        태스크를 강제 종료한다.
+        TaskManager가 있으면 kill()을 호출하여 asyncio.Task를 취소한다.
+        없으면 상태만 failed로 변경한다.
+        """
+        task_id = input_data["task_id"]
+
+        manager = _get_task_manager(context)
+        if manager is not None:
+            if task_id not in manager.tasks:
+                return ToolResult.error(f"태스크 #{task_id}을(를) 찾을 수 없습니다.")
+            await manager.kill(task_id)
+        else:
+            task = _fallback_tasks.get(task_id)
+            if not task:
+                return ToolResult.error(f"태스크 #{task_id}을(를) 찾을 수 없습니다.")
+            task["status"] = "failed"
             task["updated_at"] = time.time()
 
         logger.info("Task stop: #%s", task_id)

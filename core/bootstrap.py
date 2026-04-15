@@ -107,6 +107,7 @@ async def init_phase2(state: GlobalState) -> dict:
     from core.memory.short_term import ShortTermMemory
     from core.model.inference import LocalModelProvider
     from core.orchestrator.query_engine import QueryEngine
+    from core.task import TaskManager
     from core.tools.base import ToolUseContext
 
     components: dict = {}
@@ -138,6 +139,11 @@ async def init_phase2(state: GlobalState) -> dict:
     components["memory_manager"] = memory_manager
     logger.info("[Phase 2] MemoryManager 초기화: 인메모리 폴백")
 
+    # ③-b TaskManager — 비동기 태스크 라이프사이클 관리
+    task_manager = TaskManager()
+    components["task_manager"] = task_manager
+    logger.info("[Phase 2] TaskManager 초기화")
+
     # ④ ToolUseContext 생성
     context = ToolUseContext(
         cwd=state.cwd or os.getcwd(),
@@ -145,6 +151,7 @@ async def init_phase2(state: GlobalState) -> dict:
         permission_mode=state.permission_mode.value,
         options={
             "memory_manager": memory_manager,
+            "task_manager": task_manager,
         },
     )
     components["tool_use_context"] = context
