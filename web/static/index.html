@@ -1,0 +1,765 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Nexus — AI Assistant</title>
+<link rel="manifest" href="/static/manifest.json">
+<meta name="theme-color" content="#0b0b0c">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="icon" type="image/svg+xml" href="/static/icon.svg">
+<style>
+/* ─── idino 컬러 팔레트 ─── */
+:root {
+  --bg-primary: #0b0b0c;
+  --bg-secondary: #14171B;
+  --bg-tertiary: #1d2128;
+  --bg-input: #202225;
+  --bg-message-user: #00479d;
+  --bg-message-assistant: #1d2128;
+  --bg-hover: #2b2e32;
+  --text-primary: #f0f0f0;
+  --text-secondary: #a1a1a1;
+  --text-muted: #6c737d;
+  --accent: #00479d;
+  --accent-light: #0e70b4;
+  --accent-hover: #005087;
+  --border: #2b2e32;
+  --border-light: #363a3f;
+  --scrollbar: #41454b;
+  --success: #209445;
+  --error: #DA017F;
+}
+
+/* ─── 리셋 + 기본 ─── */
+*, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  height: 100vh;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ─── 스크롤바 ─── */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--scrollbar); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+
+/* ─── 헤더 ─── */
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 20px;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.header-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.header-logo {
+  width: 28px;
+  height: 28px;
+}
+
+.header-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.header-subtitle {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-left: 8px;
+}
+
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.header-btn {
+  background: none;
+  border: 1px solid var(--border-light);
+  color: var(--text-secondary);
+  padding: 6px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 12px;
+  transition: all 0.15s;
+}
+
+.header-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+  border-color: var(--text-muted);
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--success);
+  display: inline-block;
+}
+
+.status-dot.offline { background: var(--error); }
+
+/* ─── 사이드바 (세션 목록) ─── */
+.layout {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+}
+
+.sidebar {
+  width: 260px;
+  background: var(--bg-secondary);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  transition: width 0.2s;
+}
+
+.sidebar.collapsed { width: 0; overflow: hidden; border: none; }
+
+.sidebar-header {
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.new-chat-btn {
+  width: 100%;
+  padding: 10px;
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 500;
+  transition: background 0.15s;
+}
+
+.new-chat-btn:hover { background: var(--accent-hover); }
+
+.session-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px;
+}
+
+.session-item {
+  padding: 10px 12px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--text-secondary);
+  margin-bottom: 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: background 0.1s;
+}
+
+.session-item:hover { background: var(--bg-hover); }
+.session-item.active { background: var(--bg-tertiary); color: var(--text-primary); }
+
+.sidebar-footer {
+  padding: 12px 16px;
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+/* ─── 메인 영역 ─── */
+.main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+/* ─── 메시지 영역 ─── */
+.messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 24px 0;
+}
+
+.messages-inner {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 0 20px;
+}
+
+/* ─── 환영 화면 ─── */
+.welcome {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 80px 20px;
+  text-align: center;
+}
+
+.welcome-logo {
+  width: 56px;
+  height: 56px;
+  margin-bottom: 20px;
+  opacity: 0.9;
+}
+
+.welcome h2 {
+  font-size: 22px;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
+.welcome p {
+  font-size: 14px;
+  color: var(--text-secondary);
+  max-width: 400px;
+  line-height: 1.6;
+}
+
+/* ─── 메시지 버블 ─── */
+.message {
+  margin-bottom: 24px;
+  animation: fadeIn 0.2s ease;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.message-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.message-avatar {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+.message-avatar.user {
+  background: var(--bg-message-user);
+  color: #fff;
+}
+
+.message-avatar.assistant {
+  background: var(--accent);
+  color: #fff;
+}
+
+.message-sender {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.message-body {
+  padding-left: 32px;
+  font-size: 14px;
+  line-height: 1.7;
+  color: var(--text-primary);
+  word-wrap: break-word;
+}
+
+.message-body p { margin-bottom: 8px; }
+.message-body p:last-child { margin-bottom: 0; }
+
+.message-body pre {
+  background: var(--bg-primary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 16px;
+  overflow-x: auto;
+  margin: 8px 0;
+  font-size: 13px;
+  font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+}
+
+.message-body code {
+  background: var(--bg-hover);
+  padding: 2px 5px;
+  border-radius: 4px;
+  font-size: 13px;
+  font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+}
+
+.message-body pre code {
+  background: none;
+  padding: 0;
+}
+
+/* ─── 스트리밍 커서 ─── */
+.streaming-cursor::after {
+  content: '';
+  display: inline-block;
+  width: 7px;
+  height: 16px;
+  background: var(--accent-light);
+  margin-left: 2px;
+  animation: blink 0.8s infinite;
+  vertical-align: text-bottom;
+}
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+/* ─── 입력 영역 ─── */
+.input-area {
+  padding: 16px 20px 20px;
+  flex-shrink: 0;
+}
+
+.input-container {
+  max-width: 720px;
+  margin: 0 auto;
+  position: relative;
+}
+
+.input-box {
+  display: flex;
+  align-items: flex-end;
+  background: var(--bg-input);
+  border: 1px solid var(--border-light);
+  border-radius: 12px;
+  padding: 12px 16px;
+  transition: border-color 0.15s;
+}
+
+.input-box:focus-within {
+  border-color: var(--accent);
+}
+
+.input-box textarea {
+  flex: 1;
+  background: none;
+  border: none;
+  outline: none;
+  color: var(--text-primary);
+  font-size: 14px;
+  font-family: inherit;
+  resize: none;
+  max-height: 150px;
+  line-height: 1.5;
+}
+
+.input-box textarea::placeholder {
+  color: var(--text-muted);
+}
+
+.send-btn {
+  background: var(--accent);
+  border: none;
+  color: #fff;
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  margin-left: 8px;
+  transition: background 0.15s;
+}
+
+.send-btn:hover { background: var(--accent-hover); }
+.send-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.send-btn svg {
+  width: 16px;
+  height: 16px;
+}
+
+.input-footer {
+  text-align: center;
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 8px;
+}
+
+/* ─── 로딩 인디케이터 ─── */
+.thinking {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding-left: 32px;
+  color: var(--text-muted);
+  font-size: 13px;
+  margin-bottom: 16px;
+}
+
+.thinking-dots span {
+  display: inline-block;
+  width: 4px;
+  height: 4px;
+  background: var(--text-muted);
+  border-radius: 50%;
+  animation: dot-pulse 1.4s infinite;
+}
+
+.thinking-dots span:nth-child(2) { animation-delay: 0.2s; }
+.thinking-dots span:nth-child(3) { animation-delay: 0.4s; }
+
+@keyframes dot-pulse {
+  0%, 80%, 100% { opacity: 0.3; transform: scale(0.8); }
+  40% { opacity: 1; transform: scale(1); }
+}
+
+/* ─── 반응형 ─── */
+@media (max-width: 768px) {
+  .sidebar { display: none; }
+  .messages-inner { padding: 0 12px; }
+  .input-area { padding: 12px; }
+}
+</style>
+</head>
+<body>
+
+<!-- 헤더 -->
+<div class="header">
+  <div class="header-left">
+    <img src="/static/icon.svg" alt="Nexus" class="header-logo">
+    <span class="header-title">Nexus</span>
+    <span class="header-subtitle">by IDINO</span>
+  </div>
+  <div class="header-right">
+    <span class="status-dot" id="statusDot" title="GPU 서버 상태"></span>
+    <button class="header-btn" onclick="checkHealth()">상태 확인</button>
+    <button class="header-btn" onclick="toggleSidebar()">세션 목록</button>
+  </div>
+</div>
+
+<!-- 레이아웃 -->
+<div class="layout">
+
+  <!-- 사이드바 -->
+  <div class="sidebar" id="sidebar">
+    <div class="sidebar-header">
+      <button class="new-chat-btn" onclick="newSession()">+ 새 대화</button>
+    </div>
+    <div class="session-list" id="sessionList"></div>
+    <div class="sidebar-footer">
+      Nexus v0.1.0 — Air-Gapped LLM
+    </div>
+  </div>
+
+  <!-- 메인 -->
+  <div class="main">
+    <div class="messages" id="messages">
+      <div class="messages-inner" id="messagesInner">
+        <div class="welcome" id="welcome">
+          <img src="/static/icon.svg" alt="Nexus" class="welcome-logo">
+          <h2>Nexus에 오신 것을 환영합니다</h2>
+          <p>에어갭 환경에서 동작하는 AI 어시스턴트입니다.<br>무엇을 도와드릴까요?</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="input-area">
+      <div class="input-container">
+        <div class="input-box">
+          <textarea id="userInput"
+                    placeholder="메시지를 입력하세요..."
+                    rows="1"
+                    onkeydown="handleKeyDown(event)"
+                    oninput="autoResize(this)"></textarea>
+          <button class="send-btn" id="sendBtn" onclick="sendMessage()">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M22 2L11 13M22 2L15 22L11 13L2 9L22 2Z"/>
+            </svg>
+          </button>
+        </div>
+        <div class="input-footer">Gemma 4 31B (INT4) — Nexus는 실수할 수 있습니다</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ─── 상태 ───
+let sessions = [];
+let currentSessionId = null;
+let isStreaming = false;
+
+// ─── 초기화 ───
+window.addEventListener('DOMContentLoaded', () => {
+  checkHealth();
+  newSession();
+  document.getElementById('userInput').focus();
+});
+
+// ─── 세션 관리 ───
+function newSession() {
+  const id = 'session-' + Date.now();
+  const session = { id, title: '새 대화', messages: [] };
+  sessions.unshift(session);
+  currentSessionId = id;
+  renderSessionList();
+  clearMessages();
+}
+
+function switchSession(id) {
+  currentSessionId = id;
+  renderSessionList();
+  const session = sessions.find(s => s.id === id);
+  clearMessages();
+  if (session) {
+    session.messages.forEach(m => appendMessage(m.role, m.content, false));
+  }
+}
+
+function renderSessionList() {
+  const list = document.getElementById('sessionList');
+  list.innerHTML = sessions.map(s =>
+    `<div class="session-item ${s.id === currentSessionId ? 'active' : ''}"
+          onclick="switchSession('${s.id}')">${s.title}</div>`
+  ).join('');
+}
+
+function clearMessages() {
+  const inner = document.getElementById('messagesInner');
+  inner.innerHTML = `
+    <div class="welcome" id="welcome">
+      <img src="/static/icon.svg" alt="Nexus" class="welcome-logo">
+      <h2>Nexus에 오신 것을 환영합니다</h2>
+      <p>에어갭 환경에서 동작하는 AI 어시스턴트입니다.<br>무엇을 도와드릴까요?</p>
+    </div>`;
+}
+
+// ─── 메시지 표시 ───
+function appendMessage(role, content, save = true) {
+  // 환영 화면 제거
+  const welcome = document.getElementById('welcome');
+  if (welcome) welcome.remove();
+
+  const inner = document.getElementById('messagesInner');
+  const div = document.createElement('div');
+  div.className = 'message';
+
+  const avatar = role === 'user' ? 'U' : 'N';
+  const avatarClass = role === 'user' ? 'user' : 'assistant';
+  const sender = role === 'user' ? '사용자' : 'Nexus';
+
+  div.innerHTML = `
+    <div class="message-header">
+      <div class="message-avatar ${avatarClass}">${avatar}</div>
+      <div class="message-sender">${sender}</div>
+    </div>
+    <div class="message-body">${formatContent(content)}</div>`;
+
+  inner.appendChild(div);
+  scrollToBottom();
+
+  if (save) {
+    const session = sessions.find(s => s.id === currentSessionId);
+    if (session) {
+      session.messages.push({ role, content });
+      // 첫 사용자 메시지로 세션 제목 업데이트
+      if (role === 'user' && session.title === '새 대화') {
+        session.title = content.substring(0, 30) + (content.length > 30 ? '...' : '');
+        renderSessionList();
+      }
+    }
+  }
+
+  return div;
+}
+
+function formatContent(text) {
+  // 코드 블록 처리
+  text = text.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => {
+    return `<pre><code>${escapeHtml(code.trim())}</code></pre>`;
+  });
+  // 인라인 코드
+  text = text.replace(/`([^`]+)`/g, '<code>$1</code>');
+  // 볼드
+  text = text.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  // 줄바꿈 → 단락
+  text = text.split('\n\n').map(p => `<p>${p.replace(/\n/g, '<br>')}</p>`).join('');
+  return text;
+}
+
+function escapeHtml(str) {
+  const div = document.createElement('div');
+  div.textContent = str;
+  return div.innerHTML;
+}
+
+// ─── 스트리밍 메시지 ───
+function startStreamingMessage() {
+  const welcome = document.getElementById('welcome');
+  if (welcome) welcome.remove();
+
+  const inner = document.getElementById('messagesInner');
+  const div = document.createElement('div');
+  div.className = 'message';
+  div.id = 'streamingMessage';
+
+  div.innerHTML = `
+    <div class="message-header">
+      <div class="message-avatar assistant">N</div>
+      <div class="message-sender">Nexus</div>
+    </div>
+    <div class="message-body streaming-cursor" id="streamingBody"></div>`;
+
+  inner.appendChild(div);
+  scrollToBottom();
+  return div;
+}
+
+function appendStreamChunk(text) {
+  const body = document.getElementById('streamingBody');
+  if (body) {
+    body.textContent += text;
+    scrollToBottom();
+  }
+}
+
+function finalizeStreamingMessage() {
+  const body = document.getElementById('streamingBody');
+  if (body) {
+    body.classList.remove('streaming-cursor');
+    const raw = body.textContent;
+    body.innerHTML = formatContent(raw);
+
+    // 세션에 저장
+    const session = sessions.find(s => s.id === currentSessionId);
+    if (session) {
+      session.messages.push({ role: 'assistant', content: raw });
+    }
+  }
+  const msg = document.getElementById('streamingMessage');
+  if (msg) msg.removeAttribute('id');
+}
+
+// ─── 전송 ───
+async function sendMessage() {
+  const input = document.getElementById('userInput');
+  const text = input.value.trim();
+  if (!text || isStreaming) return;
+
+  input.value = '';
+  autoResize(input);
+  appendMessage('user', text);
+
+  isStreaming = true;
+  document.getElementById('sendBtn').disabled = true;
+
+  // 스트리밍 메시지 시작
+  startStreamingMessage();
+
+  try {
+    const response = await fetch('/v1/chat/stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: text,
+        session_id: currentSessionId,
+      }),
+    });
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      for (const line of lines) {
+        if (line.startsWith('data: ')) {
+          try {
+            const data = JSON.parse(line.substring(6));
+            if (data.text) {
+              appendStreamChunk(data.text);
+            }
+          } catch (e) {
+            // JSON 파싱 실패 무시
+          }
+        }
+      }
+    }
+  } catch (error) {
+    appendStreamChunk(`\n\n[오류] ${error.message}`);
+  }
+
+  finalizeStreamingMessage();
+  isStreaming = false;
+  document.getElementById('sendBtn').disabled = false;
+  input.focus();
+}
+
+// ─── 헬스체크 ───
+async function checkHealth() {
+  const dot = document.getElementById('statusDot');
+  try {
+    const resp = await fetch('/health');
+    const data = await resp.json();
+    dot.className = data.status === 'ok' ? 'status-dot' : 'status-dot offline';
+    dot.title = `GPU: ${data.gpu_server}`;
+  } catch {
+    dot.className = 'status-dot offline';
+    dot.title = '서버 연결 실패';
+  }
+}
+
+// ─── UI 유틸 ───
+function handleKeyDown(e) {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendMessage();
+  }
+}
+
+function autoResize(el) {
+  el.style.height = 'auto';
+  el.style.height = Math.min(el.scrollHeight, 150) + 'px';
+}
+
+function scrollToBottom() {
+  const msgs = document.getElementById('messages');
+  requestAnimationFrame(() => { msgs.scrollTop = msgs.scrollHeight; });
+}
+
+function toggleSidebar() {
+  document.getElementById('sidebar').classList.toggle('collapsed');
+}
+</script>
+</body>
+</html>

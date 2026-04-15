@@ -22,11 +22,13 @@ import logging
 import uuid
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from web.middleware import CORSConfig, RequestLoggingMiddleware
@@ -163,6 +165,11 @@ app.add_middleware(CORSMiddleware, **CORSConfig.get_cors_kwargs())
 # 요청 로깅 미들웨어 적용
 _logging_middleware = RequestLoggingMiddleware(app)
 _app_state["logging_middleware"] = _logging_middleware
+
+# 정적 파일 서빙 — 채팅 UI (HTML/CSS/JS)
+_static_dir = Path(__file__).parent / "static"
+if _static_dir.exists():
+    app.mount("/static", StaticFiles(directory=str(_static_dir)), name="static")
 
 
 # ─────────────────────────────────────────────
@@ -426,3 +433,15 @@ async def metrics() -> dict[str, Any]:
         result["session"] = state.get_session_summary()
 
     return result
+
+
+# ─────────────────────────────────────────────
+# 채팅 UI (루트 경로)
+# ─────────────────────────────────────────────
+@app.get("/")
+async def root():
+    """루트 경로에서 채팅 UI를 반환한다."""
+    index_path = Path(__file__).parent / "static" / "index.html"
+    if index_path.exists():
+        return FileResponse(str(index_path))
+    return {"message": "Nexus API", "docs": "/docs"}
