@@ -213,16 +213,45 @@ async def query_loop(
             max_tokens = state.max_output_tokens_override
         else:
             # 입력 토큰 추정: 시스템 프롬프트 + 도구 스키마 + 메시지
+            # 토큰 추정은 문자수/3 (보수적) — 한글/특수문자가 많으면 토큰이 더 많다
             import json as _json
 
             tool_chars = sum(len(_json.dumps(s, ensure_ascii=False)) for s in tool_schemas)
             msg_chars = sum(len(str(m.content)) for m in api_messages)
             prompt_chars = len(system_prompt)
-            estimated_input = (tool_chars + msg_chars + prompt_chars) // 4
+            total_chars = tool_chars + msg_chars + prompt_chars
+            estimated_input = total_chars // 3  # 보수적 추정 (영어 /4, 한글 /2 → 평균 /3)
 
-            # 최대 컨텍스트에서 입력을 빼고 100 토큰 버퍼를 둔다
             max_context = model_cfg.max_context_tokens
-            dynamic_max = max_context - estimated_input - 100
+
+            # 입력이 컨텍스트의 85%를 초과하면 메시지를 truncate한다
+            # 왜 85%: 최소 출력 512토큰 + 버퍼 확보
+            input_limit = int(max_context * 0.85)
+            if estimated_input > input_limit and len(api_messages) > 1:
+                # 가장 최근 메시지의 내용을 자른다 (대화 맥락 유지)
+                last_msg = api_messages[-1]
+                content_str = str(last_msg.content)
+                # 초과분 계산 후 마지막 메시지에서 제거
+                excess_chars = (estimated_input - input_limit) * 3
+                if len(content_str) > excess_chars + 200:
+                    truncated = content_str[: len(content_str) - excess_chars]
+                    truncated += "\n\n[내용이 길어서 일부가 잘렸습니다. 핵심 부분만 분석합니다.]"
+                    last_msg.content = truncated
+                    # 재추정
+                    msg_chars = sum(len(str(m.content)) for m in api_messages)
+                    total_chars = tool_chars + msg_chars + prompt_chars
+                    estimated_input = total_chars // 3
+
+                orig_chars = tool_chars + prompt_chars + sum(
+                    len(str(m.content)) for m in state.messages
+                )
+                logger.info(
+                    "입력 truncate: %d → %d 토큰 (컨텍스트 %d의 85%%)",
+                    orig_chars // 3, estimated_input, max_context,
+                )
+
+            # 최대 컨텍스트에서 입력을 빼고 200 토큰 버퍼를 둔다
+            dynamic_max = max_context - estimated_input - 200
             max_tokens = max(512, min(base_max_tokens, dynamic_max))
 
         # ═══════════════════════════════════════
