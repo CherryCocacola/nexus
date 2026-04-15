@@ -5,7 +5,8 @@
 
 # GPU 서버 (Machine B) 연결 설정
 gpu_server:
-  url: "http://192.168.22.28:8000"
+  url: "http://192.168.22.28:8001"
+  embedding_url: "http://192.168.22.28:8002"
   timeout_seconds: 120.0
   max_retries: 10
   retry_base_delay: 0.5

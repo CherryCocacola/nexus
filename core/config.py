@@ -30,6 +30,7 @@ class GPUServerConfig(BaseModel):
     """GPU 서버 (Machine B) 연결 설정."""
 
     url: str = "http://localhost:8000"
+    embedding_url: str = "http://localhost:8002"  # 임베딩 서버 (별도 vLLM 인스턴스)
     timeout_seconds: float = 120.0
     max_retries: int = 10
     retry_base_delay: float = 0.5

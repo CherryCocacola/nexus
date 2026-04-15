@@ -6,11 +6,11 @@
 
 ## 현재 상태
 
-- **현재 Phase**: Phase 8.0 완료 + TaskManager 구현 완료
+- **현재 Phase**: Phase 8.0 완료 + TaskManager + GPU E2E/벤치마크/Soak 완료
 - **마지막 업데이트**: 2026-04-15
 - **브랜치**: main
-- **총 테스트**: 380개 (전부 통과) — 단위 316 + 통합 64
-- **전체 파일**: ~147개 Python 모듈
+- **총 테스트**: 400개 (전부 통과) — 단위 316 + 통합 64 + E2E 20
+- **전체 파일**: ~150개 Python 모듈
 
 ---
 
@@ -248,13 +248,36 @@
 
 ---
 
+## GPU E2E + 벤치마크 + Soak Test (완료)
+
+### v0.9.3 — 실 GPU 서버 연결 + 성능 측정 (2026-04-15)
+
+- **서버 포트 분리**:
+  - config/nexus_config.yaml: gpu_server.url → :8001, embedding_url → :8002
+  - core/config.py: GPUServerConfig에 embedding_url 추가
+  - core/model/inference.py: embedding_base_url 파라미터 + /v1/embed 엔드포인트 적용
+  - core/bootstrap.py: embedding_base_url 전달
+- **tests/e2e/test_gpu_e2e.py** (12개 테스트):
+  - 서버 연결, 모델 확인, 텍스트 생성, SSE 스트리밍, tool_calling
+  - 임베딩 생성, 배치 임베딩, LocalModelProvider 통합, 3턴 대화
+- **tests/e2e/test_benchmark.py** (5개 테스트):
+  - Simple Response Time: 0.728s (목표 <1.5s) — 통과
+  - Complex Response Time: 7.369s (목표 <8s) — 통과
+  - TTFT: 0.031s, TPS: 69.4 tokens/s, Embedding: 32.8ms
+- **tests/e2e/test_soak.py** (3개 테스트):
+  - 100-Turn 대화: 100/100 완료, 에러 0, 평균 0.314s
+  - 50회 연속 추론: 50/50 완료, 성능 변화 +18.6%
+  - 동시 임베딩+추론: 성능 저하 +1.7% (목표 <20%) — 통과
+- 400개 테스트 통과 (기존 380 + E2E 20)
+
+---
+
 ## 다음 세션 시작 시 참고
 
-1. **Phase 0.5~8.0 + 연동 + TaskManager 완료**
+1. **Phase 0.5~8.0 + 연동 + TaskManager + GPU E2E 완료**
 2. **추가 가능 작업**:
-   - 실 GPU 서버(192.168.22.28) 연결 후 E2E 테스트
-   - 성능 벤치마크 (사양서 Ch.22.4 Success Metrics)
-   - Soak Test (24시간 연속 추론, 100-Turn 대화, 모델 스왑 스트레스)
    - LoRA Phase 1 Bootstrap 학습 실행
-3. GPU 서버: 192.168.22.28, DB: 192.168.10.39
-4. ruff 클린, 380개 테스트 전부 통과
+   - 24시간 연속 추론 Soak Test (본격 버전)
+   - 모델 스왑 스트레스 테스트 (primary ↔ auxiliary)
+3. GPU 서버: 192.168.22.28 (LLM :8001, Embedding :8002), DB: 192.168.10.39
+4. ruff 클린, 400개 테스트 전부 통과

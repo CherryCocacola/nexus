@@ -113,12 +113,14 @@ async def init_phase2(state: GlobalState) -> dict:
     components: dict = {}
 
     # ① ModelProvider 생성
+    # LLM과 임베딩 서버가 별도 포트/인스턴스이므로 각각 URL을 전달한다
     config = state.config
     provider = LocalModelProvider(
         base_url=config.gpu_server_url,
         model_id=config.model.primary_model,
         max_context_tokens=config.model.max_model_len,
         max_output_tokens=config.model.max_output_tokens,
+        embedding_base_url=config.gpu_server.embedding_url,
     )
     components["model_provider"] = provider
     logger.info("[Phase 2] ModelProvider 초기화: %s", config.gpu_server_url)

@@ -141,6 +141,7 @@ class LocalModelProvider(ModelProvider):
         max_output_tokens: int = 4096,
         fallback_model_id: str | None = None,
         embedding_model_id: str = "multilingual-e5-large",
+        embedding_base_url: str | None = None,
         connect_timeout: float = 10.0,
         read_timeout: float = 300.0,
     ):
@@ -148,6 +149,11 @@ class LocalModelProvider(ModelProvider):
         self.api_key = api_key
         self.model_id = model_id
         self.embedding_model_id = embedding_model_id
+        # 임베딩 서버가 별도 포트/인스턴스인 경우 분리
+        # 없으면 base_url과 동일한 서버를 사용한다
+        self._embedding_base_url = (
+            embedding_base_url.rstrip("/") if embedding_base_url else self.base_url
+        )
 
         self._config = ModelConfig(
             model_id=model_id,
@@ -365,16 +371,22 @@ class LocalModelProvider(ModelProvider):
     # ─── embed() ───
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
-        """vLLM 또는 별도 임베딩 서버의 /v1/embeddings 엔드포인트를 호출한다."""
+        """
+        별도 임베딩 서버의 /v1/embed 엔드포인트를 호출한다.
+
+        임베딩 서버 API:
+          요청: POST /v1/embed {"texts": ["문장1", "문장2"]}
+          응답: {"embeddings": [[...], [...]], "dimension": 1024}
+        """
         try:
             response = await self._client.post(
-                f"{self.base_url}/v1/embeddings",
-                json={"input": texts, "model": self.embedding_model_id},
+                f"{self._embedding_base_url}/v1/embed",
+                json={"texts": texts},
                 headers={"Authorization": f"Bearer {self.api_key}"},
             )
             response.raise_for_status()
             data = response.json()
-            return [item["embedding"] for item in data["data"]]
+            return data["embeddings"]
         except Exception as e:
             logger.error(f"임베딩 실패: {e}")
             raise
