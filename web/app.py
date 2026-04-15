@@ -295,9 +295,22 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
         if session_id not in histories:
             histories[session_id] = []
 
-        # QueryEngine의 messages를 해당 세션의 최근 히스토리로 교체
+        # QueryEngine의 messages를 해당 세션의 히스토리로 교체
+        # 토큰 예산 내에서 최근 대화만 복원한다.
+        # 도구 스키마(~1,851) + 시스템 프롬프트(~72) = ~1,923 토큰이 고정 비용이므로,
+        # 히스토리 + 새 메시지는 컨텍스트의 절반(4,096) 이내로 제한한다.
         engine.clear_messages()
-        for msg in histories[session_id][-10:]:  # 최근 5턴(10메시지)만 복원
+        history_budget = 4096 * 3  # ~4,096 토큰 × 3자/토큰 = 12,288 문자
+        used_chars = len(request.message)
+        restored = []
+        for msg in reversed(histories[session_id]):
+            msg_chars = len(str(msg.content))
+            if used_chars + msg_chars > history_budget:
+                break
+            restored.append(msg)
+            used_chars += msg_chars
+        restored.reverse()
+        for msg in restored:
             engine._messages.append(msg)
 
         # QueryEngine을 통한 전체 에이전트 루프 (도구 사용 포함)
