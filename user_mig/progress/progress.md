@@ -6,11 +6,11 @@
 
 ## 현재 상태
 
-- **현재 Phase**: Phase 8.0 완료 + TaskManager + GPU E2E/벤치마크/Soak 완료
+- **현재 Phase**: Phase 8.0 완료 + 웹 UI + GPU E2E + DocumentProcess
 - **마지막 업데이트**: 2026-04-15
 - **브랜치**: main
 - **총 테스트**: 400개 (전부 통과) — 단위 316 + 통합 64 + E2E 20
-- **전체 파일**: ~150개 Python 모듈
+- **전체 파일**: ~155개 Python/HTML 모듈
 
 ---
 
@@ -272,12 +272,87 @@
 
 ---
 
+## 웹 채팅 UI + DocumentProcess (완료)
+
+### v0.9.4 — 웹 UI 구현 + 문서 분석 도구 (2026-04-15)
+
+- **web/static/index.html** — Claude 스타일 채팅 UI:
+  - idino 색상 팔레트 (#00479d 기반), Nexus 브랜딩 + idino 로고
+  - SSE 스트리밍 실시간 응답, 타이핑 커서 애니메이션
+  - 사이드바 (세션 목록, 기본 닫힘, 햄버거 버튼으로 오버레이)
+  - 파일 첨부 (텍스트 직접 포함 + 바이너리 서버 업로드)
+  - 토큰 카운터 (IN/OUT 실시간 표시)
+  - PWA 지원 (manifest.json, HTTPS 자체 서명 SSL)
+  - 응답 대기 스피너 ("생각하는 중...")
+- **web/app.py** — 웹 서버 연동:
+  - 세션별 히스토리 격리 (QueryEngine messages 매 요청 초기화)
+  - 히스토리 복원 시 토큰 예산 기반 제한 (tool_result 제외, user/assistant만)
+  - 파일 업로드 API (POST /v1/upload → 임시 디렉토리 저장)
+  - 웹 전용 QueryEngine (도구 8개, 토큰 예산 최적화)
+  - HTTPS 자체 서명 SSL 인증서 (config/ssl/)
+- **core/tools/implementations/document_tool.py** (신규) — DocumentProcess 도구:
+  - PDF (pypdf), DOCX (python-docx), XLSX (openpyxl) 파싱
+  - 청크 분할 (2,500자 단위) — 컨텍스트 초과 방지
+  - 문서 캐시 — 같은 파일 재파싱 방지
+  - chunk_index 파라미터로 순차 청크 읽기
+- **core/bootstrap.py** — 웹용 도구 레지스트리:
+  - `_create_web_tool_registry()` — 핵심 도구 8개 (Read, Write, Edit, Bash, Glob, Grep, LS, DocumentProcess)
+  - 토큰 예산: ~2,051 토큰 (24개 6,102 토큰 대비 67% 절약)
+- **core/model/inference.py** — 컨텍스트 초과 자동 처리:
+  - 400 에러에서 input_tokens 추출 → max_tokens 자동 축소 재시도 (3회)
+  - 재시도 모두 실패 시 "입력이 너무 길어 분석할 수 없습니다" 에러 메시지
+  - SSE 파싱을 async with 블록 안으로 이동 (StreamClosed 수정)
+- **core/orchestrator/query_loop.py** — 동적 max_tokens:
+  - 입력 토큰 추정 후 max_tokens = max(512, max_context - estimated_input - 200)
+  - 입력 초과 시 자동 truncate
+  - 재시도 시 system 메시지 추가하지 않음 (토큰 증가 방지)
+- **cli/repl.py** — Message 객체 필터링:
+  - QueryEngine이 yield하는 Message 객체를 건너뛰고 StreamEvent만 표시
+- **config** 변경:
+  - gpu_server.url: 8001, embedding_url: 8002
+  - max_context_tokens: 8192, default_max_tokens: 4096
+  - gpu_server_url → property로 전환 (YAML gpu_server.url 자동 동기화)
+- **GPU 서버** (192.168.22.28):
+  - vLLM: --max-model-len 8192, --gpu-memory-utilization 0.90
+  - 도구 호출 활성화: --enable-auto-tool-choice --tool-call-parser gemma4
+
+---
+
+## RTX 5090 (8192 ctx) 실측 제약 사항
+
+```
+VRAM 최대 max-model-len:
+  8,192 ✅ (GPU 30.7GB/32.6GB)
+  16,384 ❌ (OOM 실패)
+
+토큰 예산 (도구 8개):
+  도구 스키마:    ~2,500 토큰 (Gemma4 BPE 실측)
+  시스템 프롬프트:   ~72 토큰
+  고정 비용 합계: ~2,572 토큰
+
+  가용 (입력+출력): ~5,620 토큰
+  문서 분석 한계:  ~2,500자 (청크 1개) → A4 1~2페이지
+
+대용량 문서:
+  청크 분할로 순차 분석 가능 (무제한)
+  단, 각 청크는 독립 분석 (이전 청크 맥락 유실)
+```
+
+---
+
 ## 다음 세션 시작 시 참고
 
-1. **Phase 0.5~8.0 + 연동 + TaskManager + GPU E2E 완료**
-2. **추가 가능 작업**:
+1. **Phase 0.5~8.0 + 연동 + TaskManager + GPU E2E + 웹 UI + DocumentProcess 완료**
+2. **웹 서버 실행**: `python -m uvicorn web.app:app --host 0.0.0.0 --port 8443 --ssl-keyfile config/ssl/key.pem --ssl-certfile config/ssl/cert.pem`
+3. **CLI 실행**: `python -m cli.commands chat`
+4. **추가 가능 작업**:
    - LoRA Phase 1 Bootstrap 학습 실행
+   - RAG 파이프라인 (임베딩 기반 문서 검색 → 관련 부분만 분석)
    - 24시간 연속 추론 Soak Test (본격 버전)
    - 모델 스왑 스트레스 테스트 (primary ↔ auxiliary)
-3. GPU 서버: 192.168.22.28 (LLM :8001, Embedding :8002), DB: 192.168.10.39
-4. ruff 클린, 400개 테스트 전부 통과
+   - H100/H200 업그레이드 시 도구 24개 전체 활성화 + 컨텍스트 확장
+5. **서버 정보**:
+   - GPU: 192.168.22.28 (LLM :8001, Embedding :8002), max-model-len=8192
+   - DB: 192.168.10.39 (PostgreSQL + Redis, 현재 미연결 — 인메모리 폴백)
+   - 웹: https://192.168.22.223:8443 (자체 서명 SSL)
+6. ruff 클린, 400개 테스트 전부 통과
