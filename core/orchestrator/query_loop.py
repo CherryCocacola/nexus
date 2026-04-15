@@ -409,14 +409,7 @@ async def query_loop(
         if model_error and not tool_use_blocks:
             state.tool_parse_retry_count += 1
             if state.tool_parse_retry_count <= MAX_TOOL_PARSE_RETRY:
-                # 모델에 재시도를 요청하는 시스템 메시지 추가
-                state.messages.append(
-                    Message.system(
-                        "이전 응답에 에러가 있었습니다. "
-                        "도구를 사용하려면 올바른 형식을 사용해주세요. "
-                        "그렇지 않으면 일반 텍스트로 응답해주세요."
-                    )
-                )
+                # 재시도 — system 메시지를 추가하지 않는다 (토큰 증가 방지)
                 state.continue_reason = ContinueReason.NEXT_TURN
                 yield StreamEvent(
                     type=StreamEventType.SYSTEM_WARNING,
@@ -426,6 +419,17 @@ async def query_loop(
                 )
                 await streaming_executor.cancel_all()
                 continue
+            else:
+                # 재시도 모두 실패 — 사용자에게 에러 메시지 전달 후 종료
+                yield StreamEvent(
+                    type=StreamEventType.ERROR,
+                    error_code="CONTEXT_OVERFLOW",
+                    message=(
+                        "입력 내용이 너무 길어 분석할 수 없습니다. "
+                        "더 짧은 내용으로 다시 시도해 주세요."
+                    ),
+                )
+                return
 
         # assistant 메시지 기록
         assistant_text = "".join(assistant_text_parts)

@@ -1,17 +1,20 @@
 """
-DocumentProcess 도구 — 문서 파일 파싱 및 텍스트 추출.
+DocumentProcess 도구 — 문서 파일 파싱 및 청크 분할 텍스트 추출.
 
 사양서 Ch.13.6에 정의된 에어갭 전용 도구.
-PDF, DOCX, XLSX 파일을 읽어 텍스트 내용을 반환한다.
+PDF, DOCX, XLSX 파일을 읽어 텍스트를 추출하되,
+컨텍스트 제한(8192 토큰)에 맞춰 청크로 분할하여 반환한다.
 
-지원 형식:
-  - .pdf  → pypdf로 페이지별 텍스트 추출
-  - .docx → python-docx로 단락 텍스트 추출
-  - .xlsx → openpyxl로 시트별 셀 데이터 추출
-  - .txt, .csv, .md 등 → 일반 텍스트 읽기
+청크 분할 전략:
+  1. 문서 전체 텍스트 추출
+  2. CHUNK_SIZE(2,000자) 단위로 분할
+  3. 첫 번째 호출: 청크 1 + 문서 개요(전체 구조) 반환
+  4. 이후 호출: 다음 청크 반환 (chunk_index 파라미터)
 
-왜 별도 도구인가: Read 도구는 텍스트 파일만 읽을 수 있다.
-바이너리 형식(PDF, DOCX, XLSX)은 전용 파서가 필요하다.
+왜 청크 분할인가:
+  RTX 5090 (8192 ctx)에서 tool_result가 ~3,000자를 넘으면
+  도구 스키마 + 시스템 + 메시지와 합쳐 컨텍스트를 초과한다.
+  청크로 나누면 어떤 크기의 문서든 분석 가능하다.
 """
 
 from __future__ import annotations
@@ -30,16 +33,22 @@ from core.tools.base import (
 
 logger = logging.getLogger("nexus.tools.document")
 
-# 텍스트 추출 결과의 최대 문자 수 (컨텍스트 초과 방지)
-# RTX 5090 (8192 ctx): tool_result는 ~3,000 토큰(~6,000자) 이내여야
-# 도구 스키마 + 시스템 + 메시지 + 출력 토큰이 컨텍스트에 들어간다.
-MAX_EXTRACT_CHARS = 6000
+# 청크 크기 — RTX 5090 (8192 ctx) 기준
+# 도구 스키마(~2,500) + 시스템(~72) + 메시지(~300) + 출력(~1,500) = ~4,372
+# tool_result 가용: 8192 - 4372 = ~3,820 토큰 ≈ ~3,000자 (안전 마진 포함)
+CHUNK_SIZE = 2500
+
+# 파싱된 문서 캐시 — 같은 파일을 청크별로 여러 번 읽을 때 재파싱 방지
+_document_cache: dict[str, list[str]] = {}
 
 
 class DocumentProcessTool(BaseTool):
     """
-    문서 파일을 파싱하여 텍스트 내용을 추출하는 도구.
+    문서 파일을 파싱하여 텍스트를 청크 단위로 추출하는 도구.
     PDF, DOCX, XLSX 등 바이너리 문서 형식을 지원한다.
+
+    첫 호출 시 문서 개요 + 첫 청크를 반환하고,
+    chunk_index를 지정하면 해당 청크를 반환한다.
     """
 
     # ═══ 1. Identity ═══
@@ -52,7 +61,9 @@ class DocumentProcessTool(BaseTool):
     def description(self) -> str:
         return (
             "PDF, DOCX, XLSX 파일을 파싱하여 텍스트를 추출합니다. "
-            "file_path에 파일 경로를 지정하세요."
+            "file_path에 파일 경로를 지정하세요. "
+            "문서가 길면 자동으로 청크로 나뉘며, "
+            "chunk_index로 다음 청크를 읽을 수 있습니다."
         )
 
     @property
@@ -73,6 +84,10 @@ class DocumentProcessTool(BaseTool):
                 "file_path": {
                     "type": "string",
                     "description": "파싱할 문서 파일 경로",
+                },
+                "chunk_index": {
+                    "type": "integer",
+                    "description": "읽을 청크 번호 (0부터 시작). 생략 시 문서 개요와 첫 청크 반환.",
                 },
                 "pages": {
                     "type": "string",
@@ -104,13 +119,13 @@ class DocumentProcessTool(BaseTool):
         self, input_data: dict[str, Any], context: ToolUseContext
     ) -> ToolResult:
         """
-        문서 파일을 파싱하여 텍스트를 추출한다.
+        문서 파일을 파싱하여 청크 단위로 텍스트를 추출한다.
 
         처리 순서:
           1. 파일 존재 여부 확인
-          2. 확장자별 파서 선택 (pdf/docx/xlsx/txt)
-          3. 텍스트 추출 (최대 MAX_EXTRACT_CHARS 제한)
-          4. 결과 반환
+          2. 캐시에 있으면 재사용, 없으면 파싱 + 청크 분할
+          3. chunk_index에 해당하는 청크 반환
+          4. 문서 개요(전체 청크 수, 총 글자 수) 포함
         """
         file_path = input_data.get("file_path", "")
         if not file_path:
@@ -120,35 +135,101 @@ class DocumentProcessTool(BaseTool):
         if not path.exists():
             return ToolResult.error(f"파일을 찾을 수 없습니다: {file_path}")
 
-        ext = path.suffix.lower()
+        # 청크 캐시 확인 또는 새로 파싱
+        cache_key = str(path.resolve())
+        if cache_key not in _document_cache:
+            try:
+                full_text = self._extract_text(path, input_data.get("pages"))
+            except Exception as e:
+                logger.error("문서 파싱 실패: %s — %s", file_path, e)
+                return ToolResult.error(f"문서 파싱 실패: {type(e).__name__}: {e}")
 
-        try:
-            if ext == ".pdf":
-                text = self._parse_pdf(path, input_data.get("pages"))
-            elif ext in (".docx", ".doc"):
-                text = self._parse_docx(path)
-            elif ext in (".xlsx", ".xls"):
-                text = self._parse_xlsx(path)
-            else:
-                # 일반 텍스트 파일 폴백
-                text = path.read_text(encoding="utf-8", errors="replace")
-        except Exception as e:
-            logger.error("문서 파싱 실패: %s — %s", file_path, e)
-            return ToolResult.error(f"문서 파싱 실패: {type(e).__name__}: {e}")
+            # 청크로 분할
+            _document_cache[cache_key] = self._split_chunks(full_text)
 
-        # 컨텍스트 초과 방지를 위해 텍스트 길이 제한
-        if len(text) > MAX_EXTRACT_CHARS:
-            text = (
-                text[:MAX_EXTRACT_CHARS]
-                + f"\n\n... [전체 {len(text)}자 중 {MAX_EXTRACT_CHARS}자까지 표시]"
+        chunks = _document_cache[cache_key]
+        total_chunks = len(chunks)
+        total_chars = sum(len(c) for c in chunks)
+
+        # 요청된 청크 인덱스
+        chunk_index = input_data.get("chunk_index", 0)
+        if chunk_index < 0 or chunk_index >= total_chunks:
+            return ToolResult.error(
+                f"chunk_index {chunk_index}는 범위 밖입니다 (0~{total_chunks - 1})"
             )
 
-        return ToolResult.success(
-            text,
-            file=str(path),
-            format=ext,
-            chars=len(text),
+        # 결과 구성
+        chunk_text = chunks[chunk_index]
+        header = (
+            f"[문서: {path.name} | "
+            f"전체 {total_chars}자, {total_chunks}개 청크 | "
+            f"현재: 청크 {chunk_index + 1}/{total_chunks}]"
         )
+
+        # 다음 청크가 있으면 안내
+        if chunk_index < total_chunks - 1:
+            footer = (
+                f"\n\n[다음 청크를 읽으려면 "
+                f'DocumentProcess(file_path="{file_path}", chunk_index={chunk_index + 1}) '
+                f"를 호출하세요]"
+            )
+        else:
+            footer = "\n\n[마지막 청크입니다. 문서 전체를 읽었습니다.]"
+
+        result_text = f"{header}\n\n{chunk_text}{footer}"
+
+        return ToolResult.success(
+            result_text,
+            file=str(path),
+            chunk_index=chunk_index,
+            total_chunks=total_chunks,
+            total_chars=total_chars,
+        )
+
+    # ─── 텍스트 추출 (확장자별 분기) ───
+
+    def _extract_text(self, path: Path, pages: str | None = None) -> str:
+        """파일 확장자에 따라 적절한 파서로 텍스트를 추출한다."""
+        ext = path.suffix.lower()
+
+        if ext == ".pdf":
+            return self._parse_pdf(path, pages)
+        elif ext in (".docx", ".doc"):
+            return self._parse_docx(path)
+        elif ext in (".xlsx", ".xls"):
+            return self._parse_xlsx(path)
+        else:
+            return path.read_text(encoding="utf-8", errors="replace")
+
+    # ─── 청크 분할 ───
+
+    @staticmethod
+    def _split_chunks(text: str) -> list[str]:
+        """
+        텍스트를 CHUNK_SIZE 단위로 분할한다.
+        단락(빈 줄) 경계에서 나누어 문맥이 끊기지 않도록 한다.
+        """
+        if len(text) <= CHUNK_SIZE:
+            return [text]
+
+        chunks: list[str] = []
+        paragraphs = text.split("\n")
+        current_chunk: list[str] = []
+        current_len = 0
+
+        for para in paragraphs:
+            para_len = len(para) + 1  # +1 for newline
+            if current_len + para_len > CHUNK_SIZE and current_chunk:
+                chunks.append("\n".join(current_chunk))
+                current_chunk = []
+                current_len = 0
+            current_chunk.append(para)
+            current_len += para_len
+
+        if current_chunk:
+            chunks.append("\n".join(current_chunk))
+
+        return chunks if chunks else [text]
 
     # ─── 파서 구현 ───
 
@@ -160,14 +241,13 @@ class DocumentProcessTool(BaseTool):
         reader = PdfReader(str(path))
         total_pages = len(reader.pages)
 
-        # 페이지 범위 파싱
         if pages:
             parts = pages.split("-")
             start = max(int(parts[0]) - 1, 0)
             end = min(int(parts[-1]), total_pages)
         else:
             start = 0
-            end = min(total_pages, 20)  # 기본: 최대 20페이지
+            end = total_pages
 
         texts = []
         for i in range(start, end):
@@ -192,7 +272,6 @@ class DocumentProcessTool(BaseTool):
             if para.text.strip():
                 texts.append(para.text)
 
-        # 표(table) 내용도 추출
         for table in doc.tables:
             for row in table.rows:
                 cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
@@ -222,15 +301,11 @@ class DocumentProcessTool(BaseTool):
                 if any(c.strip() for c in cells):
                     texts.append(" | ".join(cells))
                     row_count += 1
-                    if row_count >= 200:  # 시트당 최대 200행
+                    if row_count >= 500:
                         texts.append(f"... [{sheet_name} 시트 {row_count}+ 행]")
                         break
 
         wb.close()
-
-        if len(texts) <= len(wb.sheetnames):
-            return "[XLSX 파일에서 데이터를 추출할 수 없습니다]"
-
         return "\n".join(texts)
 
     # ═══ 7. UI Hints ═══

@@ -405,6 +405,16 @@ class LocalModelProvider(ModelProvider):
             # 컨텍스트 초과 재시도가 아니면 루프 탈출
             if not context_exceeded:
                 break
+        else:
+            # for 루프가 break 없이 끝남 = 재시도 모두 실패
+            yield StreamEvent(
+                type=StreamEventType.ERROR,
+                error_code="CONTEXT_OVERFLOW",
+                message=(
+                    "입력 내용이 너무 길어 분석할 수 없습니다. "
+                    "더 짧은 내용으로 다시 시도해 주세요."
+                ),
+            )
 
         self._total_latency += time.monotonic() - start_time
 
