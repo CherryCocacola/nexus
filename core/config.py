@@ -154,8 +154,12 @@ class NexusConfig(BaseSettings):
     model_config = {"env_prefix": "NEXUS_", "env_nested_delimiter": "__"}
 
     # GPU 서버
-    gpu_server_url: str = "http://localhost:8000"
     gpu_server: GPUServerConfig = Field(default_factory=GPUServerConfig)
+
+    @property
+    def gpu_server_url(self) -> str:
+        """GPU 서버 URL — gpu_server.url에서 가져온다."""
+        return self.gpu_server.url
 
     # 데이터 저장소
     redis: RedisConfig = Field(default_factory=RedisConfig)

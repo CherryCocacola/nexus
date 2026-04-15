@@ -63,7 +63,7 @@ class TestNexusConfig:
             warnings.simplefilter("always")
             NexusConfig(
                 air_gap_mode=True,
-                gpu_server_url="http://cloud.example.com:8000",
+                gpu_server=GPUServerConfig(url="http://cloud.example.com:8000"),
             )
             # GPU 서버 URL 경고 + 에어갭 경고
             assert len(w) >= 1
@@ -83,7 +83,7 @@ class TestLoadAndValidateConfig:
         """YAML 파일에서 설정을 로드할 수 있는지 확인한다."""
         config_file = tmp_path / "test_config.yaml"
         config_data = {
-            "gpu_server_url": "http://192.168.1.100:8000",
+            "gpu_server": {"url": "http://192.168.1.100:8000"},
             "log_level": "DEBUG",
             "debug": True,
         }

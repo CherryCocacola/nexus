@@ -118,8 +118,8 @@ async def init_phase2(state: GlobalState) -> dict:
     provider = LocalModelProvider(
         base_url=config.gpu_server_url,
         model_id=config.model.primary_model,
-        max_context_tokens=config.model.max_model_len,
-        max_output_tokens=config.model.max_output_tokens,
+        max_context_tokens=config.model.max_context_tokens,
+        max_output_tokens=config.model.default_max_tokens,
         embedding_base_url=config.gpu_server.embedding_url,
     )
     components["model_provider"] = provider
