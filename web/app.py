@@ -506,6 +506,42 @@ async def metrics() -> dict[str, Any]:
 
 
 # ─────────────────────────────────────────────
+# 파일 업로드 (문서 분석용)
+# ─────────────────────────────────────────────
+@app.post("/v1/upload")
+async def upload_file(request: Any) -> dict[str, Any]:
+    """
+    파일을 서버 임시 디렉토리에 저장하고 경로를 반환한다.
+    반환된 경로를 DocumentProcess 도구로 분석할 수 있다.
+    """
+    import tempfile
+
+    from starlette.requests import Request
+
+    req: Request = request
+    form = await req.form()
+    uploaded = form.get("file")
+
+    if not uploaded:
+        return {"error": "파일이 없습니다"}
+
+    # 임시 디렉토리에 저장
+    upload_dir = Path(tempfile.gettempdir()) / "nexus_uploads"
+    upload_dir.mkdir(exist_ok=True)
+
+    file_path = upload_dir / uploaded.filename
+    content = await uploaded.read()
+    file_path.write_bytes(content)
+
+    return {
+        "status": "ok",
+        "file_path": str(file_path),
+        "file_name": uploaded.filename,
+        "size_bytes": len(content),
+    }
+
+
+# ─────────────────────────────────────────────
 # 채팅 UI (루트 경로)
 # ─────────────────────────────────────────────
 @app.get("/")

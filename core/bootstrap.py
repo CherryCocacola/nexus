@@ -246,6 +246,7 @@ def _create_web_tool_registry():  # noqa: ANN202
     GPU가 업그레이드되면 _create_tool_registry()로 교체 가능.
     """
     from core.tools.implementations.bash_tool import BashTool
+    from core.tools.implementations.document_tool import DocumentProcessTool
     from core.tools.implementations.edit_tool import EditTool
     from core.tools.implementations.glob_tool import GlobTool
     from core.tools.implementations.grep_tool import GrepTool
@@ -256,15 +257,16 @@ def _create_web_tool_registry():  # noqa: ANN202
 
     registry = ToolRegistry()
     registry.register_many([
-        ReadTool(),      # 파일 읽기 (~300 토큰)
-        WriteTool(),     # 파일 쓰기 (~225 토큰)
-        EditTool(),      # 파일 편집 (~325 토큰)
-        BashTool(),      # 명령 실행 (~275 토큰)
-        GlobTool(),      # 파일 검색 (~188 토큰)
-        GrepTool(),      # 텍스트 검색 (~375 토큰)
-        LSTool(),        # 디렉토리 조회 (~163 토큰)
+        ReadTool(),              # 파일 읽기 (~300 토큰)
+        WriteTool(),             # 파일 쓰기 (~225 토큰)
+        EditTool(),              # 파일 편집 (~325 토큰)
+        BashTool(),              # 명령 실행 (~275 토큰)
+        GlobTool(),              # 파일 검색 (~188 토큰)
+        GrepTool(),              # 텍스트 검색 (~375 토큰)
+        LSTool(),                # 디렉토리 조회 (~163 토큰)
+        DocumentProcessTool(),   # 문서 파싱 PDF/DOCX/XLSX (~200 토큰)
     ])
-    # 합계: ~1,851 토큰 — 8192 컨텍스트에서 충분한 여유 확보
+    # 합계: ~2,051 토큰 — 8192 컨텍스트에서 충분한 여유 확보
 
     return registry
 

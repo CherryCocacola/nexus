@@ -637,9 +637,9 @@ function removeFile(index) {
 }
 
 async function readFileContents() {
-  // 바이너리 파일 확장자 — 텍스트로 읽을 수 없는 형식
-  const binaryExts = ['.docx', '.doc', '.xlsx', '.xls', '.pdf', '.hwp', '.pptx', '.zip', '.tar', '.gz'];
-  // 최대 문자 수 — 8192 컨텍스트에서 도구+시스템 제외 후 여유 확보
+  // 바이너리 파일 확장자 — 서버에 업로드하여 DocumentProcess 도구로 분석
+  const binaryExts = ['.docx', '.doc', '.xlsx', '.xls', '.pdf', '.hwp', '.pptx'];
+  // 텍스트 파일 최대 문자 수
   const MAX_CHARS = 12000;
 
   const contents = [];
@@ -647,17 +647,22 @@ async function readFileContents() {
     const ext = '.' + file.name.split('.').pop().toLowerCase();
 
     if (binaryExts.includes(ext)) {
-      contents.push(
-        `[첨부파일: ${file.name} (${(file.size/1024).toFixed(1)}KB)]\n` +
-        `이 파일은 ${ext} 형식입니다. ` +
-        `텍스트로 직접 읽을 수 없으므로, Read 도구를 사용하여 서버에서 파일을 분석해 주세요.\n` +
-        `파일을 서버의 임시 경로에 저장한 뒤 분석하는 것을 권장합니다.`
-      );
+      // 바이너리 파일 → 서버에 업로드하고 경로를 전달
+      const uploadPath = await uploadFileToServer(file);
+      if (uploadPath) {
+        contents.push(
+          `사용자가 문서 파일을 업로드했습니다.\n` +
+          `파일명: ${file.name}\n` +
+          `서버 경로: ${uploadPath}\n` +
+          `DocumentProcess 도구를 사용하여 이 파일의 내용을 분석해 주세요.`
+        );
+      } else {
+        contents.push(`[첨부파일 업로드 실패: ${file.name}]`);
+      }
       continue;
     }
 
     let text = await file.text();
-    // 텍스트 길이 제한
     if (text.length > MAX_CHARS) {
       text = text.substring(0, MAX_CHARS) +
         `\n\n... [파일이 길어 ${MAX_CHARS}자까지만 포함됨. 전체 ${text.length}자 중 일부.]`;
@@ -665,6 +670,22 @@ async function readFileContents() {
     contents.push(`[첨부파일: ${file.name}]\n${text}`);
   }
   return contents.join('\n\n');
+}
+
+async function uploadFileToServer(file) {
+  try {
+    const formData = new FormData();
+    formData.append('file', file);
+    const resp = await fetch('/v1/upload', { method: 'POST', body: formData });
+    const data = await resp.json();
+    if (data.status === 'ok') {
+      return data.file_path;
+    }
+    return null;
+  } catch (e) {
+    console.error('파일 업로드 실패:', e);
+    return null;
+  }
 }
 
 // ─── 메시지 표시 ───
