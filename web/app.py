@@ -296,19 +296,32 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
             histories[session_id] = []
 
         # QueryEngine의 messages를 해당 세션의 히스토리로 교체
-        # 토큰 예산 내에서 최근 대화만 복원한다.
-        # 도구 스키마(~1,851) + 시스템 프롬프트(~72) = ~1,923 토큰이 고정 비용이므로,
-        # 히스토리 + 새 메시지는 컨텍스트의 절반(4,096) 이내로 제한한다.
+        # 도구 호출/결과 메시지는 토큰을 많이 차지하므로 제외하고,
+        # user/assistant 텍스트 메시지만 예산 내에서 복원한다.
         engine.clear_messages()
-        history_budget = 4096 * 3  # ~4,096 토큰 × 3자/토큰 = 12,288 문자
-        used_chars = len(request.message)
+
+        # user/assistant 텍스트 메시지만 필터링
+
+        text_messages = []
+        for msg in histories[session_id]:
+            role = msg.role if isinstance(msg.role, str) else msg.role.value
+            # tool_result, tool_use 메시지는 건너뛰고 user/assistant만
+            if role in ("user", "assistant"):
+                # 도구 호출이 포함된 assistant 메시지도 텍스트만 추출
+                text = msg.text_content if hasattr(msg, "text_content") else str(msg.content)
+                if text and len(text) > 5:  # 빈 메시지 제외
+                    text_messages.append(msg)
+
+        # 예산 내에서 최근 메시지만 복원 (2,000 토큰 = ~6,000자)
+        budget = 6000
+        used = len(request.message)
         restored = []
-        for msg in reversed(histories[session_id]):
-            msg_chars = len(str(msg.content))
-            if used_chars + msg_chars > history_budget:
+        for msg in reversed(text_messages):
+            content = msg.text_content if hasattr(msg, "text_content") else str(msg.content)
+            if used + len(content) > budget:
                 break
             restored.append(msg)
-            used_chars += msg_chars
+            used += len(content)
         restored.reverse()
         for msg in restored:
             engine._messages.append(msg)
@@ -338,9 +351,14 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
                     )
                 yield f"data: {json.dumps(sse_data, ensure_ascii=False)}\n\n"
 
-        # 이번 턴의 메시지를 세션 히스토리에 저장
-        # QueryEngine이 messages[]에 user + assistant 메시지를 추가했으므로 동기화
-        histories[session_id] = list(engine._messages)
+        # 이번 턴의 user/assistant 텍스트 메시지만 히스토리에 저장
+        # tool_result/tool_use 메시지는 토큰이 크므로 저장하지 않는다
+        for msg in engine._messages:
+            role = msg.role if isinstance(msg.role, str) else msg.role.value
+            if role in ("user", "assistant"):
+                content = msg.text_content if hasattr(msg, "text_content") else str(msg.content)
+                if content and len(content) > 5 and msg not in histories[session_id]:
+                    histories[session_id].append(msg)
 
     return StreamingResponse(
         generate(),
