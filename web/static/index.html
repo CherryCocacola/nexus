@@ -468,6 +468,9 @@ body {
 <!-- 헤더 -->
 <div class="header">
   <div class="header-left">
+    <button class="header-btn" onclick="toggleSidebar()" title="세션 목록">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg>
+    </button>
     <img src="/static/images.png" alt="Nexus" class="header-logo">
     <span class="header-title">Nexus</span>
     <span class="header-subtitle">by IDINO</span>
@@ -479,9 +482,6 @@ body {
       <span>OUT: <b id="tokenOut">0</b></span>
     </div>
     <span class="status-dot" id="statusDot" title="GPU 서버 상태"></span>
-    <button class="header-btn" onclick="toggleSidebar()">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg>
-    </button>
   </div>
 </div>
 
