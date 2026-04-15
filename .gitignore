@@ -70,3 +70,6 @@ desktop.ini
 # ===========================
 .nexus/
 *.jsonl
+
+# SSL 인증서 (자체 서명)
+config/ssl/
