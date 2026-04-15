@@ -135,10 +135,42 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
         # Phase 2: ToolRegistry, MemoryManager, QueryEngine 초기화
         components = await init_phase2(state)
-        _app_state["query_engine"] = components.get("query_engine")
         _app_state["tool_registry"] = components.get("tool_registry")
         _app_state["model_provider"] = components.get("model_provider")
-        logger.info("웹 서버 부트스트랩 완료 (Phase 1 + 2)")
+
+        # 웹 전용 QueryEngine — 도구 8개로 축소 (토큰 예산 관리)
+        # RTX 5090 (8192 ctx)에서 도구 24개(~6,102토큰)는 컨텍스트 초과.
+        # 핵심 도구 8개(~1,851토큰)만 사용하여 입력+출력 공간 확보.
+        from core.bootstrap import _create_web_tool_registry
+        from core.orchestrator.query_engine import QueryEngine
+        from core.tools.base import ToolUseContext
+
+        web_registry = _create_web_tool_registry()
+        web_context = ToolUseContext(
+            cwd=state.cwd or ".",
+            session_id=state.session_id,
+            permission_mode=state.permission_mode.value,
+            options={
+                "memory_manager": components.get("memory_manager"),
+                "task_manager": components.get("task_manager"),
+            },
+        )
+        web_engine = QueryEngine(
+            model_provider=components["model_provider"],
+            tools=web_registry.get_all_tools(),
+            context=web_context,
+            system_prompt=(
+                "You are Nexus, an AI assistant by IDINO. "
+                "Respond helpfully in the user's language. "
+                "Use available tools when needed to read, write, or search files."
+            ),
+            max_turns=200,
+        )
+        _app_state["query_engine"] = web_engine
+        logger.info(
+            "웹 서버 부트스트랩 완료 (Phase 1 + 2, 웹 도구 %d개)",
+            len(web_registry.get_all_tools()),
+        )
     except Exception as e:
         logger.warning(f"부트스트랩 실패, 기본 설정으로 시작: {e}")
 
@@ -242,7 +274,7 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
         """
         import json
 
-        from core.message import Message, StreamEvent
+        from core.message import StreamEvent
 
         engine = _app_state.get("query_engine")
         if engine is None:
