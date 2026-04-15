@@ -35,7 +35,7 @@ model:
   primary_model: "gemma-4-31b-it"
   auxiliary_model: "exaone-7.8b"
   embedding_model: "multilingual-e5-large"
-  max_context_tokens: 4096
+  max_context_tokens: 8192
   default_temperature: 0.7
   default_max_tokens: 4096
 

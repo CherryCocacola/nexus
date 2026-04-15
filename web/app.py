@@ -242,56 +242,27 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
         """
         import json
 
-        from core.message import StreamEvent
+        from core.message import Message, StreamEvent
 
-        from core.message import Message, StreamEvent, StreamEventType
-
-        provider = _app_state.get("model_provider")
-        if provider is None:
+        engine = _app_state.get("query_engine")
+        if engine is None:
             placeholder = {
                 "type": "text_delta",
-                "text": "모델 프로바이더가 아직 초기화되지 않았습니다.",
+                "text": "QueryEngine이 아직 초기화되지 않았습니다.",
                 "session_id": session_id,
             }
             yield f"data: {json.dumps(placeholder, ensure_ascii=False)}\n\n"
             return
 
-        # 대화 히스토리 관리 (세션별)
-        if "chat_histories" not in _app_state:
-            _app_state["chat_histories"] = {}
-        histories = _app_state["chat_histories"]
-        if session_id not in histories:
-            histories[session_id] = []
-
-        # 사용자 메시지 추가
-        histories[session_id].append(Message.user(request.message))
-
-        # 최근 20턴만 전송 (컨텍스트 초과 방지)
-        recent_messages = histories[session_id][-40:]
-
-        # 도구 스키마 없이 순수 대화 — 컨텍스트 초과 방지
-        system_prompt = (
-            "You are Nexus, an AI assistant by IDINO. "
-            "Respond helpfully in the user's language. "
-            "Keep responses concise and clear."
-        )
-
-        assistant_text_parts: list[str] = []
-        async for event in provider.stream(
-            messages=recent_messages,
-            system_prompt=system_prompt,
-            tools=None,
-            temperature=0.7,
-            max_tokens=2048,
-        ):
+        # QueryEngine을 통한 전체 에이전트 루프 (도구 사용 포함)
+        async for event in engine.submit_message(request.message):
             if isinstance(event, StreamEvent):
                 sse_data: dict[str, Any] = {
                     "type": event.type if isinstance(event.type, str) else event.type.value,
-                    "session_id": session_id,
+                    "session_id": engine.session_id,
                 }
                 if event.text:
                     sse_data["text"] = event.text
-                    assistant_text_parts.append(event.text)
                 if event.message:
                     sse_data["message"] = event.message
                 if event.error_code:
@@ -302,12 +273,6 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
                         stop_val if isinstance(stop_val, str) else stop_val.value
                     )
                 yield f"data: {json.dumps(sse_data, ensure_ascii=False)}\n\n"
-
-        # 어시스턴트 응답을 히스토리에 추가
-        if assistant_text_parts:
-            histories[session_id].append(
-                Message.assistant("".join(assistant_text_parts))
-            )
 
     return StreamingResponse(
         generate(),
