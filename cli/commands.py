@@ -109,19 +109,29 @@ def ask(query: str, model: str) -> None:
     async def _run_ask():
         """비대화형 질문을 실행한다."""
         try:
-            from core.bootstrap import init
+            from core.bootstrap import init, init_phase2
 
-            await init()
+            state = await init()
+            components = await init_phase2(state)
+            engine = components.get("query_engine")
         except Exception as e:
             console.print(f"[red]부트스트랩 실패: {e}[/red]")
             sys.exit(1)
 
-        # QueryEngine이 없으면 안내 메시지를 표시한다
-        # TODO(nexus): Phase 3 완성 후 QueryEngine 연동
-        console.print(
-            "[yellow]QueryEngine이 아직 초기화되지 않았습니다.\n"
-            "Phase 3 (Orchestrator) 모듈이 완성되면 사용할 수 있습니다.[/yellow]"
-        )
+        if engine is None:
+            console.print("[yellow]QueryEngine 초기화 실패[/yellow]")
+            sys.exit(1)
+
+        # QueryEngine에 메시지를 보내고 텍스트 응답을 출력한다
+        from core.message import StreamEvent, StreamEventType
+
+        async for event in engine.submit_message(query):
+            if (
+                isinstance(event, StreamEvent)
+                and event.type == StreamEventType.TEXT_DELTA
+                and event.text
+            ):
+                console.print(event.text, end="")
 
     asyncio.run(_run_ask())
 

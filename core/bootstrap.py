@@ -11,9 +11,10 @@ Phase 1 (이 파일): 환경 비의존 초기화
   - GPU 서버 사전 연결 (fire-and-forget)
   - 플랫폼 감지
 
-Phase 2 (향후 구현): 환경 의존 초기화
-  - 세션 관리, Redis/PG 연결, Tool Registry 등
-  - Phase 2+ 모듈에 의존하므로 해당 모듈 완성 후 구현
+Phase 2 (init_phase2): 환경 의존 초기화
+  - ToolRegistry (24개 도구 등록)
+  - MemoryManager (단기+장기 메모리)
+  - QueryEngine (Tier 1 세션 오케스트레이터)
 
 왜 2-Phase인가: Claude Code가 이 패턴을 사용하는 이유는
 Phase 1이 src/ 내부 모듈을 전혀 import하지 않아서
@@ -80,6 +81,161 @@ async def init(
     logger.info(f"[Phase 1] 플랫폼: {state.platform.get('os', 'unknown')}")
 
     return state
+
+
+# ─────────────────────────────────────────────
+# Phase 2: 환경 의존 초기화
+# ─────────────────────────────────────────────
+async def init_phase2(state: GlobalState) -> dict:
+    """
+    Phase 2 초기화. Phase 1(init) 이후 호출한다.
+    core/ 내부 모듈(ToolRegistry, MemoryManager, QueryEngine)을 초기화한다.
+
+    Args:
+        state: Phase 1에서 생성된 GlobalState
+
+    Returns:
+        초기화된 컴포넌트 딕셔너리:
+          - tool_registry: ToolRegistry (24개 도구 등록됨)
+          - memory_manager: MemoryManager (인메모리 폴백)
+          - model_provider: LocalModelProvider
+          - query_engine: QueryEngine (Tier 1)
+    """
+    # lazy import — Phase 2 모듈은 Phase 1에서 import하지 않는다
+    from core.memory.long_term import LongTermMemory
+    from core.memory.manager import MemoryManager
+    from core.memory.short_term import ShortTermMemory
+    from core.model.inference import LocalModelProvider
+    from core.orchestrator.query_engine import QueryEngine
+    from core.tools.base import ToolUseContext
+
+    components: dict = {}
+
+    # ① ModelProvider 생성
+    config = state.config
+    provider = LocalModelProvider(
+        base_url=config.gpu_server_url,
+        model_id=config.model.primary_model,
+        max_context_tokens=config.model.max_model_len,
+        max_output_tokens=config.model.max_output_tokens,
+    )
+    components["model_provider"] = provider
+    logger.info("[Phase 2] ModelProvider 초기화: %s", config.gpu_server_url)
+
+    # ② ToolRegistry — 24개 도구 등록
+    registry = _create_tool_registry()
+    components["tool_registry"] = registry
+    logger.info("[Phase 2] ToolRegistry 초기화: %d개 도구", registry.tool_count)
+
+    # ③ MemoryManager — 인메모리 폴백 (Redis/PG 없이 동작)
+    stm = ShortTermMemory(redis_client=None)
+    ltm = LongTermMemory(pg_pool=None)
+    memory_manager = MemoryManager(
+        short_term=stm,
+        long_term=ltm,
+        model_provider=provider,
+    )
+    components["memory_manager"] = memory_manager
+    logger.info("[Phase 2] MemoryManager 초기화: 인메모리 폴백")
+
+    # ④ ToolUseContext 생성
+    context = ToolUseContext(
+        cwd=state.cwd or os.getcwd(),
+        session_id=state.session_id,
+        permission_mode=state.permission_mode.value,
+        options={
+            "memory_manager": memory_manager,
+        },
+    )
+    components["tool_use_context"] = context
+
+    # ⑤ QueryEngine — Tier 1 세션 오케스트레이터
+    # 시스템 프롬프트는 기본값 사용 (CLI/Web에서 커스터마이즈 가능)
+    tools = registry.get_all_tools()
+    engine = QueryEngine(
+        model_provider=provider,
+        tools=tools,
+        context=context,
+        system_prompt=_build_default_system_prompt(),
+        max_turns=200,
+    )
+    components["query_engine"] = engine
+    logger.info("[Phase 2] QueryEngine 초기화: session=%s", engine.session_id)
+
+    return components
+
+
+def _create_tool_registry():  # noqa: ANN202 — ToolRegistry는 함수 내부에서 import
+    """24개 도구를 등록한 ToolRegistry를 생성한다."""
+    from core.tools.implementations.bash_tool import BashTool
+    from core.tools.implementations.docker_tools import DockerBuildTool, DockerRunTool
+    from core.tools.implementations.edit_tool import EditTool
+    from core.tools.implementations.git_tools import (
+        GitBranchTool,
+        GitCheckoutTool,
+        GitCommitTool,
+        GitDiffTool,
+        GitLogTool,
+        GitStatusTool,
+    )
+    from core.tools.implementations.glob_tool import GlobTool
+    from core.tools.implementations.grep_tool import GrepTool
+    from core.tools.implementations.ls_tool import LSTool
+    from core.tools.implementations.memory_tools import MemoryReadTool, MemoryWriteTool
+    from core.tools.implementations.multi_edit_tool import MultiEditTool
+    from core.tools.implementations.notebook_tools import NotebookEditTool, NotebookReadTool
+    from core.tools.implementations.read_tool import ReadTool
+    from core.tools.implementations.task_tools import TaskTool, TodoReadTool, TodoWriteTool
+    from core.tools.implementations.write_tool import WriteTool
+    from core.tools.registry import ToolRegistry
+
+    registry = ToolRegistry()
+    registry.register_many([
+        # 파일 시스템 (4개)
+        ReadTool(),
+        WriteTool(),
+        EditTool(),
+        MultiEditTool(),
+        # 실행 (1개)
+        BashTool(),
+        # 검색 (3개)
+        GlobTool(),
+        GrepTool(),
+        LSTool(),
+        # Git (6개)
+        GitLogTool(),
+        GitDiffTool(),
+        GitStatusTool(),
+        GitCommitTool(),
+        GitBranchTool(),
+        GitCheckoutTool(),
+        # 노트북 (2개)
+        NotebookReadTool(),
+        NotebookEditTool(),
+        # 태스크 (3개)
+        TodoReadTool(),
+        TodoWriteTool(),
+        TaskTool(),
+        # 메모리 (2개)
+        MemoryReadTool(),
+        MemoryWriteTool(),
+        # Docker (2개)
+        DockerBuildTool(),
+        DockerRunTool(),
+    ])
+
+    return registry
+
+
+def _build_default_system_prompt() -> str:
+    """기본 시스템 프롬프트를 생성한다."""
+    return (
+        "You are Nexus, an AI coding assistant running in an air-gapped environment.\n"
+        "You help users with software engineering tasks using available tools.\n"
+        "Always respond in the user's language.\n"
+        "When you need to read, write, or modify files, use the appropriate tools.\n"
+        "Think step by step before taking actions."
+    )
 
 
 # ─────────────────────────────────────────────

@@ -143,13 +143,21 @@ class MemoryReadTool(BaseTool):
 
         manager = _get_memory_manager(context)
 
-        # TODO(nexus): Phase 5.0 MemoryManager 구현 후 벡터 검색 연동
-        if manager and hasattr(manager, "search"):
-            results = await manager.search(query=query, tags=tags, limit=max_results)
-            if not results:
-                return ToolResult.success("검색 결과가 없습니다.", count=0)
-            # MemoryManager의 결과 형식에 따라 포맷 (추후 구현)
-            return ToolResult.success(str(results), count=len(results))
+        # MemoryManager가 있으면 벡터+텍스트 검색을 위임한다
+        if manager and hasattr(manager, "search_relevant"):
+            try:
+                entries = await manager.search_relevant(query=query, top_k=max_results)
+                if not entries:
+                    return ToolResult.success(f"'{query}'에 대한 검색 결과가 없습니다.", count=0)
+                # MemoryEntry 목록을 포맷하여 반환
+                lines = []
+                for entry in entries:
+                    entry_tags = getattr(entry, "tags", []) or []
+                    tags_str = ", ".join(entry_tags) if entry_tags else "없음"
+                    lines.append(f"[{entry.id}] (태그: {tags_str})\n  {entry.content}")
+                return ToolResult.success("\n\n".join(lines), count=len(entries))
+            except Exception as e:
+                logger.warning("MemoryManager 검색 실패, 폴백 사용: %s", e)
 
         # 인메모리 폴백: 단순 키워드 매칭
         query_lower = query.lower()
@@ -277,11 +285,23 @@ class MemoryWriteTool(BaseTool):
 
         manager = _get_memory_manager(context)
 
-        # TODO(nexus): Phase 5.0 MemoryManager 구현 후 연동
-        if manager and hasattr(manager, "store"):
-            mem_id = await manager.store(content=content, tags=tags)
-            logger.info("MemoryWrite: stored via manager, id=%s", mem_id)
-            return ToolResult.success(f"메모리를 저장했습니다. (ID: {mem_id})", memory_id=mem_id)
+        # MemoryManager가 있으면 시맨틱 메모리로 저장 (벡터 임베딩 포함)
+        if manager and hasattr(manager, "add_semantic"):
+            try:
+                # add_semantic(key, value, tags)으로 장기 메모리에 저장
+                mem_id = await manager.add_semantic(
+                    key=f"user_stored_{int(time.time())}",
+                    value=content,
+                    tags=tags or None,
+                )
+                logger.info("MemoryWrite: stored via MemoryManager, id=%s", mem_id)
+                tags_str = ", ".join(tags) if tags else "없음"
+                return ToolResult.success(
+                    f"메모리를 저장했습니다. (ID: {mem_id}, 태그: {tags_str})",
+                    memory_id=mem_id,
+                )
+            except Exception as e:
+                logger.warning("MemoryManager 저장 실패, 폴백 사용: %s", e)
 
         # 인메모리 폴백 저장
         global _memory_counter  # noqa: PLW0603 — 모듈 레벨 카운터, 간단한 폴백용

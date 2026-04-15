@@ -148,42 +148,72 @@ class AgentTool(BaseTool):
             prompt[:50],
         )
 
-        # TODO(nexus): Phase 3.0 완성 후 실제 QueryEngine 연동
-        # 아래는 stub 구현 — 실제로는 다음과 같이 동작해야 한다:
-        #
-        # 1. 도구 필터링: DISALLOWED_TOOLS_FOR_AGENTS에 포함된 도구 제외
-        #    available_tools = [t for t in registry.tools
-        #                       if t.name not in DISALLOWED_TOOLS_FOR_AGENTS]
-        #
-        # 2. AgentDefinition 생성
-        #    agent_def = AgentDefinition(
-        #        name=f"sub-agent-{context.tool_use_id}",
-        #        description=description,
-        #        system_prompt=description,
-        #        tools=[t.name for t in available_tools],
-        #        max_turns=10,
-        #    )
-        #
-        # 3. 독립된 QueryEngine 생성 및 실행
-        #    engine = QueryEngine(agent_def, parent_context=context)
-        #    result = ""
-        #    async for event in engine.submit_message(prompt):
-        #        if event.type == EventType.TEXT_DELTA:
-        #            result += event.data
-        #
-        # 4. 결과 반환
+        # ① 사용 가능한 도구를 필터링 — 재귀/위험 도구 제외
+        # context.options에서 도구 리스트를 가져오거나 빈 리스트 사용
+        all_tools: list[BaseTool] = context.options.get("available_tools", [])
+        agent_tools = [
+            t for t in all_tools if t.name not in DISALLOWED_TOOLS_FOR_AGENTS
+        ]
 
-        # 현재는 stub 메시지 반환
-        stub_message = (
-            f"[Agent Stub] 서브 에이전트가 아직 구현되지 않았습니다.\n"
-            f"설명: {description}\n"
-            f"프롬프트: {prompt}\n\n"
-            f"Phase 3.0 (Orchestrator) 완성 후 실제 동작합니다.\n"
-            f"제외된 도구: {', '.join(sorted(DISALLOWED_TOOLS_FOR_AGENTS))}"
-        )
+        # ② 서브 에이전트용 독립 QueryEngine 생성
+        try:
+            from core.orchestrator.query_engine import QueryEngine
 
-        logger.warning("Agent: stub mode — QueryEngine not yet implemented")
-        return ToolResult.success(stub_message, stub=True)
+            # 모델 프로바이더를 context.options에서 가져온다
+            model_provider = context.options.get("model_provider")
+            if model_provider is None:
+                # 모델 프로바이더가 없으면 stub 모드로 동작
+                return ToolResult.success(
+                    f"[Agent] 모델 프로바이더가 설정되지 않았습니다.\n"
+                    f"설명: {description}\n프롬프트: {prompt}",
+                    stub=True,
+                )
+
+            # 서브 에이전트용 컨텍스트 (부모 도구 ID를 상위 참조로 설정)
+            sub_context = ToolUseContext(
+                cwd=context.cwd,
+                session_id=f"sub-{context.session_id}",
+                agent_id=f"agent-{context.tool_use_id}",
+                parent_tool_use_id=context.tool_use_id,
+                permission_mode=context.permission_mode,
+                options=context.options,
+            )
+
+            # 독립된 QueryEngine 생성 — messages[]가 부모와 격리됨
+            engine = QueryEngine(
+                model_provider=model_provider,
+                tools=agent_tools,
+                context=sub_context,
+                system_prompt=description,
+                max_turns=10,  # 서브 에이전트는 10턴 제한
+            )
+
+            # ③ 프롬프트를 전달하고 텍스트 응답을 수집한다
+            from core.message import StreamEvent, StreamEventType
+
+            result_parts: list[str] = []
+            async for event in engine.submit_message(prompt):
+                if (
+                    isinstance(event, StreamEvent)
+                    and event.type == StreamEventType.TEXT_DELTA
+                    and event.text
+                ):
+                    result_parts.append(event.text)
+
+            result_text = "".join(result_parts)
+            if not result_text:
+                result_text = "(서브 에이전트가 텍스트 응답을 생성하지 않았습니다)"
+
+            logger.info(
+                "Agent: sub-agent completed (%d turns, %d chars)",
+                engine.total_turns,
+                len(result_text),
+            )
+            return ToolResult.success(result_text, turns=engine.total_turns)
+
+        except Exception as e:
+            logger.error("Agent: sub-agent execution failed: %s", e)
+            return ToolResult.error(f"서브 에이전트 실행 실패: {e}")
 
     # ═══ 7. UI Hints ═══
 

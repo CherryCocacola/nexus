@@ -191,13 +191,47 @@
 
 ---
 
+---
+
+## TODO 연동 작업 (완료)
+
+### v0.9.1 — QueryEngine + 모듈 간 배선 연동 (2026-04-15)
+
+- **core/orchestrator/query_engine.py** (신규):
+  - Tier 1 세션 오케스트레이터 — query_loop (Tier 2) 래퍼
+  - submit_message() → AsyncGenerator[StreamEvent | Message]
+  - 대화 히스토리 관리, 세션 사용량 추적
+- **core/bootstrap.py — Phase 2 초기화**:
+  - init_phase2(): ToolRegistry(24개 도구) + MemoryManager + QueryEngine 초기화
+  - _create_tool_registry(): 24개 도구 일괄 등록
+- **web/app.py 연동**:
+  - /v1/chat: QueryEngine.submit_message() → ChatResponse
+  - /v1/chat/stream: QueryEngine → SSE 스트리밍
+  - /v1/tools: ToolRegistry.get_all_tools() → 도구 목록
+- **cli/repl.py + cli/commands.py 연동**:
+  - _bootstrap()에서 Phase 2 초기화 (QueryEngine 자동 생성)
+  - ask 커맨드: 비대화형 QueryEngine 호출
+- **core/orchestrator/query_loop.py — HookManager Transition 5**:
+  - hook_manager 파라미터 추가
+  - HookEvent.STOP → BLOCK이면 강제 다음 턴 (stop_hook_blocking)
+- **core/tools/implementations/memory_tools.py**:
+  - MemoryRead: MemoryManager.search_relevant() 벡터+텍스트 검색
+  - MemoryWrite: MemoryManager.add_semantic() 장기 메모리 저장
+- **core/tools/implementations/agent_tool.py**:
+  - 서브 에이전트: 독립 QueryEngine 생성 + DISALLOWED_TOOLS 필터링
+  - max_turns=10 제한, 부모 context 연결
+- 352개 테스트 통과 (기존 테스트 모두 유지)
+
+---
+
 ## 다음 세션 시작 시 참고
 
-1. **Phase 0.5~8.0 완료** — 전체 시스템 구현 + 통합 테스트 완료
+1. **Phase 0.5~8.0 + TODO 연동 완료** — 전체 시스템 구현 + 통합 + 배선
 2. **추가 가능 작업**:
    - 실 GPU 서버(192.168.22.28) 연결 후 E2E 테스트
    - 성능 벤치마크 (사양서 Ch.22.4 Success Metrics)
    - Soak Test (24시간 연속 추론, 100-Turn 대화, 모델 스왑 스트레스)
    - LoRA Phase 1 Bootstrap 학습 실행
+   - TaskManager 구현 (task_tools.py 완전 연동)
 3. GPU 서버: 192.168.22.28, DB: 192.168.10.39
 4. ruff 클린, 352개 테스트 전부 통과

@@ -156,16 +156,21 @@ class NexusREPL:
 
     async def _bootstrap(self) -> None:
         """
-        Phase 1 초기화를 수행한다.
+        Phase 1 + Phase 2 초기화를 수행한다.
 
-        GlobalState와 설정을 로딩한다.
-        Phase 2+ 모듈이 완성되면 QueryEngine도 여기서 초기화한다.
+        Phase 1: GlobalState와 설정을 로딩한다.
+        Phase 2: ToolRegistry, MemoryManager, QueryEngine을 초기화한다.
         """
         try:
-            from core.bootstrap import init
+            from core.bootstrap import init, init_phase2
 
+            # Phase 1: 환경 비의존 초기화
             self._state = await init()
-            logger.info("REPL 부트스트랩 완료")
+
+            # Phase 2: QueryEngine + ToolRegistry + MemoryManager
+            components = await init_phase2(self._state)
+            self._query_engine = components.get("query_engine")
+            logger.info("REPL 부트스트랩 완료 (Phase 1 + 2)")
         except Exception as e:
             # 부트스트랩 실패 시에도 기본 REPL은 동작하도록 한다
             logger.warning(f"부트스트랩 실패, 기본 모드로 시작: {e}")

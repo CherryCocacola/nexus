@@ -108,6 +108,8 @@ _app_state: dict[str, Any] = {
     "state": None,  # GlobalState
     "config": None,  # NexusConfig
     "logging_middleware": None,  # RequestLoggingMiddleware 인스턴스
+    "query_engine": None,  # QueryEngine (Phase 2에서 초기화)
+    "tool_registry": None,  # ToolRegistry (Phase 2에서 초기화)
 }
 
 
@@ -120,14 +122,20 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     앱 시작 시 Phase 1 부트스트랩을 수행하고,
     종료 시 리소스를 정리한다.
     """
-    # 시작: 부트스트랩
+    # 시작: Phase 1 + Phase 2 부트스트랩
     try:
-        from core.bootstrap import init
+        from core.bootstrap import init, init_phase2
 
+        # Phase 1: 환경 비의존 초기화
         state = await init()
         _app_state["state"] = state
         _app_state["config"] = state.config
-        logger.info("웹 서버 부트스트랩 완료")
+
+        # Phase 2: ToolRegistry, MemoryManager, QueryEngine 초기화
+        components = await init_phase2(state)
+        _app_state["query_engine"] = components.get("query_engine")
+        _app_state["tool_registry"] = components.get("tool_registry")
+        logger.info("웹 서버 부트스트랩 완료 (Phase 1 + 2)")
     except Exception as e:
         logger.warning(f"부트스트랩 실패, 기본 설정으로 시작: {e}")
 
@@ -171,16 +179,39 @@ async def chat(request: ChatRequest) -> ChatResponse:
     # 세션 ID 생성 또는 재사용
     session_id = request.session_id or str(uuid.uuid4())
 
-    # TODO(nexus): Phase 3 완성 후 QueryEngine 연동
-    # QueryEngine이 없으면 placeholder 응답을 반환한다
+    engine = _app_state.get("query_engine")
+    if engine is None:
+        # QueryEngine이 초기화되지 않은 경우 placeholder 응답
+        return ChatResponse(
+            session_id=session_id,
+            response="QueryEngine이 아직 초기화되지 않았습니다.",
+            tool_calls=[],
+            usage=UsageInfo(),
+        )
+
+    # QueryEngine으로 메시지를 처리하고 모든 이벤트를 수집한다
+    from core.message import StreamEvent, StreamEventType
+
+    response_text_parts: list[str] = []
+    tool_calls_info: list[ToolCallInfo] = []
+    usage = UsageInfo()
+
+    async for event in engine.submit_message(request.message):
+        if isinstance(event, StreamEvent):
+            if event.type == StreamEventType.TEXT_DELTA and event.text:
+                response_text_parts.append(event.text)
+            elif event.type == StreamEventType.USAGE_UPDATE and event.usage:
+                usage = UsageInfo(
+                    input_tokens=event.usage.input_tokens,
+                    output_tokens=event.usage.output_tokens,
+                    total_tokens=event.usage.total_tokens,
+                )
+
     return ChatResponse(
-        session_id=session_id,
-        response=(
-            "QueryEngine이 아직 초기화되지 않았습니다. "
-            "Phase 3 (Orchestrator) 모듈이 완성되면 사용할 수 있습니다."
-        ),
-        tool_calls=[],
-        usage=UsageInfo(input_tokens=0, output_tokens=0, total_tokens=0),
+        session_id=engine.session_id,
+        response="".join(response_text_parts),
+        tool_calls=tool_calls_info,
+        usage=usage,
     )
 
 
@@ -198,22 +229,41 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
         """
         SSE 이벤트를 생성하는 AsyncGenerator.
 
-        StreamEvent를 수신하여 'data: {json}\n\n' 형식으로 변환한다.
+        QueryEngine의 StreamEvent를 수신하여
+        'data: {json}\n\n' 형식으로 실시간 전송한다.
         """
         import json
 
-        # TODO(nexus): Phase 3 완성 후 QueryEngine 연동
-        # 현재는 placeholder 이벤트를 전송한다
-        placeholder = {
-            "type": "text_delta",
-            "text": ("QueryEngine이 아직 초기화되지 않았습니다. Phase 3 완성 후 사용 가능합니다."),
-            "session_id": session_id,
-        }
-        yield f"data: {json.dumps(placeholder, ensure_ascii=False)}\n\n"
+        from core.message import StreamEvent
 
-        # 스트림 종료 이벤트
-        done = {"type": "message_stop", "session_id": session_id}
-        yield f"data: {json.dumps(done, ensure_ascii=False)}\n\n"
+        engine = _app_state.get("query_engine")
+        if engine is None:
+            # QueryEngine 미초기화 시 placeholder
+            placeholder = {
+                "type": "text_delta",
+                "text": "QueryEngine이 아직 초기화되지 않았습니다.",
+                "session_id": session_id,
+            }
+            yield f"data: {json.dumps(placeholder, ensure_ascii=False)}\n\n"
+            done = {"type": "message_stop", "session_id": session_id}
+            yield f"data: {json.dumps(done, ensure_ascii=False)}\n\n"
+            return
+
+        # QueryEngine에서 StreamEvent를 수신하여 SSE로 전송
+        async for event in engine.submit_message(request.message):
+            if isinstance(event, StreamEvent):
+                sse_data: dict[str, Any] = {
+                    "type": event.type if isinstance(event.type, str) else event.type.value,
+                    "session_id": engine.session_id,
+                }
+                if event.text:
+                    sse_data["text"] = event.text
+                if event.stop_reason:
+                    stop_val = event.stop_reason
+                    sse_data["stop_reason"] = (
+                        stop_val if isinstance(stop_val, str) else stop_val.value
+                    )
+                yield f"data: {json.dumps(sse_data, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(
         generate(),
@@ -260,9 +310,22 @@ async def list_tools() -> dict[str, Any]:
 
     ToolRegistry에서 등록된 모든 도구의 이름, 설명, 그룹을 반환한다.
     """
-    # TODO(nexus): ToolRegistry 연동
-    # Phase 2 (Tool System)에서 등록된 도구를 조회한다
-    return {"tools": [], "total": 0}
+    registry = _app_state.get("tool_registry")
+    if registry is None:
+        return {"tools": [], "total": 0}
+
+    # ToolRegistry에서 등록된 모든 도구의 정보를 반환한다
+    tools = registry.get_all_tools()
+    tool_list = [
+        ToolInfo(
+            name=t.name,
+            description=t.description,
+            group=t.group,
+            is_read_only=t.is_read_only,
+        ).model_dump()
+        for t in tools
+    ]
+    return {"tools": tool_list, "total": len(tool_list)}
 
 
 # ─────────────────────────────────────────────

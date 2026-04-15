@@ -135,6 +135,7 @@ async def query_loop(
     context: ToolUseContext,
     context_manager: Any | None = None,
     max_turns: int = MAX_TURNS,
+    hook_manager: Any | None = None,
 ) -> AsyncGenerator[StreamEvent | Message, None]:
     """
     핵심 에이전트 턴 루프.
@@ -157,6 +158,7 @@ async def query_loop(
         context: 도구 실행 컨텍스트
         context_manager: 컨텍스트 압축 관리자 (Ch.6, 선택)
         max_turns: 최대 턴 수 (기본: 200)
+        hook_manager: 훅 매니저 (Ch.10, 선택) — 도구 실행 전후/종료 시 훅 실행
 
     Yields:
         StreamEvent: 스트리밍 이벤트 (UI 업데이트용)
@@ -440,9 +442,32 @@ async def query_loop(
                         continue
 
             # ─── Transition 5: stop_hook_blocking ───
-            # Hook 시스템이 구현되면 여기서 종료 차단 여부를 확인한다
-            # (Phase 4에서 HookManager 구현 후 활성화 예정)
-            # TODO(nexus): HookManager 연동 — Ch.10 참조
+            # HookManager가 있으면 STOP 이벤트를 실행하여
+            # 종료를 차단할 수 있는지 확인한다
+            if hook_manager is not None:
+                try:
+                    from core.hooks.hook_manager import HookDecision, HookEvent, HookInput
+
+                    hook_input = HookInput(
+                        event=HookEvent.STOP,
+                        metadata={
+                            "stop_reason": str(stop_reason) if stop_reason else None,
+                            "turn_count": state.turn_count,
+                            "assistant_text": assistant_text[:200],
+                        },
+                    )
+                    hook_result = await hook_manager.run(HookEvent.STOP, hook_input)
+                    if hook_result.decision == HookDecision.BLOCK:
+                        # Hook이 종료를 차단 → 강제 다음 턴
+                        state.continue_reason = ContinueReason.STOP_HOOK_BLOCKING
+                        logger.info(
+                            "Hook이 종료를 차단: %s", hook_result.block_reason
+                        )
+                        await streaming_executor.cancel_all()
+                        continue
+                except Exception as e:
+                    # Hook 실행 실패 시 정상 종료 진행 (fail-open)
+                    logger.warning("STOP Hook 실행 실패: %s", e)
 
             # ─── Transition 6: token_budget_continuation ───
             # 로컬 모델은 비용이 0이므로 이 전환은 거의 발생하지 않음
