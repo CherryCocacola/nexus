@@ -637,9 +637,31 @@ function removeFile(index) {
 }
 
 async function readFileContents() {
+  // 바이너리 파일 확장자 — 텍스트로 읽을 수 없는 형식
+  const binaryExts = ['.docx', '.doc', '.xlsx', '.xls', '.pdf', '.hwp', '.pptx', '.zip', '.tar', '.gz'];
+  // 최대 문자 수 — 8192 컨텍스트에서 도구+시스템 제외 후 여유 확보
+  const MAX_CHARS = 12000;
+
   const contents = [];
   for (const file of attachedFiles) {
-    const text = await file.text();
+    const ext = '.' + file.name.split('.').pop().toLowerCase();
+
+    if (binaryExts.includes(ext)) {
+      contents.push(
+        `[첨부파일: ${file.name} (${(file.size/1024).toFixed(1)}KB)]\n` +
+        `이 파일은 ${ext} 형식입니다. ` +
+        `텍스트로 직접 읽을 수 없으므로, Read 도구를 사용하여 서버에서 파일을 분석해 주세요.\n` +
+        `파일을 서버의 임시 경로에 저장한 뒤 분석하는 것을 권장합니다.`
+      );
+      continue;
+    }
+
+    let text = await file.text();
+    // 텍스트 길이 제한
+    if (text.length > MAX_CHARS) {
+      text = text.substring(0, MAX_CHARS) +
+        `\n\n... [파일이 길어 ${MAX_CHARS}자까지만 포함됨. 전체 ${text.length}자 중 일부.]`;
+    }
     contents.push(`[첨부파일: ${file.name}]\n${text}`);
   }
   return contents.join('\n\n');

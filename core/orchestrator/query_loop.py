@@ -227,7 +227,7 @@ async def query_loop(
             # 입력이 컨텍스트의 85%를 초과하면 메시지를 truncate한다
             # 왜 85%: 최소 출력 512토큰 + 버퍼 확보
             input_limit = int(max_context * 0.85)
-            if estimated_input > input_limit and len(api_messages) > 1:
+            if estimated_input > input_limit and len(api_messages) >= 1:
                 # 가장 최근 메시지의 내용을 자른다 (대화 맥락 유지)
                 last_msg = api_messages[-1]
                 content_str = str(last_msg.content)
