@@ -685,6 +685,8 @@ function finalizeStreamingMessage() {
     body.classList.remove('streaming-cursor');
     const raw = body.textContent;
     body.innerHTML = formatContent(raw);
+    // ID를 제거하여 다음 메시지가 새 body를 사용하게 한다
+    body.removeAttribute('id');
 
     // 세션에 저장
     const session = sessions.find(s => s.id === currentSessionId);
@@ -809,7 +811,12 @@ function autoResize(el) {
 
 function scrollToBottom() {
   const msgs = document.getElementById('messages');
-  requestAnimationFrame(() => { msgs.scrollTop = msgs.scrollHeight; });
+  // 즉시 + 약간의 지연 후 두 번 스크롤 — DOM 업데이트 반영 보장
+  msgs.scrollTop = msgs.scrollHeight;
+  requestAnimationFrame(() => {
+    msgs.scrollTop = msgs.scrollHeight;
+    setTimeout(() => { msgs.scrollTop = msgs.scrollHeight; }, 50);
+  });
 }
 
 function toggleSidebar() {
