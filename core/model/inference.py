@@ -287,79 +287,74 @@ class LocalModelProvider(ModelProvider):
                         )
                         return
 
-                # SSE 라인 파싱
-                async for line in response.aiter_lines():
-                    if not line.startswith("data: "):
-                        continue
+                    # SSE 라인 파싱 (async with 블록 안에서 수행)
+                    async for line in response.aiter_lines():
+                        if not line.startswith("data: "):
+                            continue
 
-                    data_str = line[6:].strip()
-                    if data_str == "[DONE]":
-                        # 누적된 tool_calls 최종 yield
-                        for _evt in self._finalize_tool_calls(accumulated_tool_calls):
-                            yield _evt
-                        yield StreamEvent(
-                            type=StreamEventType.MESSAGE_STOP,
-                            stop_reason=StopReason.END_TURN,
-                            usage=total_usage,
-                        )
-                        return
-
-                    try:
-                        data = json.loads(data_str)
-                    except json.JSONDecodeError:
-                        logger.warning(f"잘못된 SSE JSON: {data_str[:200]}")
-                        continue
-
-                    # 사용량 업데이트
-                    if "usage" in data and data["usage"]:
-                        u = data["usage"]
-                        total_usage = TokenUsage(
-                            input_tokens=u.get("prompt_tokens", 0),
-                            output_tokens=u.get("completion_tokens", 0),
-                        )
-
-                    if not data.get("choices"):
-                        continue
-
-                    choice = data["choices"][0]
-                    delta = choice.get("delta", {})
-                    finish_reason = choice.get("finish_reason")
-
-                    # 텍스트 델타
-                    if delta.get("content"):
-                        yield StreamEvent(
-                            type=StreamEventType.TEXT_DELTA,
-                            text=delta["content"],
-                        )
-
-                    # tool_calls 증분 누적
-                    if "tool_calls" in delta:
-                        for tc_delta in delta["tool_calls"]:
-                            for _evt in self._accumulate_tool_call(
-                                accumulated_tool_calls, tc_delta
-                            ):
+                        data_str = line[6:].strip()
+                        if data_str == "[DONE]":
+                            for _evt in self._finalize_tool_calls(accumulated_tool_calls):
                                 yield _evt
+                            yield StreamEvent(
+                                type=StreamEventType.MESSAGE_STOP,
+                                stop_reason=StopReason.END_TURN,
+                                usage=total_usage,
+                            )
+                            return
 
-                    # finish_reason 처리
-                    if finish_reason:
-                        stop = {
-                            "stop": StopReason.END_TURN,
-                            "length": StopReason.MAX_TOKENS,
-                            "tool_calls": StopReason.TOOL_USE,
-                        }.get(finish_reason, StopReason.END_TURN)
+                        try:
+                            data = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            logger.warning("잘못된 SSE JSON: %s", data_str[:200])
+                            continue
 
-                        if finish_reason == "tool_calls":
-                            for _evt in self._finalize_tool_calls(
-                                accumulated_tool_calls
-                            ):
-                                yield _evt
+                        if "usage" in data and data["usage"]:
+                            u = data["usage"]
+                            total_usage = TokenUsage(
+                                input_tokens=u.get("prompt_tokens", 0),
+                                output_tokens=u.get("completion_tokens", 0),
+                            )
 
-                        yield StreamEvent(
-                            type=StreamEventType.MESSAGE_STOP,
-                            stop_reason=stop,
-                            usage=total_usage,
-                        )
-                        return
+                        if not data.get("choices"):
+                            continue
+
+                        choice = data["choices"][0]
+                        delta = choice.get("delta", {})
+                        finish_reason = choice.get("finish_reason")
+
+                        if delta.get("content"):
+                            yield StreamEvent(
+                                type=StreamEventType.TEXT_DELTA,
+                                text=delta["content"],
+                            )
+
+                        if "tool_calls" in delta:
+                            for tc_delta in delta["tool_calls"]:
+                                for _evt in self._accumulate_tool_call(
+                                    accumulated_tool_calls, tc_delta
+                                ):
+                                    yield _evt
+
+                        if finish_reason:
+                            stop = {
+                                "stop": StopReason.END_TURN,
+                                "length": StopReason.MAX_TOKENS,
+                                "tool_calls": StopReason.TOOL_USE,
+                            }.get(finish_reason, StopReason.END_TURN)
+
+                            if finish_reason == "tool_calls":
+                                for _evt in self._finalize_tool_calls(
+                                    accumulated_tool_calls
+                                ):
+                                    yield _evt
+
+                            yield StreamEvent(
+                                type=StreamEventType.MESSAGE_STOP,
+                                stop_reason=stop,
+                                usage=total_usage,
+                            )
+                            return
 
             except httpx.ConnectError as e:
                 self._error_count += 1
