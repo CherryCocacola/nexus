@@ -234,29 +234,58 @@ class LocalModelProvider(ModelProvider):
             model_id=self.model_id,
         )
 
-        # SSE 스트리밍 처리
-        # tool_calls는 여러 chunk에 걸쳐 증분으로 도착하므로 누적한다
-        accumulated_tool_calls: dict[int, dict[str, Any]] = {}
-        total_usage = TokenUsage()
+        # 컨텍스트 초과 시 max_tokens를 줄여서 자동 재시도
+        # 왜 여기서 하는가: vLLM의 실제 토큰 카운트는 BPE 기반이라
+        # 사전 추정이 부정확하다. 에러 발생 후 정확한 input_tokens 값으로 재계산.
+        max_retries_for_context = 3
+        current_max_tokens = payload["max_tokens"]
 
-        try:
-            async with self._client.stream(
-                "POST",
-                f"{self.base_url}/v1/chat/completions",
-                json=payload,
-                headers=headers,
-            ) as response:
-                # HTTP 에러 처리
-                if response.status_code != 200:
-                    error_body = ""
-                    async for chunk in response.aiter_bytes():
-                        error_body += chunk.decode("utf-8", errors="replace")
-                    yield StreamEvent(
-                        type=StreamEventType.ERROR,
-                        error_code=f"HTTP_{response.status_code}",
-                        message=f"vLLM 서버 에러: {response.status_code} - {error_body[:500]}",
-                    )
-                    return
+        for attempt in range(max_retries_for_context):
+            payload["max_tokens"] = current_max_tokens
+
+            # SSE 스트리밍 처리
+            accumulated_tool_calls: dict[int, dict[str, Any]] = {}
+            total_usage = TokenUsage()
+            context_exceeded = False
+
+            try:
+                async with self._client.stream(
+                    "POST",
+                    f"{self.base_url}/v1/chat/completions",
+                    json=payload,
+                    headers=headers,
+                ) as response:
+                    if response.status_code != 200:
+                        error_body = ""
+                        async for chunk in response.aiter_bytes():
+                            error_body += chunk.decode("utf-8", errors="replace")
+
+                        # 컨텍스트 초과 에러 감지 → max_tokens 줄여서 재시도
+                        if response.status_code == 400 and "context length" in error_body:
+                            # 에러에서 실제 input_tokens 추출
+                            import re
+
+                            m = re.search(r"contains at least (\d+) input", error_body)
+                            if m:
+                                actual_input = int(m.group(1))
+                                new_max = self._config.max_context_tokens - actual_input - 100
+                                current_max_tokens = max(256, new_max)
+                                logger.warning(
+                                    "컨텍스트 초과 → 재시도 %d/%d: "
+                                    "input=%d, max_tokens=%d→%d",
+                                    attempt + 1, max_retries_for_context,
+                                    actual_input, payload["max_tokens"],
+                                    current_max_tokens,
+                                )
+                                context_exceeded = True
+                                continue
+
+                        yield StreamEvent(
+                            type=StreamEventType.ERROR,
+                            error_code=f"HTTP_{response.status_code}",
+                            message=f"vLLM 서버 에러: {response.status_code} - {error_body[:500]}",
+                        )
+                        return
 
                 # SSE 라인 파싱
                 async for line in response.aiter_lines():
@@ -332,41 +361,45 @@ class LocalModelProvider(ModelProvider):
                         )
                         return
 
-        except httpx.ConnectError as e:
-            self._error_count += 1
-            yield StreamEvent(
-                type=StreamEventType.ERROR,
-                error_code="CONNECT_ERROR",
-                message=(
-                    f"GPU 서버(vLLM) 연결 실패: {self.base_url}\n"
-                    f"상세: {e}\n"
-                    f"확인: 1) GPU 서버 실행 여부 2) 네트워크 연결 3) 방화벽 설정"
-                ),
-            )
-        except httpx.ReadTimeout as e:
-            self._error_count += 1
-            yield StreamEvent(
-                type=StreamEventType.ERROR,
-                error_code="READ_TIMEOUT",
-                message=f"GPU 서버 응답 타임아웃 ({self._client.timeout.read}s): {e}",
-            )
-        except httpx.HTTPStatusError as e:
-            self._error_count += 1
-            yield StreamEvent(
-                type=StreamEventType.ERROR,
-                error_code=f"HTTP_{e.response.status_code}",
-                message=f"vLLM HTTP 에러: {e.response.status_code} - {e.response.text[:500]}",
-            )
-        except Exception as e:
-            self._error_count += 1
-            logger.exception(f"stream()에서 예상치 못한 에러: {e}")
-            yield StreamEvent(
-                type=StreamEventType.ERROR,
-                error_code="UNKNOWN",
-                message=f"예상치 못한 에러: {type(e).__name__}: {e}",
-            )
-        finally:
-            self._total_latency += time.monotonic() - start_time
+            except httpx.ConnectError as e:
+                self._error_count += 1
+                yield StreamEvent(
+                    type=StreamEventType.ERROR,
+                    error_code="CONNECT_ERROR",
+                    message=(
+                        f"GPU 서버(vLLM) 연결 실패: {self.base_url}\n"
+                        f"상세: {e}\n"
+                        f"확인: 1) GPU 서버 실행 여부 2) 네트워크 연결 3) 방화벽 설정"
+                    ),
+                )
+            except httpx.ReadTimeout as e:
+                self._error_count += 1
+                yield StreamEvent(
+                    type=StreamEventType.ERROR,
+                    error_code="READ_TIMEOUT",
+                    message=f"GPU 서버 응답 타임아웃 ({self._client.timeout.read}s): {e}",
+                )
+            except httpx.HTTPStatusError as e:
+                self._error_count += 1
+                yield StreamEvent(
+                    type=StreamEventType.ERROR,
+                    error_code=f"HTTP_{e.response.status_code}",
+                    message=f"vLLM HTTP 에러: {e.response.status_code} - {e.response.text[:500]}",
+                )
+            except Exception as e:
+                self._error_count += 1
+                logger.exception("stream()에서 예상치 못한 에러: %s", e)
+                yield StreamEvent(
+                    type=StreamEventType.ERROR,
+                    error_code="UNKNOWN",
+                    message=f"예상치 못한 에러: {type(e).__name__}: {e}",
+                )
+
+            # 컨텍스트 초과 재시도가 아니면 루프 탈출
+            if not context_exceeded:
+                break
+
+        self._total_latency += time.monotonic() - start_time
 
     # ─── embed() ───
 
