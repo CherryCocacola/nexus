@@ -237,7 +237,14 @@ class NexusREPL:
 
         OutputFormatter를 사용하여 이벤트를 Rich 렌더러블로 변환하고,
         텍스트 델타는 실시간으로, Panel은 한 번에 출력한다.
+
+        QueryEngine.submit_message()는 StreamEvent와 Message를 모두 yield한다.
+        Message 객체는 대화 히스토리용이므로 표시하지 않는다.
         """
+        # Message 객체는 표시 대상이 아님 — StreamEvent만 처리
+        if not isinstance(event, StreamEvent):
+            return
+
         result = self._formatter.format_event(event)
         if result is None:
             return
