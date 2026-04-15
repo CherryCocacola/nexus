@@ -160,9 +160,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             tools=web_registry.get_all_tools(),
             context=web_context,
             system_prompt=(
-                "You are Nexus, an AI assistant by IDINO. "
-                "Respond helpfully in the user's language. "
-                "Use available tools when needed to read, write, or search files."
+                "You are Nexus, an AI coding assistant by IDINO running on the user's local machine. "
+                "You have FULL ACCESS to the local file system through your tools. "
+                "When the user asks about files or directories, ALWAYS use your tools (Read, LS, Glob, Grep, DocumentProcess) to access them. "
+                "NEVER say you cannot access local files - you CAN and SHOULD use tools to do so. "
+                "Respond in the user's language."
             ),
             max_turns=200,
         )
