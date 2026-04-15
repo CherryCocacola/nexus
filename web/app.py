@@ -286,6 +286,20 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
             yield f"data: {json.dumps(placeholder, ensure_ascii=False)}\n\n"
             return
 
+        # 세션별 대화 히스토리 관리
+        # QueryEngine._messages는 모든 세션이 공유하므로,
+        # 매 요청마다 초기화하고 해당 세션의 히스토리만 복원한다.
+        if "chat_histories" not in _app_state:
+            _app_state["chat_histories"] = {}
+        histories = _app_state["chat_histories"]
+        if session_id not in histories:
+            histories[session_id] = []
+
+        # QueryEngine의 messages를 해당 세션의 최근 히스토리로 교체
+        engine.clear_messages()
+        for msg in histories[session_id][-10:]:  # 최근 5턴(10메시지)만 복원
+            engine._messages.append(msg)
+
         # QueryEngine을 통한 전체 에이전트 루프 (도구 사용 포함)
         async for event in engine.submit_message(request.message):
             if isinstance(event, StreamEvent):
@@ -310,6 +324,10 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
                         stop_val if isinstance(stop_val, str) else stop_val.value
                     )
                 yield f"data: {json.dumps(sse_data, ensure_ascii=False)}\n\n"
+
+        # 이번 턴의 메시지를 세션 히스토리에 저장
+        # QueryEngine이 messages[]에 user + assistant 메시지를 추가했으므로 동기화
+        histories[session_id] = list(engine._messages)
 
     return StreamingResponse(
         generate(),
