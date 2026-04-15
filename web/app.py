@@ -267,6 +267,11 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
                     sse_data["message"] = event.message
                 if event.error_code:
                     sse_data["error_code"] = event.error_code
+                if event.usage:
+                    sse_data["usage"] = {
+                        "input_tokens": event.usage.input_tokens,
+                        "output_tokens": event.usage.output_tokens,
+                    }
                 if event.stop_reason:
                     stop_val = event.stop_reason
                     sse_data["stop_reason"] = (

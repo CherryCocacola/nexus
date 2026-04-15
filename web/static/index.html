@@ -8,7 +8,7 @@
 <meta name="theme-color" content="#0b0b0c">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<link rel="icon" type="image/svg+xml" href="/static/images.png">
+<link rel="icon" type="image/png" href="/static/images.png">
 <style>
 /* ─── idino 컬러 팔레트 ─── */
 :root {
@@ -32,7 +32,6 @@
   --error: #DA017F;
 }
 
-/* ─── 리셋 + 기본 ─── */
 *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
 
 body {
@@ -45,7 +44,6 @@ body {
   flex-direction: column;
 }
 
-/* ─── 스크롤바 ─── */
 ::-webkit-scrollbar { width: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--scrollbar); border-radius: 3px; }
@@ -68,28 +66,13 @@ body {
   gap: 10px;
 }
 
-.header-logo {
-  width: 28px;
-  height: 28px;
-}
+.header-logo { width: 28px; height: 28px; border-radius: 6px; }
 
-.header-title {
-  font-size: 15px;
-  font-weight: 600;
-  color: var(--text-primary);
-}
+.header-title { font-size: 15px; font-weight: 600; }
 
-.header-subtitle {
-  font-size: 12px;
-  color: var(--text-muted);
-  margin-left: 8px;
-}
+.header-subtitle { font-size: 12px; color: var(--text-muted); margin-left: 8px; }
 
-.header-right {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}
+.header-right { display: flex; align-items: center; gap: 12px; }
 
 .header-btn {
   background: none;
@@ -109,21 +92,28 @@ body {
 }
 
 .status-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--success);
-  display: inline-block;
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--success); display: inline-block;
 }
-
 .status-dot.offline { background: var(--error); }
 
-/* ─── 사이드바 (세션 목록) ─── */
-.layout {
+/* ─── 토큰 카운터 ─── */
+.token-counter {
   display: flex;
-  flex: 1;
-  overflow: hidden;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--text-muted);
+  padding: 3px 8px;
+  background: var(--bg-primary);
+  border-radius: 4px;
+  border: 1px solid var(--border);
 }
+
+.token-counter span { font-variant-numeric: tabular-nums; }
+
+/* ─── 사이드바 ─── */
+.layout { display: flex; flex: 1; overflow: hidden; position: relative; }
 
 .sidebar {
   width: 260px;
@@ -132,18 +122,29 @@ body {
   display: flex;
   flex-direction: column;
   flex-shrink: 0;
-  transition: width 0.2s;
+  transition: transform 0.25s ease, opacity 0.25s ease;
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  z-index: 10;
+  transform: translateX(0);
+  opacity: 1;
 }
 
-.sidebar.collapsed { width: 0; overflow: hidden; border: none; }
+.sidebar.collapsed {
+  transform: translateX(-100%);
+  opacity: 0;
+  pointer-events: none;
+}
 
 .sidebar-header {
   padding: 14px 16px;
   border-bottom: 1px solid var(--border);
+  display: flex;
+  gap: 8px;
 }
 
 .new-chat-btn {
-  width: 100%;
+  flex: 1;
   padding: 10px;
   background: var(--accent);
   color: #fff;
@@ -154,14 +155,21 @@ body {
   font-weight: 500;
   transition: background 0.15s;
 }
-
 .new-chat-btn:hover { background: var(--accent-hover); }
 
-.session-list {
-  flex: 1;
-  overflow-y: auto;
-  padding: 8px;
+.sidebar-close-btn {
+  background: none;
+  border: 1px solid var(--border-light);
+  color: var(--text-secondary);
+  width: 36px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 16px;
+  transition: all 0.15s;
 }
+.sidebar-close-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
+
+.session-list { flex: 1; overflow-y: auto; padding: 8px; }
 
 .session-item {
   padding: 10px 12px;
@@ -175,7 +183,6 @@ body {
   text-overflow: ellipsis;
   transition: background 0.1s;
 }
-
 .session-item:hover { background: var(--bg-hover); }
 .session-item.active { background: var(--bg-tertiary); color: var(--text-primary); }
 
@@ -195,12 +202,7 @@ body {
   min-width: 0;
 }
 
-/* ─── 메시지 영역 ─── */
-.messages {
-  flex: 1;
-  overflow-y: auto;
-  padding: 24px 0;
-}
+.messages { flex: 1; overflow-y: auto; padding: 24px 0; }
 
 .messages-inner {
   max-width: 720px;
@@ -219,17 +221,13 @@ body {
 }
 
 .welcome-logo {
-  width: 56px;
-  height: 56px;
+  width: 56px; height: 56px;
   margin-bottom: 20px;
   opacity: 0.9;
+  border-radius: 12px;
 }
 
-.welcome h2 {
-  font-size: 22px;
-  font-weight: 600;
-  margin-bottom: 8px;
-}
+.welcome h2 { font-size: 22px; font-weight: 600; margin-bottom: 8px; }
 
 .welcome p {
   font-size: 14px;
@@ -239,10 +237,7 @@ body {
 }
 
 /* ─── 메시지 버블 ─── */
-.message {
-  margin-bottom: 24px;
-  animation: fadeIn 0.2s ease;
-}
+.message { margin-bottom: 24px; animation: fadeIn 0.2s ease; }
 
 @keyframes fadeIn {
   from { opacity: 0; transform: translateY(6px); }
@@ -257,8 +252,7 @@ body {
 }
 
 .message-avatar {
-  width: 24px;
-  height: 24px;
+  width: 24px; height: 24px;
   border-radius: 50%;
   display: flex;
   align-items: center;
@@ -268,20 +262,10 @@ body {
   flex-shrink: 0;
 }
 
-.message-avatar.user {
-  background: var(--bg-message-user);
-  color: #fff;
-}
+.message-avatar.user { background: var(--bg-message-user); color: #fff; }
+.message-avatar.assistant { background: var(--accent); color: #fff; }
 
-.message-avatar.assistant {
-  background: var(--accent);
-  color: #fff;
-}
-
-.message-sender {
-  font-size: 13px;
-  font-weight: 600;
-}
+.message-sender { font-size: 13px; font-weight: 600; }
 
 .message-body {
   padding-left: 32px;
@@ -313,17 +297,13 @@ body {
   font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
 }
 
-.message-body pre code {
-  background: none;
-  padding: 0;
-}
+.message-body pre code { background: none; padding: 0; }
 
 /* ─── 스트리밍 커서 ─── */
 .streaming-cursor::after {
   content: '';
   display: inline-block;
-  width: 7px;
-  height: 16px;
+  width: 7px; height: 16px;
   background: var(--accent-light);
   margin-left: 2px;
   animation: blink 0.8s infinite;
@@ -349,17 +329,33 @@ body {
 
 .input-box {
   display: flex;
-  align-items: flex-end;
+  align-items: center;
   background: var(--bg-input);
   border: 1px solid var(--border-light);
   border-radius: 12px;
-  padding: 12px 16px;
+  padding: 8px 12px;
+  gap: 8px;
   transition: border-color 0.15s;
 }
 
-.input-box:focus-within {
-  border-color: var(--accent);
+.input-box:focus-within { border-color: var(--accent); }
+
+/* 첨부 버튼 */
+.attach-btn {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 4px;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: color 0.15s;
 }
+.attach-btn:hover { color: var(--text-primary); }
+.attach-btn svg { width: 18px; height: 18px; }
 
 .input-box textarea {
   flex: 1;
@@ -371,36 +367,28 @@ body {
   font-family: inherit;
   resize: none;
   max-height: 150px;
-  line-height: 1.5;
+  line-height: 21px;
+  padding: 4px 0;
 }
 
-.input-box textarea::placeholder {
-  color: var(--text-muted);
-}
+.input-box textarea::placeholder { color: var(--text-muted); }
 
 .send-btn {
   background: var(--accent);
   border: none;
   color: #fff;
-  width: 32px;
-  height: 32px;
+  width: 32px; height: 32px;
   border-radius: 8px;
   cursor: pointer;
   display: flex;
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
-  margin-left: 8px;
   transition: background 0.15s;
 }
-
 .send-btn:hover { background: var(--accent-hover); }
 .send-btn:disabled { opacity: 0.4; cursor: not-allowed; }
-
-.send-btn svg {
-  width: 16px;
-  height: 16px;
-}
+.send-btn svg { width: 16px; height: 16px; }
 
 .input-footer {
   text-align: center;
@@ -408,6 +396,38 @@ body {
   color: var(--text-muted);
   margin-top: 8px;
 }
+
+/* 첨부파일 프리뷰 */
+.attach-preview {
+  display: none;
+  padding: 6px 12px;
+  margin-bottom: 4px;
+}
+
+.attach-preview.visible { display: flex; flex-wrap: wrap; gap: 6px; }
+
+.attach-chip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 10px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.attach-chip .remove {
+  cursor: pointer;
+  color: var(--text-muted);
+  font-size: 14px;
+  line-height: 1;
+}
+.attach-chip .remove:hover { color: var(--error); }
+
+/* 숨겨진 파일 입력 */
+#fileInput { display: none; }
 
 /* ─── 로딩 인디케이터 ─── */
 .thinking {
@@ -422,13 +442,11 @@ body {
 
 .thinking-dots span {
   display: inline-block;
-  width: 4px;
-  height: 4px;
+  width: 4px; height: 4px;
   background: var(--text-muted);
   border-radius: 50%;
   animation: dot-pulse 1.4s infinite;
 }
-
 .thinking-dots span:nth-child(2) { animation-delay: 0.2s; }
 .thinking-dots span:nth-child(3) { animation-delay: 0.4s; }
 
@@ -439,7 +457,7 @@ body {
 
 /* ─── 반응형 ─── */
 @media (max-width: 768px) {
-  .sidebar { display: none; }
+  .sidebar { width: 100%; }
   .messages-inner { padding: 0 12px; }
   .input-area { padding: 12px; }
 }
@@ -455,24 +473,29 @@ body {
     <span class="header-subtitle">by IDINO</span>
   </div>
   <div class="header-right">
+    <div class="token-counter" id="tokenCounter" title="누적 토큰 사용량">
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>
+      <span>IN: <b id="tokenIn">0</b></span>
+      <span>OUT: <b id="tokenOut">0</b></span>
+    </div>
     <span class="status-dot" id="statusDot" title="GPU 서버 상태"></span>
-    <button class="header-btn" onclick="checkHealth()">상태 확인</button>
-    <button class="header-btn" onclick="toggleSidebar()">세션 목록</button>
+    <button class="header-btn" onclick="toggleSidebar()">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg>
+    </button>
   </div>
 </div>
 
 <!-- 레이아웃 -->
 <div class="layout">
 
-  <!-- 사이드바 -->
-  <div class="sidebar" id="sidebar">
+  <!-- 사이드바 (기본 닫힘) -->
+  <div class="sidebar collapsed" id="sidebar">
     <div class="sidebar-header">
       <button class="new-chat-btn" onclick="newSession()">+ 새 대화</button>
+      <button class="sidebar-close-btn" onclick="toggleSidebar()">&times;</button>
     </div>
     <div class="session-list" id="sessionList"></div>
-    <div class="sidebar-footer">
-      Nexus v0.1.0 — Air-Gapped LLM
-    </div>
+    <div class="sidebar-footer">Nexus v0.1.0</div>
   </div>
 
   <!-- 메인 -->
@@ -482,14 +505,22 @@ body {
         <div class="welcome" id="welcome">
           <img src="/static/images.png" alt="Nexus" class="welcome-logo">
           <h2>Nexus에 오신 것을 환영합니다</h2>
-          <p>에어갭 환경에서 동작하는 AI 어시스턴트입니다.<br>무엇을 도와드릴까요?</p>
+          <p>무엇을 도와드릴까요?</p>
         </div>
       </div>
     </div>
 
     <div class="input-area">
       <div class="input-container">
+        <!-- 첨부파일 프리뷰 -->
+        <div class="attach-preview" id="attachPreview"></div>
         <div class="input-box">
+          <button class="attach-btn" onclick="document.getElementById('fileInput').click()" title="파일 첨부">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/>
+            </svg>
+          </button>
+          <input type="file" id="fileInput" multiple accept=".txt,.py,.js,.ts,.json,.yaml,.yml,.md,.csv,.html,.css,.sql,.xml,.log,.pdf,.docx,.hwp,.xlsx" onchange="handleFileSelect(event)">
           <textarea id="userInput"
                     placeholder="메시지를 입력하세요..."
                     rows="1"
@@ -512,6 +543,9 @@ body {
 let sessions = [];
 let currentSessionId = null;
 let isStreaming = false;
+let attachedFiles = [];
+let totalInputTokens = 0;
+let totalOutputTokens = 0;
 
 // ─── 초기화 ───
 window.addEventListener('DOMContentLoaded', () => {
@@ -528,6 +562,9 @@ function newSession() {
   currentSessionId = id;
   renderSessionList();
   clearMessages();
+  totalInputTokens = 0;
+  totalOutputTokens = 0;
+  updateTokenDisplay();
 }
 
 function switchSession(id) {
@@ -554,13 +591,62 @@ function clearMessages() {
     <div class="welcome" id="welcome">
       <img src="/static/images.png" alt="Nexus" class="welcome-logo">
       <h2>Nexus에 오신 것을 환영합니다</h2>
-      <p>에어갭 환경에서 동작하는 AI 어시스턴트입니다.<br>무엇을 도와드릴까요?</p>
+      <p>무엇을 도와드릴까요?</p>
     </div>`;
+}
+
+// ─── 토큰 카운터 ───
+function updateTokenDisplay() {
+  document.getElementById('tokenIn').textContent = totalInputTokens.toLocaleString();
+  document.getElementById('tokenOut').textContent = totalOutputTokens.toLocaleString();
+}
+
+// ─── 첨부파일 ───
+function handleFileSelect(event) {
+  const files = Array.from(event.target.files);
+  files.forEach(file => {
+    if (file.size > 10 * 1024 * 1024) {
+      alert(`파일이 너무 큽니다 (10MB 제한): ${file.name}`);
+      return;
+    }
+    attachedFiles.push(file);
+  });
+  renderAttachPreview();
+  event.target.value = '';
+}
+
+function renderAttachPreview() {
+  const preview = document.getElementById('attachPreview');
+  if (attachedFiles.length === 0) {
+    preview.className = 'attach-preview';
+    preview.innerHTML = '';
+    return;
+  }
+  preview.className = 'attach-preview visible';
+  preview.innerHTML = attachedFiles.map((f, i) =>
+    `<div class="attach-chip">
+      <span>${f.name} (${(f.size / 1024).toFixed(1)}KB)</span>
+      <span class="remove" onclick="removeFile(${i})">&times;</span>
+    </div>`
+  ).join('');
+}
+
+function removeFile(index) {
+  attachedFiles.splice(index, 1);
+  renderAttachPreview();
+}
+
+async function readFileContents() {
+  const contents = [];
+  for (const file of attachedFiles) {
+    const text = await file.text();
+    contents.push(`[첨부파일: ${file.name}]\n${text}`);
+  }
+  return contents.join('\n\n');
 }
 
 // ─── 메시지 표시 ───
 function appendMessage(role, content, save = true) {
-  // 환영 화면 제거
   const welcome = document.getElementById('welcome');
   if (welcome) welcome.remove();
 
@@ -568,9 +654,7 @@ function appendMessage(role, content, save = true) {
   const div = document.createElement('div');
   div.className = 'message';
 
-  const avatarClass = role === 'user' ? 'user' : 'assistant';
   const sender = role === 'user' ? '사용자' : 'Nexus';
-
   const avatarHtml = role === 'user'
     ? `<div class="message-avatar user">U</div>`
     : `<img src="/static/images.png" alt="N" class="message-avatar assistant" style="object-fit:cover;">`;
@@ -589,27 +673,21 @@ function appendMessage(role, content, save = true) {
     const session = sessions.find(s => s.id === currentSessionId);
     if (session) {
       session.messages.push({ role, content });
-      // 첫 사용자 메시지로 세션 제목 업데이트
       if (role === 'user' && session.title === '새 대화') {
         session.title = content.substring(0, 30) + (content.length > 30 ? '...' : '');
         renderSessionList();
       }
     }
   }
-
   return div;
 }
 
 function formatContent(text) {
-  // 코드 블록 처리
   text = text.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => {
     return `<pre><code>${escapeHtml(code.trim())}</code></pre>`;
   });
-  // 인라인 코드
   text = text.replace(/`([^`]+)`/g, '<code>$1</code>');
-  // 볼드
   text = text.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-  // 줄바꿈 → 단락
   text = text.split('\n\n').map(p => `<p>${p.replace(/\n/g, '<br>')}</p>`).join('');
   return text;
 }
@@ -620,7 +698,7 @@ function escapeHtml(str) {
   return div.innerHTML;
 }
 
-// ─── 스피너 (응답 대기 표시) ───
+// ─── 스피너 ───
 function showThinking() {
   const welcome = document.getElementById('welcome');
   if (welcome) welcome.remove();
@@ -650,7 +728,6 @@ function hideThinking() {
 // ─── 스트리밍 메시지 ───
 function startStreamingMessage() {
   hideThinking();
-
   const welcome = document.getElementById('welcome');
   if (welcome) welcome.remove();
 
@@ -685,10 +762,8 @@ function finalizeStreamingMessage() {
     body.classList.remove('streaming-cursor');
     const raw = body.textContent;
     body.innerHTML = formatContent(raw);
-    // ID를 제거하여 다음 메시지가 새 body를 사용하게 한다
     body.removeAttribute('id');
 
-    // 세션에 저장
     const session = sessions.find(s => s.id === currentSessionId);
     if (session) {
       session.messages.push({ role: 'assistant', content: raw });
@@ -701,8 +776,17 @@ function finalizeStreamingMessage() {
 // ─── 전송 ───
 async function sendMessage() {
   const input = document.getElementById('userInput');
-  const text = input.value.trim();
-  if (!text || isStreaming) return;
+  let text = input.value.trim();
+  if (!text && attachedFiles.length === 0) return;
+  if (isStreaming) return;
+
+  // 첨부파일 내용을 메시지에 추가
+  if (attachedFiles.length > 0) {
+    const fileContents = await readFileContents();
+    text = fileContents + (text ? '\n\n' + text : '\n\n위 첨부파일을 분석해 주세요.');
+    attachedFiles = [];
+    renderAttachPreview();
+  }
 
   input.value = '';
   autoResize(input);
@@ -711,7 +795,6 @@ async function sendMessage() {
   isStreaming = true;
   document.getElementById('sendBtn').disabled = true;
 
-  // 스피너 표시 (응답 대기)
   showThinking();
   let streamStarted = false;
 
@@ -742,7 +825,6 @@ async function sendMessage() {
           try {
             const data = JSON.parse(line.substring(6));
 
-            // 첫 텍스트 도착 시 스피너 → 스트리밍 메시지로 전환
             if (data.text && !streamStarted) {
               streamStarted = true;
               startStreamingMessage();
@@ -752,7 +834,26 @@ async function sendMessage() {
               appendStreamChunk(data.text);
             }
 
-            // 에러 메시지 표시
+            // 토큰 사용량 업데이트
+            if (data.type === 'usage_update' && data.usage) {
+              totalInputTokens = data.usage.input_tokens || totalInputTokens;
+              totalOutputTokens = data.usage.output_tokens || totalOutputTokens;
+              updateTokenDisplay();
+            }
+
+            // message_stop에서도 토큰 확인
+            if (data.type === 'message_stop') {
+              // 출력 토큰을 텍스트 길이로 추정 (서버에서 안 오는 경우)
+              if (totalOutputTokens === 0 && streamStarted) {
+                const body = document.getElementById('streamingBody');
+                if (body) {
+                  totalOutputTokens += Math.ceil(body.textContent.length / 4);
+                  totalInputTokens += Math.ceil(text.length / 4);
+                  updateTokenDisplay();
+                }
+              }
+            }
+
             if (data.type === 'error' && data.message) {
               if (!streamStarted) {
                 streamStarted = true;
@@ -760,23 +861,17 @@ async function sendMessage() {
               }
               appendStreamChunk(`[오류] ${data.message}\n`);
             }
-          } catch (e) {
-            // JSON 파싱 실패 무시
-          }
+          } catch (e) { /* JSON 파싱 실패 무시 */ }
         }
       }
     }
   } catch (error) {
-    if (!streamStarted) {
-      startStreamingMessage();
-    }
+    if (!streamStarted) startStreamingMessage();
     appendStreamChunk(`[연결 오류] ${error.message}`);
   }
 
   hideThinking();
-  if (streamStarted) {
-    finalizeStreamingMessage();
-  }
+  if (streamStarted) finalizeStreamingMessage();
   isStreaming = false;
   document.getElementById('sendBtn').disabled = false;
   input.focus();
@@ -811,7 +906,6 @@ function autoResize(el) {
 
 function scrollToBottom() {
   const msgs = document.getElementById('messages');
-  // 즉시 + 약간의 지연 후 두 번 스크롤 — DOM 업데이트 반영 보장
   msgs.scrollTop = msgs.scrollHeight;
   requestAnimationFrame(() => {
     msgs.scrollTop = msgs.scrollHeight;
