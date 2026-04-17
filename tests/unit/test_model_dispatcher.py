@@ -105,42 +105,40 @@ class TestModelDispatcherInit:
         )
         assert dispatcher.scout_enabled is False
 
-    def test_init_tier_m_scout_disabled(
+    def test_init_scout_enabled_follows_provider_presence(
         self,
         mock_worker_provider: EnhancedMockModelProvider,
         mock_scout_provider: EnhancedMockModelProvider,
         mock_tools: list[MagicMock],
         mock_context: ToolUseContext,
     ):
-        """TIER_M에서는 scout_provider가 있어도 scout가 비활성화된다."""
+        """
+        v7.0 Phase 9 재설계 이후: scout_enabled는 "Scout 서버 연결 여부"만
+        나타낸다. TIER와 무관하게 scout_provider 존재 여부로 결정된다.
+
+        실제 Scout 호출 여부는 Worker가 AgentTool로 판단하므로,
+        이 플래그는 단순 관측 지표다.
+        """
         from core.orchestrator.model_dispatcher import ModelDispatcher
 
-        dispatcher = ModelDispatcher(
+        # TIER_M + scout_provider 있음 → scout_available=True
+        dispatcher_m_with = ModelDispatcher(
             tier=HardwareTier.TIER_M,
             worker_provider=mock_worker_provider,
             worker_tools=mock_tools,
             context=mock_context,
             scout_provider=mock_scout_provider,
         )
-        assert dispatcher.scout_enabled is False
-        assert dispatcher.tier is HardwareTier.TIER_M
+        assert dispatcher_m_with.scout_enabled is True
 
-    def test_init_tier_l_scout_disabled(
-        self,
-        mock_worker_provider: EnhancedMockModelProvider,
-        mock_tools: list[MagicMock],
-        mock_context: ToolUseContext,
-    ):
-        """TIER_L에서도 scout는 비활성화된다."""
-        from core.orchestrator.model_dispatcher import ModelDispatcher
-
-        dispatcher = ModelDispatcher(
+        # TIER_L + scout_provider 없음 → False
+        dispatcher_l_without = ModelDispatcher(
             tier=HardwareTier.TIER_L,
             worker_provider=mock_worker_provider,
             worker_tools=mock_tools,
             context=mock_context,
         )
-        assert dispatcher.scout_enabled is False
+        assert dispatcher_l_without.scout_enabled is False
 
 
 # ─────────────────────────────────────────────
@@ -251,13 +249,18 @@ class TestModelDispatcherStatsFields:
         assert stats["scout_fallback_count"] == 0
         assert stats["scout_avg_latency_ms"] == 0.0
 
-    def test_stats_avg_latency_computation(
+    def test_stats_backward_compat_keys_always_zero(
         self,
         mock_worker_provider: EnhancedMockModelProvider,
         mock_tools: list[MagicMock],
         mock_context: ToolUseContext,
     ):
-        """누계 지연/호출 수로 scout_avg_latency_ms가 올바르게 계산된다."""
+        """
+        v7.0 Phase 9 재설계 이후: stats의 Scout 수치는 항상 0이다.
+
+        실제 Scout 호출 통계는 AgentTool.get_stats()에서 집계한다.
+        Dispatcher는 키만 유지하여 기존 대시보드가 깨지지 않게 한다.
+        """
         from core.orchestrator.model_dispatcher import ModelDispatcher
 
         dispatcher = ModelDispatcher(
@@ -266,34 +269,14 @@ class TestModelDispatcherStatsFields:
             worker_tools=mock_tools,
             context=mock_context,
         )
-        # 내부 누계값을 직접 조작하여 평균 계산 로직만 격리 검증한다
-        dispatcher._scout_calls = 4
-        dispatcher._scout_total_latency_ms = 2000.0  # 4회 합계 2초
 
         stats = dispatcher.stats
-        assert stats["scout_avg_latency_ms"] == 500.0
-        assert stats["scout_calls"] == 4
-
-    def test_stats_backward_compat_alias(
-        self,
-        mock_worker_provider: EnhancedMockModelProvider,
-        mock_tools: list[MagicMock],
-        mock_context: ToolUseContext,
-    ):
-        """하위 호환을 위해 scout_fallbacks와 scout_fallback_count가 같은 값을 반환한다."""
-        from core.orchestrator.model_dispatcher import ModelDispatcher
-
-        dispatcher = ModelDispatcher(
-            tier=HardwareTier.TIER_M,
-            worker_provider=mock_worker_provider,
-            worker_tools=mock_tools,
-            context=mock_context,
-        )
-        dispatcher._scout_fallbacks = 7
-
-        stats = dispatcher.stats
-        assert stats["scout_fallback_count"] == 7
-        assert stats["scout_fallbacks"] == 7
+        assert stats["scout_calls"] == 0
+        assert stats["scout_fallback_count"] == 0
+        assert stats["scout_fallbacks"] == 0
+        assert stats["scout_avg_latency_ms"] == 0.0
+        # 운영자가 실제 Scout 통계 위치를 찾을 수 있도록 안내 노트를 포함한다
+        assert "AgentTool" in stats.get("note", "")
 
 
 # ─────────────────────────────────────────────
@@ -382,14 +365,20 @@ class TestModelDispatcherRoute:
         assert captured_kwargs["max_turns"] == 50
         assert captured_kwargs["on_turn_complete"] is callback
 
-    async def test_route_tier_s_scout_then_worker(
+    async def test_route_tier_s_now_passthrough(
         self,
         mock_worker_provider: EnhancedMockModelProvider,
         mock_scout_provider: EnhancedMockModelProvider,
         mock_tools: list[MagicMock],
         mock_context: ToolUseContext,
     ):
-        """TIER_S + Scout 활성 시: Scout 탐색 → Worker 실행 순서로 동작한다."""
+        """
+        v7.0 Phase 9 재설계 이후: TIER_S + scout_provider가 있어도
+        route()는 Scout를 자동 호출하지 않고 Worker query_loop만 한 번 부른다.
+
+        Scout는 이제 Worker가 AgentTool로 호출하는 서브에이전트이므로
+        Dispatcher의 자동 전처리 경로는 제거됐다.
+        """
         from core.orchestrator.model_dispatcher import ModelDispatcher
 
         dispatcher = ModelDispatcher(
@@ -399,22 +388,16 @@ class TestModelDispatcherRoute:
             context=mock_context,
             scout_provider=mock_scout_provider,
         )
+        # scout_available 플래그는 True지만 자동 실행은 안 된다
         assert dispatcher.scout_enabled is True
 
         call_count = 0
 
         async def fake_query_loop(**kwargs):
-            """Scout와 Worker 호출을 구분하여 다른 응답을 반환한다."""
             nonlocal call_count
             call_count += 1
-            if call_count == 1:
-                # 첫 번째 호출 = Scout
-                yield StreamEvent(type=StreamEventType.TEXT_DELTA, text="scout found files")
-                yield StreamEvent(type=StreamEventType.MESSAGE_STOP)
-            else:
-                # 두 번째 호출 = Worker
-                yield StreamEvent(type=StreamEventType.TEXT_DELTA, text="worker executed")
-                yield StreamEvent(type=StreamEventType.MESSAGE_STOP)
+            yield StreamEvent(type=StreamEventType.TEXT_DELTA, text="worker-direct")
+            yield StreamEvent(type=StreamEventType.MESSAGE_STOP)
 
         messages = [Message.user("이 프로젝트 분석해줘")]
 
@@ -426,101 +409,10 @@ class TestModelDispatcherRoute:
             async for event in dispatcher.route(messages, "system prompt"):
                 events.append(event)
 
-        # Scout 호출(1) + Worker 호출(1) = query_loop 2회 호출
-        assert call_count == 2
-        # Worker 이벤트만 사용자에게 전달된다
+        # query_loop은 정확히 1회만 호출 (Scout 경유 없음)
+        assert call_count == 1
         text_events = [e for e in events if hasattr(e, "text") and e.text]
-        assert any("worker executed" in e.text for e in text_events)
-
-    async def test_route_tier_s_scout_failure_fallback_to_worker(
-        self,
-        mock_worker_provider: EnhancedMockModelProvider,
-        mock_scout_provider: EnhancedMockModelProvider,
-        mock_tools: list[MagicMock],
-        mock_context: ToolUseContext,
-    ):
-        """Scout 실행 실패 시 Worker 직행으로 fallback한다."""
-        from core.orchestrator.model_dispatcher import ModelDispatcher
-
-        dispatcher = ModelDispatcher(
-            tier=HardwareTier.TIER_S,
-            worker_provider=mock_worker_provider,
-            worker_tools=mock_tools,
-            context=mock_context,
-            scout_provider=mock_scout_provider,
-        )
-
-        call_count = 0
-
-        async def fake_query_loop(**kwargs):
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                # Scout 실행 중 에러 발생
-                raise ConnectionError("Scout 서버 연결 실패")
-            else:
-                # Worker 직행
-                yield StreamEvent(type=StreamEventType.TEXT_DELTA, text="worker fallback")
-                yield StreamEvent(type=StreamEventType.MESSAGE_STOP)
-
-        messages = [Message.user("테스트")]
-
-        with patch(
-            "core.orchestrator.model_dispatcher.query_loop",
-            side_effect=fake_query_loop,
-        ):
-            events = []
-            async for event in dispatcher.route(messages, "prompt"):
-                events.append(event)
-
-        # Scout 실패 후 Worker가 실행되어야 한다
-        assert call_count == 2
-        text_events = [e for e in events if hasattr(e, "text") and e.text]
-        assert any("worker fallback" in e.text for e in text_events)
-        assert dispatcher.stats["scout_fallbacks"] == 1
-
-    async def test_route_tier_s_scout_empty_result_fallback(
-        self,
-        mock_worker_provider: EnhancedMockModelProvider,
-        mock_scout_provider: EnhancedMockModelProvider,
-        mock_tools: list[MagicMock],
-        mock_context: ToolUseContext,
-    ):
-        """Scout가 빈 결과를 반환하면 Worker 직행으로 fallback한다."""
-        from core.orchestrator.model_dispatcher import ModelDispatcher
-
-        dispatcher = ModelDispatcher(
-            tier=HardwareTier.TIER_S,
-            worker_provider=mock_worker_provider,
-            worker_tools=mock_tools,
-            context=mock_context,
-            scout_provider=mock_scout_provider,
-        )
-
-        call_count = 0
-
-        async def fake_query_loop(**kwargs):
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                # Scout가 아무것도 yield하지 않음 (빈 결과)
-                yield StreamEvent(type=StreamEventType.MESSAGE_STOP)
-            else:
-                yield StreamEvent(type=StreamEventType.TEXT_DELTA, text="worker direct")
-                yield StreamEvent(type=StreamEventType.MESSAGE_STOP)
-
-        messages = [Message.user("테스트")]
-
-        with patch(
-            "core.orchestrator.model_dispatcher.query_loop",
-            side_effect=fake_query_loop,
-        ):
-            events = []
-            async for event in dispatcher.route(messages, "prompt"):
-                events.append(event)
-
-        # Scout 빈 결과 → Worker fallback
-        assert call_count == 2
+        assert any("worker-direct" in e.text for e in text_events)
 
     async def test_route_stats_tracking(
         self,
@@ -529,7 +421,11 @@ class TestModelDispatcherRoute:
         mock_tools: list[MagicMock],
         mock_context: ToolUseContext,
     ):
-        """stats 프로퍼티가 Scout 호출/fallback 횟수를 올바르게 추적한다."""
+        """
+        stats는 하위 호환 필드를 유지하되 값은 항상 0이다.
+
+        Scout 호출 통계는 이제 AgentTool.get_stats()가 담당한다.
+        """
         from core.orchestrator.model_dispatcher import ModelDispatcher
 
         dispatcher = ModelDispatcher(
@@ -544,6 +440,8 @@ class TestModelDispatcherRoute:
         assert dispatcher.stats["scout_fallbacks"] == 0
         assert dispatcher.stats["scout_enabled"] is True
         assert dispatcher.stats["tier"] == "small"
+        # 안내 노트로 AgentTool 참조를 유도한다
+        assert "AgentTool" in dispatcher.stats.get("note", "")
 
     async def test_route_on_turn_complete_callback_forwarded(
         self,
