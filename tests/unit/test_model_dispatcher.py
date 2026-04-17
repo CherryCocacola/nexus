@@ -203,6 +203,100 @@ class TestModelDispatcherProperties:
 
 
 # ─────────────────────────────────────────────
+# stats 프로퍼티 — Ch 17 SessionMetrics 반영
+# ─────────────────────────────────────────────
+class TestModelDispatcherStatsFields:
+    """stats 프로퍼티가 Ch 17에서 요구하는 키를 모두 노출하는지 검증한다."""
+
+    def test_stats_contains_all_required_keys(
+        self,
+        mock_worker_provider: EnhancedMockModelProvider,
+        mock_tools: list[MagicMock],
+        mock_context: ToolUseContext,
+    ):
+        """stats가 Scout 관련 필수 키 5개를 모두 포함한다."""
+        from core.orchestrator.model_dispatcher import ModelDispatcher
+
+        dispatcher = ModelDispatcher(
+            tier=HardwareTier.TIER_M,
+            worker_provider=mock_worker_provider,
+            worker_tools=mock_tools,
+            context=mock_context,
+        )
+        stats = dispatcher.stats
+        # Ch 17 요구 필드 — SessionMetrics에 그대로 노출된다
+        assert "tier" in stats
+        assert "scout_enabled" in stats
+        assert "scout_calls" in stats
+        assert "scout_fallback_count" in stats
+        assert "scout_avg_latency_ms" in stats
+
+    def test_stats_initial_zero_values(
+        self,
+        mock_worker_provider: EnhancedMockModelProvider,
+        mock_tools: list[MagicMock],
+        mock_context: ToolUseContext,
+    ):
+        """Scout 호출 전에는 통계가 모두 0이어야 한다."""
+        from core.orchestrator.model_dispatcher import ModelDispatcher
+
+        dispatcher = ModelDispatcher(
+            tier=HardwareTier.TIER_M,
+            worker_provider=mock_worker_provider,
+            worker_tools=mock_tools,
+            context=mock_context,
+        )
+        stats = dispatcher.stats
+        assert stats["scout_calls"] == 0
+        assert stats["scout_fallback_count"] == 0
+        assert stats["scout_avg_latency_ms"] == 0.0
+
+    def test_stats_avg_latency_computation(
+        self,
+        mock_worker_provider: EnhancedMockModelProvider,
+        mock_tools: list[MagicMock],
+        mock_context: ToolUseContext,
+    ):
+        """누계 지연/호출 수로 scout_avg_latency_ms가 올바르게 계산된다."""
+        from core.orchestrator.model_dispatcher import ModelDispatcher
+
+        dispatcher = ModelDispatcher(
+            tier=HardwareTier.TIER_M,
+            worker_provider=mock_worker_provider,
+            worker_tools=mock_tools,
+            context=mock_context,
+        )
+        # 내부 누계값을 직접 조작하여 평균 계산 로직만 격리 검증한다
+        dispatcher._scout_calls = 4
+        dispatcher._scout_total_latency_ms = 2000.0  # 4회 합계 2초
+
+        stats = dispatcher.stats
+        assert stats["scout_avg_latency_ms"] == 500.0
+        assert stats["scout_calls"] == 4
+
+    def test_stats_backward_compat_alias(
+        self,
+        mock_worker_provider: EnhancedMockModelProvider,
+        mock_tools: list[MagicMock],
+        mock_context: ToolUseContext,
+    ):
+        """하위 호환을 위해 scout_fallbacks와 scout_fallback_count가 같은 값을 반환한다."""
+        from core.orchestrator.model_dispatcher import ModelDispatcher
+
+        dispatcher = ModelDispatcher(
+            tier=HardwareTier.TIER_M,
+            worker_provider=mock_worker_provider,
+            worker_tools=mock_tools,
+            context=mock_context,
+        )
+        dispatcher._scout_fallbacks = 7
+
+        stats = dispatcher.stats
+        assert stats["scout_fallback_count"] == 7
+        assert stats["scout_fallbacks"] == 7
+
+
+# ─────────────────────────────────────────────
 # ModelDispatcher.route() 테스트
 # ─────────────────────────────────────────────
 class TestModelDispatcherRoute:

@@ -548,19 +548,28 @@ async def init_phase2(state: GlobalState) -> dict:
     dispatcher = ModelDispatcher(
         tier=tier,
         worker_provider=provider,
-        scout_provider=scout_provider,
         worker_tools=_get_worker_tools(tier, registry),
+        context=context,
+        scout_provider=scout_provider,
         scout_tools=scout_tools,
-        turn_state_store=turn_state_store,
+        max_turns=200,
     )
+    components["model_dispatcher"] = dispatcher
 
-    # ⑨ QueryEngine (수정 — dispatcher 주입)
+    # ⑨ QueryEngine (수정 — model_dispatcher 주입)
+    # 하위 호환: model_provider와 model_dispatcher를 둘 다 받는다.
+    # dispatcher가 주입되면 submit_message()는 dispatcher.route()를 호출하고,
+    # dispatcher가 None이면 기존 query_loop() 직접 호출 경로로 폴백한다.
+    # 이렇게 하면 기존 코드(구 QueryEngine(model_provider=...))를 깨지 않는다.
     engine = QueryEngine(
-        dispatcher=dispatcher,        # 신규: ModelProvider 대신 Dispatcher
+        model_provider=provider,              # 폴백 경로용
         tools=registry.get_all_tools(),
         context=context,
         system_prompt=_build_default_system_prompt(),
         max_turns=200,
+        turn_state_store=turn_state_store,
+        rag_retriever=rag_retriever,
+        model_dispatcher=dispatcher,          # 신규: 실제 라우팅은 dispatcher가 담당
     )
 ```
 
@@ -582,8 +591,13 @@ async def init_phase2(state: GlobalState) -> dict:
 - query_loop 함수 자체의 인터페이스는 변경 없음 (ModelProvider를 받는 구조 유지)
 
 **5.9 QueryEngine (수정)**:
-- submit_message()에서 ModelProvider 대신 ModelDispatcher.route() 호출
-- TIER_M/L에서는 ModelDispatcher가 passthrough이므로 동일 동작
+- 생성자에 `model_dispatcher: ModelDispatcher | None = None` 파라미터 추가
+  (기존 `model_provider` 파라미터는 **폴백 경로용으로 유지**)
+- submit_message()의 분기:
+  - `model_dispatcher`가 주입되면 → `dispatcher.route(messages, system_prompt, on_turn_complete)` 호출
+  - `model_dispatcher`가 None이면 → 기존 `query_loop(...)` 직접 호출 (하위 호환)
+- TIER_M/L에서는 ModelDispatcher가 passthrough이므로 v6.1과 동일 동작
+- `model_dispatcher` 프로퍼티를 노출하여 `/metrics` 엔드포인트가 Scout 통계에 접근한다
 
 **변경 없음**: Message 타입, BaseTool, ToolRegistry, Executor, StreamingToolExecutor
 
@@ -688,12 +702,25 @@ orchestration_mode: str = "multi_model"  # "multi_model" | "single_model"
 
 **Scout 메트릭 추가**:
 
+ModelDispatcher.stats 프로퍼티가 아래 필드를 노출한다. `web/app.py`의
+`/metrics` 엔드포인트가 `_app_state["model_dispatcher"].stats`를 읽어
+`result["scout"]`로 직렬화한다.
+
 ```python
-# SessionMetrics에 추가
-scout_calls: int = 0
-scout_avg_latency_ms: float = 0.0
-scout_fallback_count: int = 0  # Scout 실패 → Worker fallback 횟수
+# ModelDispatcher.stats 반환 필드
+{
+    "tier": "small" | "medium" | "large",
+    "scout_enabled": bool,
+    "scout_calls": int,              # Scout 호출 총 횟수
+    "scout_fallback_count": int,     # Scout 실패 → Worker 폴백 횟수
+    "scout_fallbacks": int,          # 하위 호환 alias (동일 값)
+    "scout_avg_latency_ms": float,   # Scout 호출 1회당 평균 지연 (ms)
+}
 ```
+
+누적 지연 시간은 `_scout_total_latency_ms` 필드에 `_run_scout()` 성공 시
+elapsed × 1000을 더하는 방식으로 저장하며, `stats` 계산 시점에 호출 수로
+나누어 평균을 낸다 (호출 0회면 0.0).
 
 ### Ch 20: CLI & Web Interface (경미 수정)
 

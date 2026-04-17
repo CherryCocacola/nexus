@@ -142,6 +142,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # RTX 5090 (8192 ctx)에서 도구 24개(~6,102토큰)는 컨텍스트 초과.
         # 핵심 도구 8개(~1,851토큰)만 사용하여 입력+출력 공간 확보.
         from core.bootstrap import _create_web_tool_registry
+        from core.orchestrator.model_dispatcher import ModelDispatcher
         from core.orchestrator.query_engine import QueryEngine
         from core.tools.base import ToolUseContext
 
@@ -155,10 +156,25 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 "task_manager": components.get("task_manager"),
             },
         )
+        # 웹 전용 ModelDispatcher — worker_tools만 웹용(8개)으로 교체하고
+        # scout는 bootstrap이 만든 것과 동일 인스턴스를 재사용한다.
+        # 이렇게 하면 웹 경로에서도 Scout → Worker 2단계가 동작한다.
+        web_tools = web_registry.get_all_tools()
+        web_dispatcher = ModelDispatcher(
+            tier=components["hardware_tier"],
+            worker_provider=components["model_provider"],
+            worker_tools=web_tools,
+            context=web_context,
+            scout_provider=components.get("scout_provider"),
+            scout_tools=components.get("scout_tools"),
+            max_turns=200,
+        )
+        _app_state["model_dispatcher"] = web_dispatcher
         web_engine = QueryEngine(
             model_provider=components["model_provider"],
-            tools=web_registry.get_all_tools(),
+            tools=web_tools,
             context=web_context,
+            model_dispatcher=web_dispatcher,
             # 웹 시스템 프롬프트 — 범용 AI 어시스턴트 + 파일/문서 분석 능력
             system_prompt=(
                 "You are Nexus, an AI assistant developed by IDINO. "
@@ -528,6 +544,12 @@ async def metrics() -> dict[str, Any]:
     state = _app_state.get("state")
     if state:
         result["session"] = state.get_session_summary()
+
+    # Scout 메트릭스 — Ch 17 (v7.0 Phase 9)
+    # ModelDispatcher에 누적된 Scout 호출 통계를 노출한다.
+    dispatcher = _app_state.get("model_dispatcher")
+    if dispatcher is not None:
+        result["scout"] = dispatcher.stats
 
     return result
 

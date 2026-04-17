@@ -88,9 +88,11 @@ class ModelDispatcher:
         tier_cfg = get_tier_config(tier)
         self._scout_enabled = tier_cfg["scout_enabled"] and scout_provider is not None
 
-        # Scout 실행 통계
+        # Scout 실행 통계 — Ch 17 SessionMetrics 노출 대상
+        # scout_total_latency_ms는 평균 지연 시간 계산용 누계값이다.
         self._scout_calls: int = 0
         self._scout_fallbacks: int = 0
+        self._scout_total_latency_ms: float = 0.0
 
         logger.info(
             "ModelDispatcher 초기화: tier=%s, scout=%s, worker_tools=%d개",
@@ -227,6 +229,8 @@ class ModelDispatcher:
             return None
 
         elapsed = time.monotonic() - start_time
+        # Scout 평균 지연 시간 계산용 누계 (밀리초 단위)
+        self._scout_total_latency_ms += elapsed * 1000.0
 
         # Scout 결과 조합: 도구 결과 + 텍스트 응답
         result_parts: list[str] = []
@@ -274,10 +278,28 @@ class ModelDispatcher:
 
     @property
     def stats(self) -> dict[str, Any]:
-        """Scout 실행 통계를 반환한다."""
+        """
+        Scout 실행 통계를 반환한다 — Ch 17 SessionMetrics에서 사용한다.
+
+        필드 의미:
+          - scout_calls: Scout가 호출된 총 횟수
+          - scout_fallback_count: Scout 실패 후 Worker 단독으로 전환된 횟수
+          - scout_avg_latency_ms: Scout 1회 호출당 평균 지연 시간(ms)
+          - scout_enabled: Scout 활성 여부 (TIER_S + scout_provider 존재)
+          - tier: 현재 하드웨어 티어 ("small" | "medium" | "large")
+
+        scout_fallbacks는 구 이름으로 동일 값을 노출한다 (하위 호환).
+        """
+        avg_latency_ms = (
+            self._scout_total_latency_ms / self._scout_calls
+            if self._scout_calls > 0
+            else 0.0
+        )
         return {
-            "scout_calls": self._scout_calls,
-            "scout_fallbacks": self._scout_fallbacks,
-            "scout_enabled": self._scout_enabled,
             "tier": self._tier.value,
+            "scout_enabled": self._scout_enabled,
+            "scout_calls": self._scout_calls,
+            "scout_fallback_count": self._scout_fallbacks,
+            "scout_fallbacks": self._scout_fallbacks,  # 하위 호환 alias
+            "scout_avg_latency_ms": round(avg_latency_ms, 2),
         }

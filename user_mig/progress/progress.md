@@ -414,6 +414,42 @@ VRAM 최대 max-model-len:
 
 ---
 
+## v7.0 Phase 9 실 배선 + Ch 17 Scout 메트릭 (2026-04-17)
+
+### 발견한 문제
+v7.0 Phase 9 코드(HardwareTier/TurnState/ModelDispatcher/Scout)는 모듈
+단위로 구현됐고 487줄의 유닛테스트까지 통과했으나, **실제 실행 경로에
+연결되지 않은 상태**였다:
+- bootstrap에서 `scout_provider`는 만들지만 `ModelDispatcher`는 생성 안 됨
+- `QueryEngine.submit_message`가 `model_provider`를 받아 `query_loop`를 직접
+  호출 → Scout는 한 번도 실행되지 않음
+- 웹 서버 로그에는 "Scout 초기화 성공"이 찍히지만 실 사용자 요청 처리 시
+  Scout는 호출되지 않는 "유령 구성" 상태
+
+### 해결
+1. **ModelDispatcher 배선** — bootstrap.py에 ⑩ 단계로 Dispatcher 생성 추가,
+   `components["model_dispatcher"]`로 저장, QueryEngine 생성자에 주입
+2. **QueryEngine 이중 경로** — `model_dispatcher` 파라미터가 주입되면
+   `dispatcher.route()` 호출, 없으면 기존 `query_loop()` 직접 경로로 폴백
+   (하위 호환 유지)
+3. **Scout 전용 도구 팩토리** — `_create_scout_tool_registry()` 신규
+   (Read/Glob/Grep/LS 4개, 사양서 Part 2.3 SCOUT_TOOLS와 일치)
+4. **웹 전용 Dispatcher** — `web/app.py`에서 웹 도구 8개로 별도 Dispatcher
+   생성 (scout_provider/scout_tools는 bootstrap 인스턴스 재사용)
+5. **Ch 17 Scout 메트릭 노출** — `ModelDispatcher.stats`에
+   `scout_avg_latency_ms`, `scout_fallback_count` 추가, `_run_scout` 성공 시
+   elapsed_ms 누적. `/metrics` 엔드포인트에 `result["scout"]` 섹션 추가
+6. **사양서 동기화** — v7.0 AMENDMENT의 Ch 3 / Ch 5.9 / Ch 17 블록을 실제
+   구현과 일치하도록 갱신 (dispatcher= → model_dispatcher= 등)
+
+### 신규 테스트
+- `tests/unit/test_model_dispatcher.py::TestModelDispatcherStatsFields` — 4개
+- `tests/unit/test_query_engine_dispatcher.py` — 4개 (주입 경로/폴백/프로퍼티)
+
+### 테스트: 540개 통과 (기존 532 + 신규 8)
+
+---
+
 ## 다음 세션 시작 시 참고
 
 1. **Phase 0.5~8.0 + v7.0 전체 완료 + 모델 Qwen 3.5 27B 전환**

@@ -75,13 +75,14 @@ class QueryEngine:
         hook_manager: Any | None = None,
         turn_state_store: Any | None = None,
         rag_retriever: Any | None = None,
+        model_dispatcher: Any | None = None,
     ) -> None:
         """
         QueryEngine을 초기화한다.
 
         Args:
-            model_provider: LLM 프로바이더 (Tier 3 진입점)
-            tools: 사용 가능한 도구 리스트
+            model_provider: LLM 프로바이더 (Tier 3 진입점) — 폴백 경로용
+            tools: 사용 가능한 도구 리스트 (폴백 경로에서만 사용)
             context: 도구 실행 컨텍스트 (cwd, session_id 등)
             system_prompt: 시스템 프롬프트 텍스트
             context_manager: 컨텍스트 압축 관리자 (선택)
@@ -89,6 +90,10 @@ class QueryEngine:
             hook_manager: 훅 매니저 (선택)
             turn_state_store: TurnStateStore (v7.0, 선택) — 턴 상태 외부화
             rag_retriever: RAGRetriever (선택) — 관련 문서 청크 자동 검색
+            model_dispatcher: ModelDispatcher (v7.0 Phase 9, 선택)
+                주입되면 submit_message()는 dispatcher.route()를 호출한다.
+                TIER_S에서는 Scout→Worker 2단계, TIER_M/L에서는 Worker 단독.
+                None이면 기존 경로(query_loop 직접 호출)로 폴백한다.
         """
         self._model_provider = model_provider
         self._tools = tools
@@ -103,6 +108,10 @@ class QueryEngine:
 
         # RAG: 관련 문서 청크 자동 검색
         self._rag_retriever = rag_retriever
+
+        # v7.0 Phase 9: 멀티모델 디스패처 (Scout + Worker)
+        # None이면 단일 Worker 경로로 폴백한다 (하위 호환).
+        self._model_dispatcher = model_dispatcher
 
         # 대화 히스토리 — submit_message() 호출마다 누적
         self._messages: list[Message] = []
@@ -193,19 +202,29 @@ class QueryEngine:
             if self._turn_state_store is not None:
                 self._turn_state_store.save(self._session_id, turn_state)
 
-        # Tier 2 호출: query_loop()
-        # query_loop은 messages를 직접 mutate하여
-        # assistant/tool_result 메시지를 추가한다
-        async for event in query_loop(
-            messages=self._messages,
-            system_prompt=effective_system_prompt,
-            model_provider=self._model_provider,
-            tools=self._tools,
-            context=self._context,
-            context_manager=self._context_manager,
-            max_turns=self._max_turns,
-            on_turn_complete=_on_turn_complete,
-        ):
+        # v7.0 Phase 9: dispatcher가 있으면 route() 경유, 없으면 query_loop 직접 호출
+        # dispatcher 경로는 Scout → Worker 2단계(TIER_S)를 포함하며
+        # TIER_M/L에서는 passthrough로 단일 Worker에 직행한다.
+        if self._model_dispatcher is not None:
+            stream = self._model_dispatcher.route(
+                messages=self._messages,
+                system_prompt=effective_system_prompt,
+                on_turn_complete=_on_turn_complete,
+            )
+        else:
+            # 폴백 — dispatcher 주입이 없는 경우 기존 단일 Worker 경로
+            stream = query_loop(
+                messages=self._messages,
+                system_prompt=effective_system_prompt,
+                model_provider=self._model_provider,
+                tools=self._tools,
+                context=self._context,
+                context_manager=self._context_manager,
+                max_turns=self._max_turns,
+                on_turn_complete=_on_turn_complete,
+            )
+
+        async for event in stream:
             # 사용량 추적 — USAGE_UPDATE 이벤트에서 누적
             if (
                 isinstance(event, StreamEvent)
@@ -258,6 +277,15 @@ class QueryEngine:
     def system_prompt(self) -> str:
         """현재 시스템 프롬프트를 반환한다."""
         return self._system_prompt
+
+    @property
+    def model_dispatcher(self) -> Any | None:
+        """
+        주입된 ModelDispatcher를 반환한다 (없으면 None).
+
+        Ch 17 메트릭 엔드포인트가 Scout 통계를 조회할 때 사용한다.
+        """
+        return self._model_dispatcher
 
     def update_system_prompt(self, prompt: str) -> None:
         """시스템 프롬프트를 업데이트한다."""
