@@ -32,8 +32,10 @@ postgresql:
 
 # 모델 설정 — Qwen 3.5 27B Dense AWQ (v7.0 모델 전환)
 # Dense 아키텍처 → vLLM LoRA 핫로딩 지원 (학교별/기업별 동적 전환)
+# primary_model: vLLM의 served-model-name. nexus-phase2 LoRA 지정 시
+#   Phase 2 학습된 어댑터를 거쳐 요청이 전달된다 (서브에이전트 판단 학습 포함).
 model:
-  primary_model: "qwen3.5-27b"
+  primary_model: "nexus-phase2"
   auxiliary_model: "exaone-7.8b"
   embedding_model: "multilingual-e5-large"
   max_context_tokens: 8192

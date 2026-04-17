@@ -414,6 +414,74 @@ VRAM 최대 max-model-len:
 
 ---
 
+## Scout 모델 Qwen3.5-4B 전환 + Phase 2 LoRA 학습 완료 (2026-04-17)
+
+### 동기
+B 방식 전환 후 초기 실측에서 두 이슈 발견:
+1. Scout 모델(Gemma 4 E4B)이 Qwen3.5-27B Worker와 이기종 — 토크나이저/
+   chat template 불일치로 hand-off 비용 발생
+2. 기존 Phase 1 LoRA는 Agent 도구 사용 경험이 없어 Worker가 필요 상황에서도
+   Scout를 호출하지 않고 직접 LS/Glob/Read로 탐색 (컨텍스트 소진)
+
+### 해결 — 두 축 동시 교체
+**축 1: Scout 모델 동종화 (Gemma 4 E4B → Qwen3.5-4B)**
+- 선택: `unsloth/Qwen3.5-4B-GGUF` Q4_K_M (2.6GB, Worker와 동일 패밀리)
+- GPU 서버에 `/opt/nexus-gpu/models/qwen3.5-4b-gguf/` 배치
+- llama.cpp 재기동: `--jinja` 플래그로 ChatML + tool_calls 지원
+- 코드 변경: `ScoutConfig.model_id = "qwen3.5-4b"`, SCOUT_AGENT description 갱신
+
+**축 2: Phase 2 LoRA 학습 (Agent 도구 사용 학습)**
+- Bootstrap 데이터 1000개 재생성 (도구 60% / 추론 30% / **서브에이전트 10%**)
+- 서브에이전트 시나리오 세분화:
+    subagent_use_scout: 22건 (긍정 — 대규모 탐색)
+    subagent_direct_answer: 28건 (부정 — 인사/일반 지식)
+    subagent_single_tool: 50건 (부정 — 단일 파일 작업)
+  → 부정 샘플이 긍정의 3.5배로 Scout 남용 억제
+- GPU 서버에서 Phase 2 학습: `scripts/train_qwen_lora_phase2.py`
+  - Worker vLLM 중단 → unsloth 4bit + LoRA r=8, lr=3e-4, 3 epoch
+  - `train_runtime: 3566초 (59분)`, `train_loss: 0.1681` (Phase 1 0.073 대비
+    카테고리 다양화로 소폭 상승, 정상 범위)
+  - 체크포인트: `/opt/nexus-gpu/checkpoints/qwen35-phase2/` (159MB)
+- vLLM 재기동: `--lora-modules nexus-phase1=... nexus-phase2=...` 둘 다 노출
+- `config/nexus_config.yaml`: `primary_model: "nexus-phase2"`로 전환
+
+### 실환경 검증 (Phase 2 LoRA 적용 후)
+
+| 시나리오 | Phase 1 + Gemma 4 E4B | **Phase 2 + Qwen3.5-4B** |
+|---|---|---|
+| "Hi there" (인사) | 4초, Agent 0회 ✅ | 4초, Agent 0회 ✅ |
+| "core/orchestrator 개요" | 23초, 불완전 응답 | **23초, 한글 요약 완성** |
+| "5계층 권한 시스템 전수 조사" | 시도 안 함 | **45초, Agent(scout) 자율 호출** ✅ |
+
+중요 관찰: 5계층 권한 탐색 같은 대규모 요청에서 Worker가 **스스로**
+"scout sub-agent를 사용하는 것이 적합합니다"라고 판단 후 Agent 도구를
+호출함. Phase 2 학습 전에는 일어나지 않던 행동.
+
+### Scout 메트릭 (/metrics)
+```json
+"agents": {
+    "scout": {
+        "calls": 1,
+        "total_latency_ms": 25156.0,
+        "avg_latency_ms": 25156.0
+    }
+}
+```
+Scout 지연 시간 25초 — Gemma 4 E4B 대비 **약 28% 단축** (35초 → 25초).
+
+### 알려진 후속 이슈
+- Scout 응답 품질: 25초에 29자 짧은 응답. Qwen3.5-4B Q4_K_M의 CPU 추론
+  한계. 개선 방안: 양자화 완화(Q5/Q6) 또는 Scout 전용 후속 LoRA.
+- 서브에이전트 학습 샘플 22개는 여전히 적음. 실 사용 데이터 누적 후
+  Phase 3 재학습으로 보강 예정.
+
+### 사양서/코드 영향
+- `config/nexus_config.yaml` — primary_model을 nexus-phase2로
+- `core/config.py`, `core/model/scout_provider.py` — model_id = qwen3.5-4b
+- `core/orchestrator/agent_definition.py` — description에 Qwen3.5-4B 명시
+
+---
+
 ## v7.0 Phase 9 B 방식 전환 — Scout를 서브에이전트로 승격 (2026-04-17)
 
 ### 배경
