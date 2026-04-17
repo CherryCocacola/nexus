@@ -833,7 +833,10 @@ function startStreamingMessage() {
     <div class="message-body streaming-cursor" id="streamingBody"></div>`;
 
   // 스트리밍 thinking 상태 초기화
-  _streamThinking = true;
+  // 서버(Qwen3.5)는 enable_thinking=false라 기본적으로 <think> 태그를
+  // 보내지 않는다. 따라서 UI도 "일반 모드"로 시작한다. <think>가 등장할
+  // 때만 thinking 모드로 전환한다.
+  _streamThinking = false;
   _streamThinkBuf = '';
 
   inner.appendChild(div);
@@ -841,8 +844,8 @@ function startStreamingMessage() {
   return div;
 }
 
-// 스트리밍 중 thinking 상태
-let _streamThinking = true;
+// 스트리밍 중 thinking 상태 (기본: 일반 모드)
+let _streamThinking = false;
 let _streamThinkBuf = '';
 
 function appendStreamChunk(text) {
@@ -851,35 +854,38 @@ function appendStreamChunk(text) {
   if (!body) return;
 
   if (_streamThinking) {
-    // </think> 감지 — thinking 종료
-    const idx = text.indexOf('</think>');
-    if (idx !== -1) {
+    // 현재 thinking 모드 — </think>가 오면 종료하고 이후 텍스트를 본문에
+    const closeIdx = text.indexOf('</think>');
+    if (closeIdx !== -1) {
+      _streamThinkBuf += text.substring(0, closeIdx);
       _streamThinking = false;
-      // </think> 이전 부분은 thinking에 추가
-      _streamThinkBuf += text.substring(0, idx);
-      // thinking 블록 표시 (짧게 요약)
       if (thinkEl && _streamThinkBuf.trim()) {
         const short = _streamThinkBuf.trim().substring(0, 120).replace(/\n/g, ' ');
         thinkEl.textContent = short;
         thinkEl.style.display = 'block';
       }
-      // </think> 이후 실제 응답
-      const after = text.substring(idx + 8);
-      if (after.trim()) {
-        body.textContent += after;
-      }
+      const after = text.substring(closeIdx + 8);
+      if (after) body.textContent += after;
     } else {
-      // 아직 thinking 중 — 버퍼에만 축적, 화면에는 표시 안 함
       _streamThinkBuf += text;
-      // thinking 중임을 표시
       if (thinkEl) {
         thinkEl.textContent = _streamThinkBuf.trim().substring(0, 80).replace(/\n/g, ' ');
         thinkEl.style.display = 'block';
       }
     }
   } else {
-    // 일반 응답 — 그대로 표시
-    body.textContent += text;
+    // 일반 모드 — <think>가 등장하면 thinking 모드로 진입, 아니면 본문에 append
+    const openIdx = text.indexOf('<think>');
+    if (openIdx !== -1) {
+      // <think> 이전 부분은 본문에
+      if (openIdx > 0) body.textContent += text.substring(0, openIdx);
+      _streamThinking = true;
+      const afterOpen = text.substring(openIdx + 7);
+      // 같은 청크에 </think>까지 있는 경우 재귀 처리
+      if (afterOpen) appendStreamChunk(afterOpen);
+    } else {
+      body.textContent += text;
+    }
   }
   scrollToBottom();
 }
@@ -889,7 +895,13 @@ function finalizeStreamingMessage() {
   const thinkEl = document.getElementById('streamingThinking');
   if (body) {
     body.classList.remove('streaming-cursor');
-    const raw = body.textContent;
+    let raw = body.textContent;
+    // 만약 </think> 없이 스트림이 끝났는데 thinking 중이었다면 버퍼의
+    // 내용을 본문에 합쳐 넣는다 (사용자에게 빈 응답 방지)
+    if (_streamThinking && _streamThinkBuf.trim() && !raw.trim()) {
+      raw = _streamThinkBuf.trim();
+      body.textContent = raw;
+    }
     body.innerHTML = formatContent(raw);
     body.removeAttribute('id');
 
@@ -901,8 +913,8 @@ function finalizeStreamingMessage() {
   if (thinkEl) thinkEl.removeAttribute('id');
   const msg = document.getElementById('streamingMessage');
   if (msg) msg.removeAttribute('id');
-  // 상태 리셋
-  _streamThinking = true;
+  // 상태 리셋 — 다음 스트림도 기본 "일반 모드"로 시작
+  _streamThinking = false;
   _streamThinkBuf = '';
 }
 
