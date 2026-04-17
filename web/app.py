@@ -18,12 +18,52 @@ SSE 스트리밍, 세션 관리, 도구/모델 조회 등을 제공한다.
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 import uuid
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
+
+
+# ─────────────────────────────────────────────
+# thinking 태그/찌꺼기 정제 헬퍼
+# ─────────────────────────────────────────────
+# Qwen3.5 chat template이 <think>...</think> 블록을 삽입할 수 있다.
+# enable_thinking=false로 대부분 예방되지만, 과거 세션이나 예외 상황에서
+# 찌꺼기가 들어오면 다음 턴에서 Worker가 그 스타일을 모방할 수 있다.
+_THINK_BLOCK = re.compile(r"<think>.*?</think>", flags=re.DOTALL)
+_DANGLING_THINK_TAIL = re.compile(r"^.*?</think>\s*", flags=re.DOTALL)
+
+
+def _strip_thinking(text: str) -> str:
+    """<think>...</think> 블록 + 비정상 잘린 </think> 접두를 제거한다."""
+    if not text:
+        return text
+    cleaned = _THINK_BLOCK.sub("", text)
+    # 여는 <think> 없이 닫는 </think>만 남은 경우(스트리밍 중단 등)
+    if "</think>" in cleaned and "<think>" not in cleaned:
+        cleaned = _DANGLING_THINK_TAIL.sub("", cleaned)
+    return cleaned.strip()
+
+
+def _sanitize_history_inplace(history: list) -> None:
+    """히스토리에 저장된 Message 중 thinking 찌꺼기가 있으면 정제된 Message로 교체."""
+    from core.message import Message
+
+    for i, msg in enumerate(history):
+        role = msg.role if isinstance(msg.role, str) else msg.role.value
+        if role not in ("user", "assistant"):
+            continue
+        content = msg.text_content if hasattr(msg, "text_content") else str(msg.content)
+        if content and ("<think>" in content or "</think>" in content):
+            cleaned = _strip_thinking(content)
+            if cleaned:
+                history[i] = (
+                    Message.assistant(cleaned) if role == "assistant" else Message.user(cleaned)
+                )
 
 from fastapi import FastAPI, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -332,8 +372,6 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
         QueryEngine의 StreamEvent를 수신하여
         'data: {json}\n\n' 형식으로 실시간 전송한다.
         """
-        import json
-
         from core.message import StreamEvent
 
         engine = _app_state.get("query_engine")
@@ -354,6 +392,10 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
         histories = _app_state["chat_histories"]
         if session_id not in histories:
             histories[session_id] = []
+
+        # Qwen3.5 thinking 찌꺼기가 들어있는 과거 메시지를 1회성 정제
+        # (세션이 enable_thinking=false 전의 오염된 상태일 수 있다)
+        _sanitize_history_inplace(histories[session_id])
 
         # QueryEngine의 messages를 해당 세션의 히스토리로 교체
         # 도구 호출/결과 메시지는 토큰을 많이 차지하므로 제외하고,
@@ -413,12 +455,23 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
 
         # 이번 턴의 user/assistant 텍스트 메시지만 히스토리에 저장
         # tool_result/tool_use 메시지는 토큰이 크므로 저장하지 않는다
+        # Qwen3.5의 <think>…</think> 블록이 혹여 섞여 들어오면 다음 턴의
+        # in-context 모방을 유발하므로 저장 전에 제거한다 (safeguard).
         for msg in engine._messages:
             role = msg.role if isinstance(msg.role, str) else msg.role.value
             if role in ("user", "assistant"):
                 content = msg.text_content if hasattr(msg, "text_content") else str(msg.content)
                 if content and len(content) > 5 and msg not in histories[session_id]:
-                    histories[session_id].append(msg)
+                    content_clean = _strip_thinking(content)
+                    if content_clean and content_clean != content:
+                        # content가 정제됐다면 원본 Message는 그대로 두되 저장용
+                        # 얕은 복사본을 만들어 히스토리에 넣는다. 원본 Message는
+                        # Pydantic frozen이므로 text를 바꿀 수 없다 → 새 Message 생성.
+                        from core.message import Message
+                        new_msg = Message.assistant(content_clean) if role == "assistant" else Message.user(content_clean)
+                        histories[session_id].append(new_msg)
+                    elif content_clean:
+                        histories[session_id].append(msg)
 
     return StreamingResponse(
         generate(),
