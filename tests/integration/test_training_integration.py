@@ -37,9 +37,11 @@ class TestBootstrapGenerator:
         assert result["total"] == 20
         assert "tool_samples" in result
         assert "reasoning_samples" in result
-        # 도구 70%, 추론 30% 비율
-        assert result["tool_samples"] == 14  # 20 * 0.7
-        assert result["reasoning_samples"] == 6  # 20 * 0.3
+        assert "subagent_samples" in result
+        # v7.0 Phase 9: 도구 60% / 추론 30% / 서브에이전트 10%
+        assert result["tool_samples"] == 12  # 20 * 0.60
+        assert result["reasoning_samples"] == 6  # 20 * 0.30
+        assert result["subagent_samples"] == 2  # 20 - 12 - 6
 
     async def test_generate_output_file_exists(self, tmp_path: Path) -> None:
         """생성된 JSONL 파일이 실제로 디스크에 존재하고 내용이 유효하다."""

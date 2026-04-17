@@ -709,6 +709,98 @@ _REASONING_TEMPLATES: list[dict[str, Any]] = [
 ]
 
 
+# ─────────────────────────────────────────────
+# 서브에이전트 판단 템플릿 — v7.0 Phase 9 (B 방식)
+# Worker에게 "언제 Agent(scout)를 호출하고 언제 직접 응답할지" 학습시킨다.
+#
+# 각 템플릿은 "trigger" 타입에 따라 두 방향의 응답을 생성한다:
+#   - "use_scout": Agent 도구로 scout를 호출하는 assistant 메시지
+#   - "direct_answer": 도구 호출 없이 텍스트만 반환하는 assistant 메시지
+#   - "single_tool": 특정 단일 도구(Read/Grep 등)만 호출 (scout 없이)
+#
+# 목표 분포: use_scout 40% / direct_answer 40% / single_tool 20%
+# (부정 샘플 60%로 남용 방지를 강화 — CPU Scout는 느리므로 보수적 기본값)
+# ─────────────────────────────────────────────
+_SUBAGENT_TEMPLATES: list[dict[str, Any]] = [
+    # ── use_scout: 대규모/다중 파일 탐색이 필요한 요청 ──
+    {
+        "trigger": "use_scout",
+        "user_prompts": [
+            "이 프로젝트의 전체 구조를 요약해줘.",
+            "core 디렉토리에 어떤 모듈들이 있는지 알려줘.",
+            "이 저장소의 주요 기능을 파악해서 정리해줘.",
+            "프로젝트에서 인증 관련 코드를 전부 찾아줘.",
+            "이 코드베이스에서 deprecated된 API 사용처를 다 찾아줘.",
+            "Give me a high-level overview of the src directory.",
+            "Find all usages of OldClass across the codebase.",
+            "Summarize the architecture of this project.",
+            "core/orchestrator 아래 파일들의 역할을 각각 설명해줘.",
+            "이 프로젝트에서 테스트 전략이 어떻게 구성돼 있는지 탐색해줘.",
+        ],
+        "scout_prompt": "Explore the project and summarize findings relevant to the user's request.",
+    },
+    # ── direct_answer: 단순 질문/인사/일반 지식 ──
+    {
+        "trigger": "direct_answer",
+        "user_prompts": [
+            "안녕!",
+            "고마워.",
+            "좋은 하루 보내!",
+            "Hello, how are you?",
+            "Python에서 리스트와 튜플의 차이가 뭐야?",
+            "async와 await의 의미를 간단히 설명해줘.",
+            "What is the difference between a process and a thread?",
+            "REST API란 무엇인가?",
+            "SQL에서 JOIN의 종류를 알려줘.",
+            "git rebase와 merge의 차이가 뭐야?",
+        ],
+        "answers": [
+            "안녕하세요! 무엇을 도와드릴까요?",
+            "천만에요. 또 필요한 게 있으면 말씀해 주세요.",
+            "감사합니다. 좋은 하루 되세요!",
+            "I'm doing well, thanks for asking! How can I help?",
+            "리스트는 가변(mutable), 튜플은 불변(immutable)입니다. 튜플은 해시 가능하여 dict 키로 쓸 수 있습니다.",
+            "async는 코루틴 함수를 선언하고, await는 다른 코루틴의 완료를 비동기로 기다립니다.",
+            "A process has its own memory; threads share the parent process's memory.",
+            "HTTP 메서드(GET/POST/PUT/DELETE)와 리소스 URL로 상태 없는 통신을 하는 아키텍처 스타일입니다.",
+            "INNER/LEFT/RIGHT/FULL OUTER/CROSS JOIN이 있습니다.",
+            "rebase는 히스토리를 선형으로 만들고, merge는 분기를 그대로 보존하는 merge commit을 만듭니다.",
+        ],
+    },
+    # ── single_tool: 단일 파일/단일 도구로 충분한 작업 ──
+    {
+        "trigger": "single_tool",
+        "user_prompts": [
+            "config/settings.yaml 파일 읽어줘.",
+            "README.md의 내용을 보여줘.",
+            "src/main.py의 첫 20줄만 보여줘.",
+            "Show me the content of pyproject.toml.",
+        ],
+        "tool": "Read",
+        "tool_inputs": [
+            {"file_path": "config/settings.yaml"},
+            {"file_path": "README.md"},
+            {"file_path": "src/main.py", "offset": 1, "limit": 20},
+            {"file_path": "pyproject.toml"},
+        ],
+    },
+    {
+        "trigger": "single_tool",
+        "user_prompts": [
+            "현재 디렉토리의 파일 목록을 보여줘.",
+            "core 폴더에 뭐가 있는지 ls해줘.",
+            "List files in the tests directory.",
+        ],
+        "tool": "LS",
+        "tool_inputs": [
+            {"path": "."},
+            {"path": "core"},
+            {"path": "tests"},
+        ],
+    },
+]
+
+
 class BootstrapGenerator:
     """
     Phase 1용 합성 학습 데이터를 생성한다.
@@ -725,6 +817,7 @@ class BootstrapGenerator:
         self._rng = random.Random(seed)  # noqa: S311
         self._tool_templates = _TOOL_USE_TEMPLATES
         self._reasoning_templates = _REASONING_TEMPLATES
+        self._subagent_templates = _SUBAGENT_TEMPLATES
 
     async def generate(
         self,
@@ -748,9 +841,12 @@ class BootstrapGenerator:
         out_dir.mkdir(parents=True, exist_ok=True)
         output_file = out_dir / "bootstrap_data.jsonl"
 
-        # 도구 70%, 추론 30% 비율로 생성
-        tool_count = int(count * 0.7)
-        reasoning_count = count - tool_count
+        # v7.0: 도구 60% / 추론 30% / 서브에이전트 판단 10%
+        # subagent 10%에서 다시 use_scout 40% / direct_answer 40% / single_tool 20%
+        # → 부정 샘플이 전체의 60%로 Scout 남용을 억제한다.
+        tool_count = int(count * 0.60)
+        reasoning_count = int(count * 0.30)
+        subagent_count = count - tool_count - reasoning_count
 
         samples: list[dict[str, Any]] = []
 
@@ -766,6 +862,12 @@ class BootstrapGenerator:
             if sample:
                 samples.append(sample)
 
+        # 서브에이전트 판단 샘플 생성 — v7.0 Phase 9
+        for _ in range(subagent_count):
+            sample = self._generate_subagent_sample()
+            if sample:
+                samples.append(sample)
+
         # 순서를 셔플하여 학습 시 편향 방지
         self._rng.shuffle(samples)
 
@@ -777,15 +879,17 @@ class BootstrapGenerator:
         stats = {
             "tool_samples": tool_count,
             "reasoning_samples": reasoning_count,
+            "subagent_samples": subagent_count,
             "total": len(samples),
             "output_file": str(output_file),
         }
 
         logger.info(
-            "부트스트랩 데이터 생성 완료: %d개 (도구: %d, 추론: %d) → %s",
+            "부트스트랩 데이터 생성 완료: %d개 (도구: %d, 추론: %d, 서브에이전트: %d) → %s",
             stats["total"],
             stats["tool_samples"],
             stats["reasoning_samples"],
+            stats["subagent_samples"],
             output_file,
         )
 
@@ -950,3 +1054,107 @@ class BootstrapGenerator:
                 "category": f"reasoning_{category}",
             },
         }
+
+    def _generate_subagent_sample(self) -> dict[str, Any]:
+        """
+        v7.0 Phase 9: 서브에이전트 판단 학습 샘플을 생성한다.
+
+        Worker(Qwen)가 "언제 Agent(scout)를 호출하고 언제 직접 응답할지"를
+        학습할 수 있는 대조적 샘플을 만든다. 세 가지 trigger 타입:
+
+          - use_scout: 대규모 탐색 요청 → Agent 도구 호출
+          - direct_answer: 단순 질문/인사 → 텍스트만 반환 (도구 없음)
+          - single_tool: 단일 파일/단일 도구로 충분 → 직접 도구 호출 (Scout 없이)
+
+        부정 샘플(direct_answer + single_tool)이 긍정(use_scout)의 1.5배로
+        많이 생성되어 Scout 남용을 억제한다.
+        """
+        template = self._rng.choice(self._subagent_templates)
+        trigger = template["trigger"]
+        user_prompt = self._rng.choice(template["user_prompts"])
+
+        # OpenAI tool_calls 형식의 ID (재현성을 위해 seeded RNG 사용)
+        tool_call_id = f"call_{self._rng.randbytes(12).hex()}"
+
+        if trigger == "use_scout":
+            # 긍정 샘플 — Agent(scout) 호출
+            scout_prompt = template["scout_prompt"]
+            return {
+                "messages": [
+                    {"role": "user", "content": user_prompt},
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": tool_call_id,
+                                "type": "function",
+                                "function": {
+                                    "name": "Agent",
+                                    "arguments": json.dumps(
+                                        {
+                                            "prompt": scout_prompt,
+                                            "subagent_type": "scout",
+                                        },
+                                        ensure_ascii=False,
+                                    ),
+                                },
+                            }
+                        ],
+                    },
+                ],
+                "metadata": {
+                    "source": "bootstrap",
+                    "category": "subagent_use_scout",
+                    "tool": "Agent",
+                },
+            }
+
+        if trigger == "direct_answer":
+            # 부정 샘플 — 텍스트만 응답, 도구 호출 없음
+            idx = template["user_prompts"].index(user_prompt)
+            answer = template["answers"][idx]
+            return {
+                "messages": [
+                    {"role": "user", "content": user_prompt},
+                    {"role": "assistant", "content": answer},
+                ],
+                "metadata": {
+                    "source": "bootstrap",
+                    "category": "subagent_direct_answer",
+                },
+            }
+
+        if trigger == "single_tool":
+            # 부정 샘플 — 단일 도구 직접 호출 (Scout 경유 안 함)
+            idx = template["user_prompts"].index(user_prompt) % len(template["tool_inputs"])
+            tool_input = dict(template["tool_inputs"][idx])
+            return {
+                "messages": [
+                    {"role": "user", "content": user_prompt},
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": tool_call_id,
+                                "type": "function",
+                                "function": {
+                                    "name": template["tool"],
+                                    "arguments": json.dumps(
+                                        tool_input, ensure_ascii=False
+                                    ),
+                                },
+                            }
+                        ],
+                    },
+                ],
+                "metadata": {
+                    "source": "bootstrap",
+                    "category": "subagent_single_tool",
+                    "tool": template["tool"],
+                },
+            }
+
+        # 알 수 없는 trigger — 안전하게 None 반환 (generate에서 필터됨)
+        return None  # type: ignore[return-value]
