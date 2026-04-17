@@ -129,169 +129,150 @@ TIER_M/L에서는 Scout 분리가 불필요하므로 Worker 단독 모드로 전
 
 ---
 
-## Part 2: 신규 — 멀티모델 디스패치 계층
+## Part 2: 수정 — 멀티모델 디스패치 계층 (B 방식 재설계, 2026-04-17)
 
-### 2.1 아키텍처 변경: 4-Tier 체인 내부에 디스패치 삽입
+> **재설계 경고 (2026-04-17):** 초기 v7.0 설계는 ModelDispatcher가 TIER_S에서
+> **모든 사용자 요청마다 Scout를 자동 전처리**하도록 했다. 실측 결과 CPU 기반
+> Scout(Gemma 4 E4B, ~16 TPS)가 모든 요청에 ~30초 오버헤드를 추가하여 "안녕"
+> 같은 단순 질문도 33초가 걸렸다. 이에 **B 방식으로 전환**한다: Scout를 자동
+> 전처리기가 아닌 "Worker가 필요할 때 호출하는 서브에이전트"로 승격시킨다.
+> 이 재설계는 사양서 Ch 14(Agent & Task System)의 원래 AgentDefinition 의도와
+> 더 일치한다.
 
-v6.1의 4-Tier 체인 구조를 **그대로 유지**하되, Tier 1(QueryEngine) 내부에 모델 디스패치 로직을 추가한다.
+### 2.1 아키텍처 (재설계 후)
+
+v6.1의 4-Tier 체인 구조를 **그대로 유지**하되, Worker가 실행 중 필요 시 서브
+에이전트를 호출할 수 있도록 Agent 도구를 노출한다.
 
 ```
-v6.1 (기존):
+v7.0 B 방식 (모든 TIER 공통):
   Tier 1: QueryEngine.submit_message()
-    └─ Tier 2: query_loop() ─── 단일 ModelProvider
-        └─ Tier 3: model_provider.stream()
-            └─ Tier 4: httpx (GPU 서버)
-
-v7.0 (TIER_S):
-  Tier 1: QueryEngine.submit_message()
-    └─ ModelDispatcher.route()          ← 신규 계층
-        ├─ Scout용 query_loop()  ─── ScoutModelProvider (CPU :8003)
-        │   └─ 도구 4개, 읽기 전용
-        │   └─ 결과: TurnState (탐색 결과 + 계획)
-        │
+    └─ ModelDispatcher.route()          ← 단순 Worker 래퍼
         └─ Worker용 query_loop() ─── WorkerModelProvider (GPU :8001)
-            └─ 도구 5~7개, 실행
-            └─ 입력: TurnState에서 필요한 정보만
-
-v7.0 (TIER_M/L):
-  Tier 1: QueryEngine.submit_message()
-    └─ ModelDispatcher.route()          ← 동일 계층, 단순 통과
-        └─ Worker용 query_loop() ─── WorkerModelProvider (GPU :8001)
-            └─ 도구 24개 전체
-            └─ v6.1과 동일하게 동작
+            ├─ 일반 도구 (Read/Edit/Bash/…)
+            └─ Agent 도구 ← Worker가 필요할 때만 호출
+                  └─ subagent_type="scout" → Scout query_loop
+                        └─ ScoutModelProvider (CPU :8003)
+                        └─ 도구 4개(Read/Glob/Grep/LS), max_turns=3
 ```
 
-**핵심**: ModelDispatcher는 TIER_M/L에서는 **단순 통과(passthrough)**다.
-Scout를 거치지 않고 바로 Worker의 query_loop()을 호출한다.
-즉 TIER_M/L에서는 v6.1과 100% 동일한 코드 경로를 탄다.
+**핵심 변경**:
+- ModelDispatcher는 이제 **모든 티어에서 passthrough**다. Worker query_loop을
+  한 번 호출할 뿐이다.
+- Scout 실행 여부는 **Worker가 AgentTool 호출로 스스로 결정**한다.
+- TIER_S에서도 단순 요청은 Worker 직행(1~3초), 대규모 탐색만 Scout 경유(+30s).
+- Dispatcher 클래스 자체는 유지하여 TIER_L 병렬 Worker 등 향후 확장을 위한
+  삽입점을 보존한다.
 
-### 2.2 ModelDispatcher 설계
+### 2.2 ModelDispatcher 설계 (재설계)
 
 ```python
 class ModelDispatcher:
     """
-    하드웨어 티어에 따라 Scout/Worker를 분배하는 디스패처.
+    Worker query_loop 실행 래퍼.
 
-    TIER_S: Scout(탐색) → Worker(실행) 2단계
-    TIER_M/L: Worker 단독 (v6.1 동일)
+    초기 설계의 자동 Scout 전처리는 제거되었다.
+    Scout는 이제 AgentTool + AgentDefinition(SCOUT_AGENT)로 처리된다.
     """
 
     def __init__(
         self,
         tier: HardwareTier,
-        worker_provider: ModelProvider,      # GPU 31B
-        scout_provider: ModelProvider | None, # CPU 4B (TIER_S만)
-        worker_tools: list[BaseTool],
-        scout_tools: list[BaseTool] | None,
-        turn_state_store: TurnStateStore,
+        worker_provider: ModelProvider,
+        worker_tools: list[BaseTool],       # AgentTool 포함
+        context: ToolUseContext,
+        scout_provider: ModelProvider | None = None,  # 보관만 — AgentTool이
+        scout_tools: list[BaseTool] | None = None,    # context.options로 꺼내감
+        max_turns: int = 200,
     ):
         ...
 
     async def route(
         self,
-        user_input: str,
         messages: list[Message],
-        context: ToolUseContext,
+        system_prompt: str,
+        on_turn_complete: Any | None = None,
     ) -> AsyncGenerator[StreamEvent | Message, None]:
-        """
-        사용자 입력을 적절한 모델에 라우팅한다.
-
-        TIER_S 흐름:
-          1. Scout에게 탐색/계획 요청 (도구 4개)
-          2. Scout 결과를 TurnState에 저장
-          3. Worker에게 TurnState 기반 실행 요청 (도구 5~7개)
-          4. Worker 결과를 TurnState에 업데이트
-
-        TIER_M/L 흐름:
-          1. Worker에게 직접 전달 (v6.1 동일)
-        """
-        if self._tier == HardwareTier.TIER_S and self._scout_provider:
-            # Phase A: Scout 탐색
-            scout_state = await self._run_scout(user_input, context)
-
-            # Phase B: Worker 실행 (Scout 결과 기반)
-            async for event in self._run_worker(user_input, scout_state, context):
-                yield event
-        else:
-            # TIER_M/L: 단일 모델 직행 (v6.1 동일 경로)
-            async for event in self._run_worker_direct(user_input, messages, context):
-                yield event
+        """Worker query_loop으로 직행 (passthrough). Scout 자동 호출 없음."""
+        async for event in query_loop(
+            messages=messages,
+            system_prompt=system_prompt,
+            model_provider=self._worker_provider,
+            tools=self._worker_tools,
+            context=self._context,
+            max_turns=self._max_turns,
+            on_turn_complete=on_turn_complete,
+        ):
+            yield event
 ```
 
-### 2.3 Scout 역할 상세
+### 2.3 Scout는 AgentDefinition으로 선언된다
 
-Scout는 **읽기 전용 탐색 에이전트**다. 절대 파일을 수정하지 않는다.
+Scout는 **`core/orchestrator/agent_definition.py`의 SCOUT_AGENT 상수**로
+선언된다 (Ch 14 참조). AgentRegistry에 등록되어 AgentTool이 조회한다.
 
 ```python
-# Scout에 할당되는 도구 (TIER_S 전용)
-SCOUT_TOOLS = ["Read", "Glob", "Grep", "LS"]
+SCOUT_AGENT = AgentDefinition(
+    name="scout",
+    description=(
+        "Read-only file explorer running on CPU (small 4B model, slow ~30s). "
+        "Use ONLY when the user asks for broad project exploration, "
+        "multi-file search, or codebase understanding. "
+        "Do NOT use for simple questions, greetings, or single-file tasks."
+    ),
+    system_prompt=(
+        "You are Scout, a read-only exploration agent.\n"
+        "Your job is to explore files and make a plan. You must NOT modify any files.\n"
+        "..."
+    ),
+    allowed_tools=("Read", "Glob", "Grep", "LS"),
+    max_turns=3,
+    model_override="scout",  # AgentTool이 context.options["scout_provider"]로 해석
+)
+```
 
-# Scout의 시스템 프롬프트
-SCOUT_SYSTEM_PROMPT = """
-You are a Scout agent. Your job is to explore and plan, NOT to execute.
+description은 Worker에게 노출되어 "언제 Scout를 호출할지" 판단하는 힌트가
+된다. 특히 "Do NOT use for simple questions" 문구가 남용을 억제한다.
 
-Given the user's request:
-1. Use Read/Glob/Grep/LS to find relevant files
-2. Identify which files need to be modified
-3. Output a structured plan in JSON:
+### 2.4 Worker 도구 (모든 TIER 공통)
 
+Worker는 일반 도구 + `AgentTool`을 받는다. Agent 도구 스키마는 다음과 같다:
+
+```python
 {
-  "relevant_files": ["path1", "path2"],
-  "file_summaries": {"path1": "짧은 요약", "path2": "짧은 요약"},
-  "plan": "What the Worker should do",
-  "requires_tools": ["Edit", "Bash"]
+    "type": "object",
+    "properties": {
+        "prompt": {"type": "string"},
+        "subagent_type": {"type": "string"},  # "scout" 등
+        "description": {"type": "string"},     # 하위 호환 ad-hoc
+    },
+    "required": ["prompt"],
 }
-
-Do NOT attempt to edit or create files. Only read and plan.
-Respond in the user's language.
-"""
 ```
 
-Scout의 출력은 **구조화된 JSON**이다. 자유 텍스트가 아니라 정형화된 계획서를 생성한다.
-이렇게 하면 Worker에게 전달할 때 토큰을 최소화할 수 있다.
+Worker의 시스템 프롬프트에는 등록된 서브에이전트 목록이 동적으로 주입된다
+(`_build_default_system_prompt(agent_registry)` 참조).
 
-### 2.4 Worker 역할 (TIER_S)
+### 2.5 TIER별 차이 (재설계 후)
 
-Worker는 Scout의 계획을 받아 **실행만 담당**한다.
+| TIER | Worker 도구 수 | Scout 서버 | Agent 도구 동작 |
+|---|---|---|---|
+| TIER_S | ~12개 (CLI) / ~9개 (웹) | llama.cpp CPU :8003 | subagent_type="scout" 호출 가능 |
+| TIER_M | 24개 전체 | 없음 | subagent_type="scout" 호출 시 에러 반환(Fail-closed) |
+| TIER_L | 24개 전체 + 병렬 | 없음 | 동일 |
 
-```python
-# Worker에 할당되는 도구 (TIER_S)
-WORKER_TOOLS_TIER_S = ["Edit", "Write", "Bash", "GitCommit", "GitDiff"]
+TIER_M/L에서는 `context.options["scout_provider"]`가 None이므로 Worker가
+잘못 Scout를 호출해도 AgentTool이 명확한 에러를 돌려준다 ("scout_provider
+not configured"). Worker는 이 에러를 보고 직접 도구로 재시도한다.
 
-# Worker의 시스템 프롬프트 (TIER_S)
-WORKER_SYSTEM_PROMPT_TIER_S = """
-You are a Worker agent. Execute the plan provided by Scout.
+### 2.6 왜 이 재설계가 v7.0 원칙과 일치하는가
 
-Context from Scout:
-{scout_plan}
+v7.0의 "3대 불변 전제"를 더 잘 만족한다:
 
-Relevant file contents (already read by Scout):
-{file_summaries}
-
-Execute the plan using your tools. Do not re-read files that Scout already summarized.
-Respond in the user's language.
-"""
-```
-
-**핵심 최적화**: Scout가 이미 읽은 파일 내용을 요약으로 전달한다.
-Worker는 파일을 다시 읽지 않으므로 Read 도구가 필요 없다.
-이로써 Worker의 컨텍스트를 **실행에만 집중**시킨다.
-
-### 2.5 Worker 역할 (TIER_M/L)
-
-TIER_M/L에서 Worker는 **Scout 없이 단독**으로 동작한다.
-v6.1의 query_loop()과 완전히 동일하다.
-
-```python
-# Worker에 할당되는 도구 (TIER_M)
-WORKER_TOOLS_TIER_M = ALL_24_TOOLS  # 전체 24개
-
-# Worker에 할당되는 도구 (TIER_L)
-WORKER_TOOLS_TIER_L = ALL_24_TOOLS  # 전체 24개
-
-# Worker의 시스템 프롬프트 (TIER_M/L)
-WORKER_SYSTEM_PROMPT_TIER_ML = _build_default_system_prompt()  # v6.1 동일
-```
+1. **Claude Code 설계 유지** — Claude Code의 Task/Agent 도구 패턴과 정확히 동일
+2. **GPU 업그레이드 시 자동 수렴** — TIER_M/L에서 Scout 없이 Worker만 동작
+   (기존 B 설계도 같은 속성을 가짐)
+3. **동일한 사용자 경험** — 단순 요청은 빠르게, 복잡한 탐색은 자동 위임
 
 ---
 
@@ -656,22 +637,88 @@ def description(self) -> str:
 
 ### Ch 14: Agent & Task System (수정)
 
-**Scout/Worker를 내장 에이전트로 정의**:
+**Scout는 서브에이전트로 정식 승격** (2026-04-17 B 방식 재설계).
+
+구현 위치: `core/orchestrator/agent_definition.py`
+
+#### AgentDefinition 정식 명세
 
 ```python
-# Scout 에이전트 정의 (TIER_S 전용)
+@dataclass(frozen=True)
+class AgentDefinition:
+    """서브 에이전트의 불변 명세."""
+
+    name: str                           # subagent_type 식별자
+    description: str                    # Worker에게 보이는 사용 가이드 힌트
+    system_prompt: str                  # 서브 에이전트 시스템 프롬프트
+    allowed_tools: tuple[str, ...]      # 사용 가능한 도구 이름 (튜플, 불변)
+    max_turns: int = 10                 # 최대 턴 수 (무한 루프 방지)
+    model_override: str | None = None   # "scout" 또는 None(부모 Worker 재사용)
+```
+
+#### AgentRegistry
+
+```python
+class AgentRegistry:
+    """선언된 서브에이전트를 관리하는 경량 레지스트리."""
+
+    def register(self, agent: AgentDefinition) -> None: ...
+    def register_many(self, agents: list[AgentDefinition]) -> None: ...
+    def get(self, name: str) -> AgentDefinition | None: ...
+    def list_names(self) -> list[str]: ...  # 이름순 정렬
+    def list_descriptions(self) -> dict[str, str]: ...  # Worker 프롬프트 주입용
+```
+
+부트스트랩이 `build_default_agent_registry()` 팩토리로 기본 레지스트리를 만들고
+`ToolUseContext.options["agent_registry"]`로 주입한다.
+
+#### SCOUT_AGENT 선언
+
+```python
 SCOUT_AGENT = AgentDefinition(
     name="scout",
-    description="읽기 전용 탐색 에이전트. 파일 검색과 계획 수립만 수행.",
-    system_prompt=SCOUT_SYSTEM_PROMPT,
-    tools=["Read", "Glob", "Grep", "LS"],
-    max_turns=3,  # Scout는 최대 3턴
-    model_override="scout",  # ScoutModelProvider 사용
+    description=(
+        "Read-only file explorer running on CPU (small 4B model, slow ~30s). "
+        "Use ONLY when the user asks for broad project exploration, "
+        "multi-file search, or codebase understanding. "
+        "Do NOT use for simple questions, greetings, or single-file tasks."
+    ),
+    system_prompt=(
+        "You are Scout, a read-only exploration agent.\n"
+        "Your job is to explore files and make a plan. You must NOT modify any files.\n"
+        "Steps: 1) use Read/Glob/Grep/LS; 2) read key files; 3) summarize findings.\n"
+        "Keep responses concise. Respond in the user's language."
+    ),
+    allowed_tools=("Read", "Glob", "Grep", "LS"),
+    max_turns=3,
+    model_override="scout",
 )
-
-# 기존 AgentRunner, TaskManager, Coordinator는 변경 없음
-# DISALLOWED_TOOLS_FOR_AGENTS도 변경 없음
 ```
+
+#### AgentTool의 subagent_type 처리
+
+Worker가 Agent 도구를 호출할 때 경로:
+
+1. `context.options["agent_registry"]`에서 `subagent_type`으로 AgentDefinition 조회
+2. `model_override == "scout"`이면 `context.options["scout_provider"]` 선택;
+   그렇지 않으면 부모 Worker 프로바이더 재사용
+3. `allowed_tools`에 명시된 도구만 `context.options["available_tools"]`에서 필터링
+4. 독립 `QueryEngine`을 생성해 서브 세션으로 실행 (messages[] 격리)
+5. 실행 시간 통계를 `AgentTool._stats[name]`에 누적
+
+에러 처리:
+- `agent_registry`가 없거나 `subagent_type`이 미등록 → `ToolResult.error(...)`
+- `model_override="scout"`인데 `scout_provider`가 없음 (TIER_M/L) → 명확한 에러
+
+#### DISALLOWED_TOOLS_FOR_AGENTS (변경 없음)
+
+서브에이전트는 `{Agent, TaskCreate, TaskStop, TrainingTool, CheckpointTool}`을
+사용할 수 없다. 재귀 호출과 위험 도구를 차단하여 제어 흐름을 단순하게 유지한다.
+
+#### 기존 AgentRunner/TaskManager/Coordinator (변경 없음)
+
+이들은 TaskManager 아래에서 장기 실행 태스크(LOCAL_AGENT 등)를 관리하며,
+지금 재설계는 그 상위의 AgentDefinition 정의만 건드린다.
 
 ### Ch 15: State Management (경미 수정)
 
@@ -698,29 +745,59 @@ orchestration_mode: str = "multi_model"  # "multi_model" | "single_model"
 }
 ```
 
-### Ch 17: Monitoring & Metrics (경미 수정)
+### Ch 17: Monitoring & Metrics (재설계, 2026-04-17)
 
-**Scout 메트릭 추가**:
+**서브에이전트 메트릭** (B 방식):
 
-ModelDispatcher.stats 프로퍼티가 아래 필드를 노출한다. `web/app.py`의
-`/metrics` 엔드포인트가 `_app_state["model_dispatcher"].stats`를 읽어
-`result["scout"]`로 직렬화한다.
+`/metrics` 엔드포인트는 `AgentTool.get_stats()`를 참조하여 서브에이전트별
+호출 통계를 노출한다. Scout 자동 전처리가 제거됐으므로 `ModelDispatcher.stats`
+는 더 이상 실제 수치를 누적하지 않는다 (하위 호환 0 유지).
 
 ```python
-# ModelDispatcher.stats 반환 필드
+# GET /metrics 응답 구조
 {
-    "tier": "small" | "medium" | "large",
-    "scout_enabled": bool,
-    "scout_calls": int,              # Scout 호출 총 횟수
-    "scout_fallback_count": int,     # Scout 실패 → Worker 폴백 횟수
-    "scout_fallbacks": int,          # 하위 호환 alias (동일 값)
-    "scout_avg_latency_ms": float,   # Scout 호출 1회당 평균 지연 (ms)
+    "http": {...},
+    "session": {...},
+    "agents": {
+        "scout": {
+            "calls": int,                # AgentTool로 Scout가 호출된 횟수
+            "total_latency_ms": float,   # 누적 지연 시간
+            "avg_latency_ms": float,     # 평균 지연 (calls로 나눔)
+        },
+        # 향후 추가 서브에이전트: code-reviewer, sql-explorer 등
+    },
+    "scout": {                           # 하위 호환 — 대시보드 유지용
+        "tier": "small" | "medium" | "large",
+        "scout_enabled": bool,
+        "scout_calls": int,              # = agents.scout.calls
+        "scout_avg_latency_ms": float,   # = agents.scout.avg_latency_ms
+        "scout_fallback_count": 0,       # B 방식에선 의미 없음 (항상 0)
+        "note": "sourced from AgentTool.get_stats()",
+    },
 }
 ```
 
-누적 지연 시간은 `_scout_total_latency_ms` 필드에 `_run_scout()` 성공 시
-elapsed × 1000을 더하는 방식으로 저장하며, `stats` 계산 시점에 호출 수로
-나누어 평균을 낸다 (호출 0회면 0.0).
+**구현**:
+- `AgentTool._stats` (ClassVar dict) — subagent_type별 calls/total_latency_ms
+- `AgentTool._record_stats(key, elapsed_ms)` — call() 내에서 성공·실패 모두 누적
+- `AgentTool.get_stats()` — 읽기 전용 복사본 반환, avg_latency_ms 즉석 계산
+- `AgentTool.reset_stats()` — 테스트 격리용
+
+**ModelDispatcher.stats** (하위 호환 전용):
+```python
+{
+    "tier": str,
+    "scout_enabled": bool,  # 서버 연결 여부 (자동 호출 의미 아님)
+    "scout_calls": 0,
+    "scout_fallback_count": 0,
+    "scout_fallbacks": 0,
+    "scout_avg_latency_ms": 0.0,
+    "note": "Scout is now invoked by the Worker via AgentTool",
+}
+```
+
+기존 대시보드가 `scout_calls` 같은 평탄한 키를 참조하는 경우를 위해 `web/app.py`
+가 AgentTool 통계를 꺼내 `result["scout"]`에도 평탄화해 넣는다.
 
 ### Ch 20: CLI & Web Interface (경미 수정)
 

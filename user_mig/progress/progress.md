@@ -414,6 +414,96 @@ VRAM 최대 max-model-len:
 
 ---
 
+## v7.0 Phase 9 B 방식 전환 — Scout를 서브에이전트로 승격 (2026-04-17)
+
+### 배경
+A 방식(Dispatcher 자동 Scout 전처리) 배선 직후 실측해보니, TIER_S에서는
+"안녕" 같은 단순 인사에도 Scout가 조건 없이 선행 실행되어 ~33초가 걸렸다.
+Scout는 CPU 4B(llama.cpp) 모델이라 모든 요청에 고정 오버헤드를 더하는 구조가
+실사용에서 불합리했다.
+
+사용자 결정: **B 방식으로 전환** — Scout를 자동 전처리기가 아니라
+"Worker가 필요할 때 호출하는 서브에이전트"로 승격시킨다. 납품 일정보다 올바른
+아키텍처가 우선.
+
+### 구현 (10단계, 각 Phase별 커밋 분리)
+
+**Phase 1 (e134a4c)**: `core/orchestrator/agent_definition.py` 신규
+- `AgentDefinition` frozen dataclass (name/desc/system_prompt/allowed_tools/max_turns/model_override)
+- `AgentRegistry` — register/get/list_names/list_descriptions
+- `SCOUT_AGENT` 상수 — Read/Glob/Grep/LS, max_turns=3, model_override="scout"
+- `build_default_agent_registry()` 팩토리
+- 21개 테스트 통과
+
+**Phase 2 (4f57de5)**: `core/tools/implementations/agent_tool.py` 확장
+- `subagent_type` 파라미터 추가, AgentRegistry 조회
+- `model_override="scout"` → `context.options["scout_provider"]` 선택
+- `allowed_tools` 기반 도구 필터링 (+ DISALLOWED 이중 보호)
+- `AgentTool._stats` 클래스 레벨 통계 + `get_stats()/reset_stats()`
+- 하위 호환: subagent_type 없으면 description 기반 ad-hoc 동작
+- 14개 테스트 통과
+
+**Phase 3 (242e02b)**: ModelDispatcher의 Scout 자동 전처리 제거
+- `_run_scout()` 메서드 완전 제거
+- `route()`는 모든 티어에서 passthrough (항상 Worker 직행)
+- `stats`는 하위 호환 키 유지하되 값 항상 0, `note` 필드로 AgentTool 안내
+- 기존 테스트 3개 제거, 1개 재작성(`test_route_tier_s_now_passthrough`)
+
+**Phase 4 (098896d)**: Worker에게 AgentTool 노출
+- `_create_cli_tool_registry`, `_create_web_tool_registry`에 AgentTool() 등록
+- `ToolUseContext.options`에 agent_registry/scout_provider/available_tools 주입
+- `_build_default_system_prompt(agent_registry)` — 동적 서브에이전트 목록 +
+  "NEVER invoke scout for trivial tasks — it is slow" 경고 삽입
+- 웹 전용 QueryEngine에도 동일 처리
+
+**Phase 5 (b64a959)**: `/metrics`에 `agents` 섹션 노출
+- `AgentTool.get_stats()` → `result["agents"]`
+- 하위 호환 `result["scout"]`은 AgentTool 값 평탄화 + note 필드
+
+**Phase 6**: 테스트 정비 (Phase 2/3에 포함)
+
+**Phase 7 (8ca8610)**: `training/bootstrap_generator.py` 서브에이전트 시나리오
+- `_SUBAGENT_TEMPLATES` 추가 (use_scout/direct_answer/single_tool 3가지)
+- 생성 비율 조정: 도구 60% / 추론 30% / 서브에이전트 10%
+- 부정 샘플(direct_answer + single_tool) 비중 높여 남용 억제
+- `_generate_subagent_sample()` 추가
+
+**Phase 8 (GPU 서버 작업, 이 저장소 범위 밖)**: LoRA 재학습
+- scripts/train_qwen_lora.py 재실행 → qwen35-phase2 체크포인트
+- vLLM `--lora-modules nexus-phase2=...`로 핫로드 예정
+
+**Phase 9**: 사양서 v7.0 AMENDMENT 개정
+- Part 2 (멀티모델 디스패치 계층) — B 방식 재설계 내용으로 갱신
+- Part 5 Ch 14 — AgentDefinition/AgentRegistry/SCOUT_AGENT 정식 명세
+- Part 5 Ch 17 — AgentTool.get_stats 기반 메트릭 구조 명시
+
+**Phase 10**: 이 문서 업데이트
+
+### 실환경 검증 (웹 서버 재시작 후)
+
+"Hi, how are you today?" 요청:
+- **3초 내 응답 완료**, `tool_calls: []`
+- Worker 내부 추론: "simple greeting question. I should respond directly without using any tools"
+- Scout 미호출 ✅
+
+"Give me a high-level overview of the core/orchestrator directory" 요청:
+- Worker가 `Agent(subagent_type="scout")` 정확히 선택
+- 로그: `Agent: 서브에이전트 실행 시작 (type=scout, tools=4개, model_override=scout)`
+- Scout 35.3초 실행, Worker가 최종 응답 생성
+- `/metrics` 응답: `agents.scout.calls=1, avg_latency_ms=35266`
+
+### 알려진 후속 이슈
+
+- Scout(Gemma 4 E4B) tool_call 실행 품질이 낮음 — 29자 짧은 응답 반환 사례
+  Worker가 fallback으로 직접 도구 사용으로 전환되는 합리적 대처 확인
+  해결: Phase 8 재학습 이후 Scout 모델을 Qwen 계열 소형으로 교체 고려
+- Phase 8 재학습 전에는 Worker의 Scout 선택이 시스템 프롬프트에만 의존 →
+  "NEVER invoke for trivial" 경고로 1차 억제, 실측 결과 충분히 보수적으로 동작
+
+### 테스트: 572개 통과 (기존 571 + /metrics agents 섹션 1개)
+
+---
+
 ## v7.0 Phase 9 실 배선 + Ch 17 Scout 메트릭 (2026-04-17)
 
 ### 발견한 문제
