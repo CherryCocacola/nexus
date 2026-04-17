@@ -73,6 +73,8 @@ class QueryEngine:
         context_manager: ContextManager | None = None,
         max_turns: int = 200,
         hook_manager: Any | None = None,
+        turn_state_store: Any | None = None,
+        rag_retriever: Any | None = None,
     ) -> None:
         """
         QueryEngine을 초기화한다.
@@ -85,6 +87,8 @@ class QueryEngine:
             context_manager: 컨텍스트 압축 관리자 (선택)
             max_turns: 최대 턴 수 (기본: 200)
             hook_manager: 훅 매니저 (선택)
+            turn_state_store: TurnStateStore (v7.0, 선택) — 턴 상태 외부화
+            rag_retriever: RAGRetriever (선택) — 관련 문서 청크 자동 검색
         """
         self._model_provider = model_provider
         self._tools = tools
@@ -93,6 +97,12 @@ class QueryEngine:
         self._context_manager = context_manager
         self._max_turns = max_turns
         self._hook_manager = hook_manager
+
+        # v7.0: 턴 상태 외부화 저장소
+        self._turn_state_store = turn_state_store
+
+        # RAG: 관련 문서 청크 자동 검색
+        self._rag_retriever = rag_retriever
 
         # 대화 히스토리 — submit_message() 호출마다 누적
         self._messages: list[Message] = []
@@ -128,6 +138,27 @@ class QueryEngine:
             StreamEvent: 스트리밍 이벤트 (UI 업데이트용)
             Message: assistant/tool_result 메시지 (대화 기록용)
         """
+        # v7.0: TurnState 기반 컨텍스트 복원
+        # TurnStateStore가 있으면 이전 턴의 요약을 시스템 프롬프트에 주입하고,
+        # raw messages는 현재 턴의 사용자 메시지만 유지한다.
+        # 이전 대화 맥락은 TurnState 요약으로 대체된다.
+        effective_system_prompt = self._system_prompt
+        if self._turn_state_store is not None:
+            # 이전 턴 요약을 컨텍스트로 가져온다 (최대 1000토큰)
+            prev_context = self._turn_state_store.get_context(
+                self._session_id, max_tokens=1000
+            )
+            if prev_context:
+                effective_system_prompt = (
+                    self._system_prompt
+                    + "\n\n--- Previous context ---\n"
+                    + prev_context
+                )
+            # messages를 현재 턴만으로 초기화 (이전 raw messages 제거)
+            # 왜: TurnState 요약이 이전 맥락을 대체하므로
+            # raw messages 누적이 불필요하다.
+            self._messages.clear()
+
         # 사용자 메시지를 대화 히스토리에 추가
         user_msg = Message.user(user_input)
         self._messages.append(user_msg)
@@ -139,17 +170,41 @@ class QueryEngine:
             user_input[:80],
         )
 
+        # RAG: 관련 문서 청크를 시스템 프롬프트에 주입
+        # 사용자 입력을 임베딩으로 변환하여 인덱싱된 청크에서 유사한 것을 검색한다.
+        # 결과를 "--- Relevant files ---" 섹션으로 추가한다.
+        if self._rag_retriever is not None:
+            try:
+                rag_context = await self._rag_retriever.get_context(
+                    user_input, max_tokens=1500
+                )
+                if rag_context:
+                    effective_system_prompt = (
+                        effective_system_prompt
+                        + "\n\n--- Relevant files ---\n"
+                        + rag_context
+                        + "\n--- End of relevant files ---"
+                    )
+            except Exception as e:
+                logger.debug("RAG 검색 실패 (무시): %s", e)
+
+        # v7.0: TurnState 콜백 — query_loop이 턴 완료 시 호출
+        def _on_turn_complete(turn_state: Any) -> None:
+            if self._turn_state_store is not None:
+                self._turn_state_store.save(self._session_id, turn_state)
+
         # Tier 2 호출: query_loop()
         # query_loop은 messages를 직접 mutate하여
         # assistant/tool_result 메시지를 추가한다
         async for event in query_loop(
             messages=self._messages,
-            system_prompt=self._system_prompt,
+            system_prompt=effective_system_prompt,
             model_provider=self._model_provider,
             tools=self._tools,
             context=self._context,
             context_manager=self._context_manager,
             max_turns=self._max_turns,
+            on_turn_complete=_on_turn_complete,
         ):
             # 사용량 추적 — USAGE_UPDATE 이벤트에서 누적
             if (

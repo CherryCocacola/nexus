@@ -89,7 +89,7 @@ class PostgreSQLConfig(BaseModel):
 class ModelConfig(BaseModel):
     """LLM 모델 설정."""
 
-    primary_model: str = "gemma-4-31b-it"
+    primary_model: str = "qwen3.5-27b"
     auxiliary_model: str = "exaone-7.8b"
     embedding_model: str = "multilingual-e5-large"
     max_context_tokens: int = 4096
@@ -113,6 +113,19 @@ class SessionConfig(BaseModel):
 # ─────────────────────────────────────────────
 # 보안 설정
 # ─────────────────────────────────────────────
+class ScoutConfig(BaseModel):
+    """v7.0 Scout(CPU 4B 모델) 설정."""
+
+    model_config = {"protected_namespaces": ()}  # model_ 접두사 경고 방지
+
+    enabled: bool = True  # TIER_S에서만 자동 활성화
+    base_url: str = "http://192.168.22.28:8003"
+    api_key: str = "local-key"
+    model_id: str = "gemma-4-E4B-it"
+    max_context_tokens: int = 4096
+    max_output_tokens: int = 512
+
+
 class SecurityConfig(BaseModel):
     """보안 및 샌드박스 설정."""
 
@@ -210,6 +223,12 @@ class NexusConfig(BaseSettings):
 
     # 보안
     security: SecurityConfig = Field(default_factory=SecurityConfig)
+
+    # v7.0 Scout (CPU 4B 모델)
+    scout: ScoutConfig = Field(default_factory=ScoutConfig)
+
+    # 하드웨어 티어 (auto: GPU VRAM 기반 자동 감지)
+    hardware_tier: str = "auto"
 
     # 운영
     log_level: str = "INFO"

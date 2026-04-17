@@ -12,27 +12,28 @@ gpu_server:
   retry_base_delay: 0.5
   health_check_interval: 30.0
 
-# Redis (단기 메모리 / 세션 캐시)
+# Redis (단기 메모리 / 세션 캐시) — docutil-redis 컨테이너 공유
 redis:
   host: "192.168.10.39"
-  port: 6379
-  db: 0
-  password: ""
+  port: 6340
+  db: 6
+  password: "docutil_redis_2024"
   socket_timeout: 5.0
 
-# PostgreSQL + pgvector (장기 메모리)
+# PostgreSQL + pgvector (장기 메모리) — docutil-postgres 컨테이너, nexus DB
 postgresql:
   host: "192.168.10.39"
-  port: 5432
+  port: 5440
   database: "nexus"
   user: "nexus"
-  password: ""
+  password: "idino@12"
   min_connections: 2
   max_connections: 10
 
-# 모델 설정
+# 모델 설정 — Qwen 3.5 27B Dense AWQ (v7.0 모델 전환)
+# Dense 아키텍처 → vLLM LoRA 핫로딩 지원 (학교별/기업별 동적 전환)
 model:
-  primary_model: "gemma-4-31b-it"
+  primary_model: "qwen3.5-27b"
   auxiliary_model: "exaone-7.8b"
   embedding_model: "multilingual-e5-large"
   max_context_tokens: 8192

@@ -117,6 +117,11 @@ class GlobalState:
     # === 플랫폼 정보 ===
     platform: dict = field(default_factory=dict)
 
+    # === v7.0: 하드웨어 적응 ===
+    hardware_tier: str = "small"             # "small" | "medium" | "large"
+    scout_enabled: bool = False              # Scout(CPU 4B) 활성 여부
+    orchestration_mode: str = "multi_model"  # "multi_model" | "single_model"
+
     # === 캐시 래치 (한번 설정되면 세션 내에서 변경되지 않는 값) ===
     fast_mode_latched: bool = False
     thinking_enabled_latched: bool | None = None

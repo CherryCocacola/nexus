@@ -136,6 +136,7 @@ async def query_loop(
     context_manager: Any | None = None,
     max_turns: int = MAX_TURNS,
     hook_manager: Any | None = None,
+    on_turn_complete: Any | None = None,
 ) -> AsyncGenerator[StreamEvent | Message, None]:
     """
     핵심 에이전트 턴 루프.
@@ -274,14 +275,21 @@ async def query_loop(
 
         try:
             # Tier 3 호출: model_provider.stream()
-            # 참고: 프로덕션에서는 with_retry() (Ch.7.1)와
-            # StreamWatchdog (Ch.7.2)로 감싸야 한다
-            async for event in model_provider.stream(
+            # StreamWatchdog (Ch.7.2)로 감싸서 스트림 무응답을 감지한다.
+            # idle 30초, total 300초 초과 시 StreamWatchdogTimeout 발생 → 재시도
+            from core.orchestrator.stream_watchdog import stream_with_watchdog
+
+            _raw_stream = model_provider.stream(
                 messages=api_messages,
                 system_prompt=system_prompt,
                 tools=tool_schemas if tools else None,
                 temperature=0.7,
                 max_tokens=max_tokens,
+            )
+            async for event in stream_with_watchdog(
+                _raw_stream,
+                idle_timeout=30.0,
+                total_timeout=300.0,
             ):
                 # 이벤트를 UI로 전파
                 yield event
@@ -325,6 +333,10 @@ async def query_loop(
                 elif event_type == StreamEventType.ERROR.value:
                     # 모델 에러 (스트리밍 중)
                     model_error = event.message
+                    # 컨텍스트 초과는 재시도해도 해결 불가 — 즉시 종료
+                    if event.error_code == "CONTEXT_OVERFLOW":
+                        await streaming_executor.cancel_all()
+                        return
 
                 # 스트리밍 중 완료된 도구 결과를 소비
                 for completed in streaming_executor.get_completed():
@@ -332,6 +344,31 @@ async def query_loop(
 
         except Exception as e:
             error_name = type(e).__name__
+
+            # ─── StreamWatchdog 타임아웃 → 재시도 ───
+            # GPU 행(hang), vLLM 데드락, 네트워크 끊김을 감지한다.
+            # STREAM_STALL로 분류되어 재시도 대상이 된다.
+            from core.orchestrator.stream_watchdog import StreamWatchdogTimeout
+
+            if isinstance(e, StreamWatchdogTimeout):
+                state.model_error_count += 1
+                if state.model_error_count <= MAX_MODEL_ERROR_RETRY:
+                    logger.warning(
+                        "스트림 타임아웃 (%s), 재시도 %d/%d",
+                        e.timeout_type,
+                        state.model_error_count,
+                        MAX_MODEL_ERROR_RETRY,
+                    )
+                    yield StreamEvent(
+                        type=StreamEventType.SYSTEM_WARNING,
+                        message=(
+                            f"[스트림 {e.timeout_type} 타임아웃] "
+                            f"재시도 {state.model_error_count}/{MAX_MODEL_ERROR_RETRY}"
+                        ),
+                    )
+                    state.continue_reason = ContinueReason.NEXT_TURN
+                    await streaming_executor.cancel_all()
+                    continue
 
             # ─── Transition 1: collapse_drain_retry ───
             # "context too long" 류의 에러 → 긴급 압축 후 재시도
@@ -441,6 +478,37 @@ async def query_loop(
         yield assistant_msg
 
         state.last_stop_reason = stop_reason
+
+        # TurnState 생성 — v7.0 상태 외부화
+        # 매 턴 끝에 핵심 정보를 추출하여 콜백으로 전달한다.
+        # QueryEngine이 이 상태를 TurnStateStore에 저장한다.
+        if on_turn_complete is not None:
+            from core.orchestrator.turn_state import extract_turn_state
+
+            # 도구 결과 요약 수집
+            _tool_result_summaries: list[str] = []
+            for msg in state.messages:
+                role = msg.role if isinstance(msg.role, str) else msg.role.value
+                if role == "tool_result":
+                    content = msg.text_content if hasattr(msg, "text_content") else str(msg.content)
+                    _tool_result_summaries.append(content[:100])
+
+            # 사용자 요청 추출 (messages에서 마지막 user 메시지)
+            _user_req = ""
+            for msg in reversed(state.messages):
+                role = msg.role if isinstance(msg.role, str) else msg.role.value
+                if role == "user":
+                    _user_req = msg.text_content if hasattr(msg, "text_content") else str(msg.content)
+                    break
+
+            turn_state = extract_turn_state(
+                turn_number=state.turn_count,
+                user_request=_user_req,
+                assistant_text=assistant_text,
+                tool_use_blocks=tool_use_blocks,
+                tool_results=_tool_result_summaries[-5:],  # 최근 5개만
+            )
+            on_turn_complete(turn_state)
 
         # 턴 종료 이벤트
         yield StreamEvent(type=StreamEventType.STREAM_REQUEST_END)
