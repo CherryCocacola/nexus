@@ -147,6 +147,18 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         from core.tools.base import ToolUseContext
 
         web_registry = _create_web_tool_registry()
+        web_tools = web_registry.get_all_tools()
+
+        # Scout 후보 도구 풀 — 웹 도구 + Scout 도구 (중복 제거, name 기준)
+        scout_tools = components.get("scout_tools") or []
+        combined_pool: list = []
+        seen_names: set[str] = set()
+        for t in [*web_tools, *scout_tools]:
+            if t.name not in seen_names:
+                combined_pool.append(t)
+                seen_names.add(t.name)
+
+        # AgentTool이 해석할 의존성을 모두 options에 주입한다
         web_context = ToolUseContext(
             cwd=state.cwd or ".",
             session_id=state.session_id,
@@ -154,28 +166,50 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             options={
                 "memory_manager": components.get("memory_manager"),
                 "task_manager": components.get("task_manager"),
+                "agent_registry": components.get("agent_registry"),
+                "model_provider": components["model_provider"],
+                "scout_provider": components.get("scout_provider"),
+                "available_tools": combined_pool,
             },
         )
-        # 웹 전용 ModelDispatcher — worker_tools만 웹용(8개)으로 교체하고
-        # scout는 bootstrap이 만든 것과 동일 인스턴스를 재사용한다.
-        # 이렇게 하면 웹 경로에서도 Scout → Worker 2단계가 동작한다.
-        web_tools = web_registry.get_all_tools()
+        # 웹 전용 ModelDispatcher — Scout 자동 전처리는 Phase 3에서 제거됨.
+        # 웹 경로에서도 Worker는 필요 시 AgentTool로 Scout를 호출한다.
         web_dispatcher = ModelDispatcher(
             tier=components["hardware_tier"],
             worker_provider=components["model_provider"],
             worker_tools=web_tools,
             context=web_context,
             scout_provider=components.get("scout_provider"),
-            scout_tools=components.get("scout_tools"),
+            scout_tools=scout_tools,
             max_turns=200,
         )
         _app_state["model_dispatcher"] = web_dispatcher
+
+        # 웹 시스템 프롬프트 — 서브에이전트 가이드를 동적 주입
+        agent_registry = components.get("agent_registry")
+        agent_guide = ""
+        if agent_registry is not None and len(agent_registry) > 0:
+            agent_lines = [
+                f"  - {name}: {desc}"
+                for name, desc in agent_registry.list_descriptions().items()
+            ]
+            agent_guide = (
+                "\n\n## Sub-agents (Agent tool)\n"
+                "Delegate specialized tasks to sub-agents via the Agent tool.\n"
+                "Available sub-agents:\n"
+                + "\n".join(agent_lines)
+                + "\n\nWhen to use sub-agents:\n"
+                "  - Simple questions or greetings → answer directly, NO tools\n"
+                "  - Single file task → use Read/Edit/Write directly\n"
+                "  - Broad project exploration → Agent(subagent_type=\"scout\")\n"
+                "NEVER invoke scout for trivial tasks — it is slow (~30s on CPU)."
+            )
+
         web_engine = QueryEngine(
             model_provider=components["model_provider"],
             tools=web_tools,
             context=web_context,
             model_dispatcher=web_dispatcher,
-            # 웹 시스템 프롬프트 — 범용 AI 어시스턴트 + 파일/문서 분석 능력
             system_prompt=(
                 "You are Nexus, an AI assistant developed by IDINO. "
                 "You can answer general questions, analyze files, and process documents.\n\n"
@@ -188,6 +222,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 "For general questions, answer directly without using tools.\n"
                 "Respond in the user's language. Be concise and helpful.\n"
                 "Do NOT output your thinking process. Give the answer directly."
+                + agent_guide
             ),
             max_turns=200,
         )

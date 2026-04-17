@@ -30,6 +30,7 @@ import platform
 import signal
 import sys
 from pathlib import Path
+from typing import Any
 
 from core.config import load_and_validate_config
 from core.state import GlobalState, get_initial_state
@@ -106,6 +107,7 @@ async def init_phase2(state: GlobalState) -> dict:
     from core.memory.manager import MemoryManager
     from core.memory.short_term import ShortTermMemory
     from core.model.inference import LocalModelProvider
+    from core.orchestrator.agent_definition import build_default_agent_registry
     from core.orchestrator.query_engine import QueryEngine
     from core.task import TaskManager
     from core.tools.base import ToolUseContext
@@ -153,7 +155,17 @@ async def init_phase2(state: GlobalState) -> dict:
     components["task_manager"] = task_manager
     logger.info("[Phase 2] TaskManager 초기화")
 
-    # ④ ToolUseContext 생성
+    # ④ AgentRegistry 초기화 — v7.0 Phase 9 서브에이전트 시스템
+    # SCOUT_AGENT 등 기본 에이전트가 등록된다.
+    agent_registry = build_default_agent_registry()
+    components["agent_registry"] = agent_registry
+
+    # ④-b ToolUseContext 생성
+    # options는 AgentTool이 서브에이전트를 해석할 때 필요한 모든 의존성을 제공한다:
+    #   - agent_registry: subagent_type → AgentDefinition 조회
+    #   - model_provider: 부모 Worker (model_override가 없을 때 재사용)
+    #   - scout_provider: model_override="scout"일 때 사용 (없으면 AgentTool이 에러 반환)
+    #   - available_tools: allowed_tools 필터링의 후보 집합 (Phase 2-b에서 채움)
     context = ToolUseContext(
         cwd=state.cwd or os.getcwd(),
         session_id=state.session_id,
@@ -161,6 +173,8 @@ async def init_phase2(state: GlobalState) -> dict:
         options={
             "memory_manager": memory_manager,
             "task_manager": task_manager,
+            "agent_registry": agent_registry,
+            "model_provider": provider,
         },
     )
     components["tool_use_context"] = context
@@ -201,6 +215,8 @@ async def init_phase2(state: GlobalState) -> dict:
         else:
             logger.warning("[Phase 2] Scout 연결 실패, Worker 단독 모드")
     components["scout_provider"] = scout_provider
+    # AgentTool이 model_override="scout"을 해석할 때 꺼내간다
+    context.options["scout_provider"] = scout_provider
 
     # ⑧ 티어별 도구 레지스트리 자동 선택
     # TIER_S: 11개 도구 (~1,472토큰) — 컨텍스트 절약
@@ -216,6 +232,18 @@ async def init_phase2(state: GlobalState) -> dict:
     scout_registry = _create_scout_tool_registry()
     scout_tools = scout_registry.get_all_tools()
     components["scout_tools"] = scout_tools
+
+    # AgentTool이 allowed_tools로 필터링할 후보 도구 풀을 context.options에 주입한다.
+    # Worker가 쓰는 CLI 도구 + Scout가 쓰는 읽기 전용 도구를 합쳐 중복 없이 등록한다
+    # (ToolRegistry.register_many가 내부적으로 사용하는 name 기반 중복 검사는
+    # 여기서는 불필요하므로 단순 리스트로 관리한다).
+    tool_pool_names: set[str] = set()
+    combined_tools: list = []
+    for tool in [*cli_tools, *scout_tools]:
+        if tool.name not in tool_pool_names:
+            combined_tools.append(tool)
+            tool_pool_names.add(tool.name)
+    context.options["available_tools"] = combined_tools
 
     # ⑨ RAG 파이프라인 초기화 — 프로젝트 파일 인덱싱 + 검색
     rag_retriever = None
@@ -266,11 +294,12 @@ async def init_phase2(state: GlobalState) -> dict:
 
     # ⑪ QueryEngine — Tier 1 세션 오케스트레이터
     # model_dispatcher가 주입되면 submit_message는 dispatcher.route() 경로를 탄다.
+    # 시스템 프롬프트에는 agent_registry를 반영하여 서브에이전트 사용 가이드를 넣는다.
     engine = QueryEngine(
         model_provider=provider,
         tools=cli_tools,
         context=context,
-        system_prompt=_build_default_system_prompt(),
+        system_prompt=_build_default_system_prompt(agent_registry),
         max_turns=200,
         turn_state_store=turn_state_store,
         rag_retriever=rag_retriever,
@@ -463,10 +492,11 @@ def _create_cli_tool_registry():  # noqa: ANN202
     CLI용 핵심 도구를 등록한 ToolRegistry를 생성한다.
 
     RTX 5090 (8192 ctx)에서 24개 도구(~6,102토큰)는 컨텍스트를 초과한다.
-    파일 작업 + 검색 + Git + 문서 분석 = 12개 도구(~3,000토큰)로 제한하여
-    입력+출력에 ~5,000토큰 여유를 확보한다.
+    파일 작업 + 검색 + Git + 문서 + Agent(서브에이전트 호출) 도구로 제한하여
+    입력+출력에 충분한 토큰 여유를 확보한다.
     GPU 업그레이드 시 _create_tool_registry()로 전환 가능.
     """
+    from core.tools.implementations.agent_tool import AgentTool
     from core.tools.implementations.bash_tool import BashTool
     from core.tools.implementations.document_tool import DocumentProcessTool
     from core.tools.implementations.edit_tool import EditTool
@@ -496,8 +526,9 @@ def _create_cli_tool_registry():  # noqa: ANN202
         GitStatusTool(),
         # 문서 (1개)
         DocumentProcessTool(),
+        # 서브에이전트 (1개) — Worker가 Scout 등 전문 에이전트를 호출
+        AgentTool(),
     ])
-    # 합계: ~3,000 토큰 — 8192 컨텍스트에서 ~5,000 토큰 여유
 
     return registry
 
@@ -511,6 +542,7 @@ def _create_web_tool_registry():  # noqa: ANN202
     사용자 입력과 출력에 충분한 토큰을 확보한다.
     GPU가 업그레이드되면 _create_tool_registry()로 교체 가능.
     """
+    from core.tools.implementations.agent_tool import AgentTool
     from core.tools.implementations.bash_tool import BashTool
     from core.tools.implementations.document_tool import DocumentProcessTool
     from core.tools.implementations.edit_tool import EditTool
@@ -531,21 +563,55 @@ def _create_web_tool_registry():  # noqa: ANN202
         GrepTool(),              # 텍스트 검색 (~375 토큰)
         LSTool(),                # 디렉토리 조회 (~163 토큰)
         DocumentProcessTool(),   # 문서 파싱 PDF/DOCX/XLSX (~200 토큰)
+        AgentTool(),             # 서브에이전트 호출 (~300 토큰)
     ])
-    # 합계: ~2,051 토큰 — 8192 컨텍스트에서 충분한 여유 확보
 
     return registry
 
 
-def _build_default_system_prompt() -> str:
-    """기본 시스템 프롬프트를 생성한다."""
-    return (
+def _build_default_system_prompt(agent_registry: Any | None = None) -> str:
+    """
+    기본 시스템 프롬프트를 생성한다.
+
+    agent_registry가 주어지면 등록된 서브에이전트 목록을 프롬프트에 동적 주입한다.
+    Worker가 Agent 도구를 언제/어떻게 쓸지 판단하는 근거를 제공한다.
+
+    중요한 원칙(Worker에게 주입):
+      - 단순 질문/인사 → 직접 응답, 도구 사용 금지
+      - 단일 파일 읽기/편집 → Read/Edit 도구 직접 사용
+      - 대규모 탐색/다중 파일 검색 → Agent(subagent_type="scout")
+      - Scout는 CPU 기반이라 ~30초 걸리므로 남용 금지
+    """
+    base = (
         "You are Nexus, an AI coding assistant running in an air-gapped environment.\n"
         "You help users with software engineering tasks using available tools.\n"
         "Always respond in the user's language.\n"
         "When you need to read, write, or modify files, use the appropriate tools.\n"
-        "Think step by step before taking actions."
+        "Think step by step before taking actions.\n"
     )
+
+    # 서브에이전트 섹션 — agent_registry가 있을 때만 추가
+    if agent_registry is None or len(agent_registry) == 0:
+        return base
+
+    agent_lines = []
+    for name, desc in agent_registry.list_descriptions().items():
+        agent_lines.append(f"  - {name}: {desc}")
+
+    subagent_guide = (
+        "\n## Sub-agents (Agent tool)\n"
+        "You can delegate specialized tasks to sub-agents via the Agent tool.\n"
+        "Available sub-agents:\n"
+        + "\n".join(agent_lines)
+        + "\n\n"
+        "When to use sub-agents:\n"
+        "  - Simple questions, greetings, general knowledge → answer directly, NO tools\n"
+        "  - Single file read/edit → use Read/Edit directly (faster than sub-agent)\n"
+        "  - Broad project exploration, multi-file search → Agent(subagent_type=\"scout\")\n"
+        "\n"
+        "NEVER invoke Agent(subagent_type=\"scout\") for trivial tasks — it is slow.\n"
+    )
+    return base + subagent_guide
 
 
 # ─────────────────────────────────────────────
