@@ -414,6 +414,59 @@ VRAM 최대 max-model-len:
 
 ---
 
+## Phase 3 LoRA 학습 성공 (2026-04-17, 1차 통과)
+
+### 배경
+Phase 2 LoRA에서 두 가지 회귀 발견:
+1. tool_call 직렬화가 원시 JSON이라 vLLM qwen3_xml 파서가 인식 못 함 →
+   assistant 본문에 `{"name": "Agent", "arguments": ...}` 그대로 노출
+2. direct_answer 샘플이 짧은 인사·단답 중심이라 장문 설명 능력 퇴보
+
+### 개선
+**bootstrap_generator 재구성** (비율: 도구 45% / 추론 25% / 서브에이전트 15% / 지식 15%):
+- `_KNOWLEDGE_TEMPLATES` 신규 16건 — OOP/REST/GIL/ACID/HTTP2/CAP/TCP-UDP/
+  JWT/K8s/Git/Docker/SQL/ML/테스트/async/GraphQL 각 3~6단락 구조화 답변
+- `_SUBAGENT_TEMPLATES` use_scout 프롬프트 10→30 확대 (프로젝트 구조/다중
+  파일 검색/리팩토링/영문 프롬프트 다양화)
+- `_generate_knowledge_sample()` 추가
+
+**train_qwen_lora_phase3.py (신규)**:
+- `tokenizer.apply_chat_template(messages, tools=[AGENT_SCHEMA])` 사용
+  → tool_calls가 Qwen3.5 공식 XML 포맷으로 자동 직렬화
+    `<tool_call><function=NAME><parameter=KEY>VALUE</parameter></function></tool_call>`
+- vLLM `qwen3_xml` 파서와 완전 호환
+- 학습 결과: **train_loss=0.06946** (Phase 1 0.073, Phase 2 0.168 대비 최저)
+- 학습 시간: 71분, 1000 샘플 × 3 epoch
+
+**자동 검증 스크립트 (`scripts/_verify_phase.py`)**:
+5개 시나리오 회귀 검사 — 인사/장문 지식/단일 도구/대규모 탐색/tool_call leak
+
+### 1차 검증 결과 (nexus-phase3 적용 후)
+
+| # | 시나리오 | 결과 | 상세 |
+|---|---|---|---|
+| 1 | 짧은 인사 | **PASS** | 3.4초, 10 토큰 |
+| 2 | 장문 지식 (GIL) | **PASS** | 21.3초, **252 토큰** (Phase 2 대비 6배) |
+| 3 | 단일 파일 탐색 | **PASS** | 9.0초, 81 토큰, 도구+답변 |
+| 4 | 대규모 탐색 → Agent(scout) | **PASS** | 57.8초, scout_calls 0→1 증가 |
+| 5 | tool_call JSON/XML 누출 없음 | **PASS** | 4개 시나리오 모두 clean |
+
+**통과 5/5 — 1차 학습만으로 전 시나리오 통과.** Phase 1 롤백 없이 Phase 3 유지.
+
+### 설정 반영
+- `config/nexus_config.yaml`: `primary_model: "nexus-phase3"`
+- vLLM: `--lora-modules nexus-phase1=... nexus-phase2=... nexus-phase3=...`
+  (세 어댑터 모두 핫로드, 런타임 전환 가능)
+
+### 교훈
+- Qwen3.5 chat template의 tool_call 공식 포맷은 중첩 XML(nested function/parameter)
+- 학습 데이터 직렬화는 반드시 `tokenizer.apply_chat_template`으로 → 수동 조립은
+  포맷 drift 유발
+- bootstrap_generator의 카테고리 분포 편중이 응답 스타일 퇴보를 직접 야기함
+  (Phase 2의 "짧은 답변 편중" = 장문 능력 퇴보)
+
+---
+
 ## Scout 모델 Qwen3.5-4B 전환 + Phase 2 LoRA 학습 완료 (2026-04-17)
 
 ### 동기

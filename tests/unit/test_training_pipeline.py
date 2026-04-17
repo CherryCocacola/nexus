@@ -43,15 +43,16 @@ class TestBootstrapGenerator:
         """
         생성된 샘플 수가 요청한 수와 일치하는지 확인한다.
 
-        v7.0 Phase 9: 도구 60% / 추론 30% / 서브에이전트 판단 10% 비율.
+        Phase 3 비율: 도구 45% / 추론 25% / 서브에이전트 15% / 지식 15%.
         """
         output_dir = str(tmp_path / "bootstrap")
         stats = await generator.generate(count=100, output_path=output_dir)
 
         assert stats["total"] == 100
-        assert stats["tool_samples"] == 60  # 60%
-        assert stats["reasoning_samples"] == 30  # 30%
-        assert stats["subagent_samples"] == 10  # 10%
+        assert stats["tool_samples"] == 45  # 45%
+        assert stats["reasoning_samples"] == 25  # 25%
+        assert stats["subagent_samples"] == 15  # 15%
+        assert stats["knowledge_samples"] == 15  # 15%
 
     async def test_generate_valid_jsonl(self, generator, tmp_path):
         """생성된 JSONL이 유효한 JSON인지 확인한다."""

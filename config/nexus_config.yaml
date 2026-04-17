@@ -34,16 +34,16 @@ postgresql:
 # Dense 아키텍처 → vLLM LoRA 핫로딩 지원 (학교별/기업별 동적 전환)
 # primary_model: vLLM의 served-model-name.
 #
-# 2026-04-17 롤백: nexus-phase2 → nexus-phase1
-#   이유: Phase 2 학습 스크립트의 tool_call 직렬화가 Qwen3.5 chat template의
-#   공식 포맷(중첩 XML <tool_call><function=...><parameter=...>)이 아닌 원시
-#   JSON이라 vLLM qwen3_xml 파서가 인식 못 함 → assistant 응답 본문에 JSON
-#   문자열이 그대로 노출됨. 추가로 짧은 답변 샘플이 과도하게 학습돼 긴
-#   설명 능력도 퇴보.
-#   복구 방안(Phase 3): tokenizer.apply_chat_template으로 재직렬화 + 장문
-#   답변 데이터 증강 후 재학습.
+# 2026-04-17 Phase 3 적용: nexus-phase1 → nexus-phase3
+#   Phase 3의 개선점:
+#   1. tokenizer.apply_chat_template으로 tool_calls를 Qwen3.5 공식 XML
+#      포맷(<tool_call><function=...><parameter=...>)으로 직렬화 —
+#      vLLM qwen3_xml 파서와 호환
+#   2. 장문 지식(knowledge_explanation) 카테고리 15% 추가로 긴 설명 능력 회복
+#   3. subagent_use_scout 프롬프트 10→30 확대로 탐색 시나리오 다양화
+#   학습 결과: train_loss=0.06946 (Phase 1 0.073, Phase 2 0.168 대비 최저)
 model:
-  primary_model: "nexus-phase1"
+  primary_model: "nexus-phase3"
   auxiliary_model: "exaone-7.8b"
   embedding_model: "multilingual-e5-large"
   max_context_tokens: 8192

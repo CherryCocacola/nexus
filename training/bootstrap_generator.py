@@ -710,6 +710,291 @@ _REASONING_TEMPLATES: list[dict[str, Any]] = [
 
 
 # ─────────────────────────────────────────────
+# 장문 지식 답변 템플릿 — Phase 3 추가 (2026-04-17)
+# Phase 2 학습에서 "짧은 답변 샘플" 편중으로 장문 설명 능력이 퇴보하는 문제를
+# 완화하기 위해 도입. 사용자가 "알려줘 / 자세히 / 설명해줘"를 요청했을 때
+# 3~6개 단락의 구조화된 한국어 답변을 생성하도록 학습시킨다.
+# ─────────────────────────────────────────────
+_KNOWLEDGE_TEMPLATES: list[dict[str, Any]] = [
+    {
+        "question": "객체지향 프로그래밍의 4가지 핵심 원칙을 자세히 설명해줘.",
+        "answer": (
+            "객체지향 프로그래밍(OOP)의 네 가지 핵심 원칙은 다음과 같습니다.\n\n"
+            "1. 캡슐화(Encapsulation): 데이터와 그것을 다루는 메서드를 하나의 객체로 묶고, "
+            "외부에서 직접 접근하지 못하도록 제한합니다. public/private 접근 제어로 구현합니다.\n\n"
+            "2. 상속(Inheritance): 기존 클래스의 속성과 동작을 물려받아 새로운 클래스를 정의합니다. "
+            "코드 재사용과 계층 구조 표현에 사용됩니다.\n\n"
+            "3. 다형성(Polymorphism): 같은 인터페이스가 객체 타입에 따라 다르게 동작합니다. "
+            "메서드 오버라이딩과 오버로딩으로 구현됩니다.\n\n"
+            "4. 추상화(Abstraction): 복잡한 구현 세부사항을 감추고 본질적 특성만 노출합니다. "
+            "추상 클래스·인터페이스로 모델링합니다."
+        ),
+    },
+    {
+        "question": "RESTful API의 주요 원칙을 자세히 설명해줘.",
+        "answer": (
+            "REST(REpresentational State Transfer)는 Roy Fielding의 박사 논문에서 정의된 "
+            "분산 하이퍼미디어 시스템을 위한 아키텍처 스타일입니다. 주요 원칙은 다음과 같습니다.\n\n"
+            "1. 클라이언트-서버 구조: 사용자 인터페이스와 데이터 저장소를 분리합니다.\n"
+            "2. 무상태성(Statelessness): 각 요청은 완결적이며 서버가 클라이언트 상태를 저장하지 않습니다.\n"
+            "3. 캐시 가능성: 응답은 캐시 가능 여부를 명시합니다.\n"
+            "4. 계층화 구조: 중간 서버(로드밸런서·프록시·게이트웨이)를 투명하게 배치합니다.\n"
+            "5. 통일된 인터페이스: HTTP 메서드(GET/POST/PUT/DELETE)와 URI로 리소스를 식별·조작합니다.\n"
+            "6. 코드 온 디맨드(선택): 서버가 클라이언트에 실행 가능한 코드를 전송할 수 있습니다.\n\n"
+            "실무에서는 1~5번 원칙을 주로 따르며, URI 설계·HTTP 상태 코드·하이퍼미디어 링크를 "
+            "올바르게 사용하는 것이 중요합니다."
+        ),
+    },
+    {
+        "question": "Python의 GIL(Global Interpreter Lock)에 대해 설명해줘.",
+        "answer": (
+            "GIL(Global Interpreter Lock)은 CPython 인터프리터에 존재하는 뮤텍스(mutex)로, "
+            "하나의 프로세스 내에서 여러 스레드가 동시에 파이썬 바이트코드를 실행하지 못하도록 "
+            "직렬화하는 잠금 장치입니다.\n\n"
+            "**존재 이유**: CPython의 메모리 관리(특히 참조 카운팅)가 스레드 안전하지 않아, "
+            "내부 자료 구조를 보호하기 위해 도입되었습니다.\n\n"
+            "**영향**:\n"
+            "- CPU 바운드 작업에서 멀티스레드로 성능 향상이 제한됨 (한 번에 한 스레드만 실행)\n"
+            "- I/O 바운드 작업에서는 I/O 대기 중 GIL이 해제되므로 영향이 적음\n"
+            "- C 확장(numpy 등)은 GIL을 해제하고 네이티브 코드 실행이 가능\n\n"
+            "**우회 방법**:\n"
+            "- multiprocessing 모듈로 프로세스 단위 병렬화\n"
+            "- asyncio로 단일 스레드 내 비동기 처리\n"
+            "- 계산 집약 작업을 C/Cython/Rust 확장으로 오프로드\n\n"
+            "PEP 703(선택적 GIL 제거)이 Python 3.13부터 실험적으로 지원됩니다."
+        ),
+    },
+    {
+        "question": "트랜잭션의 ACID 속성을 자세히 알려줘.",
+        "answer": (
+            "ACID는 데이터베이스 트랜잭션이 신뢰성 있게 처리되기 위해 갖춰야 할 네 가지 속성을 "
+            "나타내는 약어입니다.\n\n"
+            "1. 원자성(Atomicity): 트랜잭션 내 모든 연산이 전부 성공하거나 전부 실패합니다. "
+            "중간 실패 시 전체를 롤백하여 부분 적용이 남지 않게 합니다.\n\n"
+            "2. 일관성(Consistency): 트랜잭션 전후로 데이터베이스가 정의된 규칙(제약조건·트리거·"
+            "참조 무결성)을 유지합니다.\n\n"
+            "3. 고립성(Isolation): 동시 실행되는 트랜잭션들이 서로의 중간 상태를 보지 못합니다. "
+            "격리 수준(READ UNCOMMITTED/READ COMMITTED/REPEATABLE READ/SERIALIZABLE)으로 "
+            "세밀하게 조정합니다.\n\n"
+            "4. 지속성(Durability): 커밋된 트랜잭션의 결과는 시스템 장애 이후에도 유지됩니다. "
+            "로그 선행 기록(WAL)과 복구 메커니즘으로 보장됩니다."
+        ),
+    },
+    {
+        "question": "HTTP/1.1과 HTTP/2의 주요 차이점을 설명해줘.",
+        "answer": (
+            "HTTP/1.1(1997)과 HTTP/2(2015)의 주요 차이는 다음과 같습니다.\n\n"
+            "1. 프레이밍: HTTP/1.1은 텍스트 기반, HTTP/2는 바이너리 프레임 기반입니다.\n"
+            "2. 멀티플렉싱: HTTP/2는 하나의 TCP 연결에서 여러 요청·응답을 병렬 처리하여 "
+            "Head-of-Line Blocking을 완화합니다.\n"
+            "3. 헤더 압축: HTTP/2는 HPACK 알고리즘으로 반복되는 헤더를 압축합니다.\n"
+            "4. 서버 푸시: HTTP/2는 클라이언트가 요청하기 전에 서버가 리소스를 선제적으로 전송할 수 있습니다.\n"
+            "5. 우선순위: HTTP/2는 스트림에 가중치를 부여해 전송 순서를 최적화합니다.\n\n"
+            "후속 표준 HTTP/3는 전송 계층을 TCP에서 QUIC(UDP 기반)으로 바꿔 연결 지연과 "
+            "Head-of-Line Blocking 문제를 더 근본적으로 해결합니다."
+        ),
+    },
+    {
+        "question": "CAP 정리(CAP Theorem)가 무엇인지 알려줘.",
+        "answer": (
+            "CAP 정리는 2000년 Eric Brewer가 제시한 분산 시스템의 근본적 제약입니다. "
+            "분산 데이터 저장소는 다음 세 속성 중 **동시에 최대 두 가지만** 보장할 수 있습니다.\n\n"
+            "- 일관성(Consistency): 모든 노드가 동시에 같은 데이터를 본다\n"
+            "- 가용성(Availability): 모든 요청이 성공/실패 여부의 응답을 받는다\n"
+            "- 분할 내성(Partition tolerance): 네트워크 장애가 있어도 시스템이 동작한다\n\n"
+            "실무적 의의: 네트워크 분할은 현실에서 피할 수 없으므로 분산 시스템은 사실상 "
+            "**CP(일관성·분할 내성)** 또는 **AP(가용성·분할 내성)** 중에서 선택합니다. "
+            "CP 예시는 전통적인 RDBMS 기반 분산 트랜잭션, AP 예시는 DynamoDB·Cassandra입니다.\n\n"
+            "이후 PACELC 정리는 '정상 상황에서의 지연 vs 일관성' 트레이드오프까지 확장합니다."
+        ),
+    },
+    {
+        "question": "TCP와 UDP의 차이점과 각각의 사용 사례를 알려줘.",
+        "answer": (
+            "TCP와 UDP는 전송 계층의 대표 프로토콜로, 다음과 같이 대비됩니다.\n\n"
+            "**TCP (Transmission Control Protocol)**:\n"
+            "- 연결 지향: 3-way handshake로 연결 수립\n"
+            "- 신뢰성: 순서 보장, 재전송, 흐름 제어, 혼잡 제어\n"
+            "- 오버헤드: 헤더 20바이트+\n"
+            "- 사용: HTTP, HTTPS, SMTP, FTP, SSH 등 대부분의 웹 트래픽\n\n"
+            "**UDP (User Datagram Protocol)**:\n"
+            "- 비연결: handshake 없이 바로 전송\n"
+            "- 최선형 전달: 순서·도착 보장 없음, 재전송 없음\n"
+            "- 오버헤드: 헤더 8바이트로 가벼움\n"
+            "- 사용: DNS, DHCP, VoIP, 게임, 실시간 스트리밍\n\n"
+            "HTTP/3는 UDP 위의 QUIC 프로토콜을 사용하여 UDP의 가벼움과 TCP의 신뢰성을 결합합니다."
+        ),
+    },
+    {
+        "question": "JWT(JSON Web Token)의 구조와 사용 방식을 설명해줘.",
+        "answer": (
+            "JWT는 두 당사자 간에 클레임(claims)을 안전하게 전달하기 위한 "
+            "Base64URL로 인코딩된 JSON 기반 토큰 표준입니다. 세 부분이 점(.)으로 연결된 형태입니다.\n\n"
+            "1. Header: 토큰 타입과 서명 알고리즘(예: HS256, RS256)\n"
+            "2. Payload: 클레임 집합(iss 발급자, sub 주체, exp 만료, iat 발급 시각 등)\n"
+            "3. Signature: Header.Payload를 비밀키로 서명\n\n"
+            "**사용 방식**:\n"
+            "- 로그인 성공 시 서버가 JWT를 발급\n"
+            "- 클라이언트는 이후 요청의 Authorization 헤더에 Bearer <JWT>를 포함\n"
+            "- 서버는 서명을 검증하여 인증\n\n"
+            "**보안 주의사항**:\n"
+            "- Payload는 암호화가 아닌 인코딩이므로 민감 정보 저장 금지\n"
+            "- 짧은 만료(exp) + Refresh Token 패턴 권장\n"
+            "- 탈취 시 즉시 무효화가 어려우므로 블랙리스트·짧은 TTL로 보완"
+        ),
+    },
+    {
+        "question": "쿠버네티스(Kubernetes)의 기본 개념을 알려줘.",
+        "answer": (
+            "쿠버네티스는 구글이 내부 시스템 Borg에서 영감을 얻어 개발한 오픈소스 컨테이너 "
+            "오케스트레이션 플랫폼입니다. 컨테이너화된 애플리케이션의 배포·확장·관리를 자동화합니다.\n\n"
+            "**핵심 추상화**:\n"
+            "- Pod: 하나 이상의 컨테이너를 묶은 최소 배포 단위\n"
+            "- Service: 여러 Pod을 묶어 안정적인 네트워크 엔드포인트 제공\n"
+            "- Deployment: Pod의 선언적 배포와 롤링 업데이트 관리\n"
+            "- Namespace: 리소스 논리 격리\n"
+            "- ConfigMap/Secret: 설정과 비밀 관리\n"
+            "- Ingress: HTTP(S) 외부 노출과 라우팅\n\n"
+            "**컨트롤 플레인**: API 서버, etcd(상태 저장), 스케줄러, 컨트롤러 매니저로 구성되어 "
+            "선언된 상태(desired state)와 실제 상태(actual state)를 지속적으로 조정합니다.\n\n"
+            "대규모 마이크로서비스 운영의 사실상 표준이며, 헬름(Helm)·아르고CD(ArgoCD)·"
+            "이스티오(Istio) 등 풍부한 생태계를 갖고 있습니다."
+        ),
+    },
+    {
+        "question": "Git에서 merge와 rebase의 차이점을 자세히 알려줘.",
+        "answer": (
+            "git merge와 git rebase는 한 브랜치의 변경을 다른 브랜치로 합치는 두 가지 방식입니다. "
+            "결과는 비슷하지만 히스토리 형태가 크게 다릅니다.\n\n"
+            "**merge**: 두 브랜치의 끝을 합치는 **새로운 merge commit**을 생성합니다. "
+            "원래 브랜치의 기록이 그대로 보존되어 분기가 시각적으로 남습니다.\n\n"
+            "**rebase**: 현재 브랜치의 커밋들을 떼어내 대상 브랜치 끝으로 **재적용**합니다. "
+            "히스토리가 선형(linear)으로 정리되지만 **원 커밋은 새 해시로 재생성**됩니다.\n\n"
+            "**실무 권장**:\n"
+            "- 공유 브랜치(main, develop)에 병합할 때는 merge로 컨텍스트 보존\n"
+            "- 로컬 feature 브랜치를 최신 main으로 갱신할 때는 rebase로 히스토리 정돈\n"
+            "- **이미 푸시된 공용 커밋은 rebase 금지** — 다른 개발자의 작업을 깨뜨림\n"
+            "- Squash merge는 feature 브랜치의 여러 작은 커밋을 하나로 합쳐 main에 넣는 용도"
+        ),
+    },
+    {
+        "question": "도커(Docker)의 개념과 장점을 알려줘.",
+        "answer": (
+            "도커는 애플리케이션과 그 실행 환경을 **컨테이너**라는 표준 단위로 묶어 "
+            "일관되게 배포·실행할 수 있게 하는 오픈소스 플랫폼입니다.\n\n"
+            "**핵심 개념**:\n"
+            "- 이미지(Image): 실행에 필요한 코드·라이브러리·설정을 담은 불변 스냅샷\n"
+            "- 컨테이너(Container): 이미지의 실행 인스턴스, 호스트와 격리된 네임스페이스\n"
+            "- Dockerfile: 이미지 빌드 절차를 기술한 선언적 스크립트\n"
+            "- 레지스트리(Registry): 이미지 저장·배포용 원격 저장소(Docker Hub 등)\n\n"
+            "**장점**:\n"
+            "- 환경 일관성: \"내 PC에서는 되는데...\" 문제 해결\n"
+            "- 가볍고 빠른 기동: VM 대비 수백 ms 단위\n"
+            "- 자원 효율: 커널 공유로 메모리/디스크 절약\n"
+            "- CI/CD 친화: 이미지 단위로 동일 artifact 배포\n\n"
+            "단점은 보안 격리가 VM보다 약하고 스테이트풀 워크로드 설계가 복잡하다는 점입니다. "
+            "운영 규모가 커지면 쿠버네티스 등 오케스트레이터와 결합합니다."
+        ),
+    },
+    {
+        "question": "SQL에서 JOIN의 종류를 예시와 함께 알려줘.",
+        "answer": (
+            "SQL JOIN은 여러 테이블의 행을 관계(보통 키)를 기준으로 결합하는 연산입니다. "
+            "주요 종류는 다음과 같습니다.\n\n"
+            "1. **INNER JOIN**: 양쪽 테이블 모두에 일치하는 행만 반환.\n"
+            "   예: `SELECT u.name, o.total FROM users u INNER JOIN orders o ON u.id = o.user_id;`\n\n"
+            "2. **LEFT (OUTER) JOIN**: 왼쪽 테이블의 모든 행 + 오른쪽 일치 행. 없으면 NULL.\n"
+            "   주문 없는 사용자도 포함하려면 LEFT JOIN 사용.\n\n"
+            "3. **RIGHT (OUTER) JOIN**: 오른쪽 테이블의 모든 행 + 왼쪽 일치 행. LEFT의 거울.\n\n"
+            "4. **FULL (OUTER) JOIN**: 양쪽 모든 행. 일치 없으면 해당 쪽이 NULL.\n"
+            "   MySQL은 기본 미지원 → `LEFT JOIN UNION RIGHT JOIN`으로 흉내.\n\n"
+            "5. **CROSS JOIN**: 두 테이블의 데카르트 곱(모든 조합). 통상 피함.\n\n"
+            "6. **SELF JOIN**: 같은 테이블을 별칭 두 개로 조인 (예: 직원·관리자 계층).\n\n"
+            "성능에는 조인 키의 인덱스와 옵티마이저의 조인 순서 결정이 핵심입니다."
+        ),
+    },
+    {
+        "question": "머신러닝의 지도학습, 비지도학습, 강화학습 차이를 설명해줘.",
+        "answer": (
+            "머신러닝은 학습 방식에 따라 크게 세 가지로 분류됩니다.\n\n"
+            "1. **지도학습(Supervised Learning)**: 입력과 정답 레이블 쌍으로 학습.\n"
+            "   - 회귀(연속값 예측): 집값, 수요 예측\n"
+            "   - 분류(이산 레이블): 스팸 탐지, 이미지 분류\n"
+            "   - 대표 알고리즘: 선형 회귀, 결정 트리, 랜덤 포레스트, 신경망\n\n"
+            "2. **비지도학습(Unsupervised Learning)**: 레이블 없이 데이터의 구조를 발견.\n"
+            "   - 군집화(Clustering): 고객 세분화, 문서 그룹핑\n"
+            "   - 차원 축소: PCA, t-SNE, UMAP\n"
+            "   - 이상치 탐지, 밀도 추정\n\n"
+            "3. **강화학습(Reinforcement Learning)**: 환경과 상호작용하며 누적 보상을 최대화.\n"
+            "   - 에이전트·상태·행동·보상의 프레임워크\n"
+            "   - 게임 AI(알파고), 로봇 제어, 추천 시스템\n"
+            "   - Q-러닝, 정책 경사(Policy Gradient), 액터-크리틱\n\n"
+            "최근에는 자기 지도 학습(Self-Supervised)이 대규모 언어 모델 사전 학습의 기반이 됩니다."
+        ),
+    },
+    {
+        "question": "유닛 테스트와 통합 테스트의 차이를 알려줘.",
+        "answer": (
+            "두 테스트는 다른 계층의 문제를 잡기 위한 도구입니다.\n\n"
+            "**유닛 테스트(Unit Test)**:\n"
+            "- 범위: 하나의 함수/클래스 등 가장 작은 코드 단위\n"
+            "- 의존성: 외부 시스템(DB, API, 파일 등)을 mock 또는 stub으로 대체\n"
+            "- 속도: 매우 빠름 (수 ms)\n"
+            "- 목적: 알고리즘 정확성, 엣지 케이스, 내부 로직\n\n"
+            "**통합 테스트(Integration Test)**:\n"
+            "- 범위: 여러 모듈·외부 시스템의 상호작용\n"
+            "- 의존성: 실제 DB/API/메시지 브로커 사용(또는 테스트 컨테이너)\n"
+            "- 속도: 수백 ms ~ 수 초\n"
+            "- 목적: 모듈 간 계약 검증, 데이터 흐름, 설정 정합성\n\n"
+            "**Test Pyramid**: 유닛 테스트를 많이, 통합을 적당히, E2E는 소수. 하단이 빠르고 "
+            "저렴하며 상단은 느리고 비싸지만 사용자 관점에 가깝습니다.\n\n"
+            "모킹 과용은 테스트가 실제와 괴리될 위험이 있으니 통합 테스트로 주기적 검증이 필요합니다."
+        ),
+    },
+    {
+        "question": "async와 await의 의미를 자세히 설명해줘.",
+        "answer": (
+            "async와 await는 비동기 프로그래밍을 **동기처럼 읽히도록** 문법적으로 지원하는 키워드입니다.\n\n"
+            "**async**: 함수를 **코루틴**으로 선언합니다. 호출해도 즉시 실행되지 않고 코루틴 객체를 "
+            "반환하며, 이벤트 루프에 스케줄링되어야 실행됩니다.\n\n"
+            "**await**: 다른 코루틴이나 Future의 완료를 **비동기로** 기다립니다. 대기 동안 이벤트 "
+            "루프는 다른 코루틴을 실행하므로 전체가 블로킹되지 않습니다.\n\n"
+            "**실행 모델**:\n"
+            "- 싱글 스레드 기반 협력적 멀티태스킹\n"
+            "- await 지점에서 제어권을 양도 (yield)\n"
+            "- I/O 대기가 많은 워크로드에서 처리량 극대화\n\n"
+            "**사용 지침**:\n"
+            "- CPU 바운드 작업은 asyncio로 해결되지 않음 → 프로세스 풀 사용\n"
+            "- 블로킹 코드(open, requests 등)를 async 함수에서 호출하면 이벤트 루프를 멈춤 → "
+            "`asyncio.to_thread` 또는 aiohttp 같은 비동기 라이브러리 사용\n"
+            "- Python은 asyncio, JavaScript는 Promise 기반으로 대체로 동일한 개념"
+        ),
+    },
+    {
+        "question": "GraphQL과 REST의 차이를 설명해줘.",
+        "answer": (
+            "GraphQL과 REST는 API 설계의 두 가지 접근 방식입니다.\n\n"
+            "**REST**:\n"
+            "- 리소스 중심: /users/42 같은 URI로 리소스 식별\n"
+            "- 여러 엔드포인트: 각 리소스/컬렉션마다 별도\n"
+            "- HTTP 메서드로 작업 표현 (GET/POST/PUT/DELETE)\n"
+            "- 응답 형태가 서버에 고정 (over-fetching / under-fetching 발생 가능)\n\n"
+            "**GraphQL**:\n"
+            "- 단일 엔드포인트(/graphql)로 모든 쿼리 처리\n"
+            "- 클라이언트가 필요한 필드를 명시 → over-fetching 해결\n"
+            "- 타입 스키마가 문서 역할 + 자동 도구(GraphiQL, Apollo Studio)\n"
+            "- 여러 리소스를 한 번의 요청으로 가져옴 (N+1 문제는 DataLoader로 완화)\n\n"
+            "**선택 기준**:\n"
+            "- 프론트엔드 다양성이 크고 over-fetch 부담이 크다면 GraphQL\n"
+            "- 캐시가 중요하고 HTTP 시맨틱을 살려야 한다면 REST\n"
+            "- 파일 업로드, 스트리밍은 REST가 편함\n\n"
+            "최근에는 tRPC·gRPC 등 타입 안전한 대안도 활발합니다."
+        ),
+    },
+]
+
+
+# ─────────────────────────────────────────────
 # 서브에이전트 판단 템플릿 — v7.0 Phase 9 (B 방식)
 # Worker에게 "언제 Agent(scout)를 호출하고 언제 직접 응답할지" 학습시킨다.
 #
@@ -726,16 +1011,41 @@ _SUBAGENT_TEMPLATES: list[dict[str, Any]] = [
     {
         "trigger": "use_scout",
         "user_prompts": [
+            # 프로젝트 구조 파악 류
             "이 프로젝트의 전체 구조를 요약해줘.",
-            "core 디렉토리에 어떤 모듈들이 있는지 알려줘.",
-            "이 저장소의 주요 기능을 파악해서 정리해줘.",
+            "core 디렉토리에 어떤 모듈들이 있는지 탐색해서 알려줘.",
+            "이 저장소의 주요 기능을 전수 조사해서 정리해줘.",
+            "이 프로젝트의 아키텍처를 폭넓게 분석해줘.",
+            "Give me a high-level overview of the src directory.",
+            "Summarize the overall architecture of this project.",
+            "이 레포가 어떻게 구성돼 있는지 전반적으로 설명해줘.",
+            "프로젝트 디렉토리 구조와 각 모듈의 역할을 알려줘.",
+            # 다중 파일 검색/추적
             "프로젝트에서 인증 관련 코드를 전부 찾아줘.",
             "이 코드베이스에서 deprecated된 API 사용처를 다 찾아줘.",
-            "Give me a high-level overview of the src directory.",
             "Find all usages of OldClass across the codebase.",
-            "Summarize the architecture of this project.",
-            "core/orchestrator 아래 파일들의 역할을 각각 설명해줘.",
+            "여러 디렉토리에 흩어져 있는 X 관련 구현을 전부 수집해줘.",
+            "이 저장소에서 A와 B가 서로 어떻게 상호작용하는지 코드로 추적해줘.",
+            "프로젝트 전반에서 동일한 패턴이 반복되는 곳을 찾아줘.",
+            "5계층 권한 시스템이 어느 파일들에 구현돼 있는지 전수 조사해줘.",
+            # 이해/탐색
             "이 프로젝트에서 테스트 전략이 어떻게 구성돼 있는지 탐색해줘.",
+            "주요 비즈니스 로직이 어디에 있는지 찾아 설명해줘.",
+            "이 저장소의 진입점(entry point)부터 주요 흐름을 따라가며 해설해줘.",
+            "프로젝트에서 DB 연결과 쿼리 관련 코드를 전반적으로 훑어봐줘.",
+            "여러 파일에 걸쳐 있는 로깅 설정을 전체적으로 조사해줘.",
+            # 리팩토링·버그 탐색
+            "코드베이스 전체에서 TODO 주석이 붙은 곳을 다 찾아줘.",
+            "프로젝트에서 사용되지 않는(dead) 함수가 있을지 조사해줘.",
+            "모든 설정 파일이 어디에 있는지 전부 찾아줘.",
+            "이 프로젝트 API 엔드포인트들이 모두 어디 정의돼 있는지 탐색해줘.",
+            "코드베이스에서 동일한 SQL 쿼리가 중복되는 위치를 찾아줘.",
+            # 영문 추가
+            "Explore the project and summarize how authentication flows end-to-end.",
+            "Find all files that depend on the deprecated `legacy_utils` module.",
+            "Audit the project for every place that writes to the filesystem.",
+            "Investigate the codebase and map out the tool registration points.",
+            "Survey the repository for all Pydantic models and group them by domain.",
         ],
         "scout_prompt": "Explore the project and summarize findings relevant to the user's request.",
     },
@@ -818,6 +1128,7 @@ class BootstrapGenerator:
         self._tool_templates = _TOOL_USE_TEMPLATES
         self._reasoning_templates = _REASONING_TEMPLATES
         self._subagent_templates = _SUBAGENT_TEMPLATES
+        self._knowledge_templates = _KNOWLEDGE_TEMPLATES
 
     async def generate(
         self,
@@ -841,30 +1152,36 @@ class BootstrapGenerator:
         out_dir.mkdir(parents=True, exist_ok=True)
         output_file = out_dir / "bootstrap_data.jsonl"
 
-        # v7.0: 도구 60% / 추론 30% / 서브에이전트 판단 10%
-        # subagent 10%에서 다시 use_scout 40% / direct_answer 40% / single_tool 20%
-        # → 부정 샘플이 전체의 60%로 Scout 남용을 억제한다.
-        tool_count = int(count * 0.60)
-        reasoning_count = int(count * 0.30)
-        subagent_count = count - tool_count - reasoning_count
+        # Phase 3 비율 (2026-04-17): 도구 45% / 추론 25% / 서브에이전트 15% / 지식 15%
+        # Phase 2에서 "짧은 답변 편중" 문제를 장문 지식 카테고리 신규 추가로 완화.
+        tool_count = int(count * 0.45)
+        reasoning_count = int(count * 0.25)
+        subagent_count = int(count * 0.15)
+        knowledge_count = count - tool_count - reasoning_count - subagent_count
 
         samples: list[dict[str, Any]] = []
 
-        # 도구 사용 샘플 생성
+        # 도구 사용 샘플
         for _ in range(tool_count):
             sample = self._generate_tool_sample()
             if sample:
                 samples.append(sample)
 
-        # 추론 샘플 생성
+        # 추론 샘플
         for _ in range(reasoning_count):
             sample = self._generate_reasoning_sample()
             if sample:
                 samples.append(sample)
 
-        # 서브에이전트 판단 샘플 생성 — v7.0 Phase 9
+        # 서브에이전트 판단 샘플 — v7.0 Phase 9
         for _ in range(subagent_count):
             sample = self._generate_subagent_sample()
+            if sample:
+                samples.append(sample)
+
+        # 장문 지식 답변 샘플 — Phase 3 신규
+        for _ in range(knowledge_count):
+            sample = self._generate_knowledge_sample()
             if sample:
                 samples.append(sample)
 
@@ -880,16 +1197,18 @@ class BootstrapGenerator:
             "tool_samples": tool_count,
             "reasoning_samples": reasoning_count,
             "subagent_samples": subagent_count,
+            "knowledge_samples": knowledge_count,
             "total": len(samples),
             "output_file": str(output_file),
         }
 
         logger.info(
-            "부트스트랩 데이터 생성 완료: %d개 (도구: %d, 추론: %d, 서브에이전트: %d) → %s",
+            "부트스트랩 데이터 생성 완료: %d개 (도구: %d, 추론: %d, 서브에이전트: %d, 지식: %d) → %s",
             stats["total"],
             stats["tool_samples"],
             stats["reasoning_samples"],
             stats["subagent_samples"],
+            stats["knowledge_samples"],
             output_file,
         )
 
@@ -1158,3 +1477,23 @@ class BootstrapGenerator:
 
         # 알 수 없는 trigger — 안전하게 None 반환 (generate에서 필터됨)
         return None  # type: ignore[return-value]
+
+    def _generate_knowledge_sample(self) -> dict[str, Any]:
+        """
+        Phase 3 신규: 장문 지식/설명 답변 샘플을 생성한다.
+
+        Phase 2 학습에서 direct_answer 샘플이 "인사/단답" 중심이라 Worker가
+        긴 설명 요청 시 응답이 짧아지는 퇴보가 관찰됐다. 이를 상쇄하기 위해
+        구조화된 3~6개 단락 답변 샘플을 별도 카테고리로 학습시킨다.
+        """
+        template = self._rng.choice(self._knowledge_templates)
+        return {
+            "messages": [
+                {"role": "user", "content": template["question"]},
+                {"role": "assistant", "content": template["answer"]},
+            ],
+            "metadata": {
+                "source": "bootstrap",
+                "category": "knowledge_explanation",
+            },
+        }

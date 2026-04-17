@@ -18,6 +18,7 @@ VENV = "/opt/nexus-gpu/.venv/bin/python3.12"
 MODEL = "/opt/nexus-gpu/models/qwen3.5-27b-awq"
 PHASE1 = "nexus-phase1=/opt/nexus-gpu/checkpoints/qwen35-phase1"
 PHASE2 = "nexus-phase2=/opt/nexus-gpu/checkpoints/qwen35-phase2"
+PHASE3 = "nexus-phase3=/opt/nexus-gpu/checkpoints/qwen35-phase3"
 
 
 def run(ssh, cmd, timeout=15):
@@ -55,7 +56,7 @@ def main() -> None:
         f"--enable-prefix-caching --enforce-eager "
         f"--enable-auto-tool-choice --tool-call-parser qwen3_xml "
         f"--enable-lora --max-lora-rank 16 "
-        f"--lora-modules {PHASE1} {PHASE2} "
+        f"--lora-modules {PHASE1} {PHASE2} {PHASE3} "
         f"</dev/null >{LOG_PATH} 2>&1 & "
         f"echo \"VLLM_PID=$!\"; disown"
     )
