@@ -323,7 +323,7 @@ class LongTermMemory:
 
         await self._pg.execute(
             """
-            INSERT INTO memories (id, memory_type, content, key, tags, importance,
+            INSERT INTO tb_memories (id, memory_type, content, key, tags, importance,
                                   access_count, created_at, last_accessed, embedding, metadata)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             """,
@@ -344,13 +344,13 @@ class LongTermMemory:
 
     async def _get_pg(self, memory_id: str) -> MemoryEntry | None:
         """PostgreSQL에서 메모리를 조회하고 access_count를 증가시킨다."""
-        row = await self._pg.fetchrow("SELECT * FROM memories WHERE id = $1", memory_id)
+        row = await self._pg.fetchrow("SELECT * FROM tb_memories WHERE id = $1", memory_id)
         if row is None:
             return None
 
         # 접근 횟수 갱신
         await self._pg.execute(
-            "UPDATE memories SET access_count = access_count + 1, last_accessed = $1 WHERE id = $2",
+            "UPDATE tb_memories SET access_count = access_count + 1, last_accessed = $1 WHERE id = $2",
             datetime.now(UTC),
             memory_id,
         )
@@ -363,7 +363,7 @@ class LongTermMemory:
         if memory_type is not None:
             rows = await self._pg.fetch(
                 """
-                SELECT * FROM memories
+                SELECT * FROM tb_memories
                 WHERE content ILIKE $1 AND memory_type = $2
                 ORDER BY importance * (1 + access_count) DESC
                 LIMIT $3
@@ -375,7 +375,7 @@ class LongTermMemory:
         else:
             rows = await self._pg.fetch(
                 """
-                SELECT * FROM memories
+                SELECT * FROM tb_memories
                 WHERE content ILIKE $1
                 ORDER BY importance * (1 + access_count) DESC
                 LIMIT $2
@@ -394,7 +394,7 @@ class LongTermMemory:
             rows = await self._pg.fetch(
                 """
                 SELECT *, embedding <=> $1::vector AS distance
-                FROM memories
+                FROM tb_memories
                 WHERE embedding IS NOT NULL AND memory_type = $2
                 ORDER BY distance ASC
                 LIMIT $3
@@ -407,7 +407,7 @@ class LongTermMemory:
             rows = await self._pg.fetch(
                 """
                 SELECT *, embedding <=> $1::vector AS distance
-                FROM memories
+                FROM tb_memories
                 WHERE embedding IS NOT NULL
                 ORDER BY distance ASC
                 LIMIT $2
@@ -448,7 +448,7 @@ class LongTermMemory:
 
         params.append(memory_id)
         # 안전: set_clauses는 allowed_fields 화이트리스트에서만 생성되므로 SQL injection 위험 없음
-        query = f"UPDATE memories SET {', '.join(set_clauses)} WHERE id = ${len(params)}"  # noqa: S608
+        query = f"UPDATE tb_memories SET {', '.join(set_clauses)} WHERE id = ${len(params)}"  # noqa: S608
 
         result = await self._pg.execute(query, *params)
         # asyncpg는 "UPDATE N" 형식의 문자열을 반환
@@ -456,14 +456,14 @@ class LongTermMemory:
 
     async def _delete_pg(self, memory_id: str) -> bool:
         """PostgreSQL에서 메모리를 삭제한다."""
-        result = await self._pg.execute("DELETE FROM memories WHERE id = $1", memory_id)
+        result = await self._pg.execute("DELETE FROM tb_memories WHERE id = $1", memory_id)
         return result is not None and "DELETE 0" not in str(result)
 
     async def _get_by_type_pg(self, memory_type: MemoryType, limit: int) -> list[MemoryEntry]:
         """PostgreSQL에서 특정 타입의 메모리를 조회한다."""
         rows = await self._pg.fetch(
             """
-            SELECT * FROM memories
+            SELECT * FROM tb_memories
             WHERE memory_type = $1
             ORDER BY created_at DESC
             LIMIT $2
@@ -476,7 +476,7 @@ class LongTermMemory:
     async def _get_all_pg(self, limit: int) -> list[MemoryEntry]:
         """PostgreSQL에서 전체 메모리를 조회한다."""
         rows = await self._pg.fetch(
-            "SELECT * FROM memories ORDER BY created_at DESC LIMIT $1",
+            "SELECT * FROM tb_memories ORDER BY created_at DESC LIMIT $1",
             limit,
         )
         return [self._row_to_entry(row) for row in rows]
