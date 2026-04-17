@@ -1,14 +1,14 @@
 # Project Nexus
 
 에어갭(폐쇄망) 로컬 LLM 오케스트레이션 플랫폼.
-Claude Code의 아키텍처를 Python으로 재구현하여, Gemma 4 31B + ExaOne 7.8B로
+Claude Code의 아키텍처를 Python으로 재구현하여, Qwen 3.5 27B + ExaOne 7.8B로
 완전 자율 운영이 가능한 AI 시스템을 구축한다.
 
 ## 기술 스택
 
 - **언어**: Python 3.11+ (asyncio)
 - **추론 서버**: vLLM (OpenAI 호환 API)
-- **모델**: Gemma 4 31B (primary), ExaOne 7.8B (Korean auxiliary), e5-large (embedding)
+- **모델**: Qwen 3.5 27B (primary), ExaOne 7.8B (Korean auxiliary), e5-large (embedding)
 - **GPU**: RTX 5090 (32GB) — INT4 양자화, H100/H200 확장 경로
 - **저장소**: Redis (단기 메모리/세션), PostgreSQL + pgvector (장기 메모리)
 - **UI**: Rich/Textual (터미널)

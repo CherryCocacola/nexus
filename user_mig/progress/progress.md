@@ -340,19 +340,126 @@ VRAM 최대 max-model-len:
 
 ---
 
+## v7.0 적응형 멀티모델 오케스트레이션 (완료)
+
+### v7.0.0 — Phase 9.0a~c + 9.5 (2026-04-16)
+
+- **설계 개정안**: `user_mig/PROJECT_NEXUS_SPEC_v7.0_AMENDMENT.md` 작성
+  - 3가지 불변 전제: Claude Code 설계 유지, GPU 업그레이드 시 성능 향상, 동일 사용자 경험
+  - HardwareTier 적응형 (TIER_S/M/L), TIER_M/L에서는 v6.1과 100% 동일 동작
+- **Phase 9.0a: 도구 스키마 축소**
+  - 11개 CLI 도구 description 영문 축소 (1,588 → 1,472 토큰)
+- **Phase 9.0b: TurnState 상태 외부화**
+  - `core/orchestrator/turn_state.py` (신규): TurnState, TurnStateStore, extract_turn_state()
+  - query_loop에 on_turn_complete 콜백 추가
+  - QueryEngine에서 TurnState 컨텍스트 복원 (이전 messages 대신 요약)
+- **Phase 9.0c: HardwareTier 감지 + ModelDispatcher**
+  - `core/model/hardware_tier.py` (신규): HardwareTier enum, detect_hardware_tier()
+  - `core/orchestrator/model_dispatcher.py` (신규): ModelDispatcher (Scout→Worker 분배)
+  - bootstrap.py: 티어별 자동 도구 선택 + TurnState + Scout 초기화
+- **Phase 9.5: Scout 통합 (llama.cpp CPU 모델)**
+  - GPU 서버에 llama.cpp b8808 + Gemma 4 E4B (Q4_K_M, 4.7GB) 설치
+  - Scout 서버: :8003 (CPU, ~16 TPS), 방화벽 8003 포트 개방
+  - `core/model/scout_provider.py` (신규): ScoutModelProvider
+  - `core/config.py`: ScoutConfig + hardware_tier 필드 추가
+  - Scout → Worker 핸드오프: _run_scout() 구현 (탐색→계획→Worker 실행)
+  - Scout 실패 시 Worker 단독 fallback
+- **버그 수정**:
+  - 토큰 0/0 수정 (inference.py: finish_reason 후 usage 청크 대기)
+  - CONTEXT_OVERFLOW 즉시 종료 (query_loop.py: 무한 재시도 방지)
+  - GPU health 경고 수정 (bootstrap.py: vLLM 빈 body 대응)
+  - 웹 시스템 프롬프트 수정 (파일 분석/코드 리뷰 중심)
+- **Chrome 스타일 웹 UI**: `web/static/chrome.html` (시연용)
+- **453개 테스트 통과** (기존 380 + v7.0 신규 73)
+
+---
+
+## v7.0 추가 구현 (2026-04-16 후반)
+
+### Ch 7 WithRetry + StreamWatchdog
+- `core/orchestrator/retry.py` (신규): ErrorCategory(9종), classify_error(), with_retry() AsyncGenerator
+- `core/orchestrator/stream_watchdog.py` (신규): StreamWatchdog, stream_with_watchdog()
+- query_loop에 stream_with_watchdog 통합 + StreamWatchdogTimeout 처리
+
+### RAG 파이프라인
+- `core/rag/indexer.py` (신규): ProjectIndexer (파일 탐색→청크→임베딩→저장)
+- `core/rag/retriever.py` (신규): RAGRetriever (쿼리 임베딩→벡터 검색→컨텍스트 주입)
+- QueryEngine.submit_message()에서 RAG 컨텍스트 자동 주입
+- bootstrap에서 백그라운드 인덱싱 (fire-and-forget)
+
+### Redis/PostgreSQL 실 연결
+- PostgreSQL: 192.168.10.39:5440 (nexus/idino@12, DB=nexus)
+  - pgvector v0.8.0 소스 빌드 설치 (docutil-postgres 컨테이너)
+  - tb_memories 테이블 + 인덱스 5개 (idx_ 규칙)
+  - 네이밍 규칙: tb_, idx_, vtb_, vw_, fn_, proc_
+- Redis: 192.168.10.39:6340 (pw=docutil_redis_2024, db=6)
+- bootstrap.py: _create_redis_client(), _create_pg_pool() (실패 시 인메모리 폴백)
+- long_term.py: 테이블명 memories → tb_memories
+
+### 모델 전환: Gemma 4 31B → Qwen 3.5 27B
+- **이유**: Gemma 4는 vLLM LoRA/AWQ 미지원. Qwen은 전부 지원.
+- **AWQ 서빙**: Qwen 3.5 27B AWQ (21GB) — vLLM :8001, VRAM 29GB
+- **LoRA 학습**: 원본 Qwen 3.5 27B (52GB) + unsloth 4bit QLoRA
+  - 1,000 샘플 (24개 도구 + 6개 추론 카테고리), 61분, loss 0.073
+  - 체크포인트: /opt/nexus-gpu/checkpoints/qwen35-phase1/ (153MB)
+- **LoRA 핫로딩 성공**: vLLM `--enable-lora --lora-modules nexus-phase1=...`
+  - `"model": "qwen3.5-27b"` (기본) / `"model": "nexus-phase1"` (LoRA) 동적 전환
+- **tool-call-parser**: `qwen3_xml` (hermes 아님 — Qwen 3.5 전용)
+- **코드 수정**: 14개 파일 + 테스트 Gemma→Qwen 일괄 변경
+- **Bootstrap 템플릿**: 7개 도구 → 24개 도구 전체 확장
+- httpx 로그 레벨 WARNING으로 변경 (CLI 프롬프트 덮어쓰기 방지)
+- 시스템 프롬프트: 범용 AI 어시스턴트로 변경 + thinking 출력 억제
+
+### 테스트: 532개 통과
+
+---
+
 ## 다음 세션 시작 시 참고
 
-1. **Phase 0.5~8.0 + 연동 + TaskManager + GPU E2E + 웹 UI + DocumentProcess 완료**
-2. **웹 서버 실행**: `python -m uvicorn web.app:app --host 0.0.0.0 --port 8443 --ssl-keyfile config/ssl/key.pem --ssl-certfile config/ssl/cert.pem`
-3. **CLI 실행**: `python -m cli.commands chat`
-4. **추가 가능 작업**:
-   - LoRA Phase 1 Bootstrap 학습 실행
-   - RAG 파이프라인 (임베딩 기반 문서 검색 → 관련 부분만 분석)
-   - 24시간 연속 추론 Soak Test (본격 버전)
-   - 모델 스왑 스트레스 테스트 (primary ↔ auxiliary)
-   - H100/H200 업그레이드 시 도구 24개 전체 활성화 + 컨텍스트 확장
+1. **Phase 0.5~8.0 + v7.0 전체 완료 + 모델 Qwen 3.5 27B 전환**
+2. **기본 참조 문서**: `user_mig/PROJECT_NEXUS_SPEC_v7.0_AMENDMENT.md`
+3. **웹 서버 실행**: `python -m uvicorn web.app:app --host 0.0.0.0 --port 8443 --ssl-keyfile config/ssl/key.pem --ssl-certfile config/ssl/cert.pem`
+4. **CLI 실행**: `python -m cli.commands chat`
 5. **서버 정보**:
-   - GPU: 192.168.22.28 (LLM :8001, Embedding :8002), max-model-len=8192
-   - DB: 192.168.10.39 (PostgreSQL + Redis, 현재 미연결 — 인메모리 폴백)
+   - GPU Worker: 192.168.22.28:8001 (Qwen 3.5 27B AWQ + LoRA, qwen3_xml parser)
+   - GPU Scout: 192.168.22.28:8003 (Gemma 4 E4B, llama.cpp CPU)
+   - Embedding: 192.168.22.28:8002 (e5-large)
+   - DB: 192.168.10.39:5440 (PostgreSQL nexus), :6340 (Redis db=6)
+   - 웹: https://192.168.22.223:8443
+6. **GPU 서버 모델 목록**:
+   - /opt/nexus-gpu/models/qwen3.5-27b-awq/ (21GB, 서빙용)
+   - /opt/nexus-gpu/models/qwen3.5-27b/ (52GB, 학습용)
+   - /opt/nexus-gpu/models/gemma-4-e4b-it-gguf/ (4.7GB, Scout)
+   - /opt/nexus-gpu/models/gemma-4-31b-it-awq/ (20GB, 백업)
+   - /opt/nexus-gpu/models/gemma-4-31b-it/ (59GB, 학습용 백업)
+   - /opt/nexus-gpu/models/e5-large/ (9GB, 임베딩)
+   - /opt/nexus-gpu/checkpoints/qwen35-phase1/ (153MB, LoRA 어댑터)
+7. **vLLM 시작 명령 (GPU 서버)**:
+   ```
+   /opt/nexus-gpu/.venv/bin/python3.12 -m vllm.entrypoints.openai.api_server \
+     --model /opt/nexus-gpu/models/qwen3.5-27b-awq \
+     --max-model-len 8192 --gpu-memory-utilization 0.90 \
+     --port 8001 --host 0.0.0.0 --trust-remote-code \
+     --served-model-name qwen3.5-27b \
+     --enable-prefix-caching --enforce-eager \
+     --enable-auto-tool-choice --tool-call-parser qwen3_xml \
+     --enable-lora --max-lora-rank 16 \
+     --lora-modules nexus-phase1=/opt/nexus-gpu/checkpoints/qwen35-phase1
+   ```
+8. **추가 가능 작업**:
+   - Ch 16 세션 관리 (JSONL 트랜스크립트, 세션 재개)
+   - Qwen 3.5 thinking 출력 제어 (chat_template 수정)
+   - Scout 모델을 Qwen 계열 소형으로 교체
+   - 24시간 Soak Test
+   - 웹 UI 문서 분석 개선 (청크 순차 분석 UX)
+9. **알려진 제한**:
+   - Qwen 3.5 thinking 텍스트가 응답에 포함될 수 있음
+   - 8,192 컨텍스트 한계 (RTX 5090 32GB)
+   - Scout(Gemma 4 E4B)는 Qwen 계열이 아님 (향후 교체 고려)
+10. 532개 테스트 전부 통과
+6. **서버 정보**:
+   - GPU: 192.168.22.28 (Worker :8001, Embedding :8002, Scout :8003), max-model-len=8192
+   - Scout: Gemma 4 E4B (Q4_K_M) on llama.cpp CPU, ~16 TPS
+   - DB: 192.168.10.39 (PostgreSQL + Redis, 현재 미연결)
    - 웹: https://192.168.22.223:8443 (자체 서명 SSL)
-6. ruff 클린, 400개 테스트 전부 통과
+7. 453개 테스트 전부 통과

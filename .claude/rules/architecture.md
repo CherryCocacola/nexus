@@ -69,7 +69,7 @@ OpenAI `tool_calls` 형식만 사용한다.
 Machine A (Orchestrator): Python 3.11+ / asyncio
   — CLI, bootstrap, query loop, tools, permissions, memory, hooks
 Machine B (GPU Server): Python 3.11+ / vLLM / FastAPI
-  — Gemma 4 31B, ExaOne 7.8B, e5-large, LoRA hot-loading
+  — Qwen 3.5 27B, ExaOne 7.8B, e5-large, LoRA hot-loading
 ```
 
 - 두 머신은 LAN-only HTTP/SSE로 통신

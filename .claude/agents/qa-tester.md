@@ -13,7 +13,7 @@ Nexus is an air-gapped local LLM orchestration platform that replicates Claude C
 
 ## Test Environment
 - Orchestrator: localhost (Python 3.11+ / asyncio)
-- GPU Server: LAN address (vLLM + Gemma 4 31B)
+- GPU Server: LAN address (vLLM + Qwen 3.5 27B)
 - Redis: localhost:6379
 - PostgreSQL: localhost:5432
 

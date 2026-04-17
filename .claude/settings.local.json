@@ -24,7 +24,27 @@
       "Bash(echo \"EXIT=$?\")",
       "Bash(python -c \"import paramiko; print\\('paramiko OK'\\)\")",
       "Bash(pip install:*)",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(pip show:*)",
+      "Bash(ruff check:*)",
+      "Bash(ruff format:*)",
+      "Bash(git commit:*)",
+      "Bash(xargs grep:*)",
+      "Bash(wc -l /d/workspace/nexus/core/tools/implementations/*.py)",
+      "Bash(git add:*)",
+      "Bash(ping:*)",
+      "Bash(git push:*)",
+      "WebFetch(domain:www.idino.co.kr)",
+      "Bash(grep -oE '#[0-9a-fA-F]{3,6}')",
+      "Bash(grep -oE 'background\\(-color\\)?:\\\\s*#[0-9a-fA-F]{3,6}|color:\\\\s*#[0-9a-fA-F]{3,6}')",
+      "Bash(taskkill //F //IM uvicorn.exe)",
+      "Bash(taskkill //F //FI \"WINDOWTITLE eq uvicorn*\")",
+      "Bash(pkill -f \"uvicorn web.app\")",
+      "Bash(netstat -ano)",
+      "Bash(taskkill:*)",
+      "Bash(awk '{print $5}')",
+      "Bash(where python *)",
+      "Bash(where py *)"
     ]
   }
 }
