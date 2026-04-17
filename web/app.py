@@ -46,7 +46,7 @@ class ChatRequest(BaseModel):
     session_id: str | None = Field(default=None, description="세션 ID (없으면 새 세션 생성)")
     model: str = Field(
         default="primary",
-        description="사용할 모델 (primary: Gemma 4, auxiliary: ExaOne)",
+        description="사용할 모델 (primary: Qwen 3.5, auxiliary: ExaOne)",
     )
 
 
@@ -159,12 +159,19 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             model_provider=components["model_provider"],
             tools=web_registry.get_all_tools(),
             context=web_context,
+            # 웹 시스템 프롬프트 — 범용 AI 어시스턴트 + 파일/문서 분석 능력
             system_prompt=(
-                "You are Nexus, an AI coding assistant by IDINO running on the user's local machine. "
-                "You have FULL ACCESS to the local file system through your tools. "
-                "When the user asks about files or directories, ALWAYS use your tools (Read, LS, Glob, Grep, DocumentProcess) to access them. "
-                "NEVER say you cannot access local files - you CAN and SHOULD use tools to do so. "
-                "Respond in the user's language."
+                "You are Nexus, an AI assistant developed by IDINO. "
+                "You can answer general questions, analyze files, and process documents.\n\n"
+                "Your capabilities:\n"
+                "- General knowledge: Answer questions on any topic\n"
+                "- File analysis: Read and analyze local files\n"
+                "- Document processing: Analyze PDF, DOCX, XLSX files\n"
+                "- Code assistance: Review, explain, and edit code\n\n"
+                "When the user asks about files, use your tools (Read, LS, Glob, Grep, DocumentProcess). "
+                "For general questions, answer directly without using tools.\n"
+                "Respond in the user's language. Be concise and helpful.\n"
+                "Do NOT output your thinking process. Give the answer directly."
             ),
             max_turns=200,
         )
@@ -440,7 +447,7 @@ async def list_models() -> dict[str, Any]:
         models = [
             ModelInfo(
                 id=config.model.primary_model,
-                name="Gemma 4 31B",
+                name="Qwen 3.5 27B",
                 role="primary",
             ),
             ModelInfo(
@@ -462,7 +469,7 @@ async def list_models() -> dict[str, Any]:
     # 설정이 없으면 기본 모델 정보를 반환한다
     return {
         "models": [
-            {"id": "gemma-4-31b-it", "name": "Gemma 4 31B", "role": "primary"},
+            {"id": "qwen3.5-27b", "name": "Qwen 3.5 27B", "role": "primary"},
             {"id": "exaone-7.8b", "name": "ExaOne 7.8B", "role": "auxiliary"},
         ],
         "total": 2,

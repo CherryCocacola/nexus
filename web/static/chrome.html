@@ -1,0 +1,1472 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Nexus — IDINO AI Assistant</title>
+<link rel="manifest" href="/static/manifest.json">
+<meta name="theme-color" content="#ffffff">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<link rel="icon" type="image/png" href="/static/images.png">
+<style>
+/* ─── Chrome 스타일 컬러 팔레트 (밝은 테마) ─── */
+:root {
+  /* 기본 배경/표면 */
+  --bg-page: #f8f9fa;
+  --bg-surface: #ffffff;
+  --bg-tab-bar: #dee1e6;
+  --bg-tab-active: #ffffff;
+  --bg-tab-hover: #eceef1;
+  --bg-sidebar: #f1f3f4;
+  --bg-input: #f1f3f4;
+  --bg-input-focus: #ffffff;
+  --bg-code: #f5f5f5;
+  --bg-message-user: #00479d;
+  --bg-message-ai: #ffffff;
+
+  /* 텍스트 */
+  --text-primary: #202124;
+  --text-secondary: #5f6368;
+  --text-muted: #9aa0a6;
+  --text-on-accent: #ffffff;
+
+  /* 브랜드 accent (idino) */
+  --accent: #00479d;
+  --accent-light: #1a73e8;
+  --accent-hover: #003a80;
+  --accent-bg: #e8f0fe;
+
+  /* 보더/그림자 */
+  --border: #dadce0;
+  --border-light: #e8eaed;
+  --shadow-sm: 0 1px 2px rgba(60,64,67,0.1);
+  --shadow-md: 0 1px 6px rgba(60,64,67,0.12), 0 1px 4px rgba(60,64,67,0.12);
+  --shadow-lg: 0 4px 16px rgba(60,64,67,0.15);
+
+  /* 상태 */
+  --success: #34a853;
+  --error: #ea4335;
+  --warning: #fbbc04;
+
+  /* 레이아웃 */
+  --header-height: 48px;
+  --sidebar-width: 280px;
+  --radius-sm: 6px;
+  --radius-md: 12px;
+  --radius-lg: 20px;
+  --radius-full: 9999px;
+}
+
+/* ─── 리셋 ─── */
+*, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  background: var(--bg-page);
+  color: var(--text-primary);
+  height: 100vh;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 스크롤바 (Chrome 스타일 얇은 막대) */
+::-webkit-scrollbar { width: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #c1c1c1; border-radius: 4px; border: 2px solid transparent; background-clip: padding-box; }
+::-webkit-scrollbar-thumb:hover { background: #a0a0a0; border: 2px solid transparent; background-clip: padding-box; }
+
+/* ─── 탭 바 (Chrome 상단 바 느낌) ─── */
+.tab-bar {
+  display: flex;
+  align-items: flex-end;
+  background: var(--bg-tab-bar);
+  padding: 8px 12px 0;
+  flex-shrink: 0;
+  gap: 2px;
+  /* 드래그 가능 영역 느낌 */
+  -webkit-app-region: drag;
+}
+
+/* 개별 탭 (Chrome 둥근 탭 형태) */
+.tab {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  background: var(--bg-tab-hover);
+  border-radius: 8px 8px 0 0;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--text-secondary);
+  max-width: 200px;
+  min-width: 80px;
+  transition: background 0.15s, color 0.15s;
+  -webkit-app-region: no-drag;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  position: relative;
+}
+
+.tab:hover { background: var(--bg-tab-hover); color: var(--text-primary); }
+
+.tab.active {
+  background: var(--bg-tab-active);
+  color: var(--text-primary);
+  font-weight: 500;
+}
+
+.tab-icon {
+  width: 16px;
+  height: 16px;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+
+.tab-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 1;
+}
+
+.tab-close {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  color: var(--text-muted);
+  cursor: pointer;
+  flex-shrink: 0;
+  opacity: 0;
+  transition: all 0.1s;
+  background: none;
+  border: none;
+}
+
+.tab:hover .tab-close,
+.tab.active .tab-close { opacity: 1; }
+.tab-close:hover { background: var(--border); color: var(--text-primary); }
+
+/* 새 탭 버튼 */
+.tab-new {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  color: var(--text-secondary);
+  font-size: 18px;
+  margin-bottom: 4px;
+  margin-left: 4px;
+  transition: background 0.1s;
+  -webkit-app-region: no-drag;
+  background: none;
+  border: none;
+}
+.tab-new:hover { background: var(--border); }
+
+/* ─── 툴바 (Chrome 주소창 바) ─── */
+.toolbar {
+  display: flex;
+  align-items: center;
+  padding: 6px 12px;
+  background: var(--bg-surface);
+  border-bottom: 1px solid var(--border-light);
+  gap: 10px;
+  flex-shrink: 0;
+}
+
+/* 사이드바 토글 (햄버거 메뉴) */
+.toolbar-btn {
+  width: 32px;
+  height: 32px;
+  border-radius: var(--radius-sm);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  color: var(--text-secondary);
+  transition: background 0.1s;
+  background: none;
+  border: none;
+  flex-shrink: 0;
+}
+.toolbar-btn:hover { background: var(--bg-input); }
+
+/* 주소창 스타일 정보 바 */
+.omnibox {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--bg-input);
+  border-radius: var(--radius-full);
+  padding: 6px 14px;
+  font-size: 13px;
+  color: var(--text-secondary);
+  min-width: 0;
+}
+
+.omnibox-icon { flex-shrink: 0; color: var(--text-muted); }
+
+.omnibox-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.omnibox-text strong { color: var(--text-primary); font-weight: 500; }
+
+/* 상태 표시 영역 */
+.toolbar-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.token-counter {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--text-muted);
+  padding: 4px 10px;
+  background: var(--bg-input);
+  border-radius: var(--radius-full);
+  font-variant-numeric: tabular-nums;
+}
+
+.token-counter b { color: var(--text-secondary); }
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--success);
+  flex-shrink: 0;
+}
+.status-dot.offline { background: var(--error); }
+
+/* ─── 레이아웃 (사이드바 + 메인) ─── */
+.layout {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+  position: relative;
+}
+
+/* ─── 사이드바 (세션 목록, 기본 숨김) ─── */
+.sidebar-overlay {
+  position: absolute;
+  inset: 0;
+  background: rgba(0,0,0,0.15);
+  z-index: 9;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.25s;
+}
+.sidebar-overlay.visible {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.sidebar {
+  width: var(--sidebar-width);
+  background: var(--bg-surface);
+  border-right: 1px solid var(--border-light);
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  z-index: 10;
+  transform: translateX(-100%);
+  opacity: 0;
+  transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1), opacity 0.2s;
+  box-shadow: var(--shadow-lg);
+}
+
+.sidebar.open {
+  transform: translateX(0);
+  opacity: 1;
+}
+
+.sidebar-header {
+  padding: 16px;
+  border-bottom: 1px solid var(--border-light);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.sidebar-title {
+  flex: 1;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+/* 새 대화 버튼 */
+.new-chat-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 16px;
+  margin: 12px 16px;
+  background: var(--accent);
+  color: var(--text-on-accent);
+  border: none;
+  border-radius: var(--radius-full);
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 500;
+  transition: background 0.15s;
+  box-shadow: var(--shadow-sm);
+}
+.new-chat-btn:hover { background: var(--accent-hover); }
+.new-chat-btn svg { width: 16px; height: 16px; }
+
+/* 세션 목록 */
+.session-list { flex: 1; overflow-y: auto; padding: 4px 8px; }
+
+.session-item {
+  padding: 10px 12px;
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--text-secondary);
+  margin-bottom: 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: background 0.1s;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.session-item:hover { background: var(--bg-input); }
+.session-item.active { background: var(--accent-bg); color: var(--accent); font-weight: 500; }
+
+.session-item-icon {
+  width: 18px;
+  height: 18px;
+  flex-shrink: 0;
+  color: var(--text-muted);
+}
+.session-item.active .session-item-icon { color: var(--accent); }
+
+.sidebar-footer {
+  padding: 12px 16px;
+  border-top: 1px solid var(--border-light);
+  font-size: 11px;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+/* ─── 메인 콘텐츠 영역 ─── */
+.main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  background: var(--bg-page);
+}
+
+.messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 24px 0;
+}
+
+.messages-inner {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 0 24px;
+}
+
+/* ─── 환영 화면 ─── */
+.welcome {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 80px 20px 40px;
+  text-align: center;
+}
+
+.welcome-logo {
+  width: 64px;
+  height: 64px;
+  margin-bottom: 24px;
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
+}
+
+.welcome h2 {
+  font-size: 24px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 8px;
+}
+
+.welcome p {
+  font-size: 15px;
+  color: var(--text-secondary);
+  max-width: 420px;
+  line-height: 1.6;
+}
+
+/* 환영 화면 기능 카드 */
+.welcome-cards {
+  display: flex;
+  gap: 12px;
+  margin-top: 32px;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+.welcome-card {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-md);
+  padding: 16px 20px;
+  width: 180px;
+  text-align: left;
+  cursor: pointer;
+  transition: box-shadow 0.15s, border-color 0.15s;
+}
+.welcome-card:hover {
+  box-shadow: var(--shadow-md);
+  border-color: var(--accent);
+}
+
+.welcome-card-icon {
+  font-size: 20px;
+  margin-bottom: 8px;
+}
+
+.welcome-card-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 4px;
+}
+
+.welcome-card-desc {
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+
+/* ─── 메시지 버블 ─── */
+.message {
+  margin-bottom: 20px;
+  animation: fadeIn 0.2s ease;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* 사용자 메시지 (오른쪽 정렬, 파란색 버블) */
+.message.user-msg {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.message.user-msg .message-bubble {
+  background: var(--bg-message-user);
+  color: var(--text-on-accent);
+  border-radius: var(--radius-lg) var(--radius-lg) 4px var(--radius-lg);
+  padding: 10px 16px;
+  max-width: 85%;
+  font-size: 14px;
+  line-height: 1.6;
+  word-wrap: break-word;
+  box-shadow: var(--shadow-sm);
+}
+
+.message.user-msg .message-bubble code {
+  background: rgba(255,255,255,0.15);
+  color: var(--text-on-accent);
+}
+
+.message.user-msg .message-bubble pre {
+  background: rgba(0,0,0,0.15);
+  border: none;
+}
+
+/* AI 메시지 (왼쪽 정렬, 흰색 카드) */
+.message.ai-msg {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.message-avatar {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.message-avatar.ai-avatar {
+  border: 1px solid var(--border-light);
+  object-fit: cover;
+}
+
+.ai-content {
+  flex: 1;
+  min-width: 0;
+}
+
+.ai-sender {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin-bottom: 4px;
+}
+
+.message.ai-msg .message-bubble {
+  background: var(--bg-message-ai);
+  border: 1px solid var(--border-light);
+  border-radius: 4px var(--radius-lg) var(--radius-lg) var(--radius-lg);
+  padding: 12px 16px;
+  font-size: 14px;
+  line-height: 1.7;
+  color: var(--text-primary);
+  word-wrap: break-word;
+  box-shadow: var(--shadow-sm);
+}
+
+/* 메시지 내부 서식 */
+.message-bubble p { margin-bottom: 8px; }
+.message-bubble p:last-child { margin-bottom: 0; }
+
+.message-bubble pre {
+  background: var(--bg-code);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-sm);
+  padding: 12px 16px;
+  overflow-x: auto;
+  margin: 8px 0;
+  font-size: 13px;
+  font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+}
+
+.message-bubble code {
+  background: var(--bg-code);
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 13px;
+  font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+}
+
+.message-bubble pre code { background: none; padding: 0; }
+
+/* ─── 스트리밍 커서 애니메이션 ─── */
+.streaming-cursor::after {
+  content: '';
+  display: inline-block;
+  width: 2px;
+  height: 16px;
+  background: var(--accent);
+  margin-left: 2px;
+  animation: cursor-blink 0.8s step-end infinite;
+  vertical-align: text-bottom;
+  border-radius: 1px;
+}
+
+@keyframes cursor-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+/* ─── 입력 영역 ─── */
+.input-area {
+  padding: 12px 24px 16px;
+  flex-shrink: 0;
+  background: var(--bg-page);
+}
+
+.input-container {
+  max-width: 760px;
+  margin: 0 auto;
+}
+
+/* 첨부파일 프리뷰 */
+.attach-preview {
+  display: none;
+  padding: 0 0 8px;
+}
+.attach-preview.visible { display: flex; flex-wrap: wrap; gap: 6px; }
+
+.attach-chip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-full);
+  padding: 4px 12px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.attach-chip .remove {
+  cursor: pointer;
+  color: var(--text-muted);
+  font-size: 14px;
+  line-height: 1;
+  border: none;
+  background: none;
+}
+.attach-chip .remove:hover { color: var(--error); }
+
+/* Chrome 주소창 스타일 입력 박스 */
+.input-box {
+  display: flex;
+  align-items: flex-end;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 8px 12px;
+  gap: 8px;
+  transition: border-color 0.15s, box-shadow 0.15s;
+  box-shadow: var(--shadow-sm);
+}
+
+.input-box:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-bg);
+}
+
+.attach-btn {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 6px;
+  border-radius: var(--radius-sm);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: color 0.15s, background 0.15s;
+}
+.attach-btn:hover { color: var(--text-primary); background: var(--bg-input); }
+.attach-btn svg { width: 18px; height: 18px; }
+
+.input-box textarea {
+  flex: 1;
+  background: none;
+  border: none;
+  outline: none;
+  color: var(--text-primary);
+  font-size: 14px;
+  font-family: inherit;
+  resize: none;
+  max-height: 150px;
+  line-height: 21px;
+  padding: 4px 0;
+}
+
+.input-box textarea::placeholder { color: var(--text-muted); }
+
+/* 전송 버튼 (둥근 원형) */
+.send-btn {
+  background: var(--accent);
+  border: none;
+  color: var(--text-on-accent);
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: background 0.15s, transform 0.1s;
+}
+.send-btn:hover { background: var(--accent-hover); transform: scale(1.05); }
+.send-btn:disabled { opacity: 0.3; cursor: not-allowed; transform: none; }
+.send-btn svg { width: 16px; height: 16px; }
+
+.input-footer {
+  text-align: center;
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 8px;
+}
+
+/* 숨겨진 파일 입력 */
+#fileInput { display: none; }
+
+/* ─── 생각하는 중 인디케이터 ─── */
+.thinking-indicator {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.thinking-content {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-lg);
+  padding: 10px 16px;
+  color: var(--text-muted);
+  font-size: 13px;
+  box-shadow: var(--shadow-sm);
+}
+
+/* 3-dot 바운스 애니메이션 */
+.thinking-dots {
+  display: flex;
+  gap: 3px;
+  align-items: center;
+}
+
+.thinking-dots span {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  background: var(--accent);
+  border-radius: 50%;
+  animation: dot-bounce 1.4s infinite ease-in-out;
+  opacity: 0.4;
+}
+.thinking-dots span:nth-child(1) { animation-delay: 0s; }
+.thinking-dots span:nth-child(2) { animation-delay: 0.2s; }
+.thinking-dots span:nth-child(3) { animation-delay: 0.4s; }
+
+@keyframes dot-bounce {
+  0%, 80%, 100% { opacity: 0.4; transform: scale(0.8); }
+  40% { opacity: 1; transform: scale(1.1); }
+}
+
+/* ─── 반응형 ─── */
+@media (max-width: 768px) {
+  .sidebar { width: 100%; }
+  .messages-inner { padding: 0 12px; }
+  .input-area { padding: 8px 12px 12px; }
+
+  /* 모바일: 탭 바 단순화 */
+  .tab { min-width: 60px; max-width: 120px; padding: 8px 10px; font-size: 12px; }
+  .tab-title { display: none; }
+  .tab-close { display: none; }
+  .omnibox { font-size: 12px; }
+
+  /* 환영 카드 세로 정렬 */
+  .welcome-cards { flex-direction: column; align-items: center; }
+  .welcome-card { width: 90%; max-width: 280px; }
+}
+
+@media (max-width: 360px) {
+  .toolbar-right { display: none; }
+}
+</style>
+</head>
+<body>
+
+<!-- ─── Chrome 스타일 탭 바 ─── -->
+<div class="tab-bar" id="tabBar">
+  <!-- 탭들은 JS로 렌더링 -->
+  <button class="tab-new" onclick="newSession()" title="새 대화" aria-label="새 대화">+</button>
+</div>
+
+<!-- ─── 툴바 (주소창 스타일) ─── -->
+<div class="toolbar">
+  <!-- 햄버거 메뉴 -->
+  <button class="toolbar-btn" onclick="toggleSidebar()" title="세션 목록" aria-label="사이드바 열기/닫기">
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+      <path d="M3 12h18M3 6h18M3 18h18"/>
+    </svg>
+  </button>
+
+  <!-- 주소창 (모델 정보 표시) -->
+  <div class="omnibox">
+    <span class="omnibox-icon">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
+    </span>
+    <span class="omnibox-text">
+      <strong>IDINO Nexus</strong> — Qwen 3.5 27B (INT4)
+    </span>
+  </div>
+
+  <!-- 토큰 카운터 + 상태 -->
+  <div class="toolbar-right">
+    <div class="token-counter" id="tokenCounter" title="누적 토큰 사용량">
+      IN: <b id="tokenIn">0</b> &nbsp; OUT: <b id="tokenOut">0</b>
+    </div>
+    <span class="status-dot" id="statusDot" title="GPU 서버 상태"></span>
+  </div>
+</div>
+
+<!-- ─── 레이아웃 ─── -->
+<div class="layout">
+
+  <!-- 사이드바 오버레이 (닫기용) -->
+  <div class="sidebar-overlay" id="sidebarOverlay" onclick="closeSidebar()"></div>
+
+  <!-- 사이드바 (기본 닫힘) -->
+  <div class="sidebar" id="sidebar" role="navigation" aria-label="세션 목록">
+    <div class="sidebar-header">
+      <span class="sidebar-title">대화 목록</span>
+      <button class="toolbar-btn" onclick="closeSidebar()" aria-label="사이드바 닫기">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <button class="new-chat-btn" onclick="newSession()">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"><path d="M12 5v14M5 12h14"/></svg>
+      새 대화
+    </button>
+    <div class="session-list" id="sessionList"></div>
+    <div class="sidebar-footer">Nexus v0.1.0 &middot; IDINO</div>
+  </div>
+
+  <!-- 메인 콘텐츠 -->
+  <div class="main">
+    <div class="messages" id="messages">
+      <div class="messages-inner" id="messagesInner">
+        <!-- 환영 화면 -->
+        <div class="welcome" id="welcome">
+          <img src="/static/images.png" alt="Nexus" class="welcome-logo">
+          <h2>IDINO Nexus</h2>
+          <p>코드 분석 &middot; 파일 탐색 &middot; 문서 분석을 도와드립니다</p>
+          <div class="welcome-cards">
+            <div class="welcome-card" onclick="insertPrompt('이 프로젝트의 구조를 분석해 주세요')">
+              <div class="welcome-card-icon">&#128269;</div>
+              <div class="welcome-card-title">코드 분석</div>
+              <div class="welcome-card-desc">프로젝트 구조와 코드를 분석합니다</div>
+            </div>
+            <div class="welcome-card" onclick="insertPrompt('파일 목록을 보여 주세요')">
+              <div class="welcome-card-icon">&#128193;</div>
+              <div class="welcome-card-title">파일 탐색</div>
+              <div class="welcome-card-desc">디렉토리와 파일을 탐색합니다</div>
+            </div>
+            <div class="welcome-card" onclick="insertPrompt('첨부한 문서를 요약해 주세요')">
+              <div class="welcome-card-icon">&#128196;</div>
+              <div class="welcome-card-title">문서 분석</div>
+              <div class="welcome-card-desc">PDF, DOCX 등 문서를 분석합니다</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 입력 영역 -->
+    <div class="input-area">
+      <div class="input-container">
+        <!-- 첨부파일 프리뷰 -->
+        <div class="attach-preview" id="attachPreview"></div>
+        <div class="input-box">
+          <button class="attach-btn" onclick="document.getElementById('fileInput').click()" title="파일 첨부" aria-label="파일 첨부">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/>
+            </svg>
+          </button>
+          <input type="file" id="fileInput" multiple accept=".txt,.py,.js,.ts,.json,.yaml,.yml,.md,.csv,.html,.css,.sql,.xml,.log,.pdf,.docx,.hwp,.xlsx" onchange="handleFileSelect(event)">
+          <textarea id="userInput"
+                    placeholder="Nexus에게 물어보세요..."
+                    rows="1"
+                    onkeydown="handleKeyDown(event)"
+                    oninput="autoResize(this)"
+                    aria-label="메시지 입력"></textarea>
+          <button class="send-btn" id="sendBtn" onclick="sendMessage()" aria-label="메시지 전송">
+            <svg viewBox="0 0 24 24" fill="currentColor">
+              <path d="M3.478 2.404a.75.75 0 0 0-.926.941l2.432 7.905H13.5a.75.75 0 0 1 0 1.5H4.984l-2.432 7.905a.75.75 0 0 0 .926.94 60.519 60.519 0 0 0 18.445-8.986.75.75 0 0 0 0-1.218A60.517 60.517 0 0 0 3.478 2.404Z"/>
+            </svg>
+          </button>
+        </div>
+        <div class="input-footer">Qwen 3.5 27B (INT4) — Nexus는 실수할 수 있습니다</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ─── 상태 관리 ───
+let sessions = [];           // 모든 세션 배열
+let currentSessionId = null; // 현재 활성 세션 ID
+let isStreaming = false;     // 스트리밍 응답 수신 중 여부
+let attachedFiles = [];      // 첨부파일 목록
+let totalInputTokens = 0;   // 누적 입력 토큰
+let totalOutputTokens = 0;  // 누적 출력 토큰
+
+// ─── 초기화 ───
+window.addEventListener('DOMContentLoaded', () => {
+  checkHealth();
+  newSession();
+  document.getElementById('userInput').focus();
+});
+
+// ─── 세션 관리 ───
+
+/** 새 세션을 생성하고 활성화 */
+function newSession() {
+  const id = 'session-' + Date.now();
+  const session = { id, title: '새 대화', messages: [] };
+  sessions.unshift(session);
+  currentSessionId = id;
+  renderTabs();
+  renderSessionList();
+  clearMessages();
+  totalInputTokens = 0;
+  totalOutputTokens = 0;
+  updateTokenDisplay();
+}
+
+/** 특정 세션으로 전환 */
+function switchSession(id) {
+  currentSessionId = id;
+  renderTabs();
+  renderSessionList();
+  const session = sessions.find(s => s.id === id);
+  clearMessages();
+  if (session) {
+    session.messages.forEach(m => appendMessage(m.role, m.content, false));
+  }
+  closeSidebar();
+}
+
+/** 세션 닫기 (탭에서 X 클릭) */
+function closeSession(id, event) {
+  // 이벤트 버블링 방지 (탭 클릭 전환 방지)
+  if (event) event.stopPropagation();
+
+  // 세션이 1개뿐이면 새 세션 생성 후 기존 세션 삭제
+  if (sessions.length <= 1) {
+    sessions = sessions.filter(s => s.id !== id);
+    newSession();
+    return;
+  }
+
+  const index = sessions.findIndex(s => s.id === id);
+  sessions = sessions.filter(s => s.id !== id);
+
+  // 닫은 세션이 현재 세션이면 옆 세션으로 전환
+  if (currentSessionId === id) {
+    const nextIndex = Math.min(index, sessions.length - 1);
+    switchSession(sessions[nextIndex].id);
+  } else {
+    renderTabs();
+    renderSessionList();
+  }
+}
+
+/** Chrome 탭 바 렌더링 */
+function renderTabs() {
+  const tabBar = document.getElementById('tabBar');
+  // 새 탭 버튼은 유지, 기존 탭만 재생성
+  const newBtn = tabBar.querySelector('.tab-new');
+  tabBar.innerHTML = '';
+
+  sessions.forEach(s => {
+    const tab = document.createElement('div');
+    tab.className = 'tab' + (s.id === currentSessionId ? ' active' : '');
+    tab.onclick = () => switchSession(s.id);
+    tab.innerHTML = `
+      <img src="/static/images.png" alt="" class="tab-icon">
+      <span class="tab-title">${escapeHtml(s.title)}</span>
+      <button class="tab-close" onclick="closeSession('${s.id}', event)" aria-label="탭 닫기">&times;</button>
+    `;
+    tabBar.appendChild(tab);
+  });
+
+  tabBar.appendChild(newBtn);
+}
+
+/** 사이드바 세션 목록 렌더링 */
+function renderSessionList() {
+  const list = document.getElementById('sessionList');
+  list.innerHTML = sessions.map(s =>
+    `<div class="session-item ${s.id === currentSessionId ? 'active' : ''}"
+          onclick="switchSession('${s.id}')">
+      <svg class="session-item-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/>
+      </svg>
+      <span>${escapeHtml(s.title)}</span>
+    </div>`
+  ).join('');
+}
+
+/** 메시지 영역 초기화 (환영 화면 복원) */
+function clearMessages() {
+  const inner = document.getElementById('messagesInner');
+  inner.innerHTML = `
+    <div class="welcome" id="welcome">
+      <img src="/static/images.png" alt="Nexus" class="welcome-logo">
+      <h2>IDINO Nexus</h2>
+      <p>코드 분석 &middot; 파일 탐색 &middot; 문서 분석을 도와드립니다</p>
+      <div class="welcome-cards">
+        <div class="welcome-card" onclick="insertPrompt('이 프로젝트의 구조를 분석해 주세요')">
+          <div class="welcome-card-icon">&#128269;</div>
+          <div class="welcome-card-title">코드 분석</div>
+          <div class="welcome-card-desc">프로젝트 구조와 코드를 분석합니다</div>
+        </div>
+        <div class="welcome-card" onclick="insertPrompt('파일 목록을 보여 주세요')">
+          <div class="welcome-card-icon">&#128193;</div>
+          <div class="welcome-card-title">파일 탐색</div>
+          <div class="welcome-card-desc">디렉토리와 파일을 탐색합니다</div>
+        </div>
+        <div class="welcome-card" onclick="insertPrompt('첨부한 문서를 요약해 주세요')">
+          <div class="welcome-card-icon">&#128196;</div>
+          <div class="welcome-card-title">문서 분석</div>
+          <div class="welcome-card-desc">PDF, DOCX 등 문서를 분석합니다</div>
+        </div>
+      </div>
+    </div>`;
+}
+
+// ─── 토큰 카운터 ───
+
+/** 토큰 사용량 표시 업데이트 */
+function updateTokenDisplay() {
+  document.getElementById('tokenIn').textContent = totalInputTokens.toLocaleString();
+  document.getElementById('tokenOut').textContent = totalOutputTokens.toLocaleString();
+}
+
+// ─── 첨부파일 처리 ───
+
+/** 파일 선택 핸들러 — 10MB 제한 체크 후 목록에 추가 */
+function handleFileSelect(event) {
+  const files = Array.from(event.target.files);
+  files.forEach(file => {
+    if (file.size > 10 * 1024 * 1024) {
+      alert('파일이 너무 큽니다 (10MB 제한): ' + file.name);
+      return;
+    }
+    attachedFiles.push(file);
+  });
+  renderAttachPreview();
+  event.target.value = '';
+}
+
+/** 첨부파일 프리뷰 칩 렌더링 */
+function renderAttachPreview() {
+  const preview = document.getElementById('attachPreview');
+  if (attachedFiles.length === 0) {
+    preview.className = 'attach-preview';
+    preview.innerHTML = '';
+    return;
+  }
+  preview.className = 'attach-preview visible';
+  preview.innerHTML = attachedFiles.map((f, i) =>
+    `<div class="attach-chip">
+      <span>${escapeHtml(f.name)} (${(f.size / 1024).toFixed(1)}KB)</span>
+      <button class="remove" onclick="removeFile(${i})" aria-label="파일 제거">&times;</button>
+    </div>`
+  ).join('');
+}
+
+/** 첨부파일 제거 */
+function removeFile(index) {
+  attachedFiles.splice(index, 1);
+  renderAttachPreview();
+}
+
+/**
+ * 첨부파일 내용 읽기
+ * - 바이너리 파일(pdf, docx 등): 서버에 업로드 → DocumentProcess로 분석 유도
+ * - 텍스트 파일: 내용을 직접 읽어서 메시지에 삽입 (12000자 제한)
+ */
+async function readFileContents() {
+  const binaryExts = ['.docx', '.doc', '.xlsx', '.xls', '.pdf', '.hwp', '.pptx'];
+  const MAX_CHARS = 12000;
+
+  const contents = [];
+  for (const file of attachedFiles) {
+    const ext = '.' + file.name.split('.').pop().toLowerCase();
+
+    if (binaryExts.includes(ext)) {
+      // 바이너리 파일 → 서버에 업로드하고 경로를 전달
+      const uploadPath = await uploadFileToServer(file);
+      if (uploadPath) {
+        contents.push(
+          '사용자가 문서 파일을 업로드했습니다.\n' +
+          '파일명: ' + file.name + '\n' +
+          '서버 경로: ' + uploadPath + '\n' +
+          'DocumentProcess 도구를 사용하여 이 파일의 내용을 분석해 주세요.'
+        );
+      } else {
+        contents.push('[첨부파일 업로드 실패: ' + file.name + ']');
+      }
+      continue;
+    }
+
+    let text = await file.text();
+    if (text.length > MAX_CHARS) {
+      text = text.substring(0, MAX_CHARS) +
+        '\n\n... [파일이 길어 ' + MAX_CHARS + '자까지만 포함됨. 전체 ' + text.length + '자 중 일부.]';
+    }
+    contents.push('[첨부파일: ' + file.name + ']\n' + text);
+  }
+  return contents.join('\n\n');
+}
+
+/** 바이너리 파일을 서버에 업로드하고 저장 경로를 반환 */
+async function uploadFileToServer(file) {
+  try {
+    const formData = new FormData();
+    formData.append('file', file);
+    const resp = await fetch('/v1/upload', { method: 'POST', body: formData });
+    const data = await resp.json();
+    if (data.status === 'ok') {
+      return data.file_path;
+    }
+    return null;
+  } catch (e) {
+    console.error('파일 업로드 실패:', e);
+    return null;
+  }
+}
+
+// ─── 메시지 표시 ───
+
+/**
+ * 메시지를 화면에 추가
+ * @param {string} role - 'user' 또는 'assistant'
+ * @param {string} content - 메시지 텍스트
+ * @param {boolean} save - 세션에 저장할지 여부
+ */
+function appendMessage(role, content, save = true) {
+  const welcome = document.getElementById('welcome');
+  if (welcome) welcome.remove();
+
+  const inner = document.getElementById('messagesInner');
+  const div = document.createElement('div');
+
+  if (role === 'user') {
+    // 사용자 메시지: 오른쪽 파란색 버블
+    div.className = 'message user-msg';
+    div.innerHTML = '<div class="message-bubble">' + formatContent(content) + '</div>';
+  } else {
+    // AI 메시지: 왼쪽 흰색 카드 + 아바타
+    div.className = 'message ai-msg';
+    div.innerHTML = `
+      <img src="/static/images.png" alt="Nexus" class="message-avatar ai-avatar">
+      <div class="ai-content">
+        <div class="ai-sender">Nexus</div>
+        <div class="message-bubble">${formatContent(content)}</div>
+      </div>`;
+  }
+
+  inner.appendChild(div);
+  scrollToBottom();
+
+  // 세션 데이터에 메시지 저장
+  if (save) {
+    const session = sessions.find(s => s.id === currentSessionId);
+    if (session) {
+      session.messages.push({ role, content });
+      // 첫 사용자 메시지로 세션 제목 설정
+      if (role === 'user' && session.title === '새 대화') {
+        session.title = content.substring(0, 30) + (content.length > 30 ? '...' : '');
+        renderTabs();
+        renderSessionList();
+      }
+    }
+  }
+  return div;
+}
+
+/** 마크다운 기본 서식 변환 (코드블록, 인라인코드, 볼드) */
+function formatContent(text) {
+  text = text.replace(/```(\w*)\n([\s\S]*?)```/g, function(_, lang, code) {
+    return '<pre><code>' + escapeHtml(code.trim()) + '</code></pre>';
+  });
+  text = text.replace(/`([^`]+)`/g, '<code>$1</code>');
+  text = text.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  text = text.split('\n\n').map(function(p) {
+    return '<p>' + p.replace(/\n/g, '<br>') + '</p>';
+  }).join('');
+  return text;
+}
+
+/** HTML 특수문자 이스케이프 */
+function escapeHtml(str) {
+  const div = document.createElement('div');
+  div.textContent = str;
+  return div.innerHTML;
+}
+
+// ─── "생각하는 중" 스피너 ───
+
+/** 스피너 표시 */
+function showThinking() {
+  const welcome = document.getElementById('welcome');
+  if (welcome) welcome.remove();
+
+  const inner = document.getElementById('messagesInner');
+  const div = document.createElement('div');
+  div.id = 'thinkingIndicator';
+  div.className = 'thinking-indicator';
+  div.innerHTML = `
+    <img src="/static/images.png" alt="Nexus" class="message-avatar ai-avatar">
+    <div class="thinking-content">
+      <span>생각하는 중</span>
+      <div class="thinking-dots"><span></span><span></span><span></span></div>
+    </div>`;
+  inner.appendChild(div);
+  scrollToBottom();
+}
+
+/** 스피너 제거 */
+function hideThinking() {
+  const el = document.getElementById('thinkingIndicator');
+  if (el) el.remove();
+}
+
+// ─── 스트리밍 메시지 ───
+
+/** AI 스트리밍 응답용 빈 메시지 버블 생성 */
+function startStreamingMessage() {
+  hideThinking();
+  const welcome = document.getElementById('welcome');
+  if (welcome) welcome.remove();
+
+  const inner = document.getElementById('messagesInner');
+  const div = document.createElement('div');
+  div.className = 'message ai-msg';
+  div.id = 'streamingMessage';
+
+  div.innerHTML = `
+    <img src="/static/images.png" alt="Nexus" class="message-avatar ai-avatar">
+    <div class="ai-content">
+      <div class="ai-sender">Nexus</div>
+      <div class="message-bubble streaming-cursor" id="streamingBody"></div>
+    </div>`;
+
+  inner.appendChild(div);
+  scrollToBottom();
+  return div;
+}
+
+/** 스트리밍 텍스트 청크를 현재 메시지에 추가 */
+function appendStreamChunk(text) {
+  const body = document.getElementById('streamingBody');
+  if (body) {
+    body.textContent += text;
+    scrollToBottom();
+  }
+}
+
+/** 스트리밍 완료: 커서 제거, 서식 적용, 세션에 저장 */
+function finalizeStreamingMessage() {
+  const body = document.getElementById('streamingBody');
+  if (body) {
+    body.classList.remove('streaming-cursor');
+    const raw = body.textContent;
+    body.innerHTML = formatContent(raw);
+    body.removeAttribute('id');
+
+    // 세션에 완성된 메시지 저장
+    const session = sessions.find(s => s.id === currentSessionId);
+    if (session) {
+      session.messages.push({ role: 'assistant', content: raw });
+    }
+  }
+  const msg = document.getElementById('streamingMessage');
+  if (msg) msg.removeAttribute('id');
+}
+
+// ─── 메시지 전송 (SSE 스트리밍) ───
+
+/** 사용자 메시지를 서버에 전송하고 SSE 응답을 스트리밍 수신 */
+async function sendMessage() {
+  const input = document.getElementById('userInput');
+  let text = input.value.trim();
+  if (!text && attachedFiles.length === 0) return;
+  if (isStreaming) return;
+
+  // 첨부파일 내용을 메시지에 합침
+  if (attachedFiles.length > 0) {
+    const fileContents = await readFileContents();
+    text = fileContents + (text ? '\n\n' + text : '\n\n위 첨부파일을 분석해 주세요.');
+    attachedFiles = [];
+    renderAttachPreview();
+  }
+
+  input.value = '';
+  autoResize(input);
+  appendMessage('user', text);
+
+  isStreaming = true;
+  document.getElementById('sendBtn').disabled = true;
+
+  showThinking();
+  let streamStarted = false;
+
+  try {
+    // SSE 스트리밍 POST 요청
+    const response = await fetch('/v1/chat/stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: text,
+        session_id: currentSessionId,
+      }),
+    });
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      for (const line of lines) {
+        if (line.startsWith('data: ')) {
+          try {
+            const data = JSON.parse(line.substring(6));
+
+            // 첫 텍스트 청크가 오면 스트리밍 버블 생성
+            if (data.text && !streamStarted) {
+              streamStarted = true;
+              startStreamingMessage();
+            }
+
+            // 텍스트 청크 추가
+            if (data.text) {
+              appendStreamChunk(data.text);
+            }
+
+            // 토큰 사용량 업데이트
+            if (data.type === 'usage_update' && data.usage) {
+              totalInputTokens = data.usage.input_tokens || totalInputTokens;
+              totalOutputTokens = data.usage.output_tokens || totalOutputTokens;
+              updateTokenDisplay();
+            }
+
+            // 응답 종료 시 토큰 추정 (서버에서 안 오는 경우 대비)
+            if (data.type === 'message_stop') {
+              if (totalOutputTokens === 0 && streamStarted) {
+                const body = document.getElementById('streamingBody');
+                if (body) {
+                  totalOutputTokens += Math.ceil(body.textContent.length / 4);
+                  totalInputTokens += Math.ceil(text.length / 4);
+                  updateTokenDisplay();
+                }
+              }
+            }
+
+            // 에러 메시지 표시
+            if (data.type === 'error' && data.message) {
+              if (!streamStarted) {
+                streamStarted = true;
+                startStreamingMessage();
+              }
+              appendStreamChunk('[오류] ' + data.message + '\n');
+            }
+          } catch (e) { /* JSON 파싱 실패 무시 */ }
+        }
+      }
+    }
+  } catch (error) {
+    // 네트워크 연결 오류 처리
+    if (!streamStarted) startStreamingMessage();
+    appendStreamChunk('[연결 오류] ' + error.message);
+  }
+
+  hideThinking();
+  if (streamStarted) finalizeStreamingMessage();
+  isStreaming = false;
+  document.getElementById('sendBtn').disabled = false;
+  input.focus();
+}
+
+// ─── 헬스체크 ───
+
+/** GPU 서버 상태 확인 — 주기적으로 호출 */
+async function checkHealth() {
+  const dot = document.getElementById('statusDot');
+  try {
+    const resp = await fetch('/health');
+    const data = await resp.json();
+    dot.className = data.status === 'ok' ? 'status-dot' : 'status-dot offline';
+    dot.title = 'GPU: ' + data.gpu_server;
+  } catch {
+    dot.className = 'status-dot offline';
+    dot.title = '서버 연결 실패';
+  }
+}
+
+// ─── UI 유틸리티 ───
+
+/** Enter 키로 전송, Shift+Enter로 줄바꿈 */
+function handleKeyDown(e) {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendMessage();
+  }
+}
+
+/** 텍스트에어리어 높이 자동 조절 (최대 150px) */
+function autoResize(el) {
+  el.style.height = 'auto';
+  el.style.height = Math.min(el.scrollHeight, 150) + 'px';
+}
+
+/** 메시지 영역을 맨 아래로 스크롤 */
+function scrollToBottom() {
+  const msgs = document.getElementById('messages');
+  msgs.scrollTop = msgs.scrollHeight;
+  requestAnimationFrame(function() {
+    msgs.scrollTop = msgs.scrollHeight;
+    setTimeout(function() { msgs.scrollTop = msgs.scrollHeight; }, 50);
+  });
+}
+
+/** 사이드바 열기/닫기 토글 */
+function toggleSidebar() {
+  const sidebar = document.getElementById('sidebar');
+  const overlay = document.getElementById('sidebarOverlay');
+  const isOpen = sidebar.classList.contains('open');
+
+  if (isOpen) {
+    closeSidebar();
+  } else {
+    sidebar.classList.add('open');
+    overlay.classList.add('visible');
+  }
+}
+
+/** 사이드바 닫기 */
+function closeSidebar() {
+  document.getElementById('sidebar').classList.remove('open');
+  document.getElementById('sidebarOverlay').classList.remove('visible');
+}
+
+/** 환영 카드 클릭 시 입력창에 프롬프트 삽입 */
+function insertPrompt(text) {
+  const input = document.getElementById('userInput');
+  input.value = text;
+  input.focus();
+  autoResize(input);
+}
+</script>
+</body>
+</html>
