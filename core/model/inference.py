@@ -206,6 +206,12 @@ class LocalModelProvider(ModelProvider):
         oai_messages = self._convert_messages(messages, system_prompt)
 
         # 요청 페이로드 구성
+        # chat_template_kwargs로 Qwen3.5 thinking 모드를 끈다.
+        # 왜: Qwen3.5의 기본 chat template은 <think> 블록을 강제 삽입한다.
+        # 도구 호출 흐름에서는 Worker가 내부 독백만 뱉고 실제 답변을 누락하는
+        # 사례가 관찰됨 ("사용자가 X에 대해 물어보고 있습니다..."로만 끝).
+        # enable_thinking=false를 넘기면 빈 <think></think>가 주입되어
+        # Worker가 곧바로 답변 생성 모드로 진입한다.
         payload: dict[str, Any] = {
             "model": self.model_id,
             "messages": oai_messages,
@@ -213,6 +219,7 @@ class LocalModelProvider(ModelProvider):
             "max_tokens": max_tokens,
             "stream": True,
             "stream_options": {"include_usage": True},  # vLLM 사용량 추적
+            "chat_template_kwargs": {"enable_thinking": False},
         }
 
         if stop_sequences:
