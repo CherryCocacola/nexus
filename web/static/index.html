@@ -660,7 +660,7 @@ function removeFile(index) {
 }
 
 async function readFileContents() {
-  // 바이너리 파일 확장자 — 서버에 업로드하여 DocumentProcess 도구로 분석
+  // 바이너리 파일 확장자 — 서버에 업로드하여 Scout 서브에이전트가 분석
   const binaryExts = ['.docx', '.doc', '.xlsx', '.xls', '.pdf', '.hwp', '.pptx'];
   // 텍스트 파일 최대 문자 수
   const MAX_CHARS = 12000;
@@ -670,14 +670,17 @@ async function readFileContents() {
     const ext = '.' + file.name.split('.').pop().toLowerCase();
 
     if (binaryExts.includes(ext)) {
-      // 바이너리 파일 → 서버에 업로드하고 경로를 전달
+      // 바이너리 파일 → 서버 업로드 후 Scout 서브에이전트로 위임
+      // (Worker 컨텍스트(8K)에 원문을 직접 적재하지 않기 위함)
       const uploadPath = await uploadFileToServer(file);
       if (uploadPath) {
         contents.push(
           `사용자가 문서 파일을 업로드했습니다.\n` +
           `파일명: ${file.name}\n` +
           `서버 경로: ${uploadPath}\n` +
-          `DocumentProcess 도구를 사용하여 이 파일의 내용을 분석해 주세요.`
+          `Agent 도구를 사용해 subagent_type="scout"으로 이 파일을 분석하고 ` +
+          `요약을 받아 주세요. scout가 DocumentProcess로 청크별로 읽어 ` +
+          `핵심 내용만 반환할 것입니다.`
         );
       } else {
         contents.push(`[첨부파일 업로드 실패: ${file.name}]`);

@@ -464,13 +464,18 @@ def _create_scout_tool_registry():  # noqa: ANN202
     """
     Scout 에이전트 전용 읽기 전용 도구 레지스트리.
 
-    왜 4개만인가:
-      - Scout는 CPU 4B 모델로 작고 느리므로 컨텍스트(4096)를 작게 써야 한다
-      - 탐색만 담당하므로 파일을 수정하는 Edit/Write/Bash 류는 포함하지 않는다
-      - Read/Glob/Grep/LS 4개는 is_read_only=True라 권한 프롬프트가 뜨지 않음
+    v7.0 Part 2.3 개정 (2026-04-17): DocumentProcess 포함 5개.
 
-    사양서 Part 2.3 SCOUT_TOOLS와 일치한다.
+    왜 5개인가:
+      - Scout는 CPU 4B 모델이지만 Worker의 컨텍스트를 절약하는 것이 본 목적.
+        큰 문서를 Scout가 흡수해 요약만 Worker에 넘기면 Worker는 8K ctx 안에서
+        여유롭게 동작할 수 있다.
+      - Read/Glob/Grep/LS: 코드/파일 탐색
+      - DocumentProcess: 업로드된 PDF/DOCX/XLSX를 청크 단위로 파싱
+      - 전부 is_read_only=True라 권한 프롬프트가 뜨지 않음
+      - 수정 도구(Edit/Write/Bash)는 포함하지 않음 (fail-closed)
     """
+    from core.tools.implementations.document_tool import DocumentProcessTool
     from core.tools.implementations.glob_tool import GlobTool
     from core.tools.implementations.grep_tool import GrepTool
     from core.tools.implementations.ls_tool import LSTool
@@ -483,6 +488,7 @@ def _create_scout_tool_registry():  # noqa: ANN202
         GlobTool(),
         GrepTool(),
         LSTool(),
+        DocumentProcessTool(),
     ])
     return registry
 
@@ -498,7 +504,6 @@ def _create_cli_tool_registry():  # noqa: ANN202
     """
     from core.tools.implementations.agent_tool import AgentTool
     from core.tools.implementations.bash_tool import BashTool
-    from core.tools.implementations.document_tool import DocumentProcessTool
     from core.tools.implementations.edit_tool import EditTool
     from core.tools.implementations.git_tools import GitDiffTool, GitLogTool, GitStatusTool
     from core.tools.implementations.glob_tool import GlobTool
@@ -508,9 +513,11 @@ def _create_cli_tool_registry():  # noqa: ANN202
     from core.tools.implementations.write_tool import WriteTool
     from core.tools.registry import ToolRegistry
 
+    # v7.0 Part 2.3 개정: DocumentProcess는 Scout 전용. Worker(CLI)는
+    # 큰 문서를 직접 흡수하지 않고 Agent(subagent_type="scout")로 위임한다.
     registry = ToolRegistry()
     registry.register_many([
-        # 파일 시스템 (4개)
+        # 파일 시스템 (3개)
         ReadTool(),
         WriteTool(),
         EditTool(),
@@ -524,8 +531,6 @@ def _create_cli_tool_registry():  # noqa: ANN202
         GitLogTool(),
         GitDiffTool(),
         GitStatusTool(),
-        # 문서 (1개)
-        DocumentProcessTool(),
         # 서브에이전트 (1개) — Worker가 Scout 등 전문 에이전트를 호출
         AgentTool(),
     ])
@@ -535,16 +540,18 @@ def _create_cli_tool_registry():  # noqa: ANN202
 
 def _create_web_tool_registry():  # noqa: ANN202
     """
-    웹 채팅용 도구 8개를 등록한 ToolRegistry를 생성한다.
+    웹 채팅용 도구 레지스트리.
 
-    왜 8개인가: RTX 5090 (8192 컨텍스트)에서 도구 스키마 24개(~6,102토큰)는
-    입력 공간을 초과한다. 핵심 도구 8개(~2,026토큰)만 등록하여
-    사용자 입력과 출력에 충분한 토큰을 확보한다.
-    GPU가 업그레이드되면 _create_tool_registry()로 교체 가능.
+    v7.0 Part 2.3 개정 (2026-04-17): DocumentProcess를 Scout로 이관.
+    Worker(웹)는 코드/명령 작업만 담당하고, 업로드된 PDF/DOCX/XLSX 분석은
+    Agent(subagent_type="scout")로 위임한다. 큰 문서가 Worker 컨텍스트에
+    직접 들어가지 않도록 하는 Scout 본래 설계 의도 복원.
+
+    RTX 5090 (8192 컨텍스트)에서 도구 스키마 비용을 ~300토큰 절감한다.
+    GPU 업그레이드 시 _create_tool_registry()로 교체 가능.
     """
     from core.tools.implementations.agent_tool import AgentTool
     from core.tools.implementations.bash_tool import BashTool
-    from core.tools.implementations.document_tool import DocumentProcessTool
     from core.tools.implementations.edit_tool import EditTool
     from core.tools.implementations.glob_tool import GlobTool
     from core.tools.implementations.grep_tool import GrepTool
@@ -555,15 +562,15 @@ def _create_web_tool_registry():  # noqa: ANN202
 
     registry = ToolRegistry()
     registry.register_many([
-        ReadTool(),              # 파일 읽기 (~300 토큰)
-        WriteTool(),             # 파일 쓰기 (~225 토큰)
-        EditTool(),              # 파일 편집 (~325 토큰)
-        BashTool(),              # 명령 실행 (~275 토큰)
-        GlobTool(),              # 파일 검색 (~188 토큰)
-        GrepTool(),              # 텍스트 검색 (~375 토큰)
-        LSTool(),                # 디렉토리 조회 (~163 토큰)
-        DocumentProcessTool(),   # 문서 파싱 PDF/DOCX/XLSX (~200 토큰)
-        AgentTool(),             # 서브에이전트 호출 (~300 토큰)
+        ReadTool(),      # 파일 읽기 (~300 토큰)
+        WriteTool(),     # 파일 쓰기 (~225 토큰)
+        EditTool(),      # 파일 편집 (~325 토큰)
+        BashTool(),      # 명령 실행 (~275 토큰)
+        GlobTool(),      # 파일 검색 (~188 토큰)
+        GrepTool(),      # 텍스트 검색 (~375 토큰)
+        LSTool(),        # 디렉토리 조회 (~163 토큰)
+        AgentTool(),     # 서브에이전트 호출 (~300 토큰)
+        # DocumentProcess는 Scout 전용으로 이관됨 (core.bootstrap._create_scout_tool_registry)
     ])
 
     return registry

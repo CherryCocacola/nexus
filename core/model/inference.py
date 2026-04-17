@@ -277,7 +277,11 @@ class LocalModelProvider(ModelProvider):
                             m = re.search(r"contains at least (\d+) input", error_body)
                             if m:
                                 actual_input = int(m.group(1))
-                                new_max = self._config.max_context_tokens - actual_input - 100
+                                # 여유 마진 300 — vLLM 재시도 시 input이 100 토큰 가량
+                                # 증가하는 현상이 관찰됨(원인 미상, 아마도 prefix cache
+                                # 또는 chat_template 동적 요소). 마진을 넉넉히 두어
+                                # 재시도 2회까지 견딜 수 있게 한다.
+                                new_max = self._config.max_context_tokens - actual_input - 300
                                 # 입력만으로 컨텍스트를 초과하면 재시도 불가
                                 if new_max < 256:
                                     yield StreamEvent(

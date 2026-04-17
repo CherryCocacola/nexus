@@ -134,16 +134,37 @@ def run() -> int:
     print(f"  응답 (200자): {r['response'][:200]!r}")
     results.append(("broad_exploration_scout", ok4))
 
-    # 5. tool_call leak 회귀 — 이미 다른 테스트가 커버했으니 별도 케이스로 확인
-    print("\n[5/5] tool_call 누출 종합 확인 (위 4개에서 0건인지)")
-    ok5 = all(ok for _, ok in results)  # 모든 이전 테스트가 leak-free면 pass
-    # 직접 재확인
-    for name, ok in results:
-        if not ok:
-            # leak일 가능성
-            pass
-    print(f"  결과: {'PASS' if ok5 else 'FAIL (상위 테스트 중 하나에서 leak 또는 실패)'}")
-    results.append(("no_tool_leak_aggregate", ok5))
+    # 5. 파일 업로드 → Scout 경유 분석 — Part 2.3 개정 검증
+    # 실제 파일 업로드는 스킵하고, "업로드된 문서 분석" 메시지로 Worker가
+    # Agent(scout)를 호출하는지 확인한다 (scout_calls 증가로 판정).
+    print("\n[5/6] 파일 분석 요청 → Agent(scout) 호출 (Part 2.3 개정)")
+    scout_calls_before_5 = after_scout_calls
+    r = post_chat(
+        "사용자가 문서 파일을 업로드했습니다.\n"
+        "파일명: sample.pdf\n"
+        "서버 경로: /tmp/sample.pdf\n"
+        "Agent 도구를 사용해 subagent_type=\"scout\"으로 이 파일을 분석하고 "
+        "요약을 받아 주세요.",
+        "verify-file-upload",
+        timeout=240,
+    )
+    metrics5 = get_metrics()
+    scout_calls_after_5 = metrics5.get("agents", {}).get("scout", {}).get("calls", 0)
+    file_scout_invoked = scout_calls_after_5 > scout_calls_before_5
+    ok5 = (
+        check_no_tool_leak(r["response"])[0]
+        and file_scout_invoked
+    )
+    print(f"  elapsed={r['_elapsed_sec']}s, tokens={r['usage']['output_tokens']}")
+    print(f"  scout_calls 증가: {scout_calls_before_5} → {scout_calls_after_5}")
+    print(f"  결과: {'PASS' if ok5 else 'FAIL'}")
+    results.append(("file_analysis_via_scout", ok5))
+
+    # 6. tool_call leak 회귀 — 위 모든 테스트 종합 확인
+    print("\n[6/6] tool_call 누출 종합 확인")
+    ok6 = all(ok for _, ok in results)
+    print(f"  결과: {'PASS' if ok6 else 'FAIL (상위 테스트 중 하나에서 leak 또는 실패)'}")
+    results.append(("no_tool_leak_aggregate", ok6))
 
     # 요약
     print("\n" + "=" * 60)

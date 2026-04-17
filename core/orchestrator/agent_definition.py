@@ -128,23 +128,32 @@ class AgentRegistry:
 SCOUT_AGENT: AgentDefinition = AgentDefinition(
     name="scout",
     description=(
-        "Read-only file explorer running on CPU (Qwen3.5-4B, slow ~15-30s). "
-        "Use ONLY when the user asks for broad project exploration, "
-        "multi-file search, or codebase understanding. "
-        "Do NOT use for simple questions, greetings, or single-file tasks."
+        "Read-only file/document explorer running on CPU (Qwen3.5-4B, slow ~15-30s). "
+        "Use when the user asks for broad project exploration, multi-file search, "
+        "codebase understanding, OR when analyzing an uploaded document "
+        "(PDF/DOCX/XLSX). Do NOT use for simple questions, greetings, or "
+        "single-line file edits."
     ),
     system_prompt=(
-        "You are Scout, a read-only exploration agent.\n"
-        "Your job is to explore files and make a plan. You must NOT modify any files.\n\n"
-        "Steps:\n"
-        "1. Use your tools (Read, Glob, Grep, LS) to find relevant files\n"
-        "2. Read key files to understand the context\n"
-        "3. At the end, summarize what you found and suggest a plan\n\n"
-        "Keep your responses concise. Focus on facts, not opinions.\n"
-        "Respond in the user's language."
+        "You are Scout, a read-only exploration and document-analysis agent.\n"
+        "Your job is to absorb large data sources on behalf of the Worker so the "
+        "Worker's context stays small. You must NOT modify any files.\n\n"
+        "Your tools:\n"
+        "  - Read / Glob / Grep / LS: explore the project\n"
+        "  - DocumentProcess: parse uploaded PDF/DOCX/XLSX in 2500-char chunks\n\n"
+        "Workflow:\n"
+        "1. Pick the right tool for the task (DocumentProcess for uploaded docs, "
+        "Read/Glob/Grep/LS for code exploration).\n"
+        "2. For large documents, call DocumentProcess repeatedly with chunk_index "
+        "until coverage is sufficient for the user's question.\n"
+        "3. Summarize findings as a SHORT plan or answer (aim for 200-500 tokens). "
+        "Do NOT dump raw text back to the Worker.\n"
+        "4. If the user's language is Korean, reply in Korean.\n\n"
+        "Your goal is to return a compact summary — the Worker has very limited "
+        "context budget."
     ),
-    allowed_tools=("Read", "Glob", "Grep", "LS"),
-    max_turns=3,
+    allowed_tools=("Read", "Glob", "Grep", "LS", "DocumentProcess"),
+    max_turns=5,
     model_override="scout",
 )
 

@@ -212,27 +212,64 @@ Scout는 **`core/orchestrator/agent_definition.py`의 SCOUT_AGENT 상수**로
 선언된다 (Ch 14 참조). AgentRegistry에 등록되어 AgentTool이 조회한다.
 
 ```python
+# v7.0 Part 2.3 초판 (2026-04-16): Read/Glob/Grep/LS 4개
+# v7.0 Part 2.3 개정 (2026-04-17): DocumentProcess 추가 (총 5개)
 SCOUT_AGENT = AgentDefinition(
     name="scout",
     description=(
-        "Read-only file explorer running on CPU (small 4B model, slow ~30s). "
-        "Use ONLY when the user asks for broad project exploration, "
-        "multi-file search, or codebase understanding. "
-        "Do NOT use for simple questions, greetings, or single-file tasks."
+        "Read-only file/document explorer running on CPU (Qwen3.5-4B, slow ~15-30s). "
+        "Use when the user asks for broad project exploration, multi-file search, "
+        "codebase understanding, OR when analyzing an uploaded document "
+        "(PDF/DOCX/XLSX). Do NOT use for simple questions, greetings, or "
+        "single-line file edits."
     ),
     system_prompt=(
-        "You are Scout, a read-only exploration agent.\n"
-        "Your job is to explore files and make a plan. You must NOT modify any files.\n"
-        "..."
+        "You are Scout, a read-only exploration and document-analysis agent.\n"
+        "Your job is to absorb large data sources on behalf of the Worker so the "
+        "Worker's context stays small. You must NOT modify any files.\n"
+        "Tools: Read, Glob, Grep, LS, DocumentProcess (chunked PDF/DOCX/XLSX).\n"
+        "Workflow: pick the right tool → for big docs call DocumentProcess with "
+        "chunk_index repeatedly → return a SHORT summary (200~500 tokens)."
     ),
-    allowed_tools=("Read", "Glob", "Grep", "LS"),
-    max_turns=3,
-    model_override="scout",  # AgentTool이 context.options["scout_provider"]로 해석
+    allowed_tools=("Read", "Glob", "Grep", "LS", "DocumentProcess"),
+    max_turns=5,        # 문서 청크 순차 처리 위해 3→5 증가
+    model_override="scout",
 )
 ```
 
+#### Part 2.3 개정 근거 (2026-04-17)
+
+- DocumentProcess는 사양서 v7.0 AMENDMENT **초판 작성 시점에 존재하지
+  않았던 도구**다. Phase 9.4에서 웹 채팅 PDF/DOCX/XLSX 분석용으로 신설.
+- 초판에 포함되지 못한 이유는 "설계자가 제외했다"가 아니라 "아직 존재하지
+  않았다"이다. 따라서 초판의 4개 도구 목록은 완결된 집합이 아니라 그 시점
+  최선이었던 집합이다.
+- **Part 2.4의 핵심 최적화 원칙**은 "Scout가 이미 흡수한 것을 Worker가
+  다시 읽지 않도록 한다"이다. DocumentProcess는 바로 이 원칙에 가장 잘
+  부합하는 도구다 — 대용량 PDF/DOCX는 Worker 컨텍스트(8K)에 직접 들어가면
+  치명적이지만, Scout가 청크 단위로 흡수 후 200~500토큰 요약만 돌려주면
+  Worker가 여유롭게 동작할 수 있다.
+- 실측 근거: Worker 풀에서 DocumentProcess 제거 시 도구 스키마 ~200토큰
+  절감 + 대용량 문서 처리 시 원문 직접 적재 방지로 수천 토큰 절감.
+
 description은 Worker에게 노출되어 "언제 Scout를 호출할지" 판단하는 힌트가
-된다. 특히 "Do NOT use for simple questions" 문구가 남용을 억제한다.
+된다. 특히 "Do NOT use for simple questions" 문구가 남용을 억제하고, 신규
+문구 "analyzing an uploaded document"가 파일 업로드 시나리오에서 Worker가
+Scout를 자발적으로 선택하도록 유도한다.
+
+#### 하드웨어 업그레이드 시 자동 복귀
+
+이 개정은 **TIER_S 전용 최적화**다. H100/H200 이상에서는:
+- Worker 컨텍스트가 32K/128K로 커져 DocumentProcess를 Worker가 직접 호출해도
+  문제 없음
+- `_create_tool_registry()` (24개 전체)를 쓰면 DocumentProcess가 자동으로
+  Worker 풀에 포함
+- Scout 자체가 TIER_M/L에서 비활성이므로 SCOUT_AGENT의 도구 목록 확장은
+  영향 없음 (사실상 dead code)
+
+따라서 이 개정은 **"TIER_S 운영 중에만 효력이 있고 상위 티어로 가면 저절로
+무력화되는 임시 장치"**다. 사양서 Part 1.3(상위 티어는 하위 티어의
+상위집합) 원칙과 일치한다.
 
 ### 2.4 Worker 도구 (모든 TIER 공통)
 
@@ -672,28 +709,33 @@ class AgentRegistry:
 부트스트랩이 `build_default_agent_registry()` 팩토리로 기본 레지스트리를 만들고
 `ToolUseContext.options["agent_registry"]`로 주입한다.
 
-#### SCOUT_AGENT 선언
+#### SCOUT_AGENT 선언 (Part 2.3 개정 반영, 2026-04-17)
 
 ```python
 SCOUT_AGENT = AgentDefinition(
     name="scout",
     description=(
-        "Read-only file explorer running on CPU (small 4B model, slow ~30s). "
-        "Use ONLY when the user asks for broad project exploration, "
-        "multi-file search, or codebase understanding. "
-        "Do NOT use for simple questions, greetings, or single-file tasks."
+        "Read-only file/document explorer running on CPU (Qwen3.5-4B, slow ~15-30s). "
+        "Use when the user asks for broad project exploration, multi-file search, "
+        "codebase understanding, OR when analyzing an uploaded document "
+        "(PDF/DOCX/XLSX). Do NOT use for simple questions, greetings, or "
+        "single-line file edits."
     ),
     system_prompt=(
-        "You are Scout, a read-only exploration agent.\n"
-        "Your job is to explore files and make a plan. You must NOT modify any files.\n"
-        "Steps: 1) use Read/Glob/Grep/LS; 2) read key files; 3) summarize findings.\n"
-        "Keep responses concise. Respond in the user's language."
+        "You are Scout, a read-only exploration and document-analysis agent.\n"
+        "Your job is to absorb large data sources on behalf of the Worker so the "
+        "Worker's context stays small. You must NOT modify any files.\n"
+        "Tools: Read, Glob, Grep, LS, DocumentProcess (chunked PDF/DOCX/XLSX).\n"
+        "Workflow: pick the right tool → for big docs call DocumentProcess with "
+        "chunk_index repeatedly → return a SHORT summary (200~500 tokens)."
     ),
-    allowed_tools=("Read", "Glob", "Grep", "LS"),
-    max_turns=3,
+    allowed_tools=("Read", "Glob", "Grep", "LS", "DocumentProcess"),
+    max_turns=5,
     model_override="scout",
 )
 ```
+
+> 개정 근거 및 하드웨어 업그레이드 시 자동 복귀 설명은 Part 2.3 참조.
 
 #### AgentTool의 subagent_type 처리
 

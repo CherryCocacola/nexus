@@ -414,6 +414,94 @@ VRAM 최대 max-model-len:
 
 ---
 
+## Scout를 문서 분석 전담자로 복원 — 경로 B (2026-04-17)
+
+### 배경
+Phase 3 LoRA 성공 후 실사용 중 15KB docx 파일 업로드 시 "입력 내용이
+너무 길어 분석할 수 없습니다" 에러 발생. 로그 분석 결과:
+- 1차 시도 input=4097, max_tokens=4096 (합 8193 > 8192 한계)
+- 재시도 시 input이 4097 → 4198 → 4299로 증가 (vLLM prefix cache 영향 추정)
+- 근본 원인: Worker가 DocumentProcess를 직접 호출하면서 큰 문서 원문이
+  Worker 컨텍스트(8K)에 직접 들어가 한계 초과
+
+### 설계 판단: Scout 원래 목적 복원
+사용자 지적 — "Scout가 원래 토큰 줄이기 위한 거 아니냐".
+사양서 v7.0 Part 2.4의 핵심 원칙 재확인:
+> Scout가 이미 읽은 파일 내용을 요약으로 전달한다. Worker는 파일을 다시
+> 읽지 않으므로 Read 도구가 필요 없다. Worker 컨텍스트를 실행에만 집중.
+
+현재 B 방식 구현은 이 원칙을 훼손 — DocumentProcess가 Worker 쪽에 있어
+큰 문서가 Worker로 직통. 이를 **Scout 전용으로 이관**하여 본래 설계
+의도 복원.
+
+### 변경
+**1. `core/orchestrator/agent_definition.py`**:
+- `SCOUT_AGENT.allowed_tools`: 4개 → 5개 (DocumentProcess 추가)
+- `max_turns`: 3 → 5 (문서 청크 순차 처리 위해)
+- `description`: "analyzing an uploaded document" 문구로 파일 업로드 시
+  Worker의 Scout 자율 선택 유도
+- `system_prompt`: "absorb large data sources on behalf of the Worker"
+  명시, DocumentProcess 청크 워크플로우 안내
+
+**2. `core/bootstrap.py`**:
+- `_create_scout_tool_registry`: DocumentProcess 추가 (5개)
+- `_create_cli_tool_registry`: DocumentProcess 제거 (Worker는 Scout 경유)
+- `_create_web_tool_registry`: DocumentProcess 제거 (스키마 ~200토큰 절감)
+
+**3. `web/static/index.html`**:
+- 파일 업로드 시 자동 생성 메시지를 "DocumentProcess 도구 사용" →
+  "Agent(scout)로 분석하고 요약 받아 주세요"로 교체
+
+**4. `core/model/inference.py`**:
+- 재시도 마진을 100 → 300으로 확대 (vLLM input 증가 완화)
+
+**5. 사양서 v7.0 AMENDMENT Part 2.3 개정**:
+- SCOUT_AGENT 선언 갱신 + 개정 근거 명시 + 하드웨어 업그레이드 시
+  자동 복귀 조항 추가
+
+**6. 테스트**: `test_agent_definition.py`와 `test_agent_tool.py`의
+`allowed_tools`/`max_turns` 단언 갱신. `_verify_phase.py`에 파일 분석
+시나리오(6번째) 추가.
+
+### 중기 계획 — 하드웨어 업그레이드 시 Scout 복잡도 철회
+
+Scout 인프라는 **RTX 5090 8K 컨텍스트 제약을 우회하기 위한 임시 장치**다.
+GPU 업그레이드 시 자동 무력화되어야 한다:
+
+| 대상 하드웨어 | Worker 컨텍스트 | Scout 상태 | DocumentProcess |
+|---|---|---|---|
+| RTX 5090 (현재, TIER_S) | 8K | **필수** (이 개정 적용) | Scout 전용 |
+| H100 80GB (TIER_M) | 32K | 비활성 | Worker 직접 사용 가능 |
+| H200 141GB (TIER_L) | 128K | 비활성 | Worker 직접 사용 가능 |
+
+**TIER_M/L 복귀 경로**:
+1. `core/model/hardware_tier.py::detect_hardware_tier()`가 VRAM 기반으로
+   TIER를 판정 → H100 감지 시 자동 TIER_M으로 진입
+2. TIER_M/L에서는 `_create_tool_registry()` (24개 전체) 사용 — DocumentProcess
+   가 Worker 풀에 자동 포함
+3. `components["scout_provider"]`는 None으로 설정되고 ModelDispatcher의
+   `scout_available=False`. AgentTool이 Scout 호출 시 명확한 에러 반환
+4. Claude Code 원래 구조(단일 Worker + 24 도구)로 자동 수렴 — 추가 수정
+   불필요
+
+**공공 납품 방향 권고 (2026-04-17)**:
+사용자와 함께 관찰한 통찰 — 현재 겪는 일련의 문제(Phase 2 실패, Phase 3
+재학습, Scout 이동 논의)는 전부 "GPU가 8K로 묶여 있어 생기는 파생 문제"다.
+본질은 RTX 5090의 KV 캐시 한계.
+- 공공 납품 사양 논의 초기에 **H100 80GB 포함 여부**를 테이블에 올릴 것
+- 포함되면 Scout 복잡도를 점진적으로 제거 가능하며, 코드 변경 없이 티어
+  감지만으로 단순화
+- 포함되지 않으면 본 개정(Part 2.3) 상태가 계속 유효
+
+### 실측 검증 계획
+웹 서버 재기동 후 15KB docx 파일 업로드:
+- Worker가 Agent(subagent_type="scout") 호출 확인
+- Scout가 DocumentProcess로 청크 순차 처리
+- 요약(200~500토큰)만 Worker에 반환
+- 최종 응답 완성 + `/metrics agents.scout.calls` 증가
+
+---
+
 ## Phase 3 LoRA 학습 성공 (2026-04-17, 1차 통과)
 
 ### 배경

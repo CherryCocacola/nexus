@@ -52,12 +52,13 @@ def _make_tool(name: str) -> MagicMock:
 
 @pytest.fixture
 def all_tools() -> list[MagicMock]:
-    """기본 도구 풀 — Scout용 4개 + 쓰기 2개 + Agent(자기 자신)."""
+    """기본 도구 풀 — Scout용 5개 + 쓰기 2개 + Agent(자기 자신)."""
     return [
         _make_tool("Read"),
         _make_tool("Glob"),
         _make_tool("Grep"),
         _make_tool("LS"),
+        _make_tool("DocumentProcess"),
         _make_tool("Write"),
         _make_tool("Edit"),
         _make_tool("Agent"),  # DISALLOWED
@@ -168,9 +169,9 @@ class TestSubagentTypePath:
         assert captured["model_provider"] is scout_provider
         # 도구는 Read/Glob/Grep/LS만 (Write/Edit/Agent 제외)
         tool_names = {t.name for t in captured["tools"]}
-        assert tool_names == {"Read", "Glob", "Grep", "LS"}
-        # max_turns가 AgentDefinition의 값(3)으로 설정됐다
-        assert captured["max_turns"] == 3
+        assert tool_names == {"Read", "Glob", "Grep", "LS", "DocumentProcess"}
+        # max_turns가 AgentDefinition의 값(5)으로 설정됐다 — Part 2.3 개정
+        assert captured["max_turns"] == 5
         # system_prompt가 AgentDefinition의 값을 사용한다 (Scout 프롬프트)
         assert "Scout" in captured["system_prompt"]
 

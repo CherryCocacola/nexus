@@ -156,16 +156,24 @@ class TestScoutAgent:
         assert SCOUT_AGENT.name == "scout"
 
     def test_scout_allowed_tools_are_read_only(self):
-        """Scout의 도구는 Read/Glob/Grep/LS 4개, 쓰기 도구 없음."""
-        assert set(SCOUT_AGENT.allowed_tools) == {"Read", "Glob", "Grep", "LS"}
+        """
+        Scout의 도구는 읽기 전용 5개 (v7.0 Part 2.3 개정, 2026-04-17):
+        Read/Glob/Grep/LS + DocumentProcess. 쓰기 도구 없음.
+        """
+        assert set(SCOUT_AGENT.allowed_tools) == {
+            "Read", "Glob", "Grep", "LS", "DocumentProcess"
+        }
 
     def test_scout_model_override_is_scout(self):
         """model_override='scout'으로 ScoutModelProvider 사용을 지시한다."""
         assert SCOUT_AGENT.model_override == "scout"
 
     def test_scout_max_turns_limited(self):
-        """Scout는 최대 3턴 — 긴 탐색 루프 방지."""
-        assert SCOUT_AGENT.max_turns == 3
+        """
+        Scout는 최대 5턴 — 문서 청크 순차 처리를 위해 기존 3턴에서 증가
+        (Part 2.3 개정과 함께 조정).
+        """
+        assert SCOUT_AGENT.max_turns == 5
 
     def test_scout_description_warns_about_cost(self):
         """Worker가 비용을 인지하도록 description에 '느림' 정보가 있어야 한다."""
