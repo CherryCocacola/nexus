@@ -114,14 +114,20 @@ class SessionConfig(BaseModel):
 # 보안 설정
 # ─────────────────────────────────────────────
 class ScoutConfig(BaseModel):
-    """v7.0 Scout(CPU 4B 모델) 설정."""
+    """
+    v7.0 Scout(CPU 4B 모델) 설정.
+
+    2026-04-17 업데이트: Gemma 4 E4B → Qwen3.5-4B 전환.
+      Worker(Qwen3.5-27B)와 동일 패밀리로 맞춰 토크나이저/chat template/
+      tool_call 문법 일관성을 확보한다.
+    """
 
     model_config = {"protected_namespaces": ()}  # model_ 접두사 경고 방지
 
     enabled: bool = True  # TIER_S에서만 자동 활성화
     base_url: str = "http://192.168.22.28:8003"
     api_key: str = "local-key"
-    model_id: str = "gemma-4-E4B-it"
+    model_id: str = "qwen3.5-4b"
     max_context_tokens: int = 4096
     max_output_tokens: int = 512
 

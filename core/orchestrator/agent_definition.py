@@ -128,7 +128,7 @@ class AgentRegistry:
 SCOUT_AGENT: AgentDefinition = AgentDefinition(
     name="scout",
     description=(
-        "Read-only file explorer running on CPU (small 4B model, slow ~30s). "
+        "Read-only file explorer running on CPU (Qwen3.5-4B, slow ~15-30s). "
         "Use ONLY when the user asks for broad project exploration, "
         "multi-file search, or codebase understanding. "
         "Do NOT use for simple questions, greetings, or single-file tasks."

@@ -1,8 +1,12 @@
 """
 Scout 모델 프로바이더 — llama.cpp CPU 모델 연동.
 
-v7.0 Phase 9.5: Scout(4B)는 CPU에서 실행되는 작은 모델로,
-파일 탐색과 계획 수립만 담당한다. GPU VRAM에 영향을 주지 않는다.
+v7.0 Phase 9.5 (2026-04-17 Qwen 소형 전환): Scout(4B)는 CPU에서 실행되는
+작은 모델로, 파일 탐색과 계획 수립만 담당한다. GPU VRAM에 영향을 주지 않는다.
+
+모델 변경: Gemma 4 E4B (llama.cpp tool_call 한계) → Qwen3.5-4B
+  이유: Worker(Qwen3.5-27B)와 동일 패밀리 유지. 토크나이저/chat template/
+  tool-call 문법이 일관되어 Scout → Worker 핸드오프 호환성이 올라간다.
 
 llama.cpp는 OpenAI 호환 API를 제공하므로,
 LocalModelProvider를 내부적으로 재사용한다.
@@ -35,7 +39,7 @@ class ScoutModelProvider(LocalModelProvider):
         self,
         base_url: str = "http://192.168.22.28:8003",
         api_key: str = "local-key",
-        model_id: str = "gemma-4-E4B-it",
+        model_id: str = "qwen3.5-4b",
         max_context_tokens: int = 4096,
         max_output_tokens: int = 512,
         connect_timeout: float = 5.0,
