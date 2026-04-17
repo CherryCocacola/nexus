@@ -39,7 +39,7 @@ class LSTool(BaseTool):
 
     @property
     def description(self) -> str:
-        return "디렉토리의 파일/폴더 목록을 표시합니다. 크기와 수정 시간을 포함합니다."
+        return "List directory contents."
 
     @property
     def group(self) -> str:
@@ -54,7 +54,7 @@ class LSTool(BaseTool):
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "표시할 디렉토리의 절대 경로",
+                    "description": "Absolute directory path",
                 },
             },
             "required": ["path"],

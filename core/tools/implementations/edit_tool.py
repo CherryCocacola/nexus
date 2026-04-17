@@ -40,11 +40,7 @@ class EditTool(BaseTool):
 
     @property
     def description(self) -> str:
-        return (
-            "파일에서 old_string을 찾아 new_string으로 교체합니다. "
-            "기본적으로 old_string은 파일 내에서 유일해야 합니다. "
-            "replace_all=true로 모든 발생을 교체할 수 있습니다."
-        )
+        return "Replace exact string in a file."
 
     @property
     def group(self) -> str:
@@ -59,15 +55,15 @@ class EditTool(BaseTool):
             "properties": {
                 "file_path": {
                     "type": "string",
-                    "description": "편집할 파일의 절대 경로",
+                    "description": "Absolute file path",
                 },
                 "old_string": {
                     "type": "string",
-                    "description": "교체할 기존 문자열",
+                    "description": "Exact string to find",
                 },
                 "new_string": {
                     "type": "string",
-                    "description": "교체 후 문자열",
+                    "description": "Replacement string",
                 },
                 "replace_all": {
                     "type": "boolean",

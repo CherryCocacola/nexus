@@ -140,10 +140,7 @@ class GitLogTool(BaseTool):
 
     @property
     def description(self) -> str:
-        return (
-            "Git 커밋 로그를 조회합니다. "
-            "최근 커밋 이력을 확인할 수 있으며, 다양한 포맷 옵션을 지원합니다."
-        )
+        return "Show git commit history."
 
     @property
     def group(self) -> str:
@@ -158,23 +155,23 @@ class GitLogTool(BaseTool):
             "properties": {
                 "max_count": {
                     "type": "integer",
-                    "description": "표시할 최대 커밋 수 (기본: 20)",
+                    "description": "Number of commits",
                     "default": 20,
                     "minimum": 1,
                     "maximum": 500,
                 },
                 "oneline": {
                     "type": "boolean",
-                    "description": "한 줄 형식으로 출력 (기본: true)",
+                    "description": "One-line format",
                     "default": True,
                 },
                 "path": {
                     "type": "string",
-                    "description": "특정 파일/디렉토리의 로그만 조회",
+                    "description": "File path filter",
                 },
                 "revision": {
                     "type": "string",
-                    "description": "특정 리비전 범위 (예: main..HEAD, v1.0..v2.0)",
+                    "description": "Revision range (e.g. main..HEAD)",
                 },
             },
             "required": [],
@@ -255,7 +252,7 @@ class GitDiffTool(BaseTool):
 
     @property
     def description(self) -> str:
-        return "Git 변경 사항을 비교합니다. 스테이징/비스테이징 변경, 커밋 간 비교를 지원합니다."
+        return "Show git diff."
 
     @property
     def group(self) -> str:
@@ -270,20 +267,20 @@ class GitDiffTool(BaseTool):
             "properties": {
                 "staged": {
                     "type": "boolean",
-                    "description": "스테이징된 변경만 보기 (--cached)",
+                    "description": "Show staged changes only",
                     "default": False,
                 },
                 "revision": {
                     "type": "string",
-                    "description": "비교 대상 리비전 (예: HEAD~3, main..feature)",
+                    "description": "Git ref (branch, commit)",
                 },
                 "path": {
                     "type": "string",
-                    "description": "특정 파일/디렉토리만 비교",
+                    "description": "File path filter",
                 },
                 "stat": {
                     "type": "boolean",
-                    "description": "변경 통계만 표시 (--stat)",
+                    "description": "Show diffstat only",
                     "default": False,
                 },
             },
@@ -364,7 +361,7 @@ class GitStatusTool(BaseTool):
 
     @property
     def description(self) -> str:
-        return "Git 작업 트리의 현재 상태를 조회합니다. 변경/추가/삭제된 파일을 보여줍니다."
+        return "Show git working tree status."
 
     @property
     def group(self) -> str:
@@ -379,7 +376,7 @@ class GitStatusTool(BaseTool):
             "properties": {
                 "short": {
                     "type": "boolean",
-                    "description": "간단한 형식으로 출력 (-s)",
+                    "description": "Short format (-s)",
                     "default": False,
                 },
             },

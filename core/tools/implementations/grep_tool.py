@@ -44,11 +44,7 @@ class GrepTool(BaseTool):
 
     @property
     def description(self) -> str:
-        return (
-            "정규표현식 패턴으로 파일 내용을 검색합니다. "
-            "output_mode로 출력 형식을 선택할 수 있습니다: "
-            "content, files_with_matches, count."
-        )
+        return "Search file contents with regex."
 
     @property
     def group(self) -> str:
@@ -63,31 +59,31 @@ class GrepTool(BaseTool):
             "properties": {
                 "pattern": {
                     "type": "string",
-                    "description": "검색할 정규표현식 패턴",
+                    "description": "Regex pattern to search",
                 },
                 "path": {
                     "type": "string",
-                    "description": "검색할 파일 또는 디렉토리 (기본: 현재 작업 디렉토리)",
+                    "description": "Directory or file to search",
                 },
                 "output_mode": {
                     "type": "string",
                     "enum": ["content", "files_with_matches", "count"],
-                    "description": "출력 모드 (기본: files_with_matches)",
+                    "description": "Output mode (default: files_with_matches)",
                     "default": "files_with_matches",
                 },
                 "glob": {
                     "type": "string",
-                    "description": "파일 필터 glob 패턴 (예: *.py, *.{ts,tsx})",
+                    "description": "File glob filter (e.g. *.py)",
                 },
                 "head_limit": {
                     "type": "integer",
-                    "description": "결과 최대 줄 수 (기본 250)",
+                    "description": "Max result lines (default: 250)",
                     "default": 250,
                     "minimum": 1,
                 },
                 "case_insensitive": {
                     "type": "boolean",
-                    "description": "대소문자 무시 검색 (기본 false)",
+                    "description": "Case insensitive (default: false)",
                     "default": False,
                 },
             },

@@ -46,10 +46,7 @@ class ReadTool(BaseTool):
 
     @property
     def description(self) -> str:
-        return (
-            "파일을 읽어 라인 번호와 함께 반환합니다. "
-            "offset과 limit으로 읽을 범위를 지정할 수 있습니다."
-        )
+        return "Read file contents with optional line range."
 
     @property
     def group(self) -> str:
@@ -64,17 +61,17 @@ class ReadTool(BaseTool):
             "properties": {
                 "file_path": {
                     "type": "string",
-                    "description": "읽을 파일의 절대 경로",
+                    "description": "Absolute file path",
                 },
                 "offset": {
                     "type": "integer",
-                    "description": "읽기 시작할 라인 번호 (0부터 시작, 기본 0)",
+                    "description": "Start line number (0-based)",
                     "default": 0,
                     "minimum": 0,
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "읽을 최대 라인 수 (기본 2000)",
+                    "description": "Number of lines to read",
                     "default": 2000,
                     "minimum": 1,
                 },

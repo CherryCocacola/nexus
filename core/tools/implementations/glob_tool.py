@@ -42,10 +42,7 @@ class GlobTool(BaseTool):
 
     @property
     def description(self) -> str:
-        return (
-            "glob 패턴으로 파일을 검색합니다. "
-            "수정 시간순(최신 먼저)으로 정렬하며, 최대 250개 결과를 반환합니다."
-        )
+        return "Find files matching a glob pattern."
 
     @property
     def group(self) -> str:
@@ -60,11 +57,11 @@ class GlobTool(BaseTool):
             "properties": {
                 "pattern": {
                     "type": "string",
-                    "description": "glob 패턴 (예: **/*.py, src/**/*.ts)",
+                    "description": "Glob pattern (e.g. **/*.py)",
                 },
                 "path": {
                     "type": "string",
-                    "description": "검색 시작 디렉토리 (기본: 현재 작업 디렉토리)",
+                    "description": "Base directory path",
                 },
             },
             "required": ["pattern"],

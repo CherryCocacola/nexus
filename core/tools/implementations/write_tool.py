@@ -40,9 +40,7 @@ class WriteTool(BaseTool):
 
     @property
     def description(self) -> str:
-        return (
-            "파일에 내용을 씁니다. 기존 파일은 덮어씁니다. 부모 디렉토리가 없으면 자동 생성합니다."
-        )
+        return "Create or overwrite a file."
 
     @property
     def group(self) -> str:
@@ -57,11 +55,11 @@ class WriteTool(BaseTool):
             "properties": {
                 "file_path": {
                     "type": "string",
-                    "description": "쓸 파일의 절대 경로",
+                    "description": "Absolute file path",
                 },
                 "content": {
                     "type": "string",
-                    "description": "파일에 쓸 내용",
+                    "description": "File content to write",
                 },
             },
             "required": ["file_path", "content"],

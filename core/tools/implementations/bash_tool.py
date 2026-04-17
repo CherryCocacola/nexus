@@ -43,11 +43,7 @@ class BashTool(BaseTool):
 
     @property
     def description(self) -> str:
-        return (
-            "셸 명령어를 실행합니다. "
-            "exit_code, stdout, stderr를 반환합니다. "
-            "timeout(초)으로 실행 시간을 제한할 수 있습니다."
-        )
+        return "Execute a shell command."
 
     @property
     def group(self) -> str:
@@ -62,11 +58,11 @@ class BashTool(BaseTool):
             "properties": {
                 "command": {
                     "type": "string",
-                    "description": "실행할 셸 명령어",
+                    "description": "Shell command to execute",
                 },
                 "timeout": {
                     "type": "integer",
-                    "description": "실행 타임아웃 (초, 기본 120)",
+                    "description": "Timeout in seconds (default: 30)",
                     "default": 120,
                     "minimum": 1,
                     "maximum": 600,

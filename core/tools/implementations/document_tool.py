@@ -59,12 +59,7 @@ class DocumentProcessTool(BaseTool):
 
     @property
     def description(self) -> str:
-        return (
-            "PDF, DOCX, XLSX 파일을 파싱하여 텍스트를 추출합니다. "
-            "file_path에 파일 경로를 지정하세요. "
-            "문서가 길면 자동으로 청크로 나뉘며, "
-            "chunk_index로 다음 청크를 읽을 수 있습니다."
-        )
+        return "Parse PDF, DOCX, or XLSX files."
 
     @property
     def aliases(self) -> list[str]:
@@ -83,15 +78,15 @@ class DocumentProcessTool(BaseTool):
             "properties": {
                 "file_path": {
                     "type": "string",
-                    "description": "파싱할 문서 파일 경로",
+                    "description": "Absolute path to document",
                 },
                 "chunk_index": {
                     "type": "integer",
-                    "description": "읽을 청크 번호 (0부터 시작). 생략 시 문서 개요와 첫 청크 반환.",
+                    "description": "Chunk number (0-based, for large docs)",
                 },
                 "pages": {
                     "type": "string",
-                    "description": "PDF 페이지 범위 (예: '1-5'). PDF에만 적용.",
+                    "description": "PDF page range (e.g. '1-5')",
                 },
             },
             "required": ["file_path"],
