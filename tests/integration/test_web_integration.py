@@ -113,3 +113,20 @@ class TestWebAPIIntegration:
         assert resp.status_code == 200
         data = resp.json()
         assert isinstance(data, dict)
+
+    async def test_metrics_exposes_agents_section(self, client: AsyncClient) -> None:
+        """
+        v7.0 Phase 9 이후: /metrics에 "agents" 섹션이 존재해야 한다.
+
+        AgentTool.get_stats()가 subagent_type별 통계를 집계하며, 호출이 없으면
+        빈 dict를 반환한다 (키 자체는 항상 존재).
+        """
+        resp = await client.get("/metrics")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "agents" in data
+        assert isinstance(data["agents"], dict)
+        # 하위 호환 scout 섹션도 유지된다
+        assert "scout" in data
+        # Scout 호출이 아직 없으면 0이어야 한다
+        assert data["scout"]["scout_calls"] >= 0

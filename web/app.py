@@ -580,11 +580,28 @@ async def metrics() -> dict[str, Any]:
     if state:
         result["session"] = state.get_session_summary()
 
-    # Scout 메트릭스 — Ch 17 (v7.0 Phase 9)
-    # ModelDispatcher에 누적된 Scout 호출 통계를 노출한다.
+    # 서브에이전트 메트릭스 — Ch 17 (v7.0 Phase 9 재설계)
+    # AgentTool.get_stats()가 subagent_type별 호출 통계를 집계한다.
+    # 예: {"scout": {"calls": 3, "total_latency_ms": 99000, "avg_latency_ms": 33000}}
+    from core.tools.implementations.agent_tool import AgentTool
+
+    result["agents"] = AgentTool.get_stats()
+
+    # 하위 호환: 기존 대시보드가 result["scout"]을 참조할 수 있으므로 alias 유지.
+    # Scout 자동 전처리가 제거됐으므로 Dispatcher.stats는 0만 반환하지만,
+    # AgentTool의 "scout" 항목을 평탄화해서 함께 노출한다.
     dispatcher = _app_state.get("model_dispatcher")
-    if dispatcher is not None:
-        result["scout"] = dispatcher.stats
+    scout_agent_stats = result["agents"].get("scout", {})
+    result["scout"] = {
+        "tier": dispatcher.tier.value if dispatcher is not None else "unknown",
+        "scout_enabled": (
+            dispatcher.scout_enabled if dispatcher is not None else False
+        ),
+        "scout_calls": scout_agent_stats.get("calls", 0),
+        "scout_avg_latency_ms": scout_agent_stats.get("avg_latency_ms", 0.0),
+        "scout_fallback_count": 0,  # fallback 개념은 AgentTool 이관 후 의미 없음
+        "note": "scout_calls/avg_latency_ms are sourced from AgentTool.get_stats().",
+    }
 
     return result
 
