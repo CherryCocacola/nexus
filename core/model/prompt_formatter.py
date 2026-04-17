@@ -53,13 +53,14 @@ def format_chat_prompt(
         messages: [{"role": "user"|"assistant"|"tool_result", "content": "..."}]
         system_prompt: 시스템 프롬프트
         tools: OpenAI function schema 리스트
-        model_name: 모델 이름 (gemma-*, exaone-*)
+        model_name: 모델 이름 (qwen-*, exaone-*)
 
     Returns:
         포맷된 프롬프트 문자열
     """
-    if "gemma" in model_name.lower():
-        return _format_gemma(messages, system_prompt, tools)
+    if "qwen" in model_name.lower():
+        # Qwen은 ChatML(<|im_start|>) 형식을 사용하므로 _format_chatml로 라우팅
+        return _format_chatml(messages, system_prompt, tools)
     elif "exaone" in model_name.lower():
         return _format_exaone(messages, system_prompt, tools)
     else:

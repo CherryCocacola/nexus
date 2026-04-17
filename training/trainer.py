@@ -49,12 +49,12 @@ class TrainingConfig:
     """
     LoRA/QLoRA 학습 하이퍼파라미터 설정.
 
-    기본값은 RTX 5090 (32GB VRAM)에서 Gemma 4 31B의
+    기본값은 RTX 5090 (32GB VRAM)에서 Qwen 3.5 27B의
     INT4 양자화 모델을 QLoRA로 학습하기 위한 최적값이다.
     """
 
     method: str = "qlora"  # "qlora", "lora", "full"
-    model_path: str = "./models/gemma-4-31b-it"  # 기본 모델 경로
+    model_path: str = "./models/qwen3.5-27b"  # 기본 모델 경로
     output_dir: str = "./checkpoints/"  # 체크포인트 저장 경로
     lora_rank: int = 16  # LoRA rank — 클수록 표현력↑ 메모리↑
     lora_alpha: int = 32  # LoRA alpha — 보통 rank의 2배

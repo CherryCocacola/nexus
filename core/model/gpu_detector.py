@@ -175,8 +175,8 @@ def get_tier_config(tier: GPUTier) -> GPUTierConfig:
         GPUTier.RTX_5090: GPUTierConfig(
             tier=GPUTier.RTX_5090,
             primary=ModelSpec(
-                name="gemma-4-31b-it",
-                path="./models/gemma-4-31b-it",
+                name="qwen3.5-27b",
+                path="./models/qwen3.5-27b",
                 quantization=QuantizationMethod.AWQ,
                 dtype="float16",
                 max_model_len=4096,
@@ -215,8 +215,8 @@ def get_tier_config(tier: GPUTier) -> GPUTierConfig:
         GPUTier.H100: GPUTierConfig(
             tier=GPUTier.H100,
             primary=ModelSpec(
-                name="gemma-4-31b-it",
-                path="./models/gemma-4-31b-it",
+                name="qwen3.5-27b",
+                path="./models/qwen3.5-27b",
                 quantization=QuantizationMethod.NONE,
                 dtype="bfloat16",
                 max_model_len=8192,
@@ -254,8 +254,8 @@ def get_tier_config(tier: GPUTier) -> GPUTierConfig:
         GPUTier.H200: GPUTierConfig(
             tier=GPUTier.H200,
             primary=ModelSpec(
-                name="gemma-4-31b-it",
-                path="./models/gemma-4-31b-it",
+                name="qwen3.5-27b",
+                path="./models/qwen3.5-27b",
                 quantization=QuantizationMethod.NONE,
                 dtype="bfloat16",
                 max_model_len=16384,
@@ -293,8 +293,8 @@ def get_tier_config(tier: GPUTier) -> GPUTierConfig:
         GPUTier.MULTI_GPU: GPUTierConfig(
             tier=GPUTier.MULTI_GPU,
             primary=ModelSpec(
-                name="gemma-4-31b-it",
-                path="./models/gemma-4-31b-it",
+                name="qwen3.5-27b",
+                path="./models/qwen3.5-27b",
                 quantization=QuantizationMethod.NONE,
                 dtype="bfloat16",
                 max_model_len=32768,

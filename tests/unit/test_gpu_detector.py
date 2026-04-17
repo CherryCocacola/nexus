@@ -51,7 +51,7 @@ class TestGPUTierConfig:
         for tier in GPUTier:
             config = get_tier_config(tier)
             assert config.primary is not None
-            assert config.primary.name == "gemma-4-31b-it"
+            assert config.primary.name == "qwen3.5-27b"
 
     def test_all_tiers_have_embedding(self):
         """모든 티어에 임베딩 모델이 설정되어 있는지 확인한다."""

@@ -30,7 +30,7 @@ logger = logging.getLogger("nexus.model.manager")
 class ActiveModel(str, Enum):
     """현재 활성 모델 식별자."""
 
-    PRIMARY = "primary"  # Gemma 4 31B
+    PRIMARY = "primary"  # Qwen 3.5 27B
     AUXILIARY = "auxiliary"  # ExaOne 7.8B
 
 

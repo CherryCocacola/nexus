@@ -20,7 +20,7 @@ import pytest
 # GPU 서버 주소 (config와 동일)
 GPU_SERVER_URL = "http://192.168.22.28:8001"
 EMBEDDING_SERVER_URL = "http://192.168.22.28:8002"
-MODEL_ID = "gemma-4-31b-it"
+MODEL_ID = "qwen3.5-27b"
 EMBEDDING_MODEL_ID = "multilingual-e5-large"
 
 
@@ -72,7 +72,7 @@ class TestGPUServerConnection:
 
     @pytest.mark.asyncio
     async def test_models_endpoint(self):
-        """/v1/models에서 gemma-4-31b-it 모델이 로드되어 있어야 한다."""
+        """/v1/models에서 qwen3.5-27b 모델이 로드되어 있어야 한다."""
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(f"{GPU_SERVER_URL}/v1/models")
             assert resp.status_code == 200

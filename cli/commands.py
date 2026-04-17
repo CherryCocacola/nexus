@@ -32,7 +32,7 @@ def cli():
     "--model",
     default="primary",
     type=click.Choice(["primary", "auxiliary"]),
-    help="사용할 모델 (primary: Gemma 4 31B, auxiliary: ExaOne 7.8B)",
+    help="사용할 모델 (primary: Qwen 3.5 27B, auxiliary: ExaOne 7.8B)",
 )
 @click.option(
     "--permission-mode",

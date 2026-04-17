@@ -42,13 +42,48 @@ class OutputFormatter:
 
     # ─── 텍스트 델타 ───
 
+    # Qwen 3.5 thinking 필터링 상태
+    _in_thinking: bool = False
+    _thinking_buffer: str = ""
+
     def format_text_delta(self, text: str) -> str:
         """
         모델의 텍스트 조각(delta)을 반환한다.
 
-        스트리밍 중에는 실시간으로 출력해야 하므로
-        Rich 렌더러블이 아닌 일반 문자열로 반환한다.
+        Qwen 3.5는 응답 전에 thinking 텍스트를 출력한다.
+        </think> 태그 이전의 텍스트는 작게 표시하고,
+        이후의 실제 응답만 일반 크기로 출력한다.
         """
+        # </think> 감지 — thinking 종료
+        if "</think>" in text:
+            parts = text.split("</think>", 1)
+            self._in_thinking = False
+            # thinking 종료 후 실제 응답 부분만 반환
+            after = parts[1].lstrip("\n")
+            if self._thinking_buffer:
+                # thinking 내용을 한 줄로 요약하여 작게 표시
+                short = self._thinking_buffer[:80].replace("\n", " ")
+                self._thinking_buffer = ""
+                prefix = f"[dim italic]  thinking: {short}...[/dim italic]\n" if short.strip() else ""
+                return prefix + after
+            return after
+
+        # thinking 중인지 판별
+        # 첫 토큰에서 thinking 시작 감지 (소문자/대문자 다양)
+        if not self._in_thinking and not self._thinking_buffer:
+            lower = text.lower().strip()
+            if any(lower.startswith(p) for p in [
+                "thinking", "the user", "i need to", "let me", "i should",
+                "분석", "사용자가", "먼저",
+            ]):
+                self._in_thinking = True
+                self._thinking_buffer = text
+                return ""
+
+        if self._in_thinking:
+            self._thinking_buffer += text
+            return ""
+
         return text
 
     # ─── 도구 사용 ───

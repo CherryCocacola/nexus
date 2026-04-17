@@ -111,6 +111,311 @@ _TOOL_USE_TEMPLATES: list[dict[str, Any]] = [
             "버그를 분석해줘",
         ],
     },
+    # ── MultiEdit 도구 ──
+    # 다중 편집은 edits 배열을 직접 설정한다 (플레이스홀더 치환 불필요)
+    {
+        "instruction": "{path} 파일에서 여러 부분을 한 번에 수정해줘.",
+        "tool": "MultiEdit",
+        "input": {
+            "file_path": "{path}",
+            "edits": [
+                {"old_string": "import os", "new_string": "import os\nimport sys"},
+                {"old_string": "DEBUG = True", "new_string": "DEBUG = False"},
+            ],
+        },
+        "paths": ["src/app.py", "core/tools/executor.py", "core/orchestrator/query_loop.py"],
+    },
+    {
+        "instruction": "{path} 파일에서 로거와 타임아웃 설정을 동시에 변경해줘.",
+        "tool": "MultiEdit",
+        "input": {
+            "file_path": "{path}",
+            "edits": [
+                {"old_string": "logger.info", "new_string": "logger.debug"},
+                {"old_string": "timeout=30", "new_string": "timeout=60"},
+            ],
+        },
+        "paths": ["core/tools/executor.py", "core/model/inference.py"],
+    },
+    # ── LS 도구 ──
+    {
+        "instruction": "{path} 디렉토리의 파일 목록을 보여줘.",
+        "tool": "LS",
+        "input": {"path": "{path}"},
+        "paths": [".", "src/", "core/tools/", "tests/", "config/"],
+    },
+    # ── GitLog 도구 ──
+    {
+        "instruction": "최근 커밋 이력을 5개 보여줘.",
+        "tool": "GitLog",
+        "input": {"max_count": 5},
+    },
+    {
+        "instruction": "최근 커밋 이력을 20개 보여줘.",
+        "tool": "GitLog",
+        "input": {"max_count": 20},
+    },
+    {
+        "instruction": "{path} 파일의 Git 커밋 이력을 보여줘.",
+        "tool": "GitLog",
+        "input": {"max_count": 10, "file_path": "{path}"},
+        "paths": ["core/orchestrator/query_loop.py", "core/tools/executor.py", "README.md"],
+    },
+    # ── GitDiff 도구 ──
+    {
+        "instruction": "현재 변경 사항을 비교해줘.",
+        "tool": "GitDiff",
+        "input": {},
+    },
+    {
+        "instruction": "HEAD~3과 HEAD 사이의 차이를 보여줘.",
+        "tool": "GitDiff",
+        "input": {"ref1": "HEAD~3", "ref2": "HEAD"},
+    },
+    {
+        "instruction": "main 브랜치와 현재 브랜치의 차이를 보여줘.",
+        "tool": "GitDiff",
+        "input": {"ref1": "main", "ref2": "HEAD"},
+    },
+    # ── GitStatus 도구 ──
+    {
+        "instruction": "현재 Git 상태를 확인해줘.",
+        "tool": "GitStatus",
+        "input": {},
+    },
+    {
+        "instruction": "변경된 파일과 스테이징 상태를 보여줘.",
+        "tool": "GitStatus",
+        "input": {},
+    },
+    # ── GitCommit 도구 ──
+    # 커밋 메시지는 고정 값 — commands 키를 사용하되 input.message는 직접 설정
+    {
+        "instruction": "'[core/tools] Read 도구 구현' 메시지로 커밋해줘.",
+        "tool": "GitCommit",
+        "input": {"message": "[core/tools] Read 도구 구현 — 파일 읽기 + 라인 범위 지원"},
+    },
+    {
+        "instruction": "'[core/orchestrator] query_loop 구현' 메시지로 커밋해줘.",
+        "tool": "GitCommit",
+        "input": {"message": "[core/orchestrator] query_loop while(True) 패턴 구현"},
+    },
+    {
+        "instruction": "스트리밍 파서 오류 수정 커밋을 만들어줘.",
+        "tool": "GitCommit",
+        "input": {"message": "[fix] 스트리밍 파서 오류 수정 — SSE 이벤트 누락 방지"},
+    },
+    # ── GitBranch 도구 ──
+    {
+        "instruction": "'feature/tool-system' 브랜치를 생성해줘.",
+        "tool": "GitBranch",
+        "input": {"name": "feature/tool-system", "action": "create"},
+    },
+    {
+        "instruction": "'fix/streaming-parser' 브랜치를 생성해줘.",
+        "tool": "GitBranch",
+        "input": {"name": "fix/streaming-parser", "action": "create"},
+    },
+    {
+        "instruction": "브랜치 목록을 보여줘.",
+        "tool": "GitBranch",
+        "input": {"action": "list"},
+    },
+    # ── GitCheckout 도구 ──
+    {
+        "instruction": "'main' 브랜치로 전환해줘.",
+        "tool": "GitCheckout",
+        "input": {"ref": "main"},
+    },
+    {
+        "instruction": "'feature/tool-system' 브랜치로 전환해줘.",
+        "tool": "GitCheckout",
+        "input": {"ref": "feature/tool-system"},
+    },
+    {
+        "instruction": "'develop' 브랜치로 전환해줘.",
+        "tool": "GitCheckout",
+        "input": {"ref": "develop"},
+    },
+    # ── NotebookRead 도구 ──
+    {
+        "instruction": "{path} 노트북 파일을 읽어줘.",
+        "tool": "NotebookRead",
+        "input": {"file_path": "{path}"},
+        "paths": [
+            "notebooks/analysis.ipynb",
+            "notebooks/experiment.ipynb",
+            "training/data_analysis.ipynb",
+        ],
+    },
+    # ── NotebookEdit 도구 ──
+    # 셀 인덱스와 소스를 직접 설정한다 (고정 값 사용)
+    {
+        "instruction": "{path} 노트북의 첫 번째 셀을 수정해줘.",
+        "tool": "NotebookEdit",
+        "input": {
+            "file_path": "{path}",
+            "cell_index": 0,
+            "new_source": "import pandas as pd\nimport numpy as np\n",
+        },
+        "paths": ["notebooks/analysis.ipynb", "notebooks/experiment.ipynb"],
+    },
+    {
+        "instruction": "{path} 노트북의 세 번째 셀을 데이터 전처리 코드로 바꿔줘.",
+        "tool": "NotebookEdit",
+        "input": {
+            "file_path": "{path}",
+            "cell_index": 2,
+            "new_source": "# 데이터 전처리\ndf = df.dropna()\ndf = df.reset_index(drop=True)\n",
+        },
+        "paths": ["notebooks/analysis.ipynb", "training/data_analysis.ipynb"],
+    },
+    # ── TodoRead 도구 ──
+    {
+        "instruction": "현재 할일 목록을 보여줘.",
+        "tool": "TodoRead",
+        "input": {},
+    },
+    {
+        "instruction": "미완료 할일 항목을 확인해줘.",
+        "tool": "TodoRead",
+        "input": {},
+    },
+    # ── TodoWrite 도구 ──
+    {
+        "instruction": "할일을 추가해줘: query_loop 단위 테스트 작성",
+        "tool": "TodoWrite",
+        "input": {"action": "add", "content": "query_loop 단위 테스트 작성"},
+    },
+    {
+        "instruction": "할일을 추가해줘: Read 도구 권한 검증 로직 추가",
+        "tool": "TodoWrite",
+        "input": {"action": "add", "content": "Read 도구 권한 검증 로직 추가"},
+    },
+    {
+        "instruction": "할일을 추가해줘: SSE 스트리밍 파서 에러 핸들링 개선",
+        "tool": "TodoWrite",
+        "input": {"action": "add", "content": "SSE 스트리밍 파서 에러 핸들링 개선"},
+    },
+    {
+        "instruction": "1번 할일을 완료 처리해줘.",
+        "tool": "TodoWrite",
+        "input": {"action": "complete", "task_id": "1"},
+    },
+    {
+        "instruction": "3번 할일을 완료 처리해줘.",
+        "tool": "TodoWrite",
+        "input": {"action": "complete", "task_id": "3"},
+    },
+    # ── Task 도구 ──
+    {
+        "instruction": "'대규모 코드베이스 분석' 비동기 태스크를 생성해줘.",
+        "tool": "Task",
+        "input": {"action": "create", "description": "대규모 코드베이스 분석"},
+    },
+    {
+        "instruction": "'전체 테스트 스위트 실행' 비동기 태스크를 생성해줘.",
+        "tool": "Task",
+        "input": {"action": "create", "description": "전체 테스트 스위트 실행"},
+    },
+    {
+        "instruction": "'데이터 마이그레이션 실행' 비동기 태스크를 생성해줘.",
+        "tool": "Task",
+        "input": {"action": "create", "description": "데이터 마이그레이션 실행"},
+    },
+    {
+        "instruction": "태스크 task_001의 상태를 확인해줘.",
+        "tool": "Task",
+        "input": {"action": "status", "task_id": "task_001"},
+    },
+    {
+        "instruction": "태스크 task_002의 상태를 확인해줘.",
+        "tool": "Task",
+        "input": {"action": "status", "task_id": "task_002"},
+    },
+    # ── MemoryRead 도구 ──
+    {
+        "instruction": "'프로젝트 아키텍처 결정 사항'에 대한 메모리를 검색해줘.",
+        "tool": "MemoryRead",
+        "input": {"query": "프로젝트 아키텍처 결정 사항"},
+    },
+    {
+        "instruction": "'이전 디버깅 세션 내용'에 대한 메모리를 검색해줘.",
+        "tool": "MemoryRead",
+        "input": {"query": "이전 디버깅 세션 내용"},
+    },
+    {
+        "instruction": "'코드 리뷰 피드백'에 대한 메모리를 검색해줘.",
+        "tool": "MemoryRead",
+        "input": {"query": "코드 리뷰 피드백"},
+    },
+    {
+        "instruction": "'설정 변경 이력'에 대한 메모리를 검색해줘.",
+        "tool": "MemoryRead",
+        "input": {"query": "설정 변경 이력"},
+    },
+    # ── MemoryWrite 도구 ──
+    {
+        "instruction": "이 내용을 메모리에 저장해줘: Redis 세션 저장소로 결정",
+        "tool": "MemoryWrite",
+        "input": {
+            "content": "Redis 세션 저장소로 결정 — TTL 기반 자동 만료",
+            "tags": ["architecture", "decision"],
+        },
+    },
+    {
+        "instruction": "이 내용을 메모리에 저장해줘: CONTEXT_COMPACT 이벤트 처리 필요",
+        "tool": "MemoryWrite",
+        "input": {
+            "content": "query_loop에서 CONTEXT_COMPACT 이벤트 처리 로직 추가 필요",
+            "tags": ["todo", "orchestrator"],
+        },
+    },
+    {
+        "instruction": "이 내용을 메모리에 저장해줘: e5-large 임베딩 응답 시간 측정 결과",
+        "tool": "MemoryWrite",
+        "input": {
+            "content": "e5-large 임베딩 모델 응답 시간: 평균 12ms",
+            "tags": ["performance", "benchmark"],
+        },
+    },
+    # ── DockerBuild 도구 ──
+    {
+        "instruction": "'nexus-orchestrator:latest' 태그로 Docker 이미지를 빌드해줘.",
+        "tool": "DockerBuild",
+        "input": {"tag": "nexus-orchestrator:latest", "dockerfile": "Dockerfile"},
+    },
+    {
+        "instruction": "GPU용 Docker 이미지를 빌드해줘.",
+        "tool": "DockerBuild",
+        "input": {"tag": "nexus-gpu:latest", "dockerfile": "Dockerfile.gpu"},
+    },
+    {
+        "instruction": "테스트용 Docker 이미지를 빌드해줘.",
+        "tool": "DockerBuild",
+        "input": {"tag": "nexus-test:dev", "dockerfile": "Dockerfile.test"},
+    },
+    # ── DockerRun 도구 ──
+    {
+        "instruction": "'nexus-orchestrator:latest' 이미지로 컨테이너를 실행해줘.",
+        "tool": "DockerRun",
+        "input": {"image": "nexus-orchestrator:latest"},
+    },
+    {
+        "instruction": "Redis 컨테이너를 포트 6379로 실행해줘.",
+        "tool": "DockerRun",
+        "input": {"image": "redis:7-alpine", "ports": "6379:6379"},
+    },
+    {
+        "instruction": "PostgreSQL 컨테이너를 포트 5432로 실행해줘.",
+        "tool": "DockerRun",
+        "input": {"image": "postgres:16-alpine", "ports": "5432:5432"},
+    },
+    {
+        "instruction": "GPU 서버 컨테이너를 8080 포트로 실행해줘.",
+        "tool": "DockerRun",
+        "input": {"image": "nexus-gpu:latest", "ports": "8080:8080"},
+    },
 ]
 
 # ─────────────────────────────────────────────
@@ -186,6 +491,218 @@ _REASONING_TEMPLATES: list[dict[str, Any]] = [
                 "code": "data = requests.get('https://api.example.com/data')",
                 "issues": "에어갭 환경에서 외부 네트워크 호출은 금지됩니다",
                 "improvements": "로컬 API 서버를 통해 데이터를 가져오도록 변경하세요",
+            },
+        ],
+    },
+    # ── 보안 취약점 분석 ──
+    {
+        "category": "security_analysis",
+        "instruction": "이 코드의 보안 취약점을 분석해줘:\n```python\n{code}\n```",
+        "reasoning": (
+            "1. 코드를 보안 관점에서 검토합니다.\n"
+            "2. 식별된 취약점: {vulnerability}\n"
+            "3. 공격 시나리오: {attack_scenario}\n"
+            "4. 권장 수정 방법: {fix}"
+        ),
+        "analyses": [
+            {
+                "code": (
+                    "query = f\"SELECT * FROM users WHERE name = '{user_input}'\""
+                    "\ncursor.execute(query)"
+                ),
+                "vulnerability": "SQL Injection — 사용자 입력이 직접 쿼리에 삽입됩니다",
+                "attack_scenario": (
+                    "공격자가 user_input에 ' OR 1=1 -- 를 입력하면 모든 사용자 데이터가 노출됩니다"
+                ),
+                "fix": (
+                    "파라미터화된 쿼리를 사용하세요: "
+                    "cursor.execute('SELECT * FROM users WHERE name = %s', (user_input,))"
+                ),
+            },
+            {
+                "code": (
+                    "file_path = os.path.join(base_dir, user_filename)\n"
+                    "with open(file_path) as f:\n"
+                    "    return f.read()"
+                ),
+                "vulnerability": (
+                    "Path Traversal — 사용자가 ../../etc/passwd 같은 "
+                    "경로를 입력하여 시스템 파일에 접근할 수 있습니다"
+                ),
+                "attack_scenario": (
+                    "user_filename에 ../../../etc/shadow를 넣으면 "
+                    "민감한 시스템 파일을 읽을 수 있습니다"
+                ),
+                "fix": (
+                    "경로를 정규화한 후 base_dir 내에 있는지 검증하세요: "
+                    "resolved = Path(file_path).resolve(); "
+                    "assert str(resolved).startswith(str(Path(base_dir).resolve()))"
+                ),
+            },
+            {
+                "code": ("html = f'<div>환영합니다, {username}!</div>'\nreturn HTMLResponse(html)"),
+                "vulnerability": (
+                    "XSS (Cross-Site Scripting) — 사용자 입력이 이스케이프 없이 HTML에 삽입됩니다"
+                ),
+                "attack_scenario": (
+                    "username에 <script>alert('XSS')</script>를 넣으면 "
+                    "브라우저에서 악성 스크립트가 실행됩니다"
+                ),
+                "fix": (
+                    "html.escape()로 사용자 입력을 이스케이프하거나 "
+                    "Jinja2 템플릿의 자동 이스케이프 기능을 사용하세요"
+                ),
+            },
+        ],
+    },
+    # ── 성능 최적화 분석 ──
+    {
+        "category": "performance",
+        "instruction": (
+            "이 코드의 성능 문제를 분석하고 최적화 방법을 제안해줘:\n```python\n{code}\n```"
+        ),
+        "reasoning": (
+            "1. 코드의 성능 특성을 분석합니다.\n"
+            "2. 식별된 성능 병목: {bottleneck}\n"
+            "3. 영향 범위: {impact}\n"
+            "4. 최적화 방법: {optimization}"
+        ),
+        "perf_issues": [
+            {
+                "code": (
+                    "for user in users:\n"
+                    "    orders = db.query(Order).filter(Order.user_id == user.id).all()\n"
+                    "    user.orders = orders"
+                ),
+                "bottleneck": ("N+1 쿼리 문제 — 사용자 수만큼 추가 DB 쿼리가 발생합니다"),
+                "impact": (
+                    "사용자 1000명이면 1001번의 DB 쿼리가 실행되어 "
+                    "응답 시간이 수 초 이상으로 증가합니다"
+                ),
+                "optimization": (
+                    "joinedload 또는 subqueryload를 사용하여 한 번의 쿼리로 "
+                    "관련 데이터를 함께 로드하세요: "
+                    "db.query(User).options(joinedload(User.orders)).all()"
+                ),
+            },
+            {
+                "code": (
+                    "results = []\n"
+                    "for item in large_list:\n"
+                    "    if item not in results:\n"
+                    "        results.append(item)"
+                ),
+                "bottleneck": ("O(n^2) 중복 제거 — 리스트의 in 연산이 매번 전체를 순회합니다"),
+                "impact": (
+                    "10만 개 항목이면 최대 100억 번의 비교가 발생하여 수 분 이상 소요될 수 있습니다"
+                ),
+                "optimization": (
+                    "set을 사용하여 O(1) 조회로 변경하세요: "
+                    "seen = set(); results = [x for x in large_list "
+                    "if x not in seen and not seen.add(x)]"
+                ),
+            },
+            {
+                "code": (
+                    "async def get_all_data():\n"
+                    "    a = await fetch_from_service_a()\n"
+                    "    b = await fetch_from_service_b()\n"
+                    "    c = await fetch_from_service_c()\n"
+                    "    return a, b, c"
+                ),
+                "bottleneck": ("순차적 비동기 호출 — 독립적인 작업을 직렬로 실행합니다"),
+                "impact": (
+                    "각 서비스 호출이 100ms라면 총 300ms가 소요되지만, "
+                    "병렬로 실행하면 100ms로 줄일 수 있습니다"
+                ),
+                "optimization": (
+                    "asyncio.gather를 사용하여 병렬로 실행하세요: "
+                    "a, b, c = await asyncio.gather("
+                    "fetch_from_service_a(), fetch_from_service_b(), fetch_from_service_c())"
+                ),
+            },
+        ],
+    },
+    # ── 리팩토링 제안 ──
+    {
+        "category": "refactoring",
+        "instruction": "이 코드의 리팩토링이 필요한 부분을 지적해줘:\n```python\n{code}\n```",
+        "reasoning": (
+            "1. 코드 구조를 분석합니다.\n"
+            "2. 식별된 코드 스멜: {smell}\n"
+            "3. 문제의 근본 원인: {root_cause}\n"
+            "4. 리팩토링 방법: {refactoring}"
+        ),
+        "smells": [
+            {
+                "code": (
+                    "def process(data, mode):\n"
+                    "    if mode == 'csv':\n"
+                    "        # 50줄의 CSV 처리 로직\n"
+                    "        pass\n"
+                    "    elif mode == 'json':\n"
+                    "        # 50줄의 JSON 처리 로직\n"
+                    "        pass\n"
+                    "    elif mode == 'xml':\n"
+                    "        # 50줄의 XML 처리 로직\n"
+                    "        pass"
+                ),
+                "smell": (
+                    "긴 함수 + 분기 폭발 — 하나의 함수가 150줄 이상이고 "
+                    "모드별 분기가 계속 증가합니다"
+                ),
+                "root_cause": (
+                    "서로 다른 형식의 처리 로직이 하나의 함수에 결합되어 "
+                    "개방-폐쇄 원칙(OCP)을 위반합니다"
+                ),
+                "refactoring": (
+                    "전략 패턴을 적용하세요: 각 모드별 처리기를 별도 클래스로 분리하고, "
+                    "딕셔너리 디스패치로 선택합니다. "
+                    "processors = {'csv': CsvProcessor(), 'json': JsonProcessor(), ...}"
+                ),
+            },
+            {
+                "code": (
+                    "from core.model.inference import ModelClient\n"
+                    "from core.tools.executor import ToolExecutor\n"
+                    "# core/tools/executor.py에서:\n"
+                    "from core.model.inference import ModelClient\n"
+                    "from core.orchestrator.query_loop import QueryLoop"
+                ),
+                "smell": ("순환 의존성 — 모듈 간 양방향 import가 발생합니다"),
+                "root_cause": (
+                    "계층 간 의존성 방향이 역전되어 있습니다. "
+                    "core/tools가 core/orchestrator를 import하면 안 됩니다"
+                ),
+                "refactoring": (
+                    "의존성 역전 원칙(DIP)을 적용하세요: "
+                    "공통 인터페이스(ABC)를 정의하고 상위 모듈에서 구현을 주입합니다. "
+                    "또는 lazy import로 런타임 순환을 회피합니다"
+                ),
+            },
+            {
+                "code": (
+                    "class UserService:\n"
+                    "    def create_user(self, name, email):\n"
+                    "        # 유효성 검사\n"
+                    "        # DB 저장\n"
+                    "        # 이메일 발송\n"
+                    "        # 감사 로그 기록\n"
+                    "        # 캐시 갱신\n"
+                    "        pass"
+                ),
+                "smell": (
+                    "단일 책임 원칙(SRP) 위반 — 하나의 메서드가 5가지 서로 다른 관심사를 처리합니다"
+                ),
+                "root_cause": (
+                    "횡단 관심사(이메일, 로그, 캐시)가 비즈니스 로직에 직접 결합되어 있습니다"
+                ),
+                "refactoring": (
+                    "이벤트 기반 아키텍처로 분리하세요: "
+                    "UserService는 생성만 담당하고, "
+                    "이메일/로그/캐시는 이벤트 핸들러로 분리합니다. "
+                    "또는 데코레이터 패턴으로 횡단 관심사를 래핑합니다"
+                ),
             },
         ],
     },
@@ -393,6 +910,30 @@ class BootstrapGenerator:
             instruction = instruction_tpl.replace("{code}", chosen["code"])
             reasoning = reasoning_tpl.replace("{issues}", chosen["issues"])
             reasoning = reasoning.replace("{improvements}", chosen["improvements"])
+
+        elif category == "security_analysis" and "analyses" in template:
+            # 보안 취약점 분석 — 코드, 취약점, 공격 시나리오, 수정 방법을 치환한다
+            chosen = self._rng.choice(template["analyses"])
+            instruction = instruction_tpl.replace("{code}", chosen["code"])
+            reasoning = reasoning_tpl.replace("{vulnerability}", chosen["vulnerability"])
+            reasoning = reasoning.replace("{attack_scenario}", chosen["attack_scenario"])
+            reasoning = reasoning.replace("{fix}", chosen["fix"])
+
+        elif category == "performance" and "perf_issues" in template:
+            # 성능 최적화 분석 — 코드, 병목, 영향, 최적화 방법을 치환한다
+            chosen = self._rng.choice(template["perf_issues"])
+            instruction = instruction_tpl.replace("{code}", chosen["code"])
+            reasoning = reasoning_tpl.replace("{bottleneck}", chosen["bottleneck"])
+            reasoning = reasoning.replace("{impact}", chosen["impact"])
+            reasoning = reasoning.replace("{optimization}", chosen["optimization"])
+
+        elif category == "refactoring" and "smells" in template:
+            # 리팩토링 제안 — 코드, 코드 스멜, 근본 원인, 리팩토링 방법을 치환한다
+            chosen = self._rng.choice(template["smells"])
+            instruction = instruction_tpl.replace("{code}", chosen["code"])
+            reasoning = reasoning_tpl.replace("{smell}", chosen["smell"])
+            reasoning = reasoning.replace("{root_cause}", chosen["root_cause"])
+            reasoning = reasoning.replace("{refactoring}", chosen["refactoring"])
 
         else:
             # 알 수 없는 카테고리 — 기본 처리

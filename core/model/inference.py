@@ -68,7 +68,7 @@ class ModelProvider(ABC):
     Claude Code의 ApiClient에 대응한다.
 
     이 인터페이스만 구현하면 QueryEngine, Tool System, Agent System 전체가
-    구체적인 모델(Gemma, ExaOne, OpenAI 등)과 독립적으로 동작한다.
+    구체적인 모델(Qwen, ExaOne, OpenAI 등)과 독립적으로 동작한다.
 
     왜 ABC인가: 향후 다른 모델 백엔드(직접 torch, TGI 등)를
     추가할 때 이 인터페이스만 구현하면 된다.
@@ -136,7 +136,7 @@ class LocalModelProvider(ModelProvider):
         self,
         base_url: str = "http://localhost:8000",
         api_key: str = "local-key",
-        model_id: str = "gemma-4-31b-it",
+        model_id: str = "qwen3.5-27b",
         max_context_tokens: int = 8192,
         max_output_tokens: int = 4096,
         fallback_model_id: str | None = None,
@@ -247,6 +247,9 @@ class LocalModelProvider(ModelProvider):
             accumulated_tool_calls: dict[int, dict[str, Any]] = {}
             total_usage = TokenUsage()
             context_exceeded = False
+            # finish_reason 이후 usage 청크를 기다리기 위한 변수
+            # vLLM은 finish_reason 청크 → usage 청크 → [DONE] 순으로 전송한다.
+            pending_stop: StopReason | None = None
 
             try:
                 async with self._client.stream(
@@ -306,11 +309,14 @@ class LocalModelProvider(ModelProvider):
 
                         data_str = line[6:].strip()
                         if data_str == "[DONE]":
-                            for _evt in self._finalize_tool_calls(accumulated_tool_calls):
-                                yield _evt
+                            # pending_stop이 없으면 (finish_reason 없이 [DONE] 도달)
+                            # 폴백으로 END_TURN 사용
+                            if pending_stop is None:
+                                for _evt in self._finalize_tool_calls(accumulated_tool_calls):
+                                    yield _evt
                             yield StreamEvent(
                                 type=StreamEventType.MESSAGE_STOP,
-                                stop_reason=StopReason.END_TURN,
+                                stop_reason=pending_stop or StopReason.END_TURN,
                                 usage=total_usage,
                             )
                             return
@@ -361,12 +367,10 @@ class LocalModelProvider(ModelProvider):
                                 ):
                                     yield _evt
 
-                            yield StreamEvent(
-                                type=StreamEventType.MESSAGE_STOP,
-                                stop_reason=stop,
-                                usage=total_usage,
-                            )
-                            return
+                            # finish_reason 이후 usage 청크가 올 수 있으므로
+                            # 바로 return하지 않고 finish 정보를 저장한다.
+                            # [DONE] 또는 usage 청크에서 최종 yield + return 한다.
+                            pending_stop = stop
 
             except httpx.ConnectError as e:
                 self._error_count += 1

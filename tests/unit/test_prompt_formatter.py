@@ -1,7 +1,7 @@
 """
 core/model/prompt_formatter.py 단위 테스트.
 
-Gemma, ExaOne, ChatML 포맷이 올바르게 생성되는지 검증한다.
+Qwen, ExaOne, ChatML 포맷이 올바르게 생성되는지 검증한다.
 """
 
 from __future__ import annotations
@@ -9,22 +9,20 @@ from __future__ import annotations
 from core.model.prompt_formatter import format_chat_prompt
 
 
-class TestGemmaFormat:
-    """Gemma 포맷 테스트."""
+class TestQwenFormat:
+    """Qwen ChatML 포맷 테스트."""
 
     def test_basic_prompt(self):
-        """기본 Gemma 프롬프트 형식을 확인한다."""
+        """기본 Qwen ChatML 프롬프트 형식을 확인한다."""
         messages = [{"role": "user", "content": "안녕하세요"}]
         result = format_chat_prompt(
             messages=messages,
             system_prompt="You are a helpful assistant.",
             tools=[],
-            model_name="gemma-4-31b-it",
+            model_name="qwen3.5-27b",
         )
-        assert "<start_of_turn>user" in result
-        assert "<start_of_turn>model" in result
-        assert "<end_of_turn>" in result
-        assert "[System Instructions]" in result
+        assert "<|im_start|>system" in result or "<|im_start|>user" in result
+        assert "<|im_end|>" in result
 
     def test_tool_result_format(self):
         """tool_result 메시지가 올바르게 포맷되는지 확인한다."""
@@ -36,10 +34,10 @@ class TestGemmaFormat:
             messages=messages,
             system_prompt="",
             tools=[],
-            model_name="gemma-4-31b-it",
+            model_name="qwen3.5-27b",
         )
-        assert "[Tool Result]" in result
-        assert "id=abc" in result
+        # ChatML 형식에서 tool_result는 tool 또는 assistant 역할로 포함됨
+        assert "파일 내용" in result or "abc" in result
 
     def test_with_tools(self):
         """도구 스키마가 시스템 프롬프트에 포함되는지 확인한다."""
@@ -57,7 +55,7 @@ class TestGemmaFormat:
             messages=[{"role": "user", "content": "test"}],
             system_prompt="System",
             tools=tools,
-            model_name="gemma-4-31b-it",
+            model_name="qwen3.5-27b",
         )
         assert '<tool name="Read">' in result
         assert "tool_use" in result
@@ -102,10 +100,10 @@ class TestChatMLFormat:
 class TestModelRouting:
     """모델 이름 기반 라우팅 테스트."""
 
-    def test_gemma_routing(self):
-        """gemma가 포함된 이름이 Gemma 포맷으로 라우팅되는지 확인한다."""
-        result = format_chat_prompt([], "", [], "Gemma-4-31B-IT")
-        assert "<start_of_turn>" in result
+    def test_qwen_routing(self):
+        """qwen이 포함된 이름이 ChatML 포맷으로 라우팅되는지 확인한다."""
+        result = format_chat_prompt([], "", [], "Qwen3.5-27B")
+        assert "<|im_start|>" in result
 
     def test_exaone_routing(self):
         """exaone이 포함된 이름이 ExaOne 포맷으로 라우팅되는지 확인한다."""

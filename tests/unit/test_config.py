@@ -49,7 +49,7 @@ class TestNexusConfig:
         assert config.air_gap_mode is True
         assert config.log_level == "INFO"
         assert config.debug is False
-        assert config.model.primary_model == "gemma-4-31b-it"
+        assert config.model.primary_model == "qwen3.5-27b"
 
     def test_redis_property_accessors(self):
         """편의 property가 올바른 값을 반환하는지 확인한다."""

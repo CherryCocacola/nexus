@@ -21,7 +21,7 @@ import pytest
 
 GPU_SERVER_URL = "http://192.168.22.28:8001"
 EMBEDDING_SERVER_URL = "http://192.168.22.28:8002"
-MODEL_ID = "gemma-4-31b-it"
+MODEL_ID = "qwen3.5-27b"
 
 
 def _gpu_server_available() -> bool:
