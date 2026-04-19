@@ -414,6 +414,81 @@ VRAM 최대 max-model-len:
 
 ---
 
+## 사양서 원본 회귀 (경로 ⓐ) — 부분 성공 + docx 이슈 (2026-04-18~19)
+
+### 배경
+경로 B 전환(2026-04-17) 후 사용자가 실사용에서 다음 지적:
+1. Scout가 짧은 요약만 뱉음 (4B가 27B가 해야 할 요약 작업 수행)
+2. Worker가 시키지 않은 파일을 임의 생성(Write logs/debug.log)
+3. Worker가 바이너리 파일에 Read fallback 시도
+
+사양서 v7.0 Part 2.3(SCOUT_TOOLS·JSON 출력)과 Part 2.4(Worker는 실행 전용·
+Read 필요 없음)와 현재 구현을 전수 대조한 결과 **3가지 중대 이탈** 발견:
+- Worker 도구 풀에 Read/Glob/Grep/LS 포함 (Part 2.4 위반)
+- Worker system_prompt에 `{scout_plan}` 슬롯 구조 부재 (Part 2.4 위반)
+- Scout가 JSON 아닌 자유 텍스트 요약 반환 (Part 2.3 위반)
+
+### 조치 (경로 ⓐ 사양서 원본 회귀)
+**1) Worker 도구 축소** — Part 2.4 원본 `{Edit, Write, Bash, GitCommit, GitDiff}` 복원
+- CLI Worker: 11개 → 6개 (Edit/Write/Bash/GitCommit/GitDiff/Agent)
+- Web Worker: 8개 → 4개 (Edit/Write/Bash/Agent)
+- Read/Glob/Grep/LS/DocumentProcess는 **Scout 전용**
+
+**2) SCOUT_AGENT.system_prompt 재작성**
+- Worker(27B)가 분석, Scout(4B)는 "탐색·계획"만
+- 출력 형식: Part 2.3 원본 JSON → 실측 결과 4B가 JSON 규율 못 지킴 →
+  **마크다운 4섹션** (`## relevant_files`, `## file_summaries`, `## plan`,
+  `## requires_tools`)으로 **2차 완화** (사양서 Part 2.3 2차 개정으로 문자화)
+
+**3) Worker system_prompt 재작성**
+- "You are the 27B brain; Scout is a 4B helper"
+- Scout 마크다운 섹션 해석 지시, `## plan` 본문을 factual ground truth로 사용
+- "Scout 1회 호출 제한, 재호출 금지" 규칙 명시
+
+**4) 사양서 Part 2.3 2차 개정 추가**
+- JSON→마크다운 완화 근거 문서화 (Qwen3.5-4B 능력 한계 반영)
+- 정신(4섹션 구조)은 유지, 형식만 완화
+
+### 검증 결과 3/4 통과
+
+| # | 시나리오 | 결과 | 비고 |
+|---|---|---|---|
+| 1 | 인사 | ✅ 1초, 10토큰 | 깔끔 |
+| 2 | 일반 지식 (짜라투스트라) | ✅ 10초, 139토큰 | 구조화된 자세한 답변 |
+| 3 | 텍스트 첨부 (DB 로그 분석) | ✅ 44초, 309토큰 | 원인 진단 + 조치 추천 |
+| 4 | docx 업로드 → Scout 분석 | ❌ 180~240초 타임아웃 | **아래 미해결 이슈 참조** |
+
+### 미해결: docx 파일 분석 무한 호출 루프
+
+**증상**: docx 업로드 시 Scout가 매 호출마다 **정확히 29자** 짧은 응답을
+반환하고 Worker가 7회 이상 재호출하며 타임아웃.
+
+**시도한 조치 (모두 효과 없음)**:
+- Scout system_prompt에 "DocumentProcess 사용 강제" 규칙
+- Scout 출력 형식 JSON → 마크다운 헤더 완화
+- Worker system_prompt에 "Scout 1회 호출 제한" 명시
+- max_turns 확대
+
+**추정 원인 (프롬프트 레벨 아님)**:
+1. Scout 서버(llama.cpp `--jinja`)가 Qwen3.5-4B의 tool_call을 제대로 파싱 못 함
+2. `chat_template_kwargs={"enable_thinking": false}` 파라미터가 llama.cpp에
+   전달은 되지만 실제 효과 미지수
+3. Scout 응답이 29자로 고정 수렴하는 건 시스템 레벨 stop 조건의 조기 발동
+   (LLM 자유 응답이 이렇게 규칙적이지 않음)
+
+**다음 세션 작업 후보**:
+- α. Scout 서버에 직접 curl로 최소 요청 보내서 실제 tool_call 생성·파싱 과정 관찰 (30분~1시간)
+- β. DocumentProcess를 Worker에 임시 복귀 (사양서 정신 타협, 15KB 이하만 지원)
+- γ. Scout 모델을 Qwen3.5-4B → 7B로 교체 (CPU 자원 여유 확인 필요, GGUF 다운로드 + llama.cpp 재기동, 1~2시간)
+
+현재는 α(디버깅)를 먼저 하는 것이 정보 확보 관점에서 권장됨.
+
+### 커밋 상태
+- 경로 ⓐ 변경 전체를 한 커밋으로 정리 (docx 이슈 주석 포함)
+- 회귀 572/572 통과, 시나리오 1~3 실작동 확인
+
+---
+
 ## Scout를 문서 분석 전담자로 복원 — 경로 B (2026-04-17)
 
 ### 배경

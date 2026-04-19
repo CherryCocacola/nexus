@@ -237,6 +237,41 @@ SCOUT_AGENT = AgentDefinition(
 )
 ```
 
+#### Part 2.3 2차 개정 (2026-04-18) — 출력 형식 JSON → 마크다운 완화
+
+**사유**: 실측 결과 Qwen3.5-4B(CPU, llama.cpp)가 구조화된 JSON 출력을 안정적으로
+생성하지 못함. Worker가 파싱 실패로 같은 Scout를 4회 반복 호출하여 240초
+타임아웃. JSON 중괄호·이스케이프·따옴표 규율은 작은 모델에겐 과도한 부담.
+
+**변경**: Scout 출력을 JSON 대신 **4개 섹션 마크다운**으로 완화. 의미 구조는
+동일 (relevant_files / file_summaries / plan / requires_tools).
+
+```
+## relevant_files
+- path/to/file1
+
+## file_summaries
+- path/to/file1: one-line description
+
+## plan
+- bullet of key facts the Worker needs
+- more facts
+...
+
+## requires_tools
+- Edit
+```
+
+**Worker 측**: JSON 파싱 대신 마크다운 섹션 헤더로 `## plan` 본문을 추출해
+답변 생성 재료로 사용. LLM이 자연어/마크다운 처리에 특화되어 있어 형식
+교환 비용은 거의 없음.
+
+**사양서 정신 준수**: Scout의 역할(탐색·계획), 4개 정보 슬롯, Worker와의
+계약 모두 그대로. 단지 wire format만 더 관대한 것으로 교체. 하드웨어 업그레이드
+시 Scout를 더 큰 모델로 교체하면 JSON으로 되돌려도 무방.
+
+---
+
 #### Part 2.3 개정 근거 (2026-04-17)
 
 - DocumentProcess는 사양서 v7.0 AMENDMENT **초판 작성 시점에 존재하지

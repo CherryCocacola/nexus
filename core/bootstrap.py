@@ -495,43 +495,32 @@ def _create_scout_tool_registry():  # noqa: ANN202
 
 def _create_cli_tool_registry():  # noqa: ANN202
     """
-    CLI용 핵심 도구를 등록한 ToolRegistry를 생성한다.
+    CLI Worker용 실행 전용 도구 레지스트리 (사양서 Part 2.4 원본 복원).
 
-    RTX 5090 (8192 ctx)에서 24개 도구(~6,102토큰)는 컨텍스트를 초과한다.
-    파일 작업 + 검색 + Git + 문서 + Agent(서브에이전트 호출) 도구로 제한하여
-    입력+출력에 충분한 토큰 여유를 확보한다.
-    GPU 업그레이드 시 _create_tool_registry()로 전환 가능.
+    원칙: Worker는 "실행에만 집중". 탐색/조회는 Scout에 위임한다.
+    사양서 Part 2.4 WORKER_TOOLS_TIER_S 정의:
+        ["Edit", "Write", "Bash", "GitCommit", "GitDiff"]
+    본 구현은 여기에 Agent(서브에이전트 호출)을 추가해 6개다.
+
+    Read/Glob/Grep/LS/GitLog/GitStatus는 **Scout 전용**으로 이관됨.
+    Worker가 파일 탐색이 필요하면 Agent(subagent_type="scout")를 호출한다.
     """
     from core.tools.implementations.agent_tool import AgentTool
     from core.tools.implementations.bash_tool import BashTool
     from core.tools.implementations.edit_tool import EditTool
-    from core.tools.implementations.git_tools import GitDiffTool, GitLogTool, GitStatusTool
-    from core.tools.implementations.glob_tool import GlobTool
-    from core.tools.implementations.grep_tool import GrepTool
-    from core.tools.implementations.ls_tool import LSTool
-    from core.tools.implementations.read_tool import ReadTool
+    from core.tools.implementations.git_tools import GitCommitTool, GitDiffTool
     from core.tools.implementations.write_tool import WriteTool
     from core.tools.registry import ToolRegistry
 
-    # v7.0 Part 2.3 개정: DocumentProcess는 Scout 전용. Worker(CLI)는
-    # 큰 문서를 직접 흡수하지 않고 Agent(subagent_type="scout")로 위임한다.
     registry = ToolRegistry()
     registry.register_many([
-        # 파일 시스템 (3개)
-        ReadTool(),
-        WriteTool(),
+        # 실행 전용 도구 (Part 2.4 원본)
         EditTool(),
-        # 실행 (1개)
+        WriteTool(),
         BashTool(),
-        # 검색 (3개)
-        GlobTool(),
-        GrepTool(),
-        LSTool(),
-        # Git (3개) — CLI에서 자주 사용하는 읽기 전용 Git 도구
-        GitLogTool(),
+        GitCommitTool(),
         GitDiffTool(),
-        GitStatusTool(),
-        # 서브에이전트 (1개) — Worker가 Scout 등 전문 에이전트를 호출
+        # 서브에이전트 호출 — Worker가 Scout 등 탐색자/전문가에 위임
         AgentTool(),
     ])
 
@@ -540,37 +529,31 @@ def _create_cli_tool_registry():  # noqa: ANN202
 
 def _create_web_tool_registry():  # noqa: ANN202
     """
-    웹 채팅용 도구 레지스트리.
+    웹 Worker용 실행 전용 도구 레지스트리 (사양서 Part 2.4 원본 복원).
 
-    v7.0 Part 2.3 개정 (2026-04-17): DocumentProcess를 Scout로 이관.
-    Worker(웹)는 코드/명령 작업만 담당하고, 업로드된 PDF/DOCX/XLSX 분석은
-    Agent(subagent_type="scout")로 위임한다. 큰 문서가 Worker 컨텍스트에
-    직접 들어가지 않도록 하는 Scout 본래 설계 의도 복원.
+    CLI보다 더 보수적으로 구성한다 — GitCommit/GitDiff는 제외.
+    웹 UI는 일반 사용자 인터페이스이므로 "대화 + 파일 편집 + 명령 실행 +
+    서브에이전트 호출"만 제공한다.
 
-    RTX 5090 (8192 컨텍스트)에서 도구 스키마 비용을 ~300토큰 절감한다.
-    GPU 업그레이드 시 _create_tool_registry()로 교체 가능.
+    사양서 Part 2.4의 WORKER_TOOLS_TIER_S는 {Edit, Write, Bash, GitCommit,
+    GitDiff}이지만, 웹에서는 Git은 일반 사용자 용도가 아니므로 CLI로만.
+
+    Read/Glob/Grep/LS는 Scout 전용. 파일 탐색은 Agent(subagent_type="scout")
+    로 위임한다. 이렇게 하면 Worker 컨텍스트(8K)에 큰 데이터가 직접 적재되는
+    상황 자체를 구조적으로 차단한다.
     """
     from core.tools.implementations.agent_tool import AgentTool
     from core.tools.implementations.bash_tool import BashTool
     from core.tools.implementations.edit_tool import EditTool
-    from core.tools.implementations.glob_tool import GlobTool
-    from core.tools.implementations.grep_tool import GrepTool
-    from core.tools.implementations.ls_tool import LSTool
-    from core.tools.implementations.read_tool import ReadTool
     from core.tools.implementations.write_tool import WriteTool
     from core.tools.registry import ToolRegistry
 
     registry = ToolRegistry()
     registry.register_many([
-        ReadTool(),      # 파일 읽기 (~300 토큰)
-        WriteTool(),     # 파일 쓰기 (~225 토큰)
-        EditTool(),      # 파일 편집 (~325 토큰)
-        BashTool(),      # 명령 실행 (~275 토큰)
-        GlobTool(),      # 파일 검색 (~188 토큰)
-        GrepTool(),      # 텍스트 검색 (~375 토큰)
-        LSTool(),        # 디렉토리 조회 (~163 토큰)
+        EditTool(),      # 편집 (~325 토큰)
+        WriteTool(),     # 쓰기 (~225 토큰)
+        BashTool(),      # 실행 (~275 토큰)
         AgentTool(),     # 서브에이전트 호출 (~300 토큰)
-        # DocumentProcess는 Scout 전용으로 이관됨 (core.bootstrap._create_scout_tool_registry)
     ])
 
     return registry
@@ -578,26 +561,45 @@ def _create_web_tool_registry():  # noqa: ANN202
 
 def _build_default_system_prompt(agent_registry: Any | None = None) -> str:
     """
-    기본 시스템 프롬프트를 생성한다.
+    CLI Worker용 기본 시스템 프롬프트 (사양서 Part 2.4 원본 복원).
 
-    agent_registry가 주어지면 등록된 서브에이전트 목록을 프롬프트에 동적 주입한다.
-    Worker가 Agent 도구를 언제/어떻게 쓸지 판단하는 근거를 제공한다.
-
-    중요한 원칙(Worker에게 주입):
-      - 단순 질문/인사 → 직접 응답, 도구 사용 금지
-      - 단일 파일 읽기/편집 → Read/Edit 도구 직접 사용
-      - 대규모 탐색/다중 파일 검색 → Agent(subagent_type="scout")
-      - Scout는 CPU 기반이라 ~30초 걸리므로 남용 금지
+    원칙 (사양서 Part 2.4):
+      - Worker는 실행 전용 (Edit/Write/Bash/GitCommit/GitDiff/Agent)
+      - 파일 탐색·읽기·검색은 모두 Scout에 위임
+      - Worker는 Scout JSON 결과를 해석해 최종 답변 생성
     """
     base = (
-        "You are Nexus, an AI coding assistant running in an air-gapped environment.\n"
-        "You help users with software engineering tasks using available tools.\n"
-        "Always respond in the user's language.\n"
-        "When you need to read, write, or modify files, use the appropriate tools.\n"
-        "Think step by step before taking actions.\n"
+        "You are Nexus, the Worker agent in an air-gapped environment.\n"
+        "You are a 27B model — the brain. Scout (a 4B helper) does all file "
+        "exploration for you.\n\n"
+        "## Your tools (execution only)\n"
+        "- Edit: edit an existing file\n"
+        "- Write: create a new file (ONLY when the user explicitly asks)\n"
+        "- Bash: run a shell command\n"
+        "- GitCommit / GitDiff: git operations\n"
+        "- Agent: delegate exploration to Scout (subagent_type='scout')\n\n"
+        "You do NOT have Read/Glob/Grep/LS/DocumentProcess. Scout does. When you "
+        "need to read a file, search code, list a directory, or analyze a document "
+        "(.pdf/.docx/.xlsx/.hwp/.pptx), call:\n"
+        "  Agent(prompt='<what you need>', subagent_type='scout')\n\n"
+        "## Scout's response (markdown report)\n"
+        "Scout returns 4 markdown sections:\n"
+        "  ## relevant_files, ## file_summaries, ## plan, ## requires_tools\n"
+        "Read `## plan` carefully — those bullets are the facts you need. Then "
+        "produce a detailed natural answer in the user's language based on those "
+        "facts.\n\n"
+        "## CRITICAL — Scout invocation limit\n"
+        "Call Agent(subagent_type='scout') AT MOST ONCE per user turn. After Scout "
+        "returns, answer the user with whatever information you received. NEVER "
+        "call Scout a second time in the same turn — it loops. If the plan seems "
+        "sparse, mention that to the user and work with what you have.\n\n"
+        "## Hard rules\n"
+        "- NEVER create a file the user didn't ask for.\n"
+        "- NEVER attempt Read/Glob/Grep/LS — those tools aren't available to you.\n"
+        "- Simple conversational questions → answer directly, no tools.\n"
     )
 
-    # 서브에이전트 섹션 — agent_registry가 있을 때만 추가
+    # 서브에이전트 목록 동적 주입
     if agent_registry is None or len(agent_registry) == 0:
         return base
 
@@ -606,17 +608,9 @@ def _build_default_system_prompt(agent_registry: Any | None = None) -> str:
         agent_lines.append(f"  - {name}: {desc}")
 
     subagent_guide = (
-        "\n## Sub-agents (Agent tool)\n"
-        "You can delegate specialized tasks to sub-agents via the Agent tool.\n"
-        "Available sub-agents:\n"
+        "\n## Registered sub-agents\n"
         + "\n".join(agent_lines)
-        + "\n\n"
-        "When to use sub-agents:\n"
-        "  - Simple questions, greetings, general knowledge → answer directly, NO tools\n"
-        "  - Single file read/edit → use Read/Edit directly (faster than sub-agent)\n"
-        "  - Broad project exploration, multi-file search → Agent(subagent_type=\"scout\")\n"
-        "\n"
-        "NEVER invoke Agent(subagent_type=\"scout\") for trivial tasks — it is slow.\n"
+        + "\n"
     )
     return base + subagent_guide
 
