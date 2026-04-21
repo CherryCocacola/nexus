@@ -885,30 +885,40 @@ Read 필요 없음)와 현재 구현을 전수 대조한 결과 **3가지 중대
 | 3 | 텍스트 첨부 (DB 로그 분석) | ✅ 44초, 309토큰 | 원인 진단 + 조치 추천 |
 | 4 | docx 업로드 → Scout 분석 | ❌ 180~240초 타임아웃 | **아래 미해결 이슈 참조** |
 
-### 미해결: docx 파일 분석 무한 호출 루프
+### 해결(2026-04-21): docx 파일 분석 무한 호출 루프
 
-**증상**: docx 업로드 시 Scout가 매 호출마다 **정확히 29자** 짧은 응답을
-반환하고 Worker가 7회 이상 재호출하며 타임아웃.
+**기존 증상**: docx 업로드 시 Scout가 매 호출마다 **정확히 29자** 짧은 응답을
+반환하고 Worker가 7회 이상 재호출하며 240초 타임아웃.
 
-**시도한 조치 (모두 효과 없음)**:
-- Scout system_prompt에 "DocumentProcess 사용 강제" 규칙
-- Scout 출력 형식 JSON → 마크다운 헤더 완화
-- Worker system_prompt에 "Scout 1회 호출 제한" 명시
-- max_turns 확대
+**해결 경로**: α(Scout 서버 직접 디버깅)를 선택하여 원인 확정 후 3가지 배선
+수정(2026-04-21 오후, 커밋 9a11b47).
 
-**추정 원인 (프롬프트 레벨 아님)**:
-1. Scout 서버(llama.cpp `--jinja`)가 Qwen3.5-4B의 tool_call을 제대로 파싱 못 함
-2. `chat_template_kwargs={"enable_thinking": false}` 파라미터가 llama.cpp에
-   전달은 되지만 실제 효과 미지수
-3. Scout 응답이 29자로 고정 수렴하는 건 시스템 레벨 stop 조건의 조기 발동
-   (LLM 자유 응답이 이렇게 규칙적이지 않음)
+**확정된 원인 (α 진단, 복합)**:
+1. `chat_template_kwargs={"enable_thinking": False}`를 Qwen3.5-4B(llama.cpp)에
+   전달하면 빈 `<think></think>` 블록 후 거짓 tool_call 1개 뱉고 28토큰에서
+   조기 종료 (Worker 27B에는 무해한 설정이 4B에서는 치명적)
+2. Part 2.5 쿼리 라우팅이 서브에이전트에도 적용되어 Scout에 `model=
+   nexus-phase3`(존재하지 않는 모델명) 주입
+3. llama.cpp가 `<think>` 블록을 `reasoning_content`로 자동 분리하는데 Nexus
+   SSE 파서가 이 필드를 버려 Scout 출력의 대부분이 Worker에 전달되지 않음
 
-**다음 세션 작업 후보**:
-- α. Scout 서버에 직접 curl로 최소 요청 보내서 실제 tool_call 생성·파싱 과정 관찰 (30분~1시간)
-- β. DocumentProcess를 Worker에 임시 복귀 (사양서 정신 타협, 15KB 이하만 지원)
-- γ. Scout 모델을 Qwen3.5-4B → 7B로 교체 (CPU 자원 여유 확인 필요, GGUF 다운로드 + llama.cpp 재기동, 1~2시간)
+**해결 (6곳 코드 수정)**:
+- `enable_thinking`을 `bool | None`으로 확장, `None`이면 `chat_template_kwargs`
+  자체를 생략
+- `ScoutModelProvider.stream`이 `enable_thinking`을 항상 `None`으로 강제
+- `reasoning_content`를 `THINKING_DELTA`로 yield, Scout는 TEXT_DELTA로 병합
+- 서브에이전트 QueryEngine은 `RoutingConfig(enabled=False)` 주입
 
-현재는 α(디버깅)를 먼저 하는 것이 정보 확보 관점에서 권장됨.
+**실측 재검증 (2026-04-21 저녁, 38.7KB docx)**:
+
+| 지표 | 이전 | 현재 |
+|---|---|---|
+| Scout 호출 횟수 | 7회 이상 (재시도) | **1회** |
+| Scout 반환 길이 | 29자 | **1,878자** (65배 ↑) |
+| 전체 응답 시간 | 240초 timeout | **88.7초** (정상 완료) |
+| 답변 품질 | 실패 | 니체 생애/핵심 개념/세 가지 변신/영향 완벽 커버 |
+
+기존 "다음 세션 작업 후보 α/β/γ"는 α만으로 해결되어 β/γ는 불필요.
 
 ### 커밋 상태
 - 경로 ⓐ 변경 전체를 한 커밋으로 정리 (docx 이슈 주석 포함)
