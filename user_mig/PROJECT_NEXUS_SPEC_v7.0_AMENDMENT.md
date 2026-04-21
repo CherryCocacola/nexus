@@ -873,20 +873,64 @@ async def init_phase2(state: GlobalState) -> dict:
 
 **변경 없음**: Message 타입, BaseTool, ToolRegistry, Executor, StreamingToolExecutor
 
-### Ch 6: Context Management (수정)
+### Ch 6: Context Management (2026-04-21 구현)
 
 **TIER_S**: 4단계 압축 파이프라인 대신 TurnState 기반 상태 외부화 (Part 3 참조)
 **TIER_M/L**: v6.1 4단계 압축 파이프라인 그대로 유지
 
+#### 구현 방식
+
+설계안의 Strategy 패턴을 별도 클래스로 분리하는 대신, `ContextManager`에
+`tier` 파라미터를 받아 내부에서 pass-through 여부를 결정하는 최소-변경 접근을
+택했다. 이유: 기존 호출자(query_loop, QueryEngine)의 인터페이스를 그대로 유지
+하면서도 사양서의 "티어별 전략" 의도를 만족시킨다.
+
 ```python
-# ContextManager에 티어별 전략 추가
 class ContextManager:
-    def __init__(self, tier: HardwareTier, ...):
-        if tier == HardwareTier.TIER_S:
-            self._strategy = TurnStateStrategy(...)   # 상태 외부화
-        else:
-            self._strategy = CompressionStrategy(...)  # v6.1 4단계 압축
+    def __init__(self, model_provider, max_context_tokens=8192, ...,
+                 tier: HardwareTier | None = None):
+        ...
+        # TIER_S는 TurnStateStore가 요약 담당 → 이 ContextManager는 pass-through
+        tier_name = getattr(tier, "name", None) or getattr(tier, "value", None)
+        self._passthrough = tier_name in ("TIER_S", "small")
 ```
+
+pass-through 적용 지점:
+- `apply_all(messages)` → TIER_S면 messages 그대로 반환
+- `auto_compact_if_needed(messages, force=...)` → TIER_S면 force=True여도 그대로
+- `emergency_compact(messages)` → TIER_S면 최근 1턴만 추출 (규칙 기반 요약 건너뜀)
+
+TIER_M/L 또는 `tier=None`(하위 호환)일 때 기존 4단계 파이프라인이 그대로 작동한다.
+
+#### bootstrap 주입
+
+`core/bootstrap.py`의 Phase 2 ⑪단계에서 ContextManager를 생성하고 QueryEngine에
+주입한다. 이전까지 QueryEngine은 `context_manager=None`으로 초기화되어 있었다.
+
+```python
+context_manager = ContextManager(
+    model_provider=provider,
+    max_context_tokens=config.model.max_context_tokens,
+    tier=tier,  # HardwareTier 전달 → TIER_S에서는 자동 pass-through
+)
+engine = QueryEngine(..., context_manager=context_manager)
+```
+
+웹 전용 QueryEngine(`web/app.py`)에도 동일한 인스턴스를 공유한다.
+
+#### 검증
+
+- 단위 테스트 `tests/unit/test_context_manager_tier.py` 신규 8건
+  - TIER_S: passthrough=True, apply_all unchanged, auto_compact skip, emergency=최근 1턴
+  - TIER_M/L/None: passthrough=False, 기존 4단계 파이프라인 유지
+- 서버 기동 로그: `ContextManager 초기화: tier=small, passthrough=True`
+- 회귀 632/632 통과
+
+#### 하드웨어 업그레이드 시 자동 수렴
+
+detect_hardware_tier()가 TIER_M을 감지하면 ContextManager의 `_passthrough=False`
+가 되어 자동으로 4단계 압축 파이프라인이 활성화된다. 설정 변경 없이 H100
+업그레이드만으로 v6.1 동작에 수렴하는 불변 전제를 지킨다.
 
 ### Ch 7: Retry & Error Recovery (수정)
 

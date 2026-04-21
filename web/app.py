@@ -250,6 +250,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             tools=web_tools,
             context=web_context,
             model_dispatcher=web_dispatcher,
+            context_manager=components.get("context_manager"),  # Ch 6 티어별 전략
             memory_manager=components.get("memory_manager"),  # Ch 16 Redis+PG 저장
             # transcript는 세션별로 다르므로 요청 핸들러에서 동적으로 주입한다
             system_prompt=(

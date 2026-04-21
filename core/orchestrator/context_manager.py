@@ -1,11 +1,22 @@
 """
-컨텍스트 관리자 — 4단계 압축 파이프라인으로 컨텍스트 윈도우를 관리한다.
+컨텍스트 관리자 — 하드웨어 티어별 전략으로 컨텍스트 윈도우를 관리한다.
 
 Claude Code의 컨텍스트 압축 시스템을 재구현한다 (Ch.6).
 로컬 모델의 짧은 컨텍스트 윈도우(4K~32K)에서도
 안정적인 멀티턴 대화를 유지하기 위한 핵심 모듈이다.
 
-4단계 압축 파이프라인:
+v7.0 Part 5 Ch 6 (2026-04-21): 하드웨어 티어별 전략을 공식화한다.
+
+전략 매핑:
+  TIER_S (RTX 5090, 8K)      → TurnStateStrategy 경유
+    - apply_all / auto_compact_if_needed / emergency_compact가 no-op
+    - QueryEngine의 TurnStateStore가 이전 턴 요약을 effective_system_prompt로 주입
+    - raw messages는 현재 턴만 유지되므로 압축 파이프라인이 불필요
+  TIER_M (H100, 32K) / TIER_L (H200+, 128K) → CompressionStrategy 경유
+    - 기존 4단계 압축 파이프라인을 그대로 수행
+    - tier=None도 동일하게 CompressionStrategy (하위 호환)
+
+4단계 압축 파이프라인 (TIER_M/L):
   ① apply_tool_result_budget: 도구 결과의 토큰 예산 적용
   ② snip_compact: 오래된 턴을 1줄 요약으로 교체
   ③ micro_compact: 도구 결과 내부 미세 압축
@@ -22,13 +33,16 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from core.message import (
     Message,
     ToolUseBlock,
 )
 from core.model.inference import ModelProvider
+
+if TYPE_CHECKING:
+    from core.model.hardware_tier import HardwareTier
 
 logger = logging.getLogger("nexus.orchestrator.context_manager")
 
@@ -50,6 +64,7 @@ class ContextManager:
         auto_compact_threshold: float = 0.9,
         preserve_recent_turns: int = 3,
         preserve_recent_tool_results: int = 2,
+        tier: HardwareTier | None = None,
     ):
         """
         Args:
@@ -60,6 +75,9 @@ class ContextManager:
             auto_compact_threshold: auto_compact 시작 임계치
             preserve_recent_turns: 항상 보존할 최근 턴 수
             preserve_recent_tool_results: 항상 보존할 최근 도구 결과 수
+            tier: 하드웨어 티어. TIER_S이면 압축 파이프라인을 비활성(pass-through)
+                으로 두어 TurnStateStore에 컨텍스트 관리를 위임한다.
+                TIER_M/L 또는 None(하위 호환)이면 기존 4단계 파이프라인을 수행.
         """
         self.model_provider = model_provider
         self.max_tokens = max_context_tokens
@@ -68,6 +86,17 @@ class ContextManager:
         self.auto_compact_threshold = auto_compact_threshold
         self.preserve_recent_turns = preserve_recent_turns
         self.preserve_recent_tool_results = preserve_recent_tool_results
+        self._tier = tier
+
+        # TIER_S는 TurnStateStore가 요약 담당 → 이 ContextManager는 pass-through
+        # 타입 이름 비교로 import 사이클 회피 (HardwareTier는 TYPE_CHECKING에만 import)
+        tier_name = getattr(tier, "name", None) or getattr(tier, "value", None)
+        self._passthrough = tier_name in ("TIER_S", "small")
+        if self._passthrough:
+            logger.info(
+                "ContextManager: TIER_S 감지 — pass-through 모드 "
+                "(TurnStateStore가 컨텍스트 관리 담당)"
+            )
 
         # 상태
         self._compact_boundary: int = 0  # 이 인덱스 이전은 요약으로 대체됨
@@ -85,12 +114,19 @@ class ContextManager:
         1~3단계를 순차 적용한다 (동기, 모델 호출 없음).
         auto_compact는 비동기이므로 별도 호출한다.
 
+        TIER_S pass-through: 메시지를 변경 없이 반환한다.
+        TurnStateStore가 이미 이전 턴 요약을 effective_system_prompt로 주입하고
+        raw messages는 현재 턴만 유지되므로 압축 파이프라인이 중복·불필요.
+
         Args:
             messages: 원본 메시지 리스트
 
         Returns:
             전처리된 메시지 리스트
         """
+        if self._passthrough:
+            return messages
+
         # compact_boundary 이후의 활성 메시지만 처리
         active = messages[self._compact_boundary :]
 
@@ -124,6 +160,8 @@ class ContextManager:
         force=True이면 임계치를 무시하고 강제 압축한다
         (에러 복구 시 사용, Transition 2: reactive_compact_retry).
 
+        TIER_S pass-through: 메시지를 변경 없이 반환한다 (TurnStateStore 담당).
+
         Args:
             messages: 현재 메시지 리스트
             force: 강제 압축 여부
@@ -131,6 +169,9 @@ class ContextManager:
         Returns:
             압축된 메시지 리스트
         """
+        if self._passthrough:
+            return messages
+
         token_count = self._estimate_tokens(messages)
 
         # 임계치 미달이고 강제가 아니면 그대로 반환
@@ -181,12 +222,18 @@ class ContextManager:
         최근 1개 턴만 보존하고 나머지를 1줄 요약으로 대체한다.
         모델 호출 없이 규칙 기반으로 수행한다 (빠르고 안전).
 
+        TIER_S pass-through: TurnStateStore가 이미 이전 맥락을 요약으로 대체
+        하므로 긴급 압축도 불필요. 최근 1개 턴만 추출하여 반환한다.
+
         Args:
             messages: 현재 메시지 리스트
 
         Returns:
             긴급 압축된 메시지 리스트
         """
+        if self._passthrough:
+            return self._extract_recent_turns(messages, 1)
+
         logger.warning("긴급 압축: 최근 1개 턴만 보존")
         self._total_compactions += 1
 
@@ -586,12 +633,24 @@ class ContextManager:
     @property
     def stats(self) -> dict[str, Any]:
         """압축 통계를 반환한다 (디버깅용)."""
+        tier_name = (
+            getattr(self._tier, "name", None)
+            or getattr(self._tier, "value", None)
+            or "unset"
+        )
         return {
+            "tier": tier_name,
+            "passthrough": self._passthrough,
             "total_compactions": self._total_compactions,
             "compact_boundary": self._compact_boundary,
             "has_summary": self._compact_summary is not None,
             "max_tokens": self.max_tokens,
         }
+
+    @property
+    def passthrough(self) -> bool:
+        """TIER_S pass-through 모드 여부 (외부 관측용)."""
+        return self._passthrough
 
 
 # ─────────────────────────────────────────────

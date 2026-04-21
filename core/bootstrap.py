@@ -293,7 +293,24 @@ async def init_phase2(state: GlobalState) -> dict:
         "활성" if dispatcher.scout_enabled else "비활성",
     )
 
-    # ⑪ QueryEngine — Tier 1 세션 오케스트레이터
+    # ⑪ ContextManager — Ch 6 티어별 전략 공식화 (2026-04-21)
+    # TIER_S: pass-through (TurnStateStore가 컨텍스트 관리)
+    # TIER_M/L: 4단계 압축 파이프라인 활성
+    # 기존 동작과 호환: QueryEngine은 None도 허용하므로 주입 없이도 동작함
+    from core.orchestrator.context_manager import ContextManager
+
+    context_manager = ContextManager(
+        model_provider=provider,
+        max_context_tokens=config.model.max_context_tokens,
+        tier=tier,  # HardwareTier 전달 → TIER_S에서는 자동 pass-through
+    )
+    components["context_manager"] = context_manager
+    logger.info(
+        "[Phase 2] ContextManager 초기화: tier=%s, passthrough=%s",
+        tier.value, context_manager.passthrough,
+    )
+
+    # ⑫ QueryEngine — Tier 1 세션 오케스트레이터
     # model_dispatcher가 주입되면 submit_message는 dispatcher.route() 경로를 탄다.
     # 시스템 프롬프트에는 agent_registry를 반영하여 서브에이전트 사용 가이드를 넣는다.
     # Ch 16: CLI 세션용 JSONL 트랜스크립트 (기본 활성)
@@ -309,6 +326,7 @@ async def init_phase2(state: GlobalState) -> dict:
         tools=cli_tools,
         context=context,
         system_prompt=_build_default_system_prompt(agent_registry),
+        context_manager=context_manager,  # Ch 6: 티어별 전략
         max_turns=200,
         turn_state_store=turn_state_store,
         rag_retriever=rag_retriever,

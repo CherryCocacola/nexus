@@ -414,6 +414,45 @@ VRAM 최대 max-model-len:
 
 ---
 
+## Ch 6 ContextManager 티어별 전략 공식화 (2026-04-21 저녁)
+
+### 배경
+TurnStateStore(TIER_S 컨텍스트 요약)는 이미 구현되어 있었으나, ContextManager는
+여전히 모든 티어에서 4단계 압축 파이프라인을 돌리도록 설계되어 있어 사양서
+Part 5 Ch 6의 "티어별 전략" 의도와 어긋남. QueryEngine이 bootstrap에서
+`context_manager=None`으로 초기화되어 있어 실질적으로는 사용되지 않았지만,
+미래에 ContextManager 주입이 필요해질 때 TIER_S에서 중복 압축이 발생할 위험.
+
+### 구현
+- `core/orchestrator/context_manager.py`
+  - `__init__`에 `tier: HardwareTier | None = None` 파라미터 추가
+  - `_passthrough` 플래그: TIER_S이면 True
+  - `apply_all`, `auto_compact_if_needed`, `emergency_compact` 각각에 pass-through
+    분기 추가 (TIER_S면 TurnStateStore가 담당하므로 no-op 또는 최근 1턴만 추출)
+  - `stats` 프로퍼티에 `tier`, `passthrough` 필드 노출
+- `core/bootstrap.py` — Phase 2 ⑪단계에서 ContextManager 생성 + QueryEngine 주입
+- `web/app.py` — 웹 QueryEngine에도 동일 인스턴스 공유
+
+### 테스트
+- `tests/unit/test_context_manager_tier.py` 신규 8건
+  - TIER_S passthrough 검증 (apply_all/auto_compact/emergency)
+  - TIER_M/L/None 기존 동작 유지 확인
+  - stats 필드 노출 확인
+
+### 회귀
+- 632/632 통과 (624 + 신규 8)
+- ruff: 신규 파일 전부 clean
+- 서버 기동 로그 실측: `ContextManager 초기화: tier=small, passthrough=True`
+
+### 하드웨어 업그레이드 시 자동 수렴
+`detect_hardware_tier()`가 H100을 감지하면 `_passthrough=False`로 자동 전환되어
+v6.1 4단계 압축 파이프라인이 활성화. 설정 변경 없이 수렴.
+
+### 사양서 반영
+`PROJECT_NEXUS_SPEC_v7.0_AMENDMENT.md` Ch 6 섹션을 구현 실태에 맞게 재작성.
+
+---
+
 ## Ch 16 세션 영속화 구현 (2026-04-21 오후)
 
 ### 배경
