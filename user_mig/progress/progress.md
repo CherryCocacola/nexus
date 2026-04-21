@@ -414,6 +414,65 @@ VRAM 최대 max-model-len:
 
 ---
 
+## Phase 10.0 Python 심볼 인덱싱 구현 (2026-04-21 야간)
+
+### 배경
+기존 ProjectIndexer(tb_memories)는 **파일 청크 단위** 인덱싱이라 "query_loop
+함수 어디 있어?" 같은 심볼 단위 질의에서 청크 경계와 의미 경계가 어긋남.
+사양서 Phase 10.0 로드맵의 "심볼 인덱스 구축 + 채팅에서 인덱스 조회" 부분을
+Python 범위에서 완성.
+
+### 신규 파일
+- `core/rag/symbol_store.py` — SymbolEntry, SymbolStore, ensure_schema,
+  build_vector_index, add/add_many/delete_by_path/search_by_name/search_by_vector
+- `core/rag/symbol_indexer.py` — Python `ast` 기반 심볼 추출 + SymbolProjectIndexer
+  (파일 단위 트랜잭션 + 배치 임베딩)
+- `core/tools/implementations/symbol_search_tool.py` — SymbolSearch 도구
+  (읽기 전용, is_concurrency_safe=True)
+- `tests/unit/test_symbol_indexer.py` — 16 케이스 (ast 추출, 스토어 CRUD, 벡터 검색,
+  도구 동작, 자연어→벡터 폴백)
+
+### 스키마 (tb_symbols)
+```
+id | source | path | module | kind | name | qualified_name | signature | docstring
+| summary | line_start/end | tags | embedding vector(1024) | created_at | metadata
+```
+인덱스 5종: btree(source/path/kind/name), GIN+pg_trgm(name/qualified_name),
+ivfflat cosine(embedding, 대량 적재 후 빌드).
+
+### 배선
+- `core/bootstrap.py` Phase 2 ⑨-c에서 SymbolStore 초기화 + 백그라운드 인덱싱
+- `ToolUseContext.options["symbol_store"]` 주입 (CLI + Web 양쪽)
+- Scout/CLI/Web 3개 도구 풀 모두에 SymbolSearchTool 등록
+
+### 실측 (Nexus 프로젝트 자기 인덱싱)
+- 전체 심볼: **1,400+** (async_function 33, async_method 288, class 212,
+  function 178, method 714)
+- SymbolSearch 평균 응답: **50~60ms** (pg_trgm 인덱스)
+
+### E2E 검증
+| 질의 | 결과 |
+|---|---|
+| "query_loop 함수는 어느 파일 몇 번째 줄?" | **core/orchestrator/query_loop.py:130** 정확 (6.4s) |
+| "KnowledgeStore.add 시그니처 알려줘" | `async def add(self, entry: KnowledgeEntry) -> str` + 파일/줄 정확 (13.3s) |
+
+로그: `SymbolSearch: 'query_loop' → 2` 0.06초, `'KnowledgeStore.add' → 10` 0.05초.
+
+### 테스트 / 회귀
+- 신규 16 케이스 전부 통과
+- 회귀 **681/681** (665 + 신규 16)
+- ruff: clean
+
+### 사양서
+`PROJECT_NEXUS_SPEC_v7.0_AMENDMENT.md` Phase 10.0 섹션 구현 실태로 재작성.
+
+### 향후 확장
+- 다언어(JS/TS/Go) 심볼 파서 추가
+- 호출 그래프(caller/callee) 관계 저장
+- ivfflat 인덱스는 대량 적재(>1k) 후 별도 빌드 권장
+
+---
+
 ## kowiki 500건 실 적재 (2026-04-21 야간)
 
 ### 실행

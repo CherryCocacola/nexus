@@ -1335,6 +1335,48 @@ v7.0 추가:
     - 채팅에서 인덱스 조회
 ```
 
+### Phase 10.0 구현 (2026-04-21, Python 범위)
+
+tb_memories의 파일 청크 RAG는 이미 가동 중이었지만, "query_loop 함수 어디
+있어?" 같은 **심볼 단위 질의**는 청크 경계가 의미 경계를 무시하기 때문에
+정확도가 떨어진다. 심볼 전용 테이블과 도구를 추가하여 해결.
+
+#### 스키마 (tb_symbols)
+```
+id (text PK, SHA-256) | source | path | module | kind | name | qualified_name
+| signature | docstring | summary | line_start/end | tags | embedding vector(1024)
+| created_at | metadata
+```
+인덱스: btree(source/path/kind/name), GIN+pg_trgm(name/qualified_name),
+ivfflat cosine(embedding).
+
+#### 신규 모듈
+- `core/rag/symbol_store.py` — SymbolEntry + SymbolStore (pg_pool None 시 인메모리
+  폴백). search_by_name(정확 + trigram), search_by_vector.
+- `core/rag/symbol_indexer.py` — `ast`로 함수/클래스/메서드/비동기 변형 추출.
+  `SymbolProjectIndexer.index_project()`가 프로젝트 전체를 순회하며 파일 단위
+  delete → add로 멱등 재인덱싱.
+- `core/tools/implementations/symbol_search_tool.py` — `SymbolSearch` 도구
+  (읽기 전용, concurrency-safe). Scout/CLI/Web 도구 풀에 모두 등록.
+
+#### bootstrap 배선
+Phase 2 ⑨-c에서 SymbolStore 생성 + ensure_schema + 백그라운드 인덱싱 시작
+(`asyncio.create_task(background_index(...))`). `ToolUseContext.options
+["symbol_store"]`로 주입.
+
+#### 실측 결과 (Nexus 프로젝트 자기 인덱싱, 500 파일 × 평균 3~5 심볼)
+| 지표 | 값 |
+|---|---|
+| 전체 심볼 | 1,400+ (async_function 33 / async_method 288 / class 212 / function 178 / method 714) |
+| SymbolSearch 평균 응답 | 50~60ms (trigram 인덱스) |
+| E2E 질의 "query_loop 어디 있어?" | 6.4초 → `core/orchestrator/query_loop.py:130` 정확 |
+| E2E 질의 "KnowledgeStore.add 시그니처?" | 13.3초 → `async def add(self, entry: KnowledgeEntry) -> str` + 파일/줄 정확 |
+
+#### 향후 확장
+- JavaScript/TypeScript 등 다언어 대응은 별도 파서 플러그인으로 추가 가능
+- 심볼 간 호출 그래프(caller/callee)는 후속 작업 여지
+- 테스트 커버리지: 심볼 단위로 어떤 함수가 테스트되는지 역매핑
+
 ### Phase 9.0 상세 (즉시 시작 가능)
 
 도구 스키마 축소와 TurnState는 **Scout 없이도 즉시 효과**가 있다.

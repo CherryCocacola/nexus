@@ -210,6 +210,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 "model_provider": components["model_provider"],
                 "scout_provider": components.get("scout_provider"),
                 "available_tools": combined_pool,
+                # Phase 10.0 — SymbolSearchTool이 조회하는 경로
+                "symbol_store": components.get("symbol_store"),
             },
         )
         # 웹 전용 ModelDispatcher — Scout 자동 전처리는 Phase 3에서 제거됨.

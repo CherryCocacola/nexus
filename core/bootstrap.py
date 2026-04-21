@@ -246,6 +246,10 @@ async def init_phase2(state: GlobalState) -> dict:
             tool_pool_names.add(tool.name)
     context.options["available_tools"] = combined_tools
 
+    # Phase 10.0 — SymbolSearchTool이 context.options["symbol_store"]로 조회한다
+    # (실제 할당은 ⑨-c 이후에 수행되지만, 키를 미리 만들어 None 폴백 허용)
+    context.options.setdefault("symbol_store", None)
+
     # ⑨ RAG 파이프라인 초기화 — 프로젝트 파일 인덱싱 + 검색
     rag_retriever = None
     try:
@@ -296,6 +300,42 @@ async def init_phase2(state: GlobalState) -> dict:
         )
     except Exception as e:
         logger.warning("[Phase 2] 지식 베이스 초기화 실패 (무시): %s", e)
+
+    # ⑨-c Phase 10.0 — 심볼 인덱스 (tb_symbols)
+    # 프로젝트 Python 파일의 함수/클래스/메서드를 ast로 추출하여 pgvector에
+    # 인덱싱한다. 기존 파일 청크 RAG(tb_memories)와 별도로 운영하여 심볼
+    # 단위 정확도를 확보한다. 부트스트랩 후 백그라운드로 실행.
+    try:
+        from core.rag.symbol_indexer import SymbolProjectIndexer, background_index
+        from core.rag.symbol_store import SymbolStore
+
+        symbol_store = SymbolStore(pg_pool=pg_pool)
+        if pg_pool is not None:
+            await symbol_store.ensure_schema()
+        components["symbol_store"] = symbol_store
+        # SymbolSearchTool이 조회하는 경로
+        context.options["symbol_store"] = symbol_store
+
+        # 임베딩 배치 콜러블 (provider.embed 그대로 래핑)
+        async def _embed_batch(texts: list[str]) -> list[list[float]]:
+            return await provider.embed(texts)
+
+        symbol_indexer = SymbolProjectIndexer(
+            store=symbol_store,
+            embedder=_embed_batch,
+            project_source="nexus",
+        )
+        components["symbol_indexer"] = symbol_indexer
+        cwd_for_symbols = state.cwd or os.getcwd()
+        asyncio.create_task(background_index(symbol_indexer, cwd_for_symbols))
+        count = await symbol_store.count()
+        logger.info(
+            "[Phase 2] SymbolStore 초기화: 레코드=%d (pg=%s, 백그라운드 인덱싱 시작)",
+            count, "connected" if pg_pool else "in-memory",
+        )
+    except Exception as e:
+        logger.warning("[Phase 2] 심볼 인덱스 초기화 실패 (무시): %s", e)
+        components["symbol_store"] = None
 
     # ⑩ ModelDispatcher — v7.0 Phase 9 멀티모델 라우터
     # TIER_S: Scout(CPU 4B) → Worker(GPU 27B) 2단계 실행
@@ -537,6 +577,7 @@ def _create_scout_tool_registry():  # noqa: ANN202
     from core.tools.implementations.grep_tool import GrepTool
     from core.tools.implementations.ls_tool import LSTool
     from core.tools.implementations.read_tool import ReadTool
+    from core.tools.implementations.symbol_search_tool import SymbolSearchTool
     from core.tools.registry import ToolRegistry
 
     registry = ToolRegistry()
@@ -546,6 +587,8 @@ def _create_scout_tool_registry():  # noqa: ANN202
         GrepTool(),
         LSTool(),
         DocumentProcessTool(),
+        # Phase 10.0 — 심볼 단위 인덱스 기반 함수/클래스 위치 검색
+        SymbolSearchTool(),
     ])
     return registry
 
@@ -566,6 +609,7 @@ def _create_cli_tool_registry():  # noqa: ANN202
     from core.tools.implementations.bash_tool import BashTool
     from core.tools.implementations.edit_tool import EditTool
     from core.tools.implementations.git_tools import GitCommitTool, GitDiffTool
+    from core.tools.implementations.symbol_search_tool import SymbolSearchTool
     from core.tools.implementations.write_tool import WriteTool
     from core.tools.registry import ToolRegistry
 
@@ -579,6 +623,8 @@ def _create_cli_tool_registry():  # noqa: ANN202
         GitDiffTool(),
         # 서브에이전트 호출 — Worker가 Scout 등 탐색자/전문가에 위임
         AgentTool(),
+        # Phase 10.0 — Worker도 심볼 위치 빠르게 찾을 수 있도록 추가
+        SymbolSearchTool(),
     ])
 
     return registry
@@ -602,15 +648,17 @@ def _create_web_tool_registry():  # noqa: ANN202
     from core.tools.implementations.agent_tool import AgentTool
     from core.tools.implementations.bash_tool import BashTool
     from core.tools.implementations.edit_tool import EditTool
+    from core.tools.implementations.symbol_search_tool import SymbolSearchTool
     from core.tools.implementations.write_tool import WriteTool
     from core.tools.registry import ToolRegistry
 
     registry = ToolRegistry()
     registry.register_many([
-        EditTool(),      # 편집 (~325 토큰)
-        WriteTool(),     # 쓰기 (~225 토큰)
-        BashTool(),      # 실행 (~275 토큰)
-        AgentTool(),     # 서브에이전트 호출 (~300 토큰)
+        EditTool(),           # 편집 (~325 토큰)
+        WriteTool(),          # 쓰기 (~225 토큰)
+        BashTool(),           # 실행 (~275 토큰)
+        AgentTool(),          # 서브에이전트 호출 (~300 토큰)
+        SymbolSearchTool(),   # Phase 10.0 심볼 검색 (~200 토큰)
     ])
 
     return registry
