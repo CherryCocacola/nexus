@@ -271,6 +271,32 @@ async def init_phase2(state: GlobalState) -> dict:
     except Exception as e:
         logger.warning("[Phase 2] RAG 초기화 실패 (무시): %s", e)
 
+    # ⑨-b 지식 베이스 RAG — Part 2.5.8 (2026-04-21)
+    # tb_knowledge에서 KNOWLEDGE_MODE 질의 시 자동 검색·주입.
+    # pg_pool이 없으면 인메모리 폴백(테스트/CI용), 있으면 실 스키마 준비.
+    knowledge_retriever = None
+    try:
+        from core.rag.knowledge_retriever import KnowledgeRetriever
+        from core.rag.knowledge_store import KnowledgeStore
+
+        knowledge_store = KnowledgeStore(pg_pool=pg_pool)
+        # pg_pool이 있으면 스키마 멱등 생성 — 실제 PostgreSQL에만 DDL 실행됨
+        if pg_pool is not None:
+            await knowledge_store.ensure_schema()
+        knowledge_retriever = KnowledgeRetriever(
+            store=knowledge_store,
+            embedding_provider=provider,  # e5-large 임베딩 서버 경유
+        )
+        components["knowledge_store"] = knowledge_store
+        components["knowledge_retriever"] = knowledge_retriever
+        count = await knowledge_store.count()
+        logger.info(
+            "[Phase 2] KnowledgeStore 초기화: 레코드=%d (pg=%s)",
+            count, "connected" if pg_pool else "in-memory",
+        )
+    except Exception as e:
+        logger.warning("[Phase 2] 지식 베이스 초기화 실패 (무시): %s", e)
+
     # ⑩ ModelDispatcher — v7.0 Phase 9 멀티모델 라우터
     # TIER_S: Scout(CPU 4B) → Worker(GPU 27B) 2단계 실행
     # TIER_M/L: Worker 단독 passthrough (v6.1 경로 동일)
@@ -334,6 +360,7 @@ async def init_phase2(state: GlobalState) -> dict:
         routing_config=config.routing,  # v7.0 Part 2.5 — 지식/도구 분기
         memory_manager=memory_manager,  # Ch 16: Redis + tb_memories 자동 저장
         transcript=cli_transcript,  # Ch 16: JSONL 영구 기록
+        knowledge_retriever=knowledge_retriever,  # Part 2.5.8: tb_knowledge RAG
     )
     components["query_engine"] = engine
     logger.info(

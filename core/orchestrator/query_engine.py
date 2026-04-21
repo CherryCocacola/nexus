@@ -129,6 +129,7 @@ class QueryEngine:
         routing_config: RoutingConfig | None = None,
         memory_manager: Any | None = None,
         transcript: Any | None = None,
+        knowledge_retriever: Any | None = None,
     ) -> None:
         """
         QueryEngine을 초기화한다.
@@ -178,6 +179,10 @@ class QueryEngine:
         # 둘 다 None 허용 — 테스트/경량 환경에서도 QueryEngine이 동작하도록.
         self._memory_manager = memory_manager
         self._transcript = transcript
+
+        # Part 2.5.8: 지식 RAG — KNOWLEDGE_MODE 진입 시 tb_knowledge에서 검색 주입
+        # None이면 주입하지 않음 (tb_knowledge 미구성 환경/테스트)
+        self._knowledge_retriever = knowledge_retriever
 
         # 대화 히스토리 — submit_message() 호출마다 누적
         self._messages: list[Message] = []
@@ -291,6 +296,30 @@ class QueryEngine:
                 active_temperature,
                 active_max_tokens_cap,
             )
+
+            # Part 2.5.8: KNOWLEDGE 분류일 때만 tb_knowledge RAG 주입
+            # 일반 지식 질의에 한해 외부 지식 베이스(위키 등)에서 관련 청크를
+            # 검색하여 시스템 프롬프트에 붙인다. TOOL 질의는 도구 호출 흐름이
+            # 우선이므로 주입하지 않는다(지연/컨텍스트 낭비 회피).
+            if query_class == "KNOWLEDGE" and self._knowledge_retriever is not None:
+                try:
+                    kb_ctx = await self._knowledge_retriever.get_context(
+                        user_input, max_tokens=1000,
+                    )
+                    if kb_ctx:
+                        effective_system_prompt = (
+                            effective_system_prompt
+                            + "\n\n--- Knowledge base ---\n"
+                            + kb_ctx
+                            + "\n--- End of knowledge base ---\n"
+                            + "Answer the user using the information above as your "
+                            "primary reference. If the knowledge base does not cover "
+                            "the question, state what you know generally and clearly "
+                            "mark uncertain parts."
+                        )
+                        logger.info("지식 RAG 주입: ~%d자", len(kb_ctx))
+                except Exception as e:
+                    logger.debug("지식 RAG 주입 실패 (무시): %s", e)
         else:
             # 라우팅 비활성 — 프로바이더의 기본 설정을 그대로 사용한다
             active_model_override = None

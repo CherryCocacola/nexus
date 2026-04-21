@@ -414,6 +414,72 @@ VRAM 최대 max-model-len:
 
 ---
 
+## Part 2.5.8 지식 RAG 파이프라인 구현 (2026-04-21 저녁)
+
+### 배경
+Part 2.5 라우팅으로 KNOWLEDGE_MODE에서 베이스 Qwen이 훨씬 정확해졌지만,
+한국어 인문학·전문 지식은 여전히 부족. **외부 지식 베이스(위키)를 pgvector로
+인덱싱하고 KNOWLEDGE 질의 시 자동 주입**하는 RAG 계층을 추가하여 근본 해결.
+
+### 신규 파일
+- `core/rag/knowledge_store.py` — KnowledgeStore + KnowledgeEntry + split_into_chunks
+  - 인메모리 폴백 지원 (pg_pool=None)
+  - add_many / search_by_vector / search_by_text / count / list_sources
+  - build_vector_index (ivfflat, 대량 적재 후 1회)
+- `core/rag/knowledge_retriever.py` — 검색 결과 → 시스템 프롬프트 블록 포매터
+  - 토큰 예산 내 청크 연결, 임베딩 실패 시 텍스트 검색 폴백
+- `scripts/prepare_kowiki.py` — kowiki 덤프 적재 스크립트 (운영 코드와 격리)
+  - bz2 스트리밍, 카테고리 필터, 1,200자 청크, 배치 임베딩, UPSERT
+- `tests/unit/test_knowledge_store.py` — 17 단위 테스트
+
+### 스키마 (tb_knowledge)
+```
+id (text PK) / source / title / section / content / chunk_index /
+total_chunks / tags (text[]) / embedding (vector(1024)) / created_at / metadata (jsonb)
+인덱스: idx_knowledge_source/title/tags(GIN) + idx_knowledge_embed (ivfflat cosine)
+```
+tb_memories와 **별도 테이블** — 대화 EPISODIC 데이터와 혼재 방지.
+
+### 수정 파일
+- `core/orchestrator/query_engine.py` — `knowledge_retriever` 인자 + KNOWLEDGE 분류
+  시 `effective_system_prompt`에 검색 결과 자동 주입
+- `core/bootstrap.py` — Phase 2 ⑨-b에 KnowledgeStore 초기화 + ensure_schema()
+- `web/app.py` — 웹 QueryEngine에 knowledge_retriever 주입
+
+### 에어갭 준수
+운영 Nexus 코드에는 외부 URL 없음. 덤프 다운로드는 GPU 서버에서 별도 wget으로
+수행한 뒤 `scripts/prepare_kowiki.py`로 적재. `anti-patterns.md` #10 위반 없음.
+
+### E2E 검증 (샘플 3건)
+수동 큐레이션 위키 스타일 요약(차라투스트라/변신/니체)을 tb_knowledge에 적재 후
+웹 요청으로 검증:
+
+| 질의 | 라우팅 | RAG | 결과 |
+|---|---|---|---|
+| "차라투스트라를 세 가지 변신 중심으로" | KNOWLEDGE | 1,190자 주입 | 낙타-사자-아이 정확 (41.9s, 790토큰) |
+| "카프카의 변신 줄거리와 주제는?" | KNOWLEDGE | 1,190자 주입 | 그레고르 잠자/소외 정확 (48.8s, 958토큰) |
+
+실 로그:
+```
+라우팅: class=KNOWLEDGE, model=qwen3.5-27b, temp=0.20, max_tokens=2048
+지식 RAG 주입: ~1190자
+```
+
+### 테스트
+- 17/17 통과 (split/id 결정론성/폴백 CRUD/벡터 정렬/텍스트 검색/retriever 포맷·예산·폴백)
+- 회귀 **649/649** 통과 (632 + 17)
+- ruff: 신규 파일 clean
+
+### 사양서
+`PROJECT_NEXUS_SPEC_v7.0_AMENDMENT.md` Part 2.5.8 섹션 전면 재작성 (스키마/적재
+스크립트/E2E 결과/한계 및 향후 과제).
+
+### 남은 작업
+- **kowiki 실 덤프 적재** (GPU 서버, 1~수 시간) — 사용자가 백그라운드로 수행
+- **Phase 10.0 RAG 심볼 인덱싱** — 우선순위 낮음
+
+---
+
 ## Ch 6 ContextManager 티어별 전략 공식화 (2026-04-21 저녁)
 
 ### 배경

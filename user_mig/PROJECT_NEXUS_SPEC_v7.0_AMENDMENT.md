@@ -555,15 +555,113 @@ Tier 4: httpx             ← 불변
 
 **기존 테스트 영향**: 600개 테스트(단위 535 + 통합 65) 전부 통과 유지.
 
-### 2.5.8 한계와 향후 과제
+### 2.5.8 지식 RAG (2026-04-21 구현)
 
-- **분류기 오판 가능성**: 예) "니체의 Übermensch 개념을 다룬 논문 파일이
-  있다면 읽어줘"는 키워드 "파일"로 TOOL로 분류되지만, 실제로는 지식 질의가
-  우세할 수 있음. 현재는 안전하게 TOOL 우선 정책을 유지 (도구로 가도 답변 가능).
-- **근본 해결은 RAG**: 짜라투스트라 수준의 교양은 베이스 모델로 커버되지만,
-  고도 전문 지식은 RAG 지식 베이스가 필요. 이는 Part 10(향후 작업)에서 다룬다.
-- **Phase 4 LoRA**: 지식 카테고리를 15% → 30%(기술 15% + 인문 15%)로 확장하는
-  재학습도 가능하나, 2.5 라우팅이 효과적이면 재학습의 ROI가 낮아진다.
+KNOWLEDGE_MODE 질의의 정확도를 한 단계 더 끌어올리기 위해 외부 지식 베이스
+(위키백과 등)를 **pgvector에 인덱싱**하고, 라우팅이 KNOWLEDGE로 분류한 질의에
+한해 **자동 검색 → 시스템 프롬프트 주입**한다.
+
+#### 구조
+
+```
+사용자 질의 (KNOWLEDGE로 분류)
+  └─ KnowledgeRetriever.get_context(query, max_tokens)
+      └─ embedding_provider.embed([query])   # e5-large (:8002)
+      └─ KnowledgeStore.search_by_vector()   # pgvector cosine
+          └─ tb_knowledge                    # 별도 테이블 (tb_memories와 분리)
+      └─ 시스템 프롬프트에 "--- Knowledge base ---" 블록 주입
+  └─ Worker(qwen3.5-27b 베이스)가 근거 기반 답변 생성
+```
+
+#### 스키마 (tb_knowledge)
+
+```sql
+CREATE TABLE tb_knowledge (
+    id            text PRIMARY KEY,                        -- SHA-256(source|title|section|chunk)
+    source        text NOT NULL,                           -- 'kowiki', 'textbook', 'manual'
+    title         text NOT NULL,
+    section       text,
+    content       text NOT NULL,
+    chunk_index   int  NOT NULL DEFAULT 0,
+    total_chunks  int  NOT NULL DEFAULT 1,
+    tags          text[] DEFAULT '{}',
+    embedding     vector(1024),                            -- e5-large 차원
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    metadata      jsonb NOT NULL DEFAULT '{}'::jsonb
+);
+-- 보조 인덱스: idx_knowledge_source, idx_knowledge_title, idx_knowledge_tags(GIN)
+-- 벡터 인덱스: idx_knowledge_embed (ivfflat cosine) — 대량 적재 후 별도 빌드
+```
+
+#### 신규/수정 파일
+
+- `core/rag/knowledge_store.py` — KnowledgeStore + KnowledgeEntry + split_into_chunks
+  - 인메모리 폴백 지원 (pg_pool=None)
+  - add/add_many/search_by_vector/search_by_text/count/list_sources/build_vector_index
+- `core/rag/knowledge_retriever.py` — 벡터 검색 → 프롬프트 블록 포매팅 + 토큰 예산 관리
+- `core/orchestrator/query_engine.py` — `knowledge_retriever` 인자 추가, KNOWLEDGE
+  분류 시 `effective_system_prompt`에 검색 결과 자동 주입
+- `core/bootstrap.py` — Phase 2 ⑨-b에 KnowledgeStore 초기화 + ensure_schema
+- `web/app.py` — 웹 QueryEngine에 knowledge_retriever 주입
+- `scripts/prepare_kowiki.py` — 덤프 적재 스크립트 (별도 격리)
+
+#### 적재 스크립트 (scripts/prepare_kowiki.py)
+
+**에어갭 준수**: 이 스크립트는 운영 Nexus 코드가 아닌 "데이터 준비" 용도.
+Nexus 런타임은 외부 네트워크를 호출하지 않는다 — 덤프 다운로드는 GPU 서버에서
+수동 wget으로 수행한 후 이 스크립트로 적재.
+
+```bash
+# 1) 덤프 획득 (GPU 서버에서 1회)
+wget -P /opt/nexus-gpu/corpora/kowiki/ \
+     https://dumps.wikimedia.org/kowiki/latest/kowiki-latest-pages-articles.xml.bz2
+
+# 2) 적재
+python scripts/prepare_kowiki.py \
+  --dump /opt/nexus-gpu/corpora/kowiki/kowiki-latest-pages-articles.xml.bz2 \
+  --categories "철학,문학,역사,인물" \
+  --limit 500 \
+  --embed-url http://192.168.22.28:8002 \
+  --pg "postgresql://nexus:idino@12@192.168.10.39:5440/nexus"
+
+# 3) 벡터 인덱스 빌드 (1회)
+python scripts/prepare_kowiki.py --build-index \
+  --pg "postgresql://nexus:idino@12@192.168.10.39:5440/nexus"
+```
+
+주요 기능:
+- bz2 스트리밍 파서 (메모리 효율)
+- 경량 위키 마크업 제거 (mwparserfromhell 의존 없이 정규식)
+- 카테고리 부분문자열 필터
+- 1,200자 청크 + 100자 overlap
+- 배치 임베딩 (5개씩)
+- UPSERT — 재실행 안전
+- `--dry-run` 지원 (파싱/청크까지만, DB·임베딩 호출 생략)
+
+#### E2E 검증 (샘플 3건 적재)
+
+수동 큐레이션 샘플(`차라투스트라는 이렇게 말했다`, `변신 (카프카)`, `프리드리히 니체`)로
+실 환경 검증:
+
+| 질의 | 라우팅 | RAG 주입 | 응답 품질 |
+|---|---|---|---|
+| "차라투스트라를 세 가지 변신 중심으로 설명" | KNOWLEDGE | 1,190자 주입 | 낙타/사자/아이 정확 전개 (41.9s, 790토큰) |
+| "프란츠 카프카의 변신 줄거리와 주제는?" | KNOWLEDGE | 1,190자 주입 | 그레고르 잠자/가족 반응/소외 주제 (48.8s, 958토큰) |
+
+로그:
+```
+라우팅: class=KNOWLEDGE, model=qwen3.5-27b, temp=0.20, max_tokens=2048
+지식 RAG 주입: ~1190자
+```
+
+#### 한계와 향후 과제
+
+- **분류기 오판 가능성**: "니체의 Übermensch 관련 파일 읽어줘"는 "파일" 키워드로
+  TOOL 분류 → 지식 RAG 주입 안 됨. 현재는 보수적 TOOL 우선 정책.
+- **kowiki 적재는 별도 단계**: GPU 서버에서 1GB 덤프 + 임베딩 ~수 시간 소요.
+  사용자가 백그라운드로 실행해야 함.
+- **Phase 4 LoRA 대안**: 지식 카테고리 재학습도 가능하나, RAG가 돌아가면 ROI가
+  낮다. 우선순위는 kowiki 본 적재 완료 이후 재평가.
 
 ---
 
