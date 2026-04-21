@@ -225,6 +225,55 @@ class ShortTermMemory:
         await self.delete(context_key)
         logger.info("세션 데이터 정리 완료: %s", session_id)
 
+    async def list_sessions(self, limit: int = 100) -> list[str]:
+        """
+        저장된 세션 ID 목록을 반환한다.
+
+        Redis에서는 SCAN 커서로 `session:*:context` 패턴을 순회하여 키를 모으고,
+        접두/접미를 잘라 session_id를 돌려준다. 인메모리 폴백 모드에서는 내부
+        딕셔너리 키를 같은 방식으로 필터링한다.
+
+        Args:
+            limit: 최대 반환 건수 (Redis SCAN의 페이지 크기와 별개의 상한)
+
+        Returns:
+            세션 ID 문자열 리스트 (정렬되지 않음 — 호출자가 필요 시 정렬)
+        """
+        prefix = "session:"
+        suffix = ":context"
+
+        def _extract(key: str) -> str | None:
+            if key.startswith(prefix) and key.endswith(suffix):
+                return key[len(prefix): -len(suffix)]
+            return None
+
+        sessions: list[str] = []
+
+        if self._redis is not None:
+            try:
+                # redis.asyncio의 scan_iter는 async generator를 반환한다
+                async for raw_key in self._redis.scan_iter(match="session:*:context"):
+                    key = (
+                        raw_key.decode("utf-8")
+                        if isinstance(raw_key, bytes)
+                        else raw_key
+                    )
+                    sid = _extract(key)
+                    if sid is not None:
+                        sessions.append(sid)
+                        if len(sessions) >= limit:
+                            break
+                return sessions
+            except Exception as e:
+                logger.warning("Redis scan_iter 실패: %s — 인메모리 폴백 사용", e)
+
+        # 인메모리 폴백
+        for key in list(self._store.keys())[:limit]:
+            sid = _extract(key)
+            if sid is not None:
+                sessions.append(sid)
+        return sessions
+
     def _cleanup_expired(self) -> int:
         """
         만료된 인메모리 항목을 정리한다 (폴백 모드 전용).

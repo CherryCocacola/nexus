@@ -27,7 +27,6 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-
 # ─────────────────────────────────────────────
 # thinking 태그/찌꺼기 정제 헬퍼
 # ─────────────────────────────────────────────
@@ -177,6 +176,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         components = await init_phase2(state)
         _app_state["tool_registry"] = components.get("tool_registry")
         _app_state["model_provider"] = components.get("model_provider")
+        _app_state["memory_manager"] = components.get("memory_manager")  # Ch 16
 
         # 웹 전용 QueryEngine — 도구 8개로 축소 (토큰 예산 관리)
         # RTX 5090 (8192 ctx)에서 도구 24개(~6,102토큰)는 컨텍스트 초과.
@@ -250,6 +250,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             tools=web_tools,
             context=web_context,
             model_dispatcher=web_dispatcher,
+            memory_manager=components.get("memory_manager"),  # Ch 16 Redis+PG 저장
+            # transcript는 세션별로 다르므로 요청 핸들러에서 동적으로 주입한다
             system_prompt=(
                 "You are Nexus, the Worker agent developed by IDINO.\n"
                 "You are a 27B model — the brain of the system. Scout (a 4B "
@@ -364,6 +366,42 @@ async def chat(request: ChatRequest) -> ChatResponse:
             usage=UsageInfo(),
         )
 
+    # Ch 16: 비스트리밍 경로도 세션 ID와 트랜스크립트를 주입한다
+    engine._session_id = session_id
+    try:
+        from core.memory.transcript import SessionTranscript as _Trans
+        cfg = _app_state.get("config")
+        sessions_dir = cfg.session.sessions_dir if cfg else ".nexus/sessions"
+        transcript_enabled = cfg.session.transcript_enabled if cfg else True
+        engine._transcript = _Trans(
+            sessions_dir=sessions_dir,
+            session_id=session_id,
+            enabled=transcript_enabled,
+        )
+    except Exception as e:
+        logger.warning("트랜스크립트 주입 실패 (%s): %s", session_id, e)
+        engine._transcript = None
+
+    # Ch 16: Redis에서 해당 세션의 이전 히스토리 복원
+    memory_manager = _app_state.get("memory_manager")
+    if memory_manager is not None:
+        try:
+            engine.clear_messages()
+            saved = await memory_manager.short_term.get_conversation_context(session_id)
+            if saved:
+                from core.message import Message as _Msg
+                for item in saved:
+                    role = item.get("role")
+                    content = item.get("content", "")
+                    if not content:
+                        continue
+                    if role == "user":
+                        engine._messages.append(_Msg.user(content))
+                    elif role == "assistant":
+                        engine._messages.append(_Msg.assistant(content))
+        except Exception as e:
+            logger.warning("비스트리밍 세션 복원 실패 (%s): %s", session_id, e)
+
     # QueryEngine으로 메시지를 처리하고 모든 이벤트를 수집한다
     from core.message import StreamEvent, StreamEventType
 
@@ -425,12 +463,59 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
         if "chat_histories" not in _app_state:
             _app_state["chat_histories"] = {}
         histories = _app_state["chat_histories"]
+
+        # Ch 16: 세션 영속화 — 메모리 매니저가 있으면 Redis에서 복원
+        # 첫 요청(인메모리 비어 있음)일 때만 Redis에서 이전 히스토리를 가져온다.
+        # 이후 턴은 인메모리 + Redis 양쪽을 유지한다(write-through).
+        memory_manager = _app_state.get("memory_manager")
         if session_id not in histories:
             histories[session_id] = []
+            if memory_manager is not None:
+                try:
+                    saved = await memory_manager.short_term.get_conversation_context(
+                        session_id
+                    )
+                    if saved:
+                        from core.message import Message as _Msg
+
+                        for item in saved:
+                            role = item.get("role")
+                            content = item.get("content", "")
+                            if not content:
+                                continue
+                            if role == "user":
+                                histories[session_id].append(_Msg.user(content))
+                            elif role == "assistant":
+                                histories[session_id].append(_Msg.assistant(content))
+                        logger.info(
+                            "세션 %s Redis 복원: %d개 메시지",
+                            session_id, len(histories[session_id]),
+                        )
+                except Exception as e:
+                    logger.warning("세션 Redis 복원 실패 (%s): %s", session_id, e)
 
         # Qwen3.5 thinking 찌꺼기가 들어있는 과거 메시지를 1회성 정제
         # (세션이 enable_thinking=false 전의 오염된 상태일 수 있다)
         _sanitize_history_inplace(histories[session_id])
+
+        # Ch 16: 세션별 JSONL 트랜스크립트 주입 (웹은 QueryEngine 싱글톤이라 동적 세팅)
+        try:
+            from core.memory.transcript import SessionTranscript as _Trans
+            cfg = _app_state.get("config")
+            sessions_dir = cfg.session.sessions_dir if cfg else ".nexus/sessions"
+            transcript_enabled = cfg.session.transcript_enabled if cfg else True
+            engine._transcript = _Trans(
+                sessions_dir=sessions_dir,
+                session_id=session_id,
+                enabled=transcript_enabled,
+            )
+        except Exception as e:
+            logger.warning("트랜스크립트 주입 실패 (%s): %s", session_id, e)
+            engine._transcript = None
+
+        # Ch 16: QueryEngine의 세션 ID를 요청 세션으로 교체 — MemoryManager 키 정합성
+        # (웹은 싱글톤 QueryEngine을 공유하므로 매 요청마다 덮어써야 한다)
+        engine._session_id = session_id
 
         # QueryEngine의 messages를 해당 세션의 히스토리로 교체
         # 도구 호출/결과 메시지는 토큰을 많이 차지하므로 제외하고,
@@ -508,6 +593,26 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
                     elif content_clean:
                         histories[session_id].append(msg)
 
+        # Ch 16: Redis에 write-through — 인메모리 히스토리를 JSON 직렬화하여 저장
+        # QueryEngine.on_turn_end도 자체적으로 save_conversation_context를 호출하지만,
+        # 웹의 경우 histories[session_id]가 "여러 턴 누적된 완전한 대화"이므로
+        # 여기서도 한 번 더 저장하여 서버 재기동 시 UI에 보이는 대화 그대로 복원.
+        if memory_manager is not None:
+            try:
+                serialized: list[dict[str, Any]] = []
+                for m in histories[session_id]:
+                    role = m.role if isinstance(m.role, str) else m.role.value
+                    if role not in ("user", "assistant"):
+                        continue
+                    text = m.text_content if hasattr(m, "text_content") else str(m.content)
+                    if text:
+                        serialized.append({"role": role, "content": text})
+                await memory_manager.short_term.save_conversation_context(
+                    session_id, serialized, ttl=86400
+                )
+            except Exception as e:
+                logger.warning("세션 Redis 저장 실패 (%s): %s", session_id, e)
+
     return StreamingResponse(
         generate(),
         media_type="text/event-stream",
@@ -525,22 +630,47 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
 @app.get("/v1/sessions")
 async def list_sessions() -> dict[str, Any]:
     """
-    활성 세션 목록을 반환한다.
+    저장된 세션 목록을 반환한다 (Ch 16).
 
-    TODO(nexus): 세션 관리자(Phase 5)가 완성되면 실제 세션 목록을 반환한다.
+    두 소스를 병합:
+      1. Redis (단기, TTL 24h) — 최근 활성 세션 (session_id만)
+      2. JSONL 트랜스크립트 (영구 기록) — 파일 시스템에 남아있는 모든 세션
+    트랜스크립트가 상세 메타데이터(라인 수, 최종 수정 시각)를 갖고 있으므로
+    이를 기본으로 삼고, Redis-only 세션은 이후에 머지한다.
     """
-    state = _app_state.get("state")
-    if state:
-        return {
-            "sessions": [
-                {
-                    "session_id": state.session_id,
-                    "active_model": state.active_model,
-                    "total_turns": state.total_turns,
-                }
-            ]
-        }
-    return {"sessions": []}
+    from core.memory.transcript import list_transcript_sessions
+
+    cfg = _app_state.get("config")
+    sessions_dir = cfg.session.sessions_dir if cfg else ".nexus/sessions"
+
+    # 1) 파일 트랜스크립트 기반 세션 (상세 정보 포함)
+    disk_sessions = list_transcript_sessions(sessions_dir, limit=100)
+
+    # 2) Redis 단기 캐시 기반 세션 (session_id만) — 트랜스크립트에 없는 것만 추가
+    memory_manager = _app_state.get("memory_manager")
+    known_ids = {s["session_id"] for s in disk_sessions}
+    redis_only: list[dict[str, Any]] = []
+    if memory_manager is not None:
+        try:
+            for sid in await memory_manager.short_term.list_sessions(limit=100):
+                if sid not in known_ids:
+                    redis_only.append(
+                        {
+                            "session_id": sid,
+                            "source": "redis_only",
+                            "last_modified": None,
+                            "entries": None,
+                        }
+                    )
+        except Exception as e:
+            # Redis 조회 실패는 치명적이지 않음 — disk 결과만으로 응답
+            logger.debug("list_sessions Redis 조회 실패 (무시): %s", e)
+
+    return {
+        "sessions": disk_sessions + redis_only,
+        "total": len(disk_sessions) + len(redis_only),
+        "sessions_dir": sessions_dir,
+    }
 
 
 # ─────────────────────────────────────────────

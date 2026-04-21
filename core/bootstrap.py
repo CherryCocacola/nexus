@@ -106,6 +106,7 @@ async def init_phase2(state: GlobalState) -> dict:
     from core.memory.long_term import LongTermMemory
     from core.memory.manager import MemoryManager
     from core.memory.short_term import ShortTermMemory
+    from core.memory.transcript import SessionTranscript
     from core.model.inference import LocalModelProvider
     from core.orchestrator.agent_definition import build_default_agent_registry
     from core.orchestrator.query_engine import QueryEngine
@@ -295,6 +296,14 @@ async def init_phase2(state: GlobalState) -> dict:
     # ⑪ QueryEngine — Tier 1 세션 오케스트레이터
     # model_dispatcher가 주입되면 submit_message는 dispatcher.route() 경로를 탄다.
     # 시스템 프롬프트에는 agent_registry를 반영하여 서브에이전트 사용 가이드를 넣는다.
+    # Ch 16: CLI 세션용 JSONL 트랜스크립트 (기본 활성)
+    cli_transcript = SessionTranscript(
+        sessions_dir=config.session.sessions_dir,
+        session_id=state.session_id,
+        enabled=config.session.transcript_enabled,
+    )
+    components["transcript"] = cli_transcript
+
     engine = QueryEngine(
         model_provider=provider,
         tools=cli_tools,
@@ -305,6 +314,8 @@ async def init_phase2(state: GlobalState) -> dict:
         rag_retriever=rag_retriever,
         model_dispatcher=dispatcher,
         routing_config=config.routing,  # v7.0 Part 2.5 — 지식/도구 분기
+        memory_manager=memory_manager,  # Ch 16: Redis + tb_memories 자동 저장
+        transcript=cli_transcript,  # Ch 16: JSONL 영구 기록
     )
     components["query_engine"] = engine
     logger.info(

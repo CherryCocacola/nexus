@@ -414,6 +414,65 @@ VRAM 최대 max-model-len:
 
 ---
 
+## Ch 16 세션 영속화 구현 (2026-04-21 오후)
+
+### 배경
+진단 결과 웹 채팅 히스토리가 `_app_state["chat_histories"]` 인메모리 dict에만
+저장되고 있어 서버 재기동 시 전부 소실. Redis/PG 연결은 성공했지만 **QueryEngine이
+MemoryManager를 호출하지 않아** 저장 기능이 연결되지 않은 "유령 구성" 상태였음.
+
+### 구현
+
+**신규 모듈**:
+- `core/memory/transcript.py` — SessionTranscript, list_transcript_sessions
+  - `{sessions_dir}/{session_id}/transcript.jsonl`에 append-only 기록
+  - 턴 단위 JSON Lines (ts, role, content, turn, usage)
+
+**수정**:
+- `core/memory/short_term.py` — `list_sessions(limit)` 추가 (Redis SCAN)
+- `core/orchestrator/query_engine.py` — `memory_manager`, `transcript` 파라미터 추가,
+  `_finalize_turn()` 내부 헬퍼로 submit_message 말미에서 호출
+- `core/bootstrap.py` — CLI용 SessionTranscript 생성 + QueryEngine에 주입
+- `web/app.py`
+  - `_app_state["memory_manager"]` 노출
+  - `/v1/chat`, `/v1/chat/stream` 핸들러에 session_id 세팅 + Redis 복원 + write-through
+  - `/v1/sessions` 엔드포인트가 실제 저장된 세션 목록 반환
+
+**저장 3단 구조**:
+| 매체 | 용도 | TTL |
+|---|---|---|
+| 인메모리 chat_histories | 프로세스 내 빠른 접근 | 소멸 |
+| Redis session:{id}:context | 재기동 후 복원 | 24h |
+| {sessions_dir}/{id}/transcript.jsonl | 영구 감사 기록 | 영구 |
+| tb_memories (중요 턴) | 의미 검색/장기 승격 | 영구 |
+
+### E2E 검증
+
+| 단계 | 결과 |
+|---|---|
+| 턴 1 "내 이름은 홍길동이야" (SID=persist-e2e-001) | 응답 2.7s, Redis+JSONL 기록 |
+| 턴 2 "내 이름이 뭐였지?" | 응답 0.7s, "홍길동" 정확 복기 |
+| **서버 재기동 후** 같은 SID로 재질의 | **messages=3개 Redis 복원** → "홍길동입니다" 1.2s |
+| `/v1/sessions` | 디스크 1 + Redis-only 1 총 2개 반환 |
+
+### 테스트
+- `tests/unit/test_session_persistence.py` 신규 (11 케이스)
+  - SessionTranscript 기록/비활성/목록 조회
+  - ShortTermMemory.list_sessions 인메모리 폴백
+  - QueryEngine._finalize_turn (memory 호출, swallow 에러, noop, 실파일 기록)
+- 회귀 624/624 통과 (기존 613 + 신규 11)
+
+### 사양서
+- Part 5 Ch 16 섹션 전면 업데이트 (아키텍처·저장 매체·E2E 결과)
+
+### 남은 작업 (후순위)
+- **Ch 6 ContextManager 티어별 전략 분기** — TIER_S는 TurnStateStrategy,
+  TIER_M/L은 기존 4단계 압축 (현재 TurnStateStore는 있지만 context_manager 공식 분기 미구현)
+- **Phase 10.0 RAG 심볼 인덱싱** (선택, 큰 작업)
+- **Part 2.5.8 인문학 RAG 지식 베이스** (사용자 결정 대기)
+
+---
+
 ## Scout 29자 수렴 근본 해결 (2026-04-21 오후)
 
 ### 배경

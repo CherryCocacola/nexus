@@ -1027,19 +1027,79 @@ scout_enabled: bool = False
 orchestration_mode: str = "multi_model"  # "multi_model" | "single_model"
 ```
 
-### Ch 16: Session Management (경미 수정)
+### Ch 16: Session Management (2026-04-21 구현)
 
-**TurnState를 세션 메타데이터에 포함**:
+**구현 상태**: Ch 16 세션 영속화가 완료되어 서버 재기동 후에도 대화 맥락이
+복원된다. 기존 MemoryManager + ShortTermMemory 인프라를 QueryEngine에 배선하고,
+JSONL 트랜스크립트로 영구 기록을 남긴다.
 
-```python
-# metadata.json에 추가
-{
-    "turn_states": [
-        {"turn": 1, "facts": [...], "todo": [...], "touched_files": [...]},
-        {"turn": 2, ...}
-    ]
-}
+#### 아키텍처
+
 ```
+웹 요청 진입
+  └─ session_id 결정 (요청 본문 or UUID)
+  └─ Redis에서 세션 컨텍스트 복원
+     (short_term.get_conversation_context → user/assistant 메시지 리스트)
+  └─ QueryEngine._session_id / _transcript 세팅
+  └─ submit_message() 실행
+     └─ query_loop → Worker 응답 생성
+     └─ _finalize_turn() 호출:
+        (1) MemoryManager.on_turn_end()
+            ├─ Redis 단기 저장 (TTL 24h, key: session:{id}:context)
+            └─ assistant 중요도 평가 → 임계치 초과 시 tb_memories(장기) 승격
+        (2) SessionTranscript.append_entry()
+            └─ {sessions_dir}/{session_id}/transcript.jsonl에 JSON Lines append
+  └─ 응답 직후 write-through
+     └─ 인메모리 histories → Redis save_conversation_context
+```
+
+#### 저장 매체 3단
+
+| 매체 | 용도 | TTL / 영속성 |
+|---|---|---|
+| 인메모리 `_app_state["chat_histories"]` | 동일 서버 프로세스 내 빠른 접근 | 프로세스 종료 시 소실 |
+| Redis `session:{id}:context` | 서버 재기동 후 복원, 다중 프로세스 공유 | 24시간 TTL |
+| `{sessions_dir}/{id}/transcript.jsonl` | 감사·재현·복구 | 영구 (운영자가 수동 관리) |
+| PostgreSQL `tb_memories` (중요 턴) | 의미 검색 + 장기 승격 | 영구, pgvector 검색 |
+
+#### 신규 파일
+
+- `core/memory/transcript.py`
+  - `SessionTranscript(sessions_dir, session_id, enabled)`
+  - `append_entry(role, content, turn, usage=None, extra=None)`
+  - `list_transcript_sessions(sessions_dir, limit)` — mtime 내림차순
+
+#### 수정 파일
+
+- `core/memory/short_term.py` — `list_sessions(limit)` 추가 (Redis SCAN + 인메모리 폴백)
+- `core/orchestrator/query_engine.py`
+  - 생성자에 `memory_manager`, `transcript` 주입
+  - `_finalize_turn(user_input)` 내부 헬퍼 추가 (submit_message 말미에서 호출)
+- `core/bootstrap.py` — CLI용 SessionTranscript 생성, QueryEngine에 주입
+- `web/app.py`
+  - `_app_state["memory_manager"]` 노출
+  - `/v1/chat`, `/v1/chat/stream` 핸들러에서 session_id → engine 세팅 + Redis 복원 + write-through 저장
+  - `/v1/sessions` 엔드포인트가 실제 저장된 세션(디스크 + Redis) 반환
+
+#### E2E 검증 (2026-04-21)
+
+시나리오: 같은 session_id로 2턴 대화 → 서버 재기동 → 같은 session_id로 재질의
+
+| 단계 | 결과 |
+|---|---|
+| 턴 1 "내 이름은 홍길동이야" | 응답 2.7s, Redis+JSONL 기록 |
+| 턴 2 "내 이름이 뭐였지?" | 응답 0.7s, "홍길동" 정확 복기 |
+| 서버 재기동 후 같은 SID | messages=3개 **Redis에서 복원**, "홍길동" 기억 유지, 1.2s 응답 |
+| `/v1/sessions` | 파일 기반 1개 + Redis-only 1개 반환 |
+| `.nexus/sessions/persist-e2e-001/transcript.jsonl` | 4줄 기록 (user-assistant × 2) |
+
+#### 하위 호환성
+
+- `memory_manager`, `transcript`는 둘 다 **None 허용** — 기존 QueryEngine
+  호출 코드(테스트 등)는 수정 없이 그대로 동작
+- 에러 발생 시 `_finalize_turn`이 swallow — 응답 본류에 영향 없음
+- `transcript_enabled=False` 또는 `sessions_dir` 쓰기 불가 환경에서도 안전하게
+  비활성 fallback
 
 ### Ch 17: Monitoring & Metrics (재설계, 2026-04-17)
 

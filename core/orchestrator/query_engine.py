@@ -127,6 +127,8 @@ class QueryEngine:
         rag_retriever: Any | None = None,
         model_dispatcher: Any | None = None,
         routing_config: RoutingConfig | None = None,
+        memory_manager: Any | None = None,
+        transcript: Any | None = None,
     ) -> None:
         """
         QueryEngine을 초기화한다.
@@ -169,6 +171,13 @@ class QueryEngine:
 
         # v7.0 Part 2.5: 쿼리 라우팅 설정 (None이면 기본값 사용)
         self._routing_config = routing_config or RoutingConfig()
+
+        # Ch 16 세션 영속화: MemoryManager와 트랜스크립트
+        # - memory_manager: on_turn_end로 Redis 단기 저장 + tb_memories 장기 승격
+        # - transcript: JSONL 파일에 영구 기록 (서버 재기동 후 조회)
+        # 둘 다 None 허용 — 테스트/경량 환경에서도 QueryEngine이 동작하도록.
+        self._memory_manager = memory_manager
+        self._transcript = transcript
 
         # 대화 히스토리 — submit_message() 호출마다 누적
         self._messages: list[Message] = []
@@ -341,6 +350,65 @@ class QueryEngine:
             self._cumulative_usage.input_tokens,
             self._cumulative_usage.output_tokens,
         )
+
+        # Ch 16: 턴 종료 훅 — 세션 영속화
+        # (1) MemoryManager.on_turn_end — Redis 단기 + 중요도 평가 후 tb_memories 승격
+        # (2) Transcript.append_entry — JSONL 파일에 user/assistant 쌍 기록
+        # 둘 다 실패해도 본류 응답은 이미 yield 완료 상태 — 최대한 안전한 swallow.
+        await self._finalize_turn(user_input)
+
+    async def _finalize_turn(self, user_input: str) -> None:
+        """턴 종료 시 메모리/트랜스크립트 기록을 수행한다 (실패 시 swallow)."""
+        # (1) MemoryManager 연동
+        if self._memory_manager is not None:
+            try:
+                await self._memory_manager.on_turn_end(
+                    session_id=self._session_id,
+                    messages=self._messages,
+                )
+            except Exception as e:
+                # 메모리 저장 실패는 치명적이지 않다 — 로그만 남기고 진행
+                logger.warning(
+                    "MemoryManager.on_turn_end 실패 (session=%s): %s",
+                    self._session_id, e,
+                )
+
+        # (2) 트랜스크립트 기록 — 마지막 user/assistant 쌍만 append
+        # 왜 쌍만? 전체 messages를 매번 덮어쓰면 append-only 규칙 위반 + 중복 누적
+        if self._transcript is not None:
+            try:
+                last_user: str | None = user_input
+                last_assistant: str | None = None
+                # messages 끝부터 역순으로 탐색 — 가장 최근 assistant 텍스트
+                for m in reversed(self._messages):
+                    role = m.role if isinstance(m.role, str) else m.role.value
+                    if role == "assistant":
+                        text = m.text_content if hasattr(m, "text_content") else str(m.content)
+                        if text:
+                            last_assistant = text
+                            break
+                usage = {
+                    "input_tokens": self._cumulative_usage.input_tokens,
+                    "output_tokens": self._cumulative_usage.output_tokens,
+                }
+                if last_user:
+                    self._transcript.append_entry(
+                        role="user",
+                        content=last_user,
+                        turn=self._total_turns,
+                    )
+                if last_assistant:
+                    self._transcript.append_entry(
+                        role="assistant",
+                        content=last_assistant,
+                        turn=self._total_turns,
+                        usage=usage,
+                    )
+            except Exception as e:
+                logger.warning(
+                    "Transcript 기록 실패 (session=%s): %s",
+                    self._session_id, e,
+                )
 
     # ─── 대화 상태 조회 메서드 ───
 
