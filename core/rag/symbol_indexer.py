@@ -1,10 +1,9 @@
 """
-Python AST 기반 심볼 추출기 (Phase 10.0, 2026-04-21).
+다언어 심볼 추출기 (Phase 10.0 + 확장, 2026-04-21).
 
-프로젝트 내 `.py` 파일을 순회하며 다음 심볼을 추출하여 SymbolStore에 적재:
-  - 모듈 top-level 함수 / 비동기 함수
-  - 클래스
-  - 클래스의 메서드 / 비동기 메서드
+지원 언어: Python(ast), JavaScript/TypeScript(정규식), Go(정규식).
+언어별 구체 파서는 `core/rag/parsers/`에 위치하고, 본 모듈은 ParserRegistry
+경유로 확장자를 라우팅한다.
 
 각 심볼의 summary(임베딩 대상 텍스트)는 다음 규칙으로 구성:
   "{kind} {qualified_name}{signature}
@@ -13,19 +12,25 @@ Python AST 기반 심볼 추출기 (Phase 10.0, 2026-04-21).
   {최대 5줄 발췌}"
 
 설계 결정:
-  - 외부 의존성 없이 표준 `ast` 모듈만 사용 — 에어갭 준수
+  - 에어갭 준수 — 외부 파서 라이브러리 없이 표준 ast / 정규식만 사용
   - 파일 단위 트랜잭션: `delete_by_path()` → `add_many()` 순으로 재인덱싱 멱등
   - 임베딩 실패(서버 다운 등)해도 본문과 메타데이터는 저장 → 텍스트 검색은 가능
 """
 
 from __future__ import annotations
 
-import ast
+import ast  # noqa: F401 — 하위 호환(extract_symbols_from_source 이전 import 참조)
 import logging
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+from core.rag.parsers import (
+    BaseParser,
+    ParsedSymbol,
+    ParserRegistry,
+    build_default_registry,
+)
 from core.rag.symbol_store import SymbolEntry, SymbolStore
 
 logger = logging.getLogger("nexus.rag.symbol_indexer")
@@ -51,18 +56,37 @@ EMBED_BATCH_SIZE = 16
 # AST 추출
 # ─────────────────────────────────────────────
 def iter_python_files(root: Path) -> Iterator[Path]:
-    """인덱싱 대상 .py 파일을 순회한다."""
+    """인덱싱 대상 .py 파일을 순회한다 (하위 호환 함수)."""
+    yield from iter_source_files(root, extensions=(".py",))
+
+
+def iter_source_files(
+    root: Path,
+    extensions: tuple[str, ...] | None = None,
+) -> Iterator[Path]:
+    """
+    인덱싱 대상 소스 파일을 순회한다.
+
+    Args:
+        root: 스캔 시작 디렉토리
+        extensions: 허용 확장자 튜플 (소문자, 점 포함). None이면 ParserRegistry
+            기본 확장자(py/js/jsx/mjs/cjs/ts/tsx/go).
+    """
+    if extensions is None:
+        extensions = tuple(build_default_registry().supported_extensions())
+    exts = tuple(e.lower() for e in extensions)
+
     for current, dirs, files in _walk(root):
-        # 제외 디렉토리 즉시 가지치기
         dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS and not d.startswith(".")]
         for f in files:
-            if f.endswith(".py"):
-                p = current / f
-                try:
-                    if p.stat().st_size <= MAX_FILE_SIZE:
-                        yield p
-                except OSError:
-                    continue
+            p = current / f
+            if p.suffix.lower() not in exts:
+                continue
+            try:
+                if p.stat().st_size <= MAX_FILE_SIZE:
+                    yield p
+            except OSError:
+                continue
 
 
 def _walk(root: Path):
@@ -72,26 +96,11 @@ def _walk(root: Path):
         yield Path(dirpath), dirnames, filenames
 
 
-def _signature_of(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
-    """함수/메서드의 시그니처 문자열을 재구성한다."""
-    try:
-        args = ast.unparse(node.args)
-    except Exception:
-        args = "..."
-    ret = ""
-    if node.returns is not None:
-        try:
-            ret = " -> " + ast.unparse(node.returns)
-        except Exception as e:
-            logger.debug("return annotation unparse 실패 (무시): %s", e)
-    return f"({args}){ret}"
-
-
 def _source_excerpt(source_lines: list[str], start: int, end: int, n: int = 5) -> str:
-    """AST 노드의 source에서 앞부분 몇 줄을 발췌한다."""
+    """AST/정규식에서 얻은 소스의 앞부분 몇 줄을 발췌한다."""
     if not source_lines or start <= 0:
         return ""
-    # ast line은 1-indexed
+    # 1-indexed
     start_idx = max(0, start - 1)
     end_idx = min(len(source_lines), start_idx + n)
     return "\n".join(source_lines[start_idx:end_idx])
@@ -104,11 +113,38 @@ def _build_summary(
     """임베딩에 넣을 요약 텍스트를 조립한다."""
     parts = [f"{kind} {qualified}{signature}"]
     if docstring:
-        # 긴 docstring은 너무 커지면 의미가 희석되므로 제한
         parts.append(docstring.strip()[:600])
     if excerpt:
         parts.append("source:\n" + excerpt)
     return "\n\n".join(parts)
+
+
+def _parsed_to_entry(
+    sym: ParsedSymbol,
+    source_text: str,
+    *, path: str, module: str, project_source: str,
+) -> SymbolEntry:
+    """ParsedSymbol → SymbolEntry 변환 (summary + 태그 포함)."""
+    source_lines = source_text.splitlines()
+    excerpt = _source_excerpt(source_lines, sym.line_start, sym.line_end, n=6)
+    summary = _build_summary(
+        sym.kind, sym.qualified_name, sym.signature, sym.docstring, excerpt,
+    )
+    tags = tuple(filter(None, (sym.language, *sym.extra_tags)))
+    return SymbolEntry(
+        source=project_source,
+        path=path,
+        module=module,
+        kind=sym.kind,
+        name=sym.name,
+        qualified_name=sym.qualified_name,
+        signature=sym.signature,
+        docstring=sym.docstring,
+        summary=summary,
+        line_start=sym.line_start,
+        line_end=sym.line_end,
+        tags=tags,
+    )
 
 
 def extract_symbols_from_source(
@@ -116,95 +152,39 @@ def extract_symbols_from_source(
     path: str,
     module: str,
     project_source: str = "nexus",
+    parser: BaseParser | None = None,
+    registry: ParserRegistry | None = None,
 ) -> list[SymbolEntry]:
     """
     단일 파일의 소스에서 심볼을 추출한다 (임베딩은 적재 단계에서 따로).
 
-    추출 대상:
-      - top-level FunctionDef / AsyncFunctionDef
-      - top-level ClassDef (클래스 자체 + 내부 메서드)
-      - 중첩 클래스도 재귀 순회
+    파서 선택:
+      - parser가 명시되면 그 파서 사용
+      - registry가 주어지면 path.suffix로 파서 조회
+      - 둘 다 없으면 확장자 `.py`일 때만 PythonParser로 자동 (하위 호환)
 
-    private 식별자(_leading_underscore)는 기본 포함 — 필요 시 호출자가 필터.
+    파서가 없으면 빈 리스트 반환 (지원 안 하는 언어는 조용히 skip).
     """
-    try:
-        tree = ast.parse(source_text, filename=path)
-    except SyntaxError as e:
-        logger.debug("SyntaxError (%s): %s", path, e)
-        return []
-
-    source_lines = source_text.splitlines()
-    out: list[SymbolEntry] = []
-
-    def _mk_func(
-        node: ast.FunctionDef | ast.AsyncFunctionDef,
-        parent_qual: str,
-        parent_kind: str | None,  # 'class'이면 이 함수는 메서드
-    ) -> SymbolEntry:
-        is_async = isinstance(node, ast.AsyncFunctionDef)
-        if parent_kind == "class":
-            kind = "async_method" if is_async else "method"
+    if parser is None:
+        if registry is None:
+            # 하위 호환: 명시적 설정 없으면 Python만
+            if not path.lower().endswith(".py"):
+                return []
+            from core.rag.parsers.python_parser import PythonParser
+            parser = PythonParser()
         else:
-            kind = "async_function" if is_async else "function"
-        sig = _signature_of(node)
-        doc = ast.get_docstring(node) or ""
-        qual = f"{parent_qual}.{node.name}" if parent_qual else node.name
-        line_start = getattr(node, "lineno", 0) or 0
-        line_end = getattr(node, "end_lineno", line_start) or line_start
-        excerpt = _source_excerpt(source_lines, line_start, line_end, n=6)
-        summary = _build_summary(kind, qual, sig, doc, excerpt)
-        return SymbolEntry(
-            source=project_source,
-            path=path,
-            module=module,
-            kind=kind,
-            name=node.name,
-            qualified_name=qual,
-            signature=sig,
-            docstring=doc,
-            summary=summary,
-            line_start=line_start,
-            line_end=line_end,
+            parser = registry.for_path(path)
+            if parser is None:
+                return []
+
+    parsed = parser.parse(source_text, path)
+    return [
+        _parsed_to_entry(
+            s, source_text,
+            path=path, module=module, project_source=project_source,
         )
-
-    def _visit(body: list[ast.stmt], parent_qual: str, parent_kind: str | None) -> None:
-        for node in body:
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                out.append(_mk_func(node, parent_qual, parent_kind))
-            elif isinstance(node, ast.ClassDef):
-                qual = f"{parent_qual}.{node.name}" if parent_qual else node.name
-                doc = ast.get_docstring(node) or ""
-                line_start = getattr(node, "lineno", 0) or 0
-                line_end = getattr(node, "end_lineno", line_start) or line_start
-                excerpt = _source_excerpt(source_lines, line_start, line_end, n=6)
-                # 클래스 시그니처 = 베이스 클래스 목록
-                try:
-                    bases = ", ".join(ast.unparse(b) for b in node.bases)
-                except Exception:
-                    bases = ""
-                sig = f"({bases})" if bases else ""
-                summary = _build_summary("class", qual, sig, doc, excerpt)
-                out.append(
-                    SymbolEntry(
-                        source=project_source,
-                        path=path,
-                        module=module,
-                        kind="class",
-                        name=node.name,
-                        qualified_name=qual,
-                        signature=sig,
-                        docstring=doc,
-                        summary=summary,
-                        line_start=line_start,
-                        line_end=line_end,
-                    )
-                )
-                # 클래스 내부도 재귀 — 부모 kind='class'
-                _visit(node.body, qual, "class")
-
-    # tree.body는 top-level. 부모 없음.
-    _visit(tree.body, "", None)
-    return out
+        for s in parsed
+    ]
 
 
 def module_name_for(path: Path, root: Path) -> str:
@@ -223,10 +203,12 @@ def module_name_for(path: Path, root: Path) -> str:
 # 프로젝트 인덱서
 # ─────────────────────────────────────────────
 class SymbolProjectIndexer:
-    """프로젝트 전체 Python 파일 → SymbolStore 적재기.
+    """프로젝트 전체 소스 파일 → SymbolStore 적재기 (다언어 지원).
 
     embedder는 임베딩 배치 함수 (list[str] → list[list[float]]). None이면
     임베딩 없이 구조 메타데이터만 적재 (텍스트 검색은 여전히 가능).
+
+    registry는 언어별 Parser 레지스트리 (확장자 라우팅). None이면 기본 등록.
     """
 
     def __init__(
@@ -234,19 +216,25 @@ class SymbolProjectIndexer:
         store: SymbolStore,
         embedder: Any | None = None,
         project_source: str = "nexus",
+        registry: ParserRegistry | None = None,
     ) -> None:
         self._store = store
         self._embedder = embedder
         self._source = project_source
+        self._registry = registry or build_default_registry()
 
     async def index_project(self, root: str | Path) -> dict[str, int]:
-        """루트 디렉토리 아래 .py 파일을 전부 재인덱싱한다 (파일 단위 delete + add_many)."""
+        """
+        루트 디렉토리 아래 지원 확장자 파일을 전부 재인덱싱한다
+        (파일 단위 delete + add_many로 멱등).
+        """
         root_path = Path(root).resolve()
         await self._store.ensure_schema()
 
         files_done = 0
         symbols_done = 0
-        for file_path in iter_python_files(root_path):
+        extensions = tuple(self._registry.supported_extensions())
+        for file_path in iter_source_files(root_path, extensions=extensions):
             try:
                 text = file_path.read_text(encoding="utf-8", errors="replace")
             except OSError:
@@ -255,7 +243,8 @@ class SymbolProjectIndexer:
             rel = str(file_path.resolve().relative_to(root_path)).replace("\\", "/")
             module = module_name_for(file_path, root_path)
             entries = extract_symbols_from_source(
-                text, path=rel, module=module, project_source=self._source
+                text, path=rel, module=module, project_source=self._source,
+                registry=self._registry,
             )
             if not entries:
                 continue

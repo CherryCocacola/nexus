@@ -414,6 +414,53 @@ VRAM 최대 max-model-len:
 
 ---
 
+## Phase 10.0 다언어 심볼 파서 (2026-04-21 야간 확장)
+
+### 배경
+Phase 10.0 초판은 Python만 지원. JavaScript/TypeScript/Go로 확장하려면
+파서 플러그인 구조가 필요했다. 에어갭 제약상 tree-sitter/esprima 등 외부
+라이브러리 사용 불가 → 표준 `ast`(Python) + 정규식(JS/TS/Go) 조합으로 구현.
+
+### 신규 파일
+- `core/rag/parsers/__init__.py` — 기본 레지스트리 팩토리
+- `core/rag/parsers/base.py` — BaseParser ABC + ParsedSymbol + ParserRegistry
+- `core/rag/parsers/python_parser.py` — 기존 ast 로직 재포장
+- `core/rag/parsers/javascript_parser.py` — JS/TS 공통 regex 파서
+  - function / arrow / class / method (async/static 태그)
+  - TypeScript: interface / type alias
+  - JSDoc (`/** ... */`) 캡처
+- `core/rag/parsers/go_parser.py` — Go regex 파서
+  - func / method(receiver) / struct / interface / type alias
+  - 대문자 시작 심볼에 `exported` 태그
+  - `// doc comment` 캡처
+- `tests/unit/test_multilang_parsers.py` — 14 케이스
+
+### 수정
+- `core/rag/symbol_indexer.py`
+  - `iter_source_files()` 추가 (확장자 인자)
+  - `extract_symbols_from_source`에 `parser` / `registry` 선택 파라미터
+  - `SymbolProjectIndexer`가 ParserRegistry 경유로 다언어 라우팅
+  - 하위 호환: Python-only 호출 경로 그대로 동작
+
+### 검증
+- 단위 14건 전부 통과, 회귀 **679/679** (665 + 14)
+- JS/TS 샘플: jsdoc 캡처, static/async 태그, qualified name(`Class.method`) 정확
+- Go 샘플: method receiver → `Type.Method`, exported 태그, doc comment 포함
+- 다언어 혼합 트리 E2E: py/js/ts/go 4파일 → 20+ 심볼 언어별 태그 확인
+
+### 디자인 결정
+- `_RE_*`의 들여쓰기는 `\s*` 대신 `[ \t]*`로 고정 — `\s`가 개행까지 소비해
+  `match.start()`가 0이 되면서 JSDoc prefix가 빈 문자열이 되는 버그를 회피
+- 주석/문자열을 같은 길이의 공백으로 scrub 후 정규식 매치 → 오탐 감소
+- 파서 에러는 조용히 빈 리스트 반환 — 단일 파일 실패가 전체 인덱싱을 망치지 않도록
+
+### 남은 여지
+- Rust/Java 등 추가 언어는 동일 BaseParser 상속으로 추가
+- 호출 그래프(caller/callee) 저장은 별도 작업
+- JS arrow function의 `line_end` 현재 `+5`로 근사
+
+---
+
 ## Phase 10.0 Python 심볼 인덱싱 구현 (2026-04-21 야간)
 
 ### 배경
