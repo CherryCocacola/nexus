@@ -104,20 +104,33 @@ def strip_wiki_markup(text: str) -> str:
     return t.strip()
 
 
+def _local(elem: ET.Element) -> str:
+    """`{namespace}name` 태그에서 로컬 이름만 추출."""
+    return elem.tag.split("}", 1)[-1]
+
+
+def _find_child(elem: ET.Element, local_name: str) -> ET.Element | None:
+    """namespace-agnostic 자식 탐색. 위키 덤프가 export-0.10/0.11 등으로
+    바뀌어도 항상 동작한다."""
+    for child in elem:
+        if _local(child) == local_name:
+            return child
+    return None
+
+
 def iter_pages(xml_stream) -> Iterator[dict[str, Any]]:
-    """위키 덤프 XML을 스트리밍 파싱하여 (title, text, categories) 튜플 방출."""
-    ns = {"w": "http://www.mediawiki.org/xml/export-0.10/"}
-    # 표준 라이브러리는 iterparse와 namespace를 조합하기 번거로우므로 수동 처리
+    """위키 덤프 XML을 스트리밍 파싱하여 (title, text, categories) 튜플 방출.
+
+    namespace-agnostic — export-0.10, 0.11, 향후 버전 모두 동작.
+    """
     for _, elem in ET.iterparse(xml_stream, events=("end",)):  # noqa: S314 — 로컬 신뢰 파일
-        tag = elem.tag.split("}", 1)[-1]  # 네임스페이스 제거
-        if tag != "page":
+        if _local(elem) != "page":
             continue
-        title_el = elem.find("w:title", ns) or elem.find("title")
-        ns_el = elem.find("w:ns", ns) or elem.find("ns")
-        text_el = None
-        rev_el = elem.find("w:revision", ns) or elem.find("revision")
-        if rev_el is not None:
-            text_el = rev_el.find("w:text", ns) or rev_el.find("text")
+
+        title_el = _find_child(elem, "title")
+        ns_el = _find_child(elem, "ns")
+        rev_el = _find_child(elem, "revision")
+        text_el = _find_child(rev_el, "text") if rev_el is not None else None
 
         try:
             title = title_el.text if title_el is not None else None
@@ -152,17 +165,23 @@ def category_matches(cats: list[str], wanted: list[str]) -> bool:
 # 임베딩 + 적재
 # ─────────────────────────────────────────────
 async def _embed_texts(base_url: str, texts: list[str]) -> list[list[float]]:
-    """임베딩 서버(:8002)에 배치 요청 — httpx만 사용 (Nexus 프로바이더 미경유)."""
+    """임베딩 서버(:8002)에 배치 요청.
+
+    Nexus 임베딩 서버 스펙:
+      POST /v1/embed
+      body: {"texts": ["...", ...]}
+      response: {"embeddings": [[1024-vec], ...], "dimension": 1024}
+    """
     import httpx  # 선택적 의존성 — 스크립트에서만 사용
 
     async with httpx.AsyncClient(timeout=60) as client:
         r = await client.post(
-            base_url.rstrip("/") + "/v1/embeddings",
-            json={"input": texts, "model": "multilingual-e5-large"},
+            base_url.rstrip("/") + "/v1/embed",
+            json={"texts": texts},
         )
         r.raise_for_status()
         data = r.json()
-    return [d["embedding"] for d in data["data"]]
+    return data["embeddings"]
 
 
 async def run_ingest(args: argparse.Namespace) -> int:

@@ -414,6 +414,55 @@ VRAM 최대 max-model-len:
 
 ---
 
+## kowiki 500건 실 적재 (2026-04-21 야간)
+
+### 실행
+서비스 중이 아닌 틈을 타서 실 kowiki 덤프 적재까지 완료.
+
+**1) 다운로드 (tmux kowiki_dl)**
+- `/opt/nexus-gpu/corpora/kowiki/kowiki-latest-pages-articles.xml.bz2` (1,270,552,032 byte, 1.2GB)
+- wget 1회차: 초기 중복 프로세스로 CRC 손상 → `bzip2 -t` 실패
+- wget 2회차: 단일 tmux 세션, 2.61 MB/s 평균, **bzip2 -t 통과**
+
+**2) 적재 (tmux kowiki_ingest)**
+- `/opt/nexus-gpu/kowiki_ingest/{scripts,core/rag}` 에 의존 파일만 전송
+- `venv`에 `asyncpg`, `httpx` 설치
+- 카테고리 필터: 철학, 문학, 역사, 인물 / limit 500
+- 수정 사항 (런타임에 발견):
+  - **XML namespace**: `export-0.10` 하드코딩 → `_find_child()` namespace-agnostic 헬퍼
+  - **임베딩 서버 스펙**: OpenAI `/v1/embeddings` → Nexus `/v1/embed` (`{"texts":[...]}` → `{"embeddings":[...]}`)
+  - **한글 인자 인코딩**: wrapper 스크립트(`run_ingest.sh`)에 `LANG=C.UTF-8 LC_ALL=C.UTF-8` 설정
+- 최종 결과: **6,431 페이지 스캔 → 500 문서 / 3,865 청크 적재** (약 14분)
+
+**3) ivfflat 인덱스 빌드**
+- `idx_knowledge_embed (ivfflat cosine, lists=100)` + 보조 4종(source/title/tags/pkey)
+
+### 실 E2E 검증
+
+| 질의 | 응답 시간 | input_tokens | 결과 |
+|---|---|---|---|
+| 니체 철학 핵심 개념 3가지 | 29.8s | 3,218 | **위버멘쉬/힘에의 의지/영원 회귀** 정확 + 상세 |
+| 니체 생애와 사상적 배경 | 34.3s | 3,311 | 1844~1900, 주요 저서, 기독교 비판 등 정확 |
+
+input_tokens가 평소(~1,500)보다 1,700 이상 커진 것 = kowiki RAG 청크가 시스템 프롬프트에 주입됐다는 직접 증거.
+
+### DB 상태
+```
+ source | chunks | docs
+--------+--------+-----
+ kowiki |   3865 |  500
+ sample |      3 |    3
+```
+
+적재된 샘플 제목(발췌): 19세기 프랑스 문학, 고대 그리스 문학, 과학철학, 기(철학),
+소크라테스 이전 철학자, 시몬 베유(철학자), 프랑스 문학, 천문학 등.
+
+### 스크립트 수정사항 (prepare_kowiki.py)
+- `iter_pages()`: namespace-agnostic `_find_child()` 헬퍼로 교체
+- `_embed_texts()`: Nexus 임베딩 서버 실 스펙(`/v1/embed` + `{texts}`)에 맞춤
+
+---
+
 ## Part 2.5.8 지식 RAG 파이프라인 구현 (2026-04-21 저녁)
 
 ### 배경
