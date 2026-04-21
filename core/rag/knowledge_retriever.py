@@ -43,9 +43,18 @@ class KnowledgeRetriever:
         self._min_similarity = min_similarity
         self._chars_per_token = chars_per_token
 
-    async def get_context(self, query: str, max_tokens: int = 1500) -> str:
+    async def get_context(
+        self,
+        query: str,
+        max_tokens: int = 1500,
+        allowed_sources: list[str] | None = None,
+    ) -> str:
         """
         질의에 관련된 지식 청크를 검색해 시스템 프롬프트용 문자열로 반환한다.
+
+        allowed_sources가 주어지면 tb_knowledge.source 값을 그 목록으로 제한한다
+        (멀티테넌시, Part 5 Ch 15). 빈 리스트 = 공통 적재만 허용해 폴백 차단이
+        필요할 때 명시적으로 넘긴다. None = 필터 없음(전체).
 
         실패하거나 결과가 없으면 빈 문자열을 반환한다 (호출자가 무영향 분기).
         """
@@ -53,6 +62,7 @@ class KnowledgeRetriever:
             return ""
 
         # 1) 벡터 검색 — 임베딩 서버가 살아있을 때만
+        # allowed_sources는 DB-level 필터로 넘겨 cross-tenant 누설을 구조적으로 막는다
         results: list[dict] = []
         if self._embedding is not None:
             try:
@@ -62,16 +72,21 @@ class KnowledgeRetriever:
                         embedding=vecs[0],
                         top_k=self._top_k,
                         min_similarity=self._min_similarity,
+                        allowed_sources=allowed_sources,
                     )
             except Exception as e:
                 logger.warning("KnowledgeRetriever 벡터 검색 실패: %s", e)
 
-        # 2) 텍스트 검색 폴백
+        # 2) 텍스트 검색 폴백 (DB search_by_text는 단일 source만 받으므로 클라이언트
+        #    측 필터로 보정 — 텍스트 검색은 주 경로 아님)
         if not results:
             try:
                 results = await self._store.search_by_text(
                     query=query, top_k=self._top_k,
                 )
+                if allowed_sources is not None:
+                    allowed_set = set(allowed_sources)
+                    results = [r for r in results if r.get("source") in allowed_set]
             except Exception as e:
                 logger.debug("KnowledgeRetriever 텍스트 검색 실패: %s", e)
                 return ""

@@ -1158,7 +1158,7 @@ Worker가 Agent 도구를 호출할 때 경로:
 이들은 TaskManager 아래에서 장기 실행 태스크(LOCAL_AGENT 등)를 관리하며,
 지금 재설계는 그 상위의 AgentDefinition 정의만 건드린다.
 
-### Ch 15: State Management (경미 수정)
+### Ch 15: State Management + 멀티테넌시 (2026-04-21 확장)
 
 **GlobalState에 필드 추가**:
 
@@ -1168,6 +1168,99 @@ hardware_tier: HardwareTier = HardwareTier.TIER_S
 scout_enabled: bool = False
 orchestration_mode: str = "multi_model"  # "multi_model" | "single_model"
 ```
+
+#### 멀티테넌시 (M1~M6)
+
+학교·기업별 서비스를 위해 **LoRA 어댑터**와 **RAG 지식 베이스**를 같은 인프라
+위에서 분리 운영한다. 데이터는 단일 DB에 `source` 컬럼으로 섞여 있고, 요청
+컨텍스트의 `tenant_id`가 허용 source 목록과 LoRA 선택을 결정한다.
+
+**구조**:
+```
+요청 진입 (/v1/chat, /v1/chat/stream)
+  └─ _resolve_tenant(body.tenant_id, X-Tenant-ID, Authorization) → TenantConfig
+      └─ registry.resolve_by_api_key() 지원
+  └─ ToolUseContext.options["tenant"] = TenantConfig
+  └─ QueryEngine.submit_message
+      └─ 라우팅: KNOWLEDGE 질의일 때 tenant.model_override로 LoRA 덮어쓰기
+      └─ KnowledgeRetriever.get_context(allowed_sources=tenant.allowed_knowledge_sources)
+          └─ KnowledgeStore.search_by_vector(allowed_sources=[...]) — DB-level WHERE source = ANY($n)
+```
+
+**데이터 모델** (`core/config.py`):
+```python
+class TenantConfig(BaseModel):
+    id: str
+    name: str = ""
+    description: str = ""
+    model_override: str | None = None       # 테넌트 전용 LoRA
+    allowed_knowledge_sources: list[str] = []  # 빈 리스트 = 필터 없음(공통)
+    api_keys: list[str] = []                # 간이 인증
+    metadata: dict[str, Any] = {}
+
+class TenantRegistry(BaseModel):
+    default_tenant: str = "default"
+    tenants: list[TenantConfig]
+    def get(self, tenant_id) -> TenantConfig | None: ...
+    def resolve(self, tenant_id) -> TenantConfig: ...       # 폴백 포함
+    def resolve_by_api_key(self, api_key) -> TenantConfig | None: ...
+```
+
+**설정 파일** (`config/tenants.yaml`, 메인 설정과 분리):
+```yaml
+default_tenant: default
+tenants:
+  - id: default
+    name: Default
+    allowed_knowledge_sources: [kowiki, sample]
+  - id: school-a
+    name: A학교
+    model_override: nexus-school-a
+    allowed_knowledge_sources: [kowiki, school-a-textbook]
+    api_keys: [sk-school-a-demo]
+```
+
+**라우팅 규칙 — tenant.model_override 우선순위**:
+- `KNOWLEDGE` 질의: tenant override가 `RoutingProfile.model`을 덮어씀
+- `TOOL` 질의: tenant override 무시, Phase LoRA(예 `nexus-phase3`) 유지
+  (이유: Phase 3 LoRA가 tool_call XML 포맷 학습을 담고 있음)
+
+**RAG 격리 — DB-level 필터**:
+- `KnowledgeStore.search_by_vector(allowed_sources=[...])` → SQL `WHERE source = ANY($n::text[])`
+- 인메모리 폴백도 동일 필터 적용
+- `KnowledgeRetriever.get_context(allowed_sources=...)` 인자로 전파
+
+**웹 API — tenant 해석 우선순위**:
+1. `request.body.tenant_id`
+2. `X-Tenant-ID` 헤더
+3. `Authorization: Bearer <api_key>` → `resolve_by_api_key`
+4. `registry.default_tenant` 폴백
+
+**/metrics 확장**:
+```json
+{
+  "tenants": {
+    "registered": [{"id": "default", "has_model_override": false, ...}],
+    "default_tenant": "default",
+    "per_tenant_stats": {"default": {"requests": 42}, "school-a": {...}}
+  }
+}
+```
+
+**하위 호환**: 모든 기존 호출(tenant 없음)은 `default` 테넌트로 해석되며 기존
+동작(`allowed_sources=[kowiki, sample]`) 유지. tenant 기능을 쓰지 않으려면
+`config/tenants.yaml`을 삭제하거나 비워두면 기본 레지스트리로 동작.
+
+**신규/수정 파일**:
+- `core/config.py` — TenantConfig, TenantRegistry + `load_and_validate_config`
+  에서 tenants.yaml 별도 로드
+- `config/tenants.yaml` (신규)
+- `core/rag/knowledge_store.py` — search_by_vector에 `allowed_sources` 인자
+- `core/rag/knowledge_retriever.py` — get_context에 `allowed_sources` 전파
+- `core/orchestrator/query_engine.py` — context.options["tenant"] 읽어 라우팅
+  override + KnowledgeRetriever 필터 전달
+- `web/app.py` — `_resolve_tenant`, 헤더/Bearer 파싱, per-tenant 호출 카운트
+- `tests/unit/test_tenant_registry.py` (신규, 10 케이스)
 
 ### Ch 16: Session Management (2026-04-21 구현)
 

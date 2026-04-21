@@ -64,7 +64,7 @@ def _sanitize_history_inplace(history: list) -> None:
                     Message.assistant(cleaned) if role == "assistant" else Message.user(cleaned)
                 )
 
-from fastapi import FastAPI, UploadFile
+from fastapi import FastAPI, Header, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -73,6 +73,44 @@ from pydantic import BaseModel, Field
 from web.middleware import CORSConfig, RequestLoggingMiddleware
 
 logger = logging.getLogger("nexus.web.app")
+
+
+# ─────────────────────────────────────────────
+# 멀티테넌시 해석 헬퍼 (Part 5 Ch 15, 2026-04-21)
+# ─────────────────────────────────────────────
+# 우선순위: body.tenant_id > X-Tenant-ID 헤더 > Authorization Bearer(API 키)
+#          > 레지스트리의 default_tenant
+def _resolve_tenant(
+    body_tenant_id: str | None,
+    header_tenant_id: str | None,
+    authorization: str | None,
+) -> Any:
+    """요청 컨텍스트에서 TenantConfig를 해석한다. 항상 유효한 객체 반환."""
+    registry = _app_state.get("tenant_registry")
+    if registry is None:
+        return None
+
+    found = None
+    # 1) body
+    if body_tenant_id:
+        found = registry.get(body_tenant_id)
+    # 2) X-Tenant-ID 헤더
+    if found is None and header_tenant_id:
+        found = registry.get(header_tenant_id)
+    # 3) Authorization Bearer — API key 기반
+    if found is None and authorization and authorization.lower().startswith("bearer "):
+        api_key = authorization[7:].strip()
+        if api_key:
+            found = registry.resolve_by_api_key(api_key)
+    # 4) 기본 테넌트 폴백
+    if found is None:
+        found = registry.resolve(None)
+
+    # per-tenant 카운트 누적 (M6)
+    stats = _app_state.setdefault("tenant_stats", {})
+    entry = stats.setdefault(found.id, {"requests": 0})
+    entry["requests"] += 1
+    return found
 
 
 # ─────────────────────────────────────────────
@@ -86,6 +124,11 @@ class ChatRequest(BaseModel):
     model: str = Field(
         default="primary",
         description="사용할 모델 (primary: Qwen 3.5, auxiliary: ExaOne)",
+    )
+    # 멀티테넌시 (Part 5 Ch 15) — body로도 지정 가능 (헤더/API 키와 병행)
+    tenant_id: str | None = Field(
+        default=None,
+        description="테넌트 ID. 헤더 X-Tenant-ID / Authorization Bearer와 같은 우선순위 중 하나.",
     )
 
 
@@ -177,6 +220,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         _app_state["tool_registry"] = components.get("tool_registry")
         _app_state["model_provider"] = components.get("model_provider")
         _app_state["memory_manager"] = components.get("memory_manager")  # Ch 16
+        _app_state["tenant_registry"] = state.config.tenants  # M2 — 헤더 해석용
 
         # 웹 전용 QueryEngine — 도구 8개로 축소 (토큰 예산 관리)
         # RTX 5090 (8192 ctx)에서 도구 24개(~6,102토큰)는 컨텍스트 초과.
@@ -350,7 +394,11 @@ if _static_dir.exists():
 # 채팅 엔드포인트
 # ─────────────────────────────────────────────
 @app.post("/v1/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest) -> ChatResponse:
+async def chat(
+    request: ChatRequest,
+    x_tenant_id: str | None = Header(default=None, alias="X-Tenant-ID"),
+    authorization: str | None = Header(default=None),
+) -> ChatResponse:
     """
     비스트리밍 채팅.
 
@@ -359,6 +407,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
     """
     # 세션 ID 생성 또는 재사용
     session_id = request.session_id or str(uuid.uuid4())
+    tenant = _resolve_tenant(request.tenant_id, x_tenant_id, authorization)
 
     engine = _app_state.get("query_engine")
     if engine is None:
@@ -372,6 +421,11 @@ async def chat(request: ChatRequest) -> ChatResponse:
 
     # Ch 16: 비스트리밍 경로도 세션 ID와 트랜스크립트를 주입한다
     engine._session_id = session_id
+    # 멀티테넌시: 이 요청의 tenant를 context.options에 주입 (SymbolSearch/RAG 등이 참조)
+    if tenant is not None:
+        engine._context.options["tenant"] = tenant
+        logger.info("tenant 해석: %s (sources=%s)", tenant.id,
+                    tenant.allowed_knowledge_sources)
     try:
         from core.memory.transcript import SessionTranscript as _Trans
         cfg = _app_state.get("config")
@@ -433,7 +487,11 @@ async def chat(request: ChatRequest) -> ChatResponse:
 
 
 @app.post("/v1/chat/stream")
-async def chat_stream(request: ChatRequest) -> StreamingResponse:
+async def chat_stream(
+    request: ChatRequest,
+    x_tenant_id: str | None = Header(default=None, alias="X-Tenant-ID"),
+    authorization: str | None = Header(default=None),
+) -> StreamingResponse:
     """
     SSE 스트리밍 채팅.
 
@@ -441,6 +499,7 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
     Server-Sent Events 형식으로 실시간 전송한다.
     """
     session_id = request.session_id or str(uuid.uuid4())
+    tenant = _resolve_tenant(request.tenant_id, x_tenant_id, authorization)
 
     async def generate() -> AsyncGenerator[str, None]:
         """
@@ -520,6 +579,11 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
         # Ch 16: QueryEngine의 세션 ID를 요청 세션으로 교체 — MemoryManager 키 정합성
         # (웹은 싱글톤 QueryEngine을 공유하므로 매 요청마다 덮어써야 한다)
         engine._session_id = session_id
+        # 멀티테넌시: 요청의 tenant를 context.options에 주입 (SymbolSearch/RAG 참조)
+        if tenant is not None:
+            engine._context.options["tenant"] = tenant
+            logger.info("tenant 해석: %s (sources=%s)", tenant.id,
+                        tenant.allowed_knowledge_sources)
 
         # QueryEngine의 messages를 해당 세션의 히스토리로 교체
         # 도구 호출/결과 메시지는 토큰을 많이 차지하므로 제외하고,
@@ -824,6 +888,25 @@ async def metrics() -> dict[str, Any]:
         "scout_fallback_count": 0,  # fallback 개념은 AgentTool 이관 후 의미 없음
         "note": "scout_calls/avg_latency_ms are sourced from AgentTool.get_stats().",
     }
+
+    # 멀티테넌시 — 등록된 테넌트 목록과 테넌트별 호출 통계 (Part 5 Ch 15)
+    registry = _app_state.get("tenant_registry")
+    tenant_stats = _app_state.get("tenant_stats") or {}
+    if registry is not None:
+        result["tenants"] = {
+            "registered": [
+                {
+                    "id": t.id,
+                    "name": t.name,
+                    "has_model_override": bool(t.model_override),
+                    "allowed_source_count": len(t.allowed_knowledge_sources),
+                    "api_key_count": len(t.api_keys),
+                }
+                for t in registry.tenants
+            ],
+            "default_tenant": registry.default_tenant,
+            "per_tenant_stats": tenant_stats,
+        }
 
     return result
 

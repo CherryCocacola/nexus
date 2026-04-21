@@ -1,0 +1,67 @@
+# =============================================================================
+# Nexus 테넌트 설정 (Part 5 Ch 15 멀티테넌시, 2026-04-21)
+# =============================================================================
+#
+# 구조:
+#   default_tenant: 요청에 tenant_id 또는 X-Tenant-ID가 없을 때 사용할 기본값
+#   tenants: 등록된 테넌트 목록
+#
+# 각 테넌트 필드:
+#   id                         : 고유 식별자 (URL/헤더에서 사용)
+#   name                       : 표시명
+#   description                : 설명
+#   model_override             : 이 테넌트 전용 LoRA (null이면 기본 라우팅 사용)
+#   allowed_knowledge_sources  : tb_knowledge.source 허용 목록 (빈 배열=전체 허용)
+#   api_keys                   : 이 테넌트를 식별하는 API 키 목록 (Authorization)
+#   metadata                   : 부서·계약 등 부가 정보
+#
+# 사용 예시 — 웹 요청:
+#   POST /v1/chat
+#   X-Tenant-ID: school-a
+#   { "message": "..." }
+#
+# 또는 API 키 기반:
+#   Authorization: Bearer sk-school-a-xxxxx
+# =============================================================================
+
+default_tenant: default
+
+tenants:
+  # 기본 테넌트 — 공개 지식(kowiki)만 접근
+  - id: default
+    name: Default
+    description: 공통 테넌트 — 공개 지식만 접근 가능
+    model_override: null
+    allowed_knowledge_sources:
+      - kowiki
+      - sample
+    api_keys: []
+    metadata: {}
+
+  # 예시: A학교 — 공개 지식 + A학교 전용 교재
+  # - id: school-a
+  #   name: A학교
+  #   description: A학교 교재·강의록 + 공개 지식
+  #   model_override: nexus-school-a  # 향후 LoRA 학습 시
+  #   allowed_knowledge_sources:
+  #     - kowiki
+  #     - school-a-textbook
+  #     - school-a-lecture
+  #   api_keys:
+  #     - sk-school-a-demo
+  #   metadata:
+  #     contract_id: 2026-A-001
+  #     contact: admin@school-a.example
+
+  # 예시: B기업 — 내부 문서만(공개 지식 차단하려면 kowiki 제외)
+  # - id: corp-b
+  #   name: B기업
+  #   description: B기업 내부 매뉴얼/위키
+  #   model_override: null
+  #   allowed_knowledge_sources:
+  #     - corp-b-manual
+  #     - corp-b-wiki
+  #   api_keys:
+  #     - sk-corp-b-prod
+  #   metadata:
+  #     contract_id: 2026-B-042

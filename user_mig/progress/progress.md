@@ -414,6 +414,76 @@ VRAM 최대 max-model-len:
 
 ---
 
+## 멀티테넌시 기반 배선 — Part 5 Ch 15 M1~M6 (2026-04-21 야간)
+
+### 배경
+학교·기업별 서비스를 위해 단일 Nexus 인스턴스에서 LoRA 어댑터와 RAG 지식
+베이스를 **tenant 단위로 분리**한다. 데이터는 한 DB에 `source` 컬럼으로
+섞여 있고, 요청의 tenant_id가 허용 source/LoRA를 결정한다.
+
+### 구현 범위 (M1~M6)
+
+| # | 항목 | 범위 |
+|---|---|---|
+| M1 | TenantConfig + tenants.yaml | Pydantic 모델 + 별도 YAML 파일 |
+| M2 | 세션 진입 시 tenant 식별 | body/헤더/Bearer API 키 3경로 |
+| M3 | QueryEngine 라우팅에 tenant.model_override | KNOWLEDGE 질의에만 적용 |
+| M4 | KnowledgeRetriever tenant 필터 | allowed_sources 전파 |
+| M5 | 권한 — DB-level cross-tenant 차단 | `source = ANY($n::text[])` |
+| M6 | /metrics 테넌트별 분해 | registered 목록 + per-tenant 요청 카운트 |
+
+### 신규 파일
+- `config/tenants.yaml` — 기본 `default` 테넌트, 학교/기업 추가 예시 주석
+- `tests/unit/test_tenant_registry.py` — 10 케이스
+
+### 수정
+- `core/config.py` — TenantConfig/TenantRegistry + tenants.yaml 별도 로더
+- `core/rag/knowledge_store.py` — `search_by_vector(allowed_sources=...)` DB-level
+  필터 + 인메모리 폴백도 동일 규칙
+- `core/rag/knowledge_retriever.py` — `get_context(allowed_sources=...)` 전파
+- `core/orchestrator/query_engine.py`
+  - `context.options["tenant"]`에서 TenantConfig 조회
+  - KNOWLEDGE 질의 시 tenant.model_override로 라우팅 LoRA 덮어쓰기
+  - tenant.allowed_knowledge_sources를 retriever로 전달
+- `web/app.py`
+  - `_resolve_tenant(body/header/bearer)` 3경로 해석 + per-tenant 카운트
+  - ChatRequest에 `tenant_id` 필드 추가
+  - `/v1/chat` 및 `/v1/chat/stream`이 X-Tenant-ID/Authorization 헤더 수신
+  - `/metrics` 응답에 `tenants` 섹션 추가
+
+### 라우팅 규칙
+- KNOWLEDGE 질의: `tenant.model_override`가 있으면 `RoutingProfile.model`을 덮어씀
+- TOOL 질의: tenant override 무시 (Phase LoRA가 tool_call XML 학습 보유)
+- 기본 테넌트(`default`): `kowiki + sample`만 허용, LoRA override 없음
+
+### 테스트
+- 10/10 통과 — registry get/resolve, API 키 매핑, allowed_sources 필터 차단,
+  KNOWLEDGE vs TOOL 라우팅 분기
+- 회귀 **699/699** (689 + 10)
+- ruff clean (신규/수정 파일 기준)
+
+### 하위 호환
+- tenants.yaml이 없으면 `default` 단일 테넌트 자동 사용
+- 기존 `search_by_vector(source=...)` 호출은 `[source]`로 정규화되어 동작
+- tenant 기능을 쓰지 않으면 기존 동작과 완전 동일
+
+### 운영 예시
+```bash
+# A학교 질의 (API 키)
+curl -H "Authorization: Bearer sk-school-a-demo" -d '{"message":"..."}' /v1/chat
+
+# 또는 헤더
+curl -H "X-Tenant-ID: school-a" -d '{"message":"..."}' /v1/chat
+```
+
+### 남은 고도화 여지
+- Audit 로그에 tenant_id 기록 (지금은 로그 라인에만)
+- Permission Layer에 명시적 tenant 훅 (현재는 DB 필터로 충분)
+- tenant별 temperature/max_tokens 프로필 덮어쓰기 (TenantConfig 확장)
+- M7 — 테넌트별 LoRA 학습 네이밍 컨벤션(`nexus-{tenant}-phaseN`) + 학습 스크립트
+
+---
+
 ## Phase 10.0 다언어 심볼 파서 (2026-04-21 야간 확장)
 
 ### 배경

@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -214,6 +215,84 @@ class RoutingConfig(BaseModel):
     )
 
 
+# ─────────────────────────────────────────────
+# 멀티테넌시 설정 (v7.0 Part 5 Ch 15, 2026-04-21)
+# ─────────────────────────────────────────────
+# 배경: 학교·기업별 서비스를 위해 LoRA 어댑터와 RAG 지식 베이스를 분리한다.
+# 같은 GPU/DB 인프라에서 tenant별 격리를 제공한다.
+#
+# 작동 구조:
+#   - 웹/API 요청의 X-Tenant-ID 헤더로 tenant 식별
+#   - TenantConfig.model_override → QueryEngine 라우팅에서 사용하는 LoRA 지정
+#   - TenantConfig.allowed_knowledge_sources → KnowledgeRetriever가 source 필터
+#   - default 테넌트는 공통 지식(kowiki 등)만 허용
+class TenantConfig(BaseModel):
+    """단일 테넌트(학교·기업·기본) 설정."""
+
+    model_config = {"protected_namespaces": ()}  # model_ 접두사 경고 방지
+
+    id: str
+    name: str = ""
+    description: str = ""
+
+    # LoRA 라우팅 — tenant 전용 어댑터. None이면 라우팅/기본값 사용
+    model_override: str | None = None
+
+    # 이 tenant가 볼 수 있는 지식 소스 목록 (tb_knowledge.source)
+    # 비어 있으면 전체 허용 (default 테넌트에만 권장)
+    allowed_knowledge_sources: list[str] = Field(default_factory=list)
+
+    # API 키 → tenant 매핑 (선택, 간이 인증)
+    api_keys: list[str] = Field(default_factory=list)
+
+    # 추가 메타데이터 (부서·계약정보 등)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class TenantRegistry(BaseModel):
+    """테넌트 레지스트리."""
+
+    default_tenant: str = "default"
+    tenants: list[TenantConfig] = Field(
+        default_factory=lambda: [
+            TenantConfig(
+                id="default",
+                name="Default",
+                description="공통 테넌트 — 공개 지식(kowiki 등)만 접근",
+                allowed_knowledge_sources=["kowiki", "sample"],
+            )
+        ]
+    )
+
+    def get(self, tenant_id: str) -> TenantConfig | None:
+        """id로 테넌트 조회. 없으면 None."""
+        for t in self.tenants:
+            if t.id == tenant_id:
+                return t
+        return None
+
+    def resolve(self, tenant_id: str | None) -> TenantConfig:
+        """tenant_id가 None·미등록이면 default로 폴백. 반드시 유효한 TenantConfig 반환."""
+        if tenant_id:
+            found = self.get(tenant_id)
+            if found is not None:
+                return found
+        default = self.get(self.default_tenant)
+        if default is not None:
+            return default
+        # 레지스트리가 비어 있을 때의 최후 폴백 — 공백 tenant
+        return TenantConfig(id="default", name="Default")
+
+    def resolve_by_api_key(self, api_key: str) -> TenantConfig | None:
+        """API 키로 tenant 조회 (간이 인증 경로)."""
+        if not api_key:
+            return None
+        for t in self.tenants:
+            if api_key in t.api_keys:
+                return t
+        return None
+
+
 class SecurityConfig(BaseModel):
     """보안 및 샌드박스 설정."""
 
@@ -318,6 +397,9 @@ class NexusConfig(BaseSettings):
     # v7.0 Part 2.5 쿼리 라우팅 — 지식/도구 질의 분기 (2026-04-21 추가)
     routing: RoutingConfig = Field(default_factory=RoutingConfig)
 
+    # 멀티테넌시 (Part 5 Ch 15, 2026-04-21)
+    tenants: TenantRegistry = Field(default_factory=TenantRegistry)
+
     # 하드웨어 티어 (auto: GPU VRAM 기반 자동 감지)
     hardware_tier: str = "auto"
 
@@ -402,5 +484,23 @@ def load_and_validate_config(
     else:
         config = NexusConfig()
         logger.info("기본 설정으로 초기화 (설정 파일 없음)")
+
+    # 멀티테넌시 설정은 별도 파일(config/tenants.yaml)에서 로드하여 병합
+    # 이유: 고객별 설정은 자주 바뀌므로 메인 설정과 분리하는 게 운영에 유리
+    tenants_path = Path("config/tenants.yaml")
+    if tenants_path.exists():
+        try:
+            import yaml
+
+            with open(tenants_path, encoding="utf-8") as f:
+                t_data = yaml.safe_load(f) or {}
+            if isinstance(t_data, dict) and ("tenants" in t_data or "default_tenant" in t_data):
+                config = config.model_copy(update={"tenants": TenantRegistry(**t_data)})
+                logger.info(
+                    "테넌트 설정 로드 완료: %s (%d 테넌트)",
+                    tenants_path, len(config.tenants.tenants),
+                )
+        except Exception as e:
+            logger.warning("테넌트 설정 로드 실패 (기본값 사용): %s", e)
 
     return config

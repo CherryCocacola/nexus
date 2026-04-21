@@ -289,10 +289,27 @@ class QueryEngine:
             active_temperature = profile.temperature
             active_max_tokens_cap: int | None = profile.max_tokens
             active_enable_thinking: bool | None = profile.enable_thinking
+
+            # 멀티테넌시: tenant.model_override가 있으면 프로필 모델보다 우선 적용.
+            # 이유: tenant 전용 LoRA가 존재하면 QueryEngine이 그 어댑터로 응답해야
+            # 학교/기업별 커스터마이즈가 의미를 갖는다. TOOL 모드에선 Phase LoRA
+            # 호환성이 필요하므로 KNOWLEDGE 질의에만 override를 적용한다.
+            tenant = self._context.options.get("tenant") if self._context else None
+            if (
+                tenant is not None
+                and getattr(tenant, "model_override", None)
+                and query_class == "KNOWLEDGE"
+            ):
+                active_model_override = tenant.model_override
+                logger.info(
+                    "라우팅(tenant): tenant=%s → model=%s",
+                    tenant.id, tenant.model_override,
+                )
+
             logger.info(
                 "라우팅: class=%s, model=%s, temp=%.2f, max_tokens=%d",
                 query_class,
-                profile.model,
+                active_model_override,
                 active_temperature,
                 active_max_tokens_cap,
             )
@@ -303,8 +320,17 @@ class QueryEngine:
             # 우선이므로 주입하지 않는다(지연/컨텍스트 낭비 회피).
             if query_class == "KNOWLEDGE" and self._knowledge_retriever is not None:
                 try:
+                    # 멀티테넌시 — tenant.allowed_knowledge_sources가 있으면 그 소스만 검색
+                    allowed = None
+                    if tenant is not None:
+                        src = getattr(tenant, "allowed_knowledge_sources", None) or []
+                        # 빈 리스트는 "명시적으로 비허용"이 아니라 "필터 미지정"으로 간주하기
+                        # 위해 None 처리. 단, 명시적 격리를 원하면 tenants.yaml에
+                        # sources=[특정값]을 정의해야 한다.
+                        allowed = list(src) if src else None
                     kb_ctx = await self._knowledge_retriever.get_context(
                         user_input, max_tokens=1000,
+                        allowed_sources=allowed,
                     )
                     if kb_ctx:
                         effective_system_prompt = (

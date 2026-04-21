@@ -189,6 +189,7 @@ class KnowledgeStore:
         embedding: list[float],
         top_k: int = 5,
         source: str | None = None,
+        allowed_sources: list[str] | None = None,
         min_similarity: float = 0.2,
     ) -> list[dict[str, Any]]:
         """코사인 유사도 기반 벡터 검색.
@@ -196,16 +197,25 @@ class KnowledgeStore:
         Args:
             embedding: 질의 임베딩 벡터(1024차원)
             top_k: 반환 건수
-            source: 특정 소스로 제한 (예: "kowiki")
+            source: 특정 소스로 제한 (예: "kowiki") — 단일값 편의 인자
+            allowed_sources: 멀티테넌시 — 허용된 source 목록(`source IN (...)`).
+                DB-level 필터로 cross-tenant 누설을 구조적으로 차단한다.
+                source와 동시 지정 시 allowed_sources가 우선.
             min_similarity: 최소 유사도 (1 - distance). 낮은 품질은 자동 제거.
 
         Returns:
             [{"title", "section", "content", "source", "similarity", "tags"}, ...]
             유사도 내림차순.
         """
+        # 단일 source는 allowed_sources의 특수 케이스로 정규화
+        if allowed_sources is None and source is not None:
+            allowed_sources = [source]
+
         if self._pg is None:
             # 인메모리 폴백 — 코사인 유사도 직접 계산
-            return _inmemory_search(self._store, embedding, top_k, source, min_similarity)
+            return _inmemory_search(
+                self._store, embedding, top_k, allowed_sources, min_similarity,
+            )
 
         vec_str = _format_vector(embedding)
         # distance < 1 - min_similarity (cosine distance = 1 - cosine similarity)
@@ -213,9 +223,9 @@ class KnowledgeStore:
 
         params: list[Any] = [vec_str, max_distance, top_k]
         where = "WHERE embedding <=> $1::vector <= $2"
-        if source is not None:
-            where += " AND source = $4"
-            params.append(source)
+        if allowed_sources:
+            where += " AND source = ANY($4::text[])"
+            params.append(list(allowed_sources))
 
         query = f"""
             SELECT source, title, section, content, tags, metadata,
@@ -352,13 +362,14 @@ def _inmemory_search(
     store: dict[str, KnowledgeEntry],
     embedding: list[float],
     top_k: int,
-    source: str | None,
+    allowed_sources: list[str] | None,
     min_similarity: float,
 ) -> list[dict[str, Any]]:
     """인메모리 폴백 벡터 검색 — 작은 데이터셋/테스트 전용."""
+    allowed = set(allowed_sources) if allowed_sources else None
     scored: list[tuple[float, KnowledgeEntry]] = []
     for e in store.values():
-        if source is not None and e.source != source:
+        if allowed is not None and e.source not in allowed:
             continue
         if not e.embedding:
             continue
