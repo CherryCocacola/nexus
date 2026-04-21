@@ -29,6 +29,7 @@ import uuid
 from collections.abc import AsyncGenerator
 from typing import Any
 
+from core.config import RoutingConfig, RoutingProfile
 from core.message import (
     Message,
     StreamEvent,
@@ -41,6 +42,55 @@ from core.orchestrator.query_loop import query_loop
 from core.tools.base import BaseTool, ToolUseContext
 
 logger = logging.getLogger("nexus.orchestrator.query_engine")
+
+
+# ─────────────────────────────────────────────
+# v7.0 Part 2.5 — 쿼리 분류기 (2026-04-21)
+# ─────────────────────────────────────────────
+# 짜라투스트라 사건(Phase 3 LoRA가 인문학 지식 표현을 좁힘) 이후 추가된 로직.
+# 실측 A/B 결과: 베이스 Qwen(LoRA OFF) + temp=0.2가 지식 질문에서 압도적 우위.
+# 반대로 도구 호출 질문은 Phase 3 LoRA가 필수 — tool_call 포맷 학습이 담겨 있음.
+# 분류기는 단순 휴리스틱(길이 + 키워드) — 복잡한 LLM 분류기는 오버헤드만 추가.
+def classify_query(user_input: str, routing: RoutingConfig) -> str:
+    """
+    사용자 입력을 "KNOWLEDGE" 또는 "TOOL"로 분류한다.
+
+    분류 규칙:
+      1. enabled=False → 항상 "TOOL" (라우팅 기능 오프)
+      2. 길이가 long_input_threshold 이상 → "TOOL"
+         (문서/로그 첨부는 거의 항상 도구 경로로 처리되어야 함)
+      3. tool_keywords 중 하나 이상 포함 → "TOOL"
+      4. 그 외 → "KNOWLEDGE"
+
+    Args:
+        user_input: 사용자 메시지 원문
+        routing: RoutingConfig (config.routing)
+
+    Returns:
+        "KNOWLEDGE" 또는 "TOOL"
+    """
+    if not routing.enabled:
+        return "TOOL"
+
+    # 1) 길이 기반 — 긴 입력은 첨부/로그 가능성이 높음
+    if len(user_input) >= routing.long_input_threshold:
+        return "TOOL"
+
+    # 2) 키워드 기반 — 대소문자 무시 단순 포함 검사
+    lowered = user_input.lower()
+    for kw in routing.tool_keywords:
+        if kw.lower() in lowered:
+            return "TOOL"
+
+    # 3) 나머지는 일반 지식 질의
+    return "KNOWLEDGE"
+
+
+def _resolve_profile(query_class: str, routing: RoutingConfig) -> RoutingProfile:
+    """분류 결과로 실행 프로필을 골라 돌려준다."""
+    if query_class == "KNOWLEDGE":
+        return routing.knowledge_mode
+    return routing.tool_mode
 
 
 class QueryEngine:
@@ -76,6 +126,7 @@ class QueryEngine:
         turn_state_store: Any | None = None,
         rag_retriever: Any | None = None,
         model_dispatcher: Any | None = None,
+        routing_config: RoutingConfig | None = None,
     ) -> None:
         """
         QueryEngine을 초기화한다.
@@ -94,6 +145,9 @@ class QueryEngine:
                 주입되면 submit_message()는 dispatcher.route()를 호출한다.
                 TIER_S에서는 Scout→Worker 2단계, TIER_M/L에서는 Worker 단독.
                 None이면 기존 경로(query_loop 직접 호출)로 폴백한다.
+            routing_config: RoutingConfig (v7.0 Part 2.5, 선택)
+                None이면 기본 RoutingConfig 사용(enabled=True).
+                enabled=False면 분류 없이 항상 tool_mode 프로필 적용.
         """
         self._model_provider = model_provider
         self._tools = tools
@@ -112,6 +166,9 @@ class QueryEngine:
         # v7.0 Phase 9: 멀티모델 디스패처 (Scout + Worker)
         # None이면 단일 Worker 경로로 폴백한다 (하위 호환).
         self._model_dispatcher = model_dispatcher
+
+        # v7.0 Part 2.5: 쿼리 라우팅 설정 (None이면 기본값 사용)
+        self._routing_config = routing_config or RoutingConfig()
 
         # 대화 히스토리 — submit_message() 호출마다 누적
         self._messages: list[Message] = []
@@ -202,6 +259,37 @@ class QueryEngine:
             if self._turn_state_store is not None:
                 self._turn_state_store.save(self._session_id, turn_state)
 
+        # v7.0 Part 2.5: 쿼리 타입 분류 → 프로필 선택
+        # KNOWLEDGE → 베이스 Qwen + temp 0.2 + max_tokens 2048 (일반 지식 QA)
+        # TOOL      → Phase 3 LoRA + temp 0.3 + max_tokens 4096 (도구 호출/프로젝트)
+        # 분류 결과는 로그와 사용량 추적에 남겨 운영자가 오판을 감지할 수 있도록 한다.
+        #
+        # routing_config.enabled=False는 "라우팅 OFF" 모드. 이때는 프로필/프로바이더
+        # 치환을 일체 하지 않고 기본 동작을 따른다. 특히 서브에이전트(Scout 등)는
+        # 자기 전용 프로바이더를 쓰므로 라우팅이 개입하면 model_override로 엉뚱한
+        # 모델명이 주입되어 오작동한다(2026-04-21 α 재진단).
+        if self._routing_config.enabled:
+            query_class = classify_query(user_input, self._routing_config)
+            profile = _resolve_profile(query_class, self._routing_config)
+            active_model_override: str | None = profile.model
+            active_temperature = profile.temperature
+            active_max_tokens_cap: int | None = profile.max_tokens
+            active_enable_thinking: bool | None = profile.enable_thinking
+            logger.info(
+                "라우팅: class=%s, model=%s, temp=%.2f, max_tokens=%d",
+                query_class,
+                profile.model,
+                active_temperature,
+                active_max_tokens_cap,
+            )
+        else:
+            # 라우팅 비활성 — 프로바이더의 기본 설정을 그대로 사용한다
+            active_model_override = None
+            active_temperature = 0.7
+            active_max_tokens_cap = None
+            active_enable_thinking = False
+            logger.info("라우팅 비활성 — 프로바이더 기본 설정 사용")
+
         # v7.0 Phase 9: dispatcher가 있으면 route() 경유, 없으면 query_loop 직접 호출
         # dispatcher 경로는 Scout → Worker 2단계(TIER_S)를 포함하며
         # TIER_M/L에서는 passthrough로 단일 Worker에 직행한다.
@@ -210,6 +298,10 @@ class QueryEngine:
                 messages=self._messages,
                 system_prompt=effective_system_prompt,
                 on_turn_complete=_on_turn_complete,
+                model_override=active_model_override,
+                temperature=active_temperature,
+                max_tokens_cap=active_max_tokens_cap,
+                enable_thinking=active_enable_thinking,
             )
         else:
             # 폴백 — dispatcher 주입이 없는 경우 기존 단일 Worker 경로
@@ -222,6 +314,10 @@ class QueryEngine:
                 context_manager=self._context_manager,
                 max_turns=self._max_turns,
                 on_turn_complete=_on_turn_complete,
+                model_override=active_model_override,
+                temperature=active_temperature,
+                max_tokens_cap=active_max_tokens_cap,
+                enable_thinking=active_enable_thinking,
             )
 
         async for event in stream:

@@ -304,6 +304,7 @@ async def init_phase2(state: GlobalState) -> dict:
         turn_state_store=turn_state_store,
         rag_retriever=rag_retriever,
         model_dispatcher=dispatcher,
+        routing_config=config.routing,  # v7.0 Part 2.5 — 지식/도구 분기
     )
     components["query_engine"] = engine
     logger.info(

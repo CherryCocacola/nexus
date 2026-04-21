@@ -299,6 +299,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 + agent_guide
             ),
             max_turns=200,
+            routing_config=state.config.routing,  # v7.0 Part 2.5 — 지식/도구 분기
         )
         _app_state["query_engine"] = web_engine
         logger.info(

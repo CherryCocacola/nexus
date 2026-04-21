@@ -44,7 +44,10 @@
       "Bash(taskkill:*)",
       "Bash(awk '{print $5}')",
       "Bash(where python *)",
-      "Bash(where py *)"
+      "Bash(where py *)",
+      "Bash(grep -l \"TurnState\" core/**/*.py)",
+      "Bash(grep -c \"scout_plan\\\\|file_summaries\" core/orchestrator/*.py)",
+      "Bash(:)"
     ]
   }
 }

@@ -211,7 +211,7 @@ class AgentTool(BaseTool):
         subagent_type: str | None,
         input_data: dict[str, Any],
         context: ToolUseContext,
-    ) -> "_AgentConfig":
+    ) -> _AgentConfig:
         """
         subagent_type 또는 description을 기반으로 서브에이전트 실행 설정을 만든다.
 
@@ -306,7 +306,7 @@ class AgentTool(BaseTool):
     async def _run_subagent(
         self,
         prompt: str,
-        config: "_AgentConfig",
+        config: _AgentConfig,
         parent_context: ToolUseContext,
     ) -> tuple[str, int]:
         """
@@ -320,6 +320,7 @@ class AgentTool(BaseTool):
                 0,
             )
 
+        from core.config import RoutingConfig
         from core.message import StreamEvent, StreamEventType
         from core.orchestrator.query_engine import QueryEngine
 
@@ -332,12 +333,19 @@ class AgentTool(BaseTool):
             options=parent_context.options,
         )
 
+        # 서브에이전트는 라우팅 비활성 — Scout는 자기 전용 프로바이더(ScoutModelProvider)를
+        # 쓰는데 부모의 라우팅 프로필이 개입하면 엉뚱한 model_override("nexus-phase3" 등)가
+        # Scout 서버(qwen3.5-4b만 서빙)로 주입되어 오작동한다 (2026-04-21 재진단).
+        # enabled=False면 프로필 치환 없이 프로바이더 기본 설정으로 동작.
+        sub_routing = RoutingConfig(enabled=False)
+
         engine = QueryEngine(
             model_provider=config.model_provider,
             tools=config.tools,
             context=sub_context,
             system_prompt=config.system_prompt,
             max_turns=config.max_turns,
+            routing_config=sub_routing,
         )
 
         text_parts: list[str] = []

@@ -132,6 +132,88 @@ class ScoutConfig(BaseModel):
     max_output_tokens: int = 512
 
 
+# ─────────────────────────────────────────────
+# 쿼리 라우팅 설정 (v7.0 Part 2.5, 2026-04-21)
+# ─────────────────────────────────────────────
+# 배경: Phase 3 LoRA가 도구 호출을 강화하는 대신 베이스 Qwen의 일반 지식
+# 표현을 좁히는 부작용 발생. 2026-04-21 A/B/C/D 실측에서 베이스 모델(LoRA OFF)이
+# 니체·카프카 같은 일반 교양 지식을 더 정확히 답변함을 확인.
+# 조치: 질의 타입에 따라 런타임에 모델(LoRA ON/OFF)과 temperature를 분기한다.
+# 이 분기는 TIER_S 한정 최적화이며, TIER_M 이상에서는 enabled=false로 끈다
+# (베이스 모델 + 24개 도구 + 긴 컨텍스트가 이미 기본값이 되기 때문).
+class RoutingProfile(BaseModel):
+    """개별 라우팅 프로필 — 질의 타입별 모델/파라미터 조합."""
+
+    model_config = {"protected_namespaces": ()}  # model_ 접두사 경고 방지
+
+    model: str  # vLLM served-model-name (LoRA 어댑터 이름 또는 베이스)
+    temperature: float = 0.3
+    max_tokens: int = 4096
+    enable_thinking: bool = False  # Qwen3.5 chat_template_kwargs 인자
+    description: str = ""  # 운영자/테스트용 설명
+
+
+class RoutingConfig(BaseModel):
+    """
+    질의 타입별 라우팅 설정.
+
+    분류 규칙:
+      1. user_input 길이가 long_input_threshold 이상 → TOOL_MODE
+         (첨부 문서/로그 분석 시나리오로 간주)
+      2. tool_keywords 중 하나라도 포함 → TOOL_MODE
+      3. 그 외 → KNOWLEDGE_MODE (일반 QA)
+
+    enabled=False이면 분류기를 돌리지 않고 항상 tool_mode 프로필을 사용한다
+    (하드웨어 업그레이드 또는 문제 발생 시 비상 스위치).
+    """
+
+    enabled: bool = True
+    long_input_threshold: int = 500  # 이 글자수 이상이면 TOOL_MODE
+    tool_keywords: list[str] = Field(
+        default_factory=lambda: [
+            # 한국어 — 파일/프로젝트/도구 명시 힌트
+            "파일", "첨부", "업로드", "이 프로젝트", "코드베이스",
+            "디렉토리", "폴더", "리포지토리", "리포지터리",
+            "읽어줘", "읽어 줘", "편집해", "수정해",
+            "모듈 구조", "디렉토리 구조", "프로젝트 구조",
+            # 영어
+            "file", "attached", "upload", "this project", "codebase",
+            "repository", "directory", "folder",
+            # 도구 이름 — 괄호 포함/미포함 양쪽 패턴
+            # 괄호 포함(함수 호출 스타일)
+            "Read(", "Write(", "Edit(", "Bash(", "Glob(", "Grep(",
+            "Agent(", "DocumentProcess",
+            # 단독 대문자 도구명 + 공백 — "Read 도구", "Edit the file" 등
+            "Read ", "Write ", "Edit ", "Bash ", "Glob ", "Grep ",
+            "Agent ", " LS ",
+            # 확장자 힌트 (공백 뒤 경로 패턴)
+            ".py ", ".md ", ".yaml ", ".json ",
+            # 프로젝트 내부 디렉토리 prefix — core/orchestrator, web/app.py 등
+            # 사용자가 특정 경로를 언급하면 코드 작업으로 간주
+            "core/", "web/", "tests/", "training/", "deployment/",
+            "cli/", "config/", "scripts/", "tools/",
+        ]
+    )
+    knowledge_mode: RoutingProfile = Field(
+        default_factory=lambda: RoutingProfile(
+            model="qwen3.5-27b",
+            temperature=0.2,
+            max_tokens=2048,
+            enable_thinking=False,
+            description="일반 지식 QA — 베이스 Qwen + 낮은 temperature",
+        )
+    )
+    tool_mode: RoutingProfile = Field(
+        default_factory=lambda: RoutingProfile(
+            model="nexus-phase3",
+            temperature=0.3,
+            max_tokens=4096,
+            enable_thinking=False,
+            description="도구 호출 — Phase 3 LoRA + 중간 temperature",
+        )
+    )
+
+
 class SecurityConfig(BaseModel):
     """보안 및 샌드박스 설정."""
 
@@ -232,6 +314,9 @@ class NexusConfig(BaseSettings):
 
     # v7.0 Scout (CPU 4B 모델)
     scout: ScoutConfig = Field(default_factory=ScoutConfig)
+
+    # v7.0 Part 2.5 쿼리 라우팅 — 지식/도구 질의 분기 (2026-04-21 추가)
+    routing: RoutingConfig = Field(default_factory=RoutingConfig)
 
     # 하드웨어 티어 (auto: GPU VRAM 기반 자동 감지)
     hardware_tier: str = "auto"

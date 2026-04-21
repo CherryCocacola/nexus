@@ -83,9 +83,23 @@ class ModelProvider(ABC):
         temperature: float = 0.7,
         max_tokens: int = 4096,
         stop_sequences: list[str] | None = None,
+        model_override: str | None = None,
+        enable_thinking: bool | None = False,
     ) -> AsyncGenerator[StreamEvent, None]:
         """
         모델에 스트리밍 요청을 보낸다.
+
+        Args:
+            model_override: 호출 시점에 기본 model_id를 덮어쓴다.
+                v7.0 Part 2.5 쿼리 라우팅에서 LoRA ON/OFF를 런타임 전환하기 위해 사용.
+                None이면 프로바이더의 model_id를 그대로 쓴다.
+            enable_thinking: Qwen3.5 chat_template_kwargs.enable_thinking 인자.
+                - False(기본): 빈 <think></think> 블록 주입 — Worker(27B)에서 내부 독백이
+                  답변을 잡아먹는 현상 회피 목적.
+                - True: thinking 블록 생성 허용.
+                - None: chat_template_kwargs 자체를 요청에서 생략 (llama.cpp/vLLM 기본
+                  동작 사용). Scout(Qwen3.5-4B)가 False에서 tool_call 조기 종료되는
+                  이슈(α 진단, 2026-04-21)를 피하기 위해 Scout 전용 값으로 추가됨.
 
         Yields:
             StreamEvent — text_delta, tool_use, message_stop 등
@@ -192,35 +206,53 @@ class LocalModelProvider(ModelProvider):
         temperature: float = 0.7,
         max_tokens: int = 4096,
         stop_sequences: list[str] | None = None,
+        model_override: str | None = None,
+        enable_thinking: bool | None = False,
     ) -> AsyncGenerator[StreamEvent, None]:
         """
         vLLM /v1/chat/completions SSE 스트리밍.
 
         변환 흐름:
           Nexus Message[] → OpenAI messages[] → SSE chunks → StreamEvent yield
+
+        model_override/enable_thinking은 v7.0 Part 2.5 쿼리 라우팅에서 LoRA
+        ON/OFF 및 thinking 모드를 런타임 전환하기 위해 사용된다.
+
+        enable_thinking=None이면 chat_template_kwargs 자체를 요청에서 빼서
+        llama.cpp/vLLM 기본 동작을 따르도록 한다(Scout 전용 경로).
         """
         self._request_count += 1
         start_time = time.monotonic()
+
+        # 라우팅에서 지정한 모델 ID가 있으면 기본값을 덮어쓴다.
+        # 예: 일반 지식 질의 → model_override="qwen3.5-27b" (LoRA OFF)
+        # 예: 도구 호출 질의 → model_override=None 또는 "nexus-phase3"
+        active_model_id = model_override or self.model_id
 
         # 메시지 변환: Nexus → OpenAI 형식
         oai_messages = self._convert_messages(messages, system_prompt)
 
         # 요청 페이로드 구성
-        # chat_template_kwargs로 Qwen3.5 thinking 모드를 끈다.
-        # 왜: Qwen3.5의 기본 chat template은 <think> 블록을 강제 삽입한다.
-        # 도구 호출 흐름에서는 Worker가 내부 독백만 뱉고 실제 답변을 누락하는
-        # 사례가 관찰됨 ("사용자가 X에 대해 물어보고 있습니다..."로만 끝).
-        # enable_thinking=false를 넘기면 빈 <think></think>가 주입되어
-        # Worker가 곧바로 답변 생성 모드로 진입한다.
+        # chat_template_kwargs로 Qwen3.5 thinking 모드를 제어한다.
+        # 왜 False가 기본인가: Qwen3.5의 기본 chat template은 <think> 블록을 강제
+        # 삽입한다. Worker(27B)의 도구 호출 흐름에서 내부 독백만 뱉고 답변을
+        # 누락하는 사례가 관찰되어 enable_thinking=False로 빈 <think></think>를
+        # 주입해 답변 생성 모드로 바로 진입시킨다.
+        # 왜 None 옵션이 있는가: Scout(Qwen3.5-4B on llama.cpp)가
+        # enable_thinking=False에서 28 토큰 조기 종료(α 진단, 2026-04-21) —
+        # Scout 전용 경로에서는 chat_template_kwargs를 아예 보내지 않고
+        # 모델의 기본 동작에 맡기는 것이 안전하다.
         payload: dict[str, Any] = {
-            "model": self.model_id,
+            "model": active_model_id,
             "messages": oai_messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
             "stream": True,
             "stream_options": {"include_usage": True},  # vLLM 사용량 추적
-            "chat_template_kwargs": {"enable_thinking": False},
         }
+        if enable_thinking is not None:
+            # bool(True/False)일 때만 명시적으로 주입 — None이면 완전 생략
+            payload["chat_template_kwargs"] = {"enable_thinking": enable_thinking}
 
         if stop_sequences:
             payload["stop"] = stop_sequences
@@ -235,10 +267,10 @@ class LocalModelProvider(ModelProvider):
             "Authorization": f"Bearer {self.api_key}",
         }
 
-        # MESSAGE_START 이벤트
+        # MESSAGE_START 이벤트 — 실제 호출된 model_id를 전달(라우팅 추적용)
         yield StreamEvent(
             type=StreamEventType.MESSAGE_START,
-            model_id=self.model_id,
+            model_id=active_model_id,
         )
 
         # 컨텍스트 초과 시 max_tokens를 줄여서 자동 재시도
@@ -356,6 +388,25 @@ class LocalModelProvider(ModelProvider):
                             yield StreamEvent(
                                 type=StreamEventType.TEXT_DELTA,
                                 text=delta["content"],
+                            )
+
+                        # Qwen3.5가 `<think>` 블록을 reasoning_content로 분리해 보내는 경우가
+                        # 있다. 프로바이더 플래그로 이 값을 어떻게 다룰지 결정한다:
+                        #   - _include_reasoning_as_text=True: TEXT_DELTA로 합쳐서 yield
+                        #     (Scout 전용 — 4B는 정답 대부분을 reasoning에 실어 보낸다)
+                        #   - 그 외: THINKING_DELTA로 분리 yield — UI에서 선택적으로 숨김
+                        reasoning = delta.get("reasoning_content")
+                        if reasoning:
+                            include_as_text = getattr(
+                                self, "_include_reasoning_as_text", False
+                            )
+                            yield StreamEvent(
+                                type=(
+                                    StreamEventType.TEXT_DELTA
+                                    if include_as_text
+                                    else StreamEventType.THINKING_DELTA
+                                ),
+                                text=reasoning,
                             )
 
                         if "tool_calls" in delta:

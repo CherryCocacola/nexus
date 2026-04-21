@@ -50,6 +50,27 @@ model:
   default_temperature: 0.7
   default_max_tokens: 4096
 
+# v7.0 Part 2.5 — 쿼리 라우팅 (2026-04-21)
+# Phase 3 LoRA가 도구 호출은 강화했지만 일반 지식 표현을 좁히는 부작용 발생.
+# 실측 A/B/C/D에서 베이스 qwen3.5-27b(LoRA OFF)가 인문학/교양 질문에서 우수.
+# 질의를 분류하여 KNOWLEDGE_MODE는 베이스 모델, TOOL_MODE는 Phase3 LoRA로 분기.
+# TIER_M 이상으로 업그레이드 시 enabled: false로 끄고 단일 경로로 회귀한다.
+routing:
+  enabled: true
+  long_input_threshold: 500   # 이 글자수 이상이면 TOOL_MODE (문서 첨부 간주)
+  knowledge_mode:
+    model: "qwen3.5-27b"      # 베이스 — LoRA 어댑터 미적용
+    temperature: 0.2
+    max_tokens: 2048
+    enable_thinking: false
+    description: "일반 지식 QA"
+  tool_mode:
+    model: "nexus-phase3"     # Phase 3 LoRA — 도구 호출 특화
+    temperature: 0.3
+    max_tokens: 4096
+    enable_thinking: false
+    description: "도구 호출 / 프로젝트 작업"
+
 # 세션 설정
 session:
   sessions_dir: ".nexus/sessions"

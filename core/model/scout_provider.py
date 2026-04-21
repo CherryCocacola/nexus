@@ -20,9 +20,11 @@ LocalModelProvider를 내부적으로 재사용한다.
 from __future__ import annotations
 
 import logging
+from collections.abc import AsyncGenerator
 from typing import Any
 
-from core.model.inference import LocalModelProvider, ModelConfig, ModelProvider
+from core.message import Message, StreamEvent
+from core.model.inference import LocalModelProvider
 
 logger = logging.getLogger("nexus.model.scout_provider")
 
@@ -33,6 +35,13 @@ class ScoutModelProvider(LocalModelProvider):
 
     LocalModelProvider를 상속하여 동일 인터페이스를 제공한다.
     Scout 전용 설정(짧은 컨텍스트, 짧은 출력)을 적용한다.
+
+    Scout 전용 오버라이드:
+      stream()에서 enable_thinking 인자를 무조건 None으로 강제한다.
+      이유: Qwen3.5-4B가 llama.cpp에서 enable_thinking=False를 받으면 빈
+      <think></think> 블록 이후 거짓 tool_call 1개를 뱉고 28 토큰 만에 조기
+      종료되는 버그가 있음(α 진단, 2026-04-21, tmp_scout_thinking 재현).
+      Worker(27B)와는 독립적인 이슈이므로 Scout 경로에서만 플래그를 빼낸다.
     """
 
     def __init__(
@@ -66,12 +75,51 @@ class ScoutModelProvider(LocalModelProvider):
             connect_timeout=connect_timeout,
             read_timeout=read_timeout,
         )
+        # Scout 전용 플래그 — reasoning_content를 TEXT_DELTA로 합쳐서 내보낸다.
+        # Qwen3.5-4B가 llama.cpp에서 Qwen chat template의 `<think>` 블록을
+        # reasoning_content로 자동 분리해 보내는데, 실제로 유용한 "4섹션 마크다운
+        # 리포트"의 상당 부분이 reasoning 쪽에 실려 온다. Worker에게 넘겨야 할
+        # 내용이므로 content와 병합해 TEXT_DELTA로 노출한다.
+        self._include_reasoning_as_text = True
+
         logger.info(
             "ScoutModelProvider 초기화: %s (ctx=%d, max_out=%d)",
             base_url,
             max_context_tokens,
             max_output_tokens,
         )
+
+    async def stream(
+        self,
+        messages: list[Message],
+        system_prompt: str,
+        tools: list[dict[str, Any]] | None = None,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+        stop_sequences: list[str] | None = None,
+        model_override: str | None = None,
+        enable_thinking: bool | None = False,
+    ) -> AsyncGenerator[StreamEvent, None]:
+        """
+        Scout 전용 stream — enable_thinking을 None으로 강제한다.
+
+        호출자가 어떤 값을 넘기든(True/False/None) 모두 None으로 변환하여
+        상위 LocalModelProvider가 chat_template_kwargs를 요청에서 빼도록 한다.
+        이렇게 하면 llama.cpp의 기본 Qwen3.5 chat template이 그대로 동작하여
+        정상적인 길이의 응답(마크다운 4섹션 리포트)을 얻을 수 있다.
+        """
+        # enable_thinking을 None으로 강제 — 4B가 False에서 깨지는 α 이슈 회피
+        async for ev in super().stream(
+            messages=messages,
+            system_prompt=system_prompt,
+            tools=tools,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            stop_sequences=stop_sequences,
+            model_override=model_override,
+            enable_thinking=None,
+        ):
+            yield ev
 
 
 async def create_scout_provider_if_available(

@@ -198,13 +198,21 @@ class EnhancedMockModelProvider(ModelProvider):
         temperature: float = 0.7,
         max_tokens: int = 4096,
         stop_sequences: list[str] | None = None,
+        model_override: str | None = None,
+        enable_thinking: bool | None = False,
     ) -> AsyncGeneratorType[StreamEvent, None]:
         """
         MockResponse에 따라 StreamEvent를 yield한다.
 
         query_loop은 TOOL_USE_STOP 이벤트의 tool_use에서 도구 정보를 추출하므로,
         tool_calls가 있을 때 정확한 이벤트 시퀀스를 생성해야 한다.
+
+        v7.0 Part 2.5 (2026-04-21): 쿼리 라우팅이 model_override/enable_thinking을
+        전달할 수 있도록 시그니처에 동일 파라미터를 추가. Mock은 값을 무시한다.
         """
+        # 라우팅 파라미터 — 테스트 검증 편의를 위해 마지막 값을 기록만 해둔다
+        self._last_model_override = model_override
+        self._last_enable_thinking = enable_thinking
         # 현재 턴에 해당하는 응답을 선택 (마지막 응답은 반복 사용)
         idx = min(self._call_count, len(self._responses) - 1)
         response = self._responses[idx]

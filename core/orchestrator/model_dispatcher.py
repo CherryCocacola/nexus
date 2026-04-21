@@ -99,6 +99,10 @@ class ModelDispatcher:
         messages: list[Message],
         system_prompt: str,
         on_turn_complete: Any | None = None,
+        model_override: str | None = None,
+        temperature: float = 0.7,
+        max_tokens_cap: int | None = None,
+        enable_thinking: bool = False,
     ) -> AsyncGenerator[StreamEvent | Message, None]:
         """
         Worker query_loop으로 직행한다 (passthrough).
@@ -106,6 +110,10 @@ class ModelDispatcher:
         이전에는 TIER_S에서 Scout를 먼저 호출했으나, v7.0 Phase 9 재설계 이후
         Scout는 Worker가 AgentTool로 호출하는 서브에이전트가 되었다.
         Dispatcher는 더 이상 자동 전처리를 하지 않는다.
+
+        v7.0 Part 2.5 (2026-04-21): QueryEngine이 쿼리 타입별로 결정한
+        model_override/temperature/max_tokens_cap/enable_thinking을 그대로
+        query_loop에 전달한다. Dispatcher 자체는 라우팅에 관여하지 않는다.
         """
         async for event in query_loop(
             messages=messages,
@@ -115,6 +123,10 @@ class ModelDispatcher:
             context=self._context,
             max_turns=self._max_turns,
             on_turn_complete=on_turn_complete,
+            model_override=model_override,
+            temperature=temperature,
+            max_tokens_cap=max_tokens_cap,
+            enable_thinking=enable_thinking,
         ):
             yield event
 

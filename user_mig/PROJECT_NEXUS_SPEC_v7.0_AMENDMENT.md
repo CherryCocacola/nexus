@@ -237,6 +237,74 @@ SCOUT_AGENT = AgentDefinition(
 )
 ```
 
+#### Part 2.3 3차 개정 (2026-04-21) — Scout 호출 파이프라인 정비
+
+**배경**: Part 2.5(쿼리 라우팅) 도입 후 Scout가 여전히 "29자 응답"으로
+수렴하는 문제가 잔존. α 진단 결과 **라우팅과 무관한 세 층의 누적 버그**로
+판명:
+
+1. `chat_template_kwargs={"enable_thinking": False}`가 Qwen3.5-4B(llama.cpp)
+   에서 거짓 tool_call 1개 뱉고 **28 토큰 조기 종료**를 유발 (Worker 27B에서는
+   무해하지만 4B에서는 치명적)
+2. Part 2.5 쿼리 라우팅이 서브에이전트 QueryEngine에도 적용되어 Scout에
+   `model=nexus-phase3`(Scout 서버에 존재하지 않는 모델명)이 주입됨
+3. llama.cpp가 Qwen3.5 chat template의 `<think>` 블록을 `reasoning_content`로
+   자동 분리해 보내는데 Nexus SSE 파서가 이 필드를 버려서 **Scout 출력의
+   대부분이 Worker에게 전달되지 않음**
+
+**해결** (모두 코드 레벨, 모델 교체 없음):
+
+```python
+# (1) inference.py — enable_thinking을 bool | None로 확장
+stream(..., enable_thinking: bool | None = False)
+# None이면 chat_template_kwargs 자체를 payload에서 생략
+
+# (2) scout_provider.py — Scout는 항상 None으로 강제
+class ScoutModelProvider(LocalModelProvider):
+    async def stream(..., enable_thinking: bool | None = False):
+        async for ev in super().stream(..., enable_thinking=None):
+            yield ev
+
+# (3) query_engine.py — enabled=False 시 model_override/temperature/
+#     max_tokens_cap/enable_thinking을 모두 기본값으로 돌려놓는다
+if self._routing_config.enabled:
+    ... # 프로필 적용
+else:
+    active_model_override = None
+    ...
+
+# (4) agent_tool.py — 서브에이전트 QueryEngine은 라우팅 OFF
+sub_routing = RoutingConfig(enabled=False)
+engine = QueryEngine(..., routing_config=sub_routing)
+
+# (5) inference.py — reasoning_content를 THINKING_DELTA로 yield
+#     (프로바이더 플래그 _include_reasoning_as_text가 True면 TEXT_DELTA로 병합)
+reasoning = delta.get("reasoning_content")
+if reasoning:
+    yield StreamEvent(
+        type=(TEXT_DELTA if include_as_text else THINKING_DELTA),
+        text=reasoning,
+    )
+
+# (6) scout_provider.py — Scout는 reasoning을 TEXT_DELTA로 병합
+self._include_reasoning_as_text = True
+```
+
+**실 E2E 검증** (2026-04-21 13:04):
+
+| 지표 | 수정 전 | 수정 후 |
+|---|---|---|
+| Scout 최종 출력 길이 | 29자 | **1,211자** (42배) |
+| Worker에 도달한 마크다운 섹션 | 잘림 | 4개 전부 |
+| 응답 성공 | ❌ timeout(300s) | ✅ 75.7s, 247토큰 정돈된 답변 |
+| 라우팅 로그 | 서브에 `nexus-phase3` 주입 | 서브에 "라우팅 비활성" |
+
+이로써 progress.md의 "docx 무한 호출 루프" 원인 가설 중 α(Scout 디버깅) 단독으로
+**모델 교체(γ) 없이** 문제 해결이 확인됐다. Scout 모델은 Qwen3.5-4B Q4_K_M을
+계속 사용한다.
+
+---
+
 #### Part 2.3 2차 개정 (2026-04-18) — 출력 형식 JSON → 마크다운 완화
 
 **사유**: 실측 결과 Qwen3.5-4B(CPU, llama.cpp)가 구조화된 JSON 출력을 안정적으로
@@ -345,6 +413,157 @@ v7.0의 "3대 불변 전제"를 더 잘 만족한다:
 2. **GPU 업그레이드 시 자동 수렴** — TIER_M/L에서 Scout 없이 Worker만 동작
    (기존 B 설계도 같은 속성을 가짐)
 3. **동일한 사용자 경험** — 단순 요청은 빠르게, 복잡한 탐색은 자동 위임
+
+---
+
+## Part 2.5: 신규 — 쿼리 라우팅 (2026-04-21)
+
+### 2.5.1 배경: Phase 3 LoRA의 지식 표현 좁힘 현상
+
+Phase 3 LoRA는 도구 호출 능력을 강화하기 위해 도구 45% / 추론 25% /
+서브에이전트 15% / **기술 지식 15%** 분포로 학습되었다 (사양서 Part 5 Ch 18
+참조). 실사용 관찰 결과, 다음과 같은 부작용이 확인되었다:
+
+- 베이스 Qwen 3.5 27B가 충분히 알고 있는 일반 교양 지식(철학·문학·역사)에
+  대해 LoRA 적용 상태에서는 **엉뚱한 연상**을 하거나(예: "짜라투스트라는 이렇게
+  말했다" → 카프카의 소설로 오답) 응답이 부실해짐
+- LoRA의 `ΔW`가 베이스 웨이트 위에 덧씌워지면서 **기술 지식 도메인의 연상
+  가중치를 강화**한 대신, 일반 지식 도메인의 자연스러운 표현을 좁힌 것으로
+  추정
+
+### 2.5.2 진단 근거 (2026-04-21 실측)
+
+동일한 질의에 대해 4가지 조합으로 직접 호출 실험:
+
+| # | model | thinking | 언어 | 결과 |
+|---|---|---|---|---|
+| A | `nexus-phase3` (LoRA ON) | OFF | KO | 정답이지만 경미한 할루시네이션 포함 |
+| B | `qwen3.5-27b` (LoRA OFF) | OFF | KO | **완벽한 상세 답변** (낙타-사자-아기 3변신까지) |
+| C | `nexus-phase3` | ON | KO | A보다 개선되나 B에 미치지 못함 |
+| D | `qwen3.5-27b` | ON | EN | thinking이 content로 leak되어 답변 잘림 |
+
+**결론**:
+- 일반 지식 질의에서 **베이스 모델(LoRA OFF)이 압도적 우위**
+- 반대로 도구 호출 질의는 Phase 3 LoRA가 필수(tool_call XML 포맷 학습이 담김)
+- `enable_thinking=True`는 vLLM에서 content leak 이슈가 있어 당분간 보류
+
+### 2.5.3 설계: QueryEngine 진입부에서 질의 분류 → 프로필 분기
+
+```
+QueryEngine.submit_message(user_input)
+  ├─ classify_query(user_input, routing_config) → "KNOWLEDGE" | "TOOL"
+  ├─ profile = routing_config.knowledge_mode or tool_mode
+  └─ dispatcher.route(
+        model_override=profile.model,          # "qwen3.5-27b" or "nexus-phase3"
+        temperature=profile.temperature,        # 0.2 or 0.3
+        max_tokens_cap=profile.max_tokens,      # 2048 or 4096
+        enable_thinking=profile.enable_thinking # 현재 둘 다 False
+     )
+       └─ query_loop → model_provider.stream(…, model_override=…)
+```
+
+**분류 규칙 (휴리스틱만으로 충분)**:
+1. `routing.enabled=False` → 항상 `TOOL` (비상 스위치)
+2. `len(user_input) >= long_input_threshold` (기본 500자) → `TOOL`
+   - 근거: 첨부 문서/로그는 거의 항상 긴 텍스트로 들어오며, 분석 요청은
+     도구 흐름이 필요함
+3. `tool_keywords` 중 하나라도 포함 → `TOOL`
+   - 예: "파일", "첨부", "이 프로젝트", "Read(", "Agent(", ".py" 등
+4. 그 외 → `KNOWLEDGE`
+
+분류기는 **상수 시간**에 완료되며, LLM 기반 분류기 같은 오버헤드를 추가하지
+않는다. 실측에서 모호한 케이스는 극히 드물며, 오분류되어도 두 프로필이
+모두 호출 가능한 모델이므로 **불완전해도 안전한 fail-operational** 설계다.
+
+### 2.5.4 RoutingConfig 데이터 모델
+
+```python
+class RoutingProfile(BaseModel):
+    model: str                    # vLLM served-model-name (LoRA ON/OFF 전환)
+    temperature: float = 0.3
+    max_tokens: int = 4096
+    enable_thinking: bool = False
+    description: str = ""
+
+
+class RoutingConfig(BaseModel):
+    enabled: bool = True
+    long_input_threshold: int = 500
+    tool_keywords: list[str] = [...]  # 한/영 키워드 ~33개
+    knowledge_mode: RoutingProfile   # 기본값: qwen3.5-27b, temp=0.2, 2048
+    tool_mode: RoutingProfile        # 기본값: nexus-phase3, temp=0.3, 4096
+```
+
+YAML 설정 (`config/nexus_config.yaml`):
+
+```yaml
+routing:
+  enabled: true
+  long_input_threshold: 500
+  knowledge_mode:
+    model: "qwen3.5-27b"
+    temperature: 0.2
+    max_tokens: 2048
+    enable_thinking: false
+  tool_mode:
+    model: "nexus-phase3"
+    temperature: 0.3
+    max_tokens: 4096
+    enable_thinking: false
+```
+
+### 2.5.5 4-Tier 체인 영향
+
+체인 구조는 불변. 각 Tier에 파라미터 4개(`model_override`, `temperature`,
+`max_tokens_cap`, `enable_thinking`)가 추가로 전파되며, 기본값(None/0.7/
+None/False)으로 호출하면 **v6.1과 완전 동일한 동작**을 한다.
+
+```
+Tier 1: QueryEngine       ← 분류 + 프로필 선택
+Tier 2: query_loop        ← 파라미터 전달 (로직 변경 없음)
+Tier 3: model_provider.stream(…, model_override=…, enable_thinking=…)
+                          ← payload["model"] 및 chat_template_kwargs에 주입
+Tier 4: httpx             ← 불변
+```
+
+### 2.5.6 하드웨어 업그레이드 시 자동 비활성화
+
+이 개정은 **TIER_S(RTX 5090 8K) 한정 최적화**다:
+
+| TIER | 권장 설정 | 근거 |
+|---|---|---|
+| TIER_S (RTX 5090) | `enabled: true` | 현재 상태 |
+| TIER_M (H100 80GB) | `enabled: false` 또는 tool_mode도 qwen3.5-27b | Phase 3 LoRA 자체가 "8K 컨텍스트 + 도구 축소" 우회책이라 32K에서는 불필요. 베이스 모델 + 24개 도구 전체로 회귀 |
+| TIER_L (H200+) | `enabled: false` | 위와 동일 + 128K 컨텍스트로 RAG 등 다른 기법이 더 적합 |
+
+`detect_hardware_tier()`가 TIER_M 이상을 감지하면 bootstrap이 `enabled=false`로
+강제 설정하는 로직을 향후 추가할 수 있다 (현재는 운영자가 YAML로 전환).
+
+### 2.5.7 구현 범위와 영향
+
+**신규/수정 파일** (2026-04-21 구현):
+- `core/config.py` — `RoutingConfig`, `RoutingProfile` Pydantic 모델
+- `config/nexus_config.yaml` — `routing:` 섹션
+- `core/model/inference.py` — `stream()`에 `model_override`/`enable_thinking`
+- `core/orchestrator/query_loop.py` — 파라미터 전파
+- `core/orchestrator/model_dispatcher.py` — 파라미터 전파
+- `core/orchestrator/query_engine.py` — `classify_query()`, `_resolve_profile()`,
+  `submit_message()` 분기 배선
+- `core/bootstrap.py`, `web/app.py` — QueryEngine 생성 시 `routing_config` 주입
+- `tests/unit/test_query_routing.py` — 28개 분류기 테스트
+- `tests/conftest.py` — Mock Provider에 새 파라미터 시그니처 반영
+
+**기존 테스트 영향**: 600개 테스트(단위 535 + 통합 65) 전부 통과 유지.
+
+### 2.5.8 한계와 향후 과제
+
+- **분류기 오판 가능성**: 예) "니체의 Übermensch 개념을 다룬 논문 파일이
+  있다면 읽어줘"는 키워드 "파일"로 TOOL로 분류되지만, 실제로는 지식 질의가
+  우세할 수 있음. 현재는 안전하게 TOOL 우선 정책을 유지 (도구로 가도 답변 가능).
+- **근본 해결은 RAG**: 짜라투스트라 수준의 교양은 베이스 모델로 커버되지만,
+  고도 전문 지식은 RAG 지식 베이스가 필요. 이는 Part 10(향후 작업)에서 다룬다.
+- **Phase 4 LoRA**: 지식 카테고리를 15% → 30%(기술 15% + 인문 15%)로 확장하는
+  재학습도 가능하나, 2.5 라우팅이 효과적이면 재학습의 ROI가 낮아진다.
 
 ---
 

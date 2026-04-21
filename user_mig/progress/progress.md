@@ -414,6 +414,161 @@ VRAM 최대 max-model-len:
 
 ---
 
+## Scout 29자 수렴 근본 해결 (2026-04-21 오후)
+
+### 배경
+Part 2.5(쿼리 라우팅) 도입 후 실측에서 Scout가 여전히 "29자"만 Worker에 전달하는
+증상 지속. α 진단(30분)으로 세 층의 누적 버그 확정.
+
+### α 진단 결과
+Scout 서버(:8003)에 직접 curl로 6개 케이스 비교:
+
+| # | enable_thinking | finish_reason | out tokens | content 길이 |
+|---|---|---|---|---|
+| A | 미주입 | stop | 255 | 478자 (정상) |
+| **B** | **False (Nexus 기본)** | **tool_calls** | **28** | **0** (버그 재현) |
+| C | True | stop | 348 | 451자 (정상) |
+
+→ `chat_template_kwargs={"enable_thinking": False}`가 Qwen3.5-4B에서
+  거짓 tool_call 1개 뱉고 28토큰 조기 종료 유발. Worker 27B에서는 무해하지만
+  4B에서는 치명적.
+
+**추가 발견 (E2E 재현 중)**:
+- Part 2.5 라우팅이 Scout 서브에이전트 QueryEngine에도 적용되어 Scout 서버에
+  `model=nexus-phase3`(존재하지 않는 모델명) 주입
+- llama.cpp가 `<think>` 블록을 reasoning_content로 자동 분리하는데 Nexus SSE
+  파서가 이 필드를 버려서 Scout 출력의 대부분이 Worker에게 전달되지 않음
+
+### 해결 (코드 6곳, 모델 교체 없음)
+
+1. `core/model/inference.py` — `stream()` 시그니처에 `enable_thinking: bool | None`
+   추가, `None`이면 `chat_template_kwargs` 생략
+2. `core/model/scout_provider.py` — `ScoutModelProvider.stream()` 오버라이드로
+   `enable_thinking`을 항상 `None`으로 강제
+3. `core/orchestrator/query_engine.py` — `routing_config.enabled=False`일 때
+   `model_override/temperature/max_tokens_cap/enable_thinking` 모두 기본값으로
+   돌려놓는 분기 추가
+4. `core/tools/implementations/agent_tool.py` — 서브에이전트 QueryEngine 생성 시
+   `routing_config=RoutingConfig(enabled=False)` 주입
+5. `core/model/inference.py` — `delta.reasoning_content`를 THINKING_DELTA로 yield
+   (프로바이더 플래그 `_include_reasoning_as_text=True`면 TEXT_DELTA로 병합)
+6. `core/model/scout_provider.py` — Scout는 `_include_reasoning_as_text=True`
+   설정하여 reasoning을 Worker에게 전달
+
+### 실 E2E 검증 (13:04)
+
+`"core/config.py 파일에 어떤 설정 클래스들이 정의되어 있는지 알려줘"`:
+
+| 지표 | 수정 전 | 수정 후 |
+|---|---|---|
+| Scout → Worker 전달 길이 | 29자 | **1,211자** (42배) |
+| Scout 출력 토큰 | 28 | 335 |
+| 응답 성공 | ❌ timeout 300s | ✅ **75.7s, 완전한 답변** |
+| 라우팅 로그 | `model=nexus-phase3` | "라우팅 비활성" |
+
+Worker가 Scout의 4섹션 마크다운 리포트를 받아 247토큰짜리 정돈된 답변 생성
+(GPUServerConfig/RedisConfig/PostgreSQLConfig/ModelConfig/SessionConfig/
+ScoutConfig/RoutingProfile/RoutingConfig 8개 클래스 나열).
+
+### 테스트
+- `tests/unit/test_scout_provider.py` 신규 (7개 테스트)
+- 회귀 613/613 통과 (기존 606 + 신규 7)
+
+### 결정: γ(Scout 모델 교체) 철회
+α 단독으로 해결됐으므로 4B → 7B 교체는 불필요. Qwen3.5-4B Q4_K_M 유지.
+
+### 사양서 반영
+`user_mig/PROJECT_NEXUS_SPEC_v7.0_AMENDMENT.md` Part 2.3에 **3차 개정 (2026-04-21)**
+절을 추가하여 위 6개 수정 지점과 근거를 문서화.
+
+---
+
+## v7.0 Part 2.5 — 쿼리 라우팅 도입 (2026-04-21)
+
+### 배경
+사용자 실사용 중 "차라투스트라는 이렇게 말했다 설명해줘" 질의에서 모델이
+"카프카의 소설"로 오답. 원인 분석 결과:
+- Phase 3 LoRA가 도구 호출·기술 지식을 강화하는 대신 일반 교양 지식의
+  표현을 좁히는 부작용 발생
+- `chat_template_kwargs={"enable_thinking": False}` + temperature 0.7로
+  자체 검증 없이 첫 연상을 그대로 출력
+
+### 0단계 진단 (A/B/C/D 실측)
+
+같은 질문(`차라투스트라는 이렇게 말했다`)에 대한 4가지 조합 curl 비교:
+
+| # | model | thinking | 언어 | 결과 |
+|---|---|---|---|---|
+| A | nexus-phase3 + thinking=False (현 운영) | OFF | KO | 정답 + 경미한 할루시네이션 ("알렉산더 폰 훔볼트 풍자" 등) |
+| B | qwen3.5-27b (LoRA OFF) + thinking=False | OFF | KO | **완벽 답변** — 낙타/사자/아기 3변신 상세 설명 |
+| C | nexus-phase3 + thinking=True | ON | KO | A보다 개선, B보다 약함 |
+| D | qwen3.5-27b + thinking=True | ON | EN | content에 thinking leak되어 답변 잘림 |
+
+**결론**:
+- LoRA OFF(B)가 일반 지식에서 압도적 우위 → LoRA가 원흉 확정
+- `enable_thinking=True`는 leak 이슈로 당분간 사용 보류
+- 도구 호출 질의는 여전히 Phase 3 LoRA 필요
+
+### 조치 — 쿼리 라우팅 분기 구현
+
+**신규 분류기**:
+- `core/orchestrator/query_engine.py` — `classify_query()`, `_resolve_profile()`
+- 규칙: `enabled=False` → TOOL / 길이 ≥500 → TOOL / tool_keywords 포함 → TOOL /
+  그 외 → KNOWLEDGE
+
+**신규 Pydantic 모델**:
+- `core/config.py` — `RoutingConfig`, `RoutingProfile`
+- `config/nexus_config.yaml` — `routing:` 섹션
+
+**프로필**:
+| 프로필 | model | temperature | max_tokens | enable_thinking |
+|---|---|---|---|---|
+| knowledge_mode | `qwen3.5-27b` (LoRA OFF) | 0.2 | 2048 | false |
+| tool_mode | `nexus-phase3` (LoRA ON) | 0.3 | 4096 | false |
+
+**전파 경로** (4-Tier 파라미터 추가, 기본값은 기존 동작과 동일):
+```
+QueryEngine.submit_message
+  → classify + profile 선택
+  → ModelDispatcher.route(model_override, temperature, max_tokens_cap, enable_thinking)
+    → query_loop(… 동일 파라미터 …)
+      → model_provider.stream(… payload["model"] = model_override …)
+```
+
+**수정 파일** (7개):
+- `core/config.py` — RoutingConfig/RoutingProfile 신규
+- `config/nexus_config.yaml` — routing 섹션 추가
+- `core/model/inference.py` — `stream()` 시그니처 확장
+- `core/orchestrator/query_loop.py` — 파라미터 전파 + max_tokens_cap 적용
+- `core/orchestrator/model_dispatcher.py` — route() 시그니처 확장
+- `core/orchestrator/query_engine.py` — 분류기 + submit_message 분기
+- `core/bootstrap.py`, `web/app.py` — QueryEngine 생성 시 routing_config 주입
+
+**테스트**:
+- `tests/unit/test_query_routing.py` (신규, 28개 케이스)
+- `tests/conftest.py` — EnhancedMockModelProvider.stream() 시그니처 동기화
+- **회귀 600개 전부 통과** (단위 535 + 통합 65)
+
+### 사양서 개정
+`user_mig/PROJECT_NEXUS_SPEC_v7.0_AMENDMENT.md`에 **Part 2.5 신규 추가**:
+- 배경, 진단 근거, 설계, 데이터 모델, 4-Tier 영향, 하드웨어 업그레이드 시
+  자동 비활성화 조항, 한계와 향후 과제
+
+### TIER_M 이상 업그레이드 시 자동 복귀
+- RTX 5090 → H100으로 업그레이드 시 `routing.enabled: false`로 전환하면
+  단일 경로(베이스 모델 + 24개 도구)로 복귀 가능
+- Phase 3 LoRA 자체가 8K 컨텍스트 우회책이라 TIER_M 이상에서는 불필요
+
+### 다음 단계 (2단계 RAG 지식 베이스 — 보류)
+사용자 결정에 따라 2단계(한국어 위키 덤프 → pgvector 인덱싱 → knowledge_mode
+진입 시 자동 검색 주입)는 1단계 실측 효과 확인 후 착수.
+
+### 실측 검증 (사용자 확인 필요)
+웹 서버 재기동 후 `차라투스트라`/`니체` 등 지식 질의 → 로그에서
+`라우팅: class=KNOWLEDGE, model=qwen3.5-27b, temp=0.20` 확인 + 응답 품질 개선.
+
+---
+
 ## 사양서 원본 회귀 (경로 ⓐ) — 부분 성공 + docx 이슈 (2026-04-18~19)
 
 ### 배경

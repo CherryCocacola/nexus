@@ -137,6 +137,10 @@ async def query_loop(
     max_turns: int = MAX_TURNS,
     hook_manager: Any | None = None,
     on_turn_complete: Any | None = None,
+    model_override: str | None = None,
+    temperature: float = 0.7,
+    max_tokens_cap: int | None = None,
+    enable_thinking: bool = False,
 ) -> AsyncGenerator[StreamEvent | Message, None]:
     """
     핵심 에이전트 턴 루프.
@@ -160,6 +164,13 @@ async def query_loop(
         context_manager: 컨텍스트 압축 관리자 (Ch.6, 선택)
         max_turns: 최대 턴 수 (기본: 200)
         hook_manager: 훅 매니저 (Ch.10, 선택) — 도구 실행 전후/종료 시 훅 실행
+        model_override: v7.0 Part 2.5 — 호출 시점에 LoRA 어댑터를 덮어쓸 때 사용.
+            KNOWLEDGE_MODE에서 "qwen3.5-27b"(LoRA OFF)로 라우팅하기 위한 경로.
+        temperature: 샘플링 온도. 라우팅 프로필에서 결정한 값을 전달받는다.
+        max_tokens_cap: 출력 상한 (선택). 지정되면 기존 동적 max_tokens 계산에서
+            base_max_tokens로 사용되어, 가벼운 답변(예: KNOWLEDGE_MODE 2048)이
+            필요할 때 과도한 토큰 소비를 막는다.
+        enable_thinking: Qwen3.5 chat_template_kwargs 인자 (기본 False).
 
     Yields:
         StreamEvent: 스트리밍 이벤트 (UI 업데이트용)
@@ -207,8 +218,11 @@ async def query_loop(
         # max_model_len에서 남는 공간을 출력에 할당한다.
         # 왜 동적인가: 도구 수와 대화 길이에 따라 입력 토큰이 달라지므로
         # 고정 max_tokens는 컨텍스트 초과 에러를 유발한다.
+        #
+        # v7.0 Part 2.5: max_tokens_cap이 주어지면 그것을 base로 사용한다.
+        # 예) KNOWLEDGE_MODE는 2048로 cap하여 지식 답변에 과도한 토큰을 쓰지 않음.
         model_cfg = model_provider.get_config()
-        base_max_tokens = model_cfg.max_output_tokens
+        base_max_tokens = max_tokens_cap or model_cfg.max_output_tokens
 
         if state.max_output_tokens_override:
             max_tokens = state.max_output_tokens_override
@@ -279,12 +293,17 @@ async def query_loop(
             # idle 30초, total 300초 초과 시 StreamWatchdogTimeout 발생 → 재시도
             from core.orchestrator.stream_watchdog import stream_with_watchdog
 
+            # v7.0 Part 2.5: 라우팅에서 결정된 model_override/temperature/
+            # enable_thinking을 Tier 3로 전달한다. None/기본값인 경우 프로바이더의
+            # 기본 설정(config.primary_model, temp=0.7, thinking=False)이 적용된다.
             _raw_stream = model_provider.stream(
                 messages=api_messages,
                 system_prompt=system_prompt,
                 tools=tool_schemas if tools else None,
-                temperature=0.7,
+                temperature=temperature,
                 max_tokens=max_tokens,
+                model_override=model_override,
+                enable_thinking=enable_thinking,
             )
             async for event in stream_with_watchdog(
                 _raw_stream,
