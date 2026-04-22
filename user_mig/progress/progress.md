@@ -1427,3 +1427,87 @@ v7.0 Phase 9 코드(HardwareTier/TurnState/ModelDispatcher/Scout)는 모듈
    - DB: 192.168.10.39 (PostgreSQL + Redis, 현재 미연결)
    - 웹: https://192.168.22.223:8443 (자체 서명 SSL)
 7. 453개 테스트 전부 통과
+
+---
+
+## v0.14.0 — 내부 구조 정비 + M7 테넌트 학습 파이프라인 (2026-04-22)
+
+**범위**: 기능 추가는 M7(테넌트별 LoRA 학습)만, 나머지는 전부 내부 리팩토링.
+
+### 리팩토링 1 — QueryEngine.submit_message 분해
+- 210줄 God-method를 분리: `core/orchestrator/routing.py`(RoutingResolver +
+  HeuristicClassifier + RoutingDecision) + `prompt_assembler.py`(PromptAssembler)
+- `submit_message()`가 ~50줄로 축소, 각 단계 독립 테스트 가능
+
+### 리팩토링 2 — QueryEngine.bind_request 공식 메서드
+- 웹 핸들러가 `engine._session_id`/`_transcript` 등 비공개 속성을 직접 치환하던
+  race condition 위험을 공식 API `bind_request(session_id, tenant, transcript,
+  restore_messages)`로 해소
+
+### 리팩토링 3 — 웹 lifespan 분해 + Worker 프롬프트 외부화
+- 인라인 130줄 부트스트랩 → `_build_web_query_engine(components, state)` 호출로 축소
+- 50줄 Worker 시스템 프롬프트 → `web/prompts/worker_system.md` 외부화
+  (운영자가 코드 수정 없이 튜닝)
+
+### 리팩토링 4 — QueryClassifier 전략 + tool_keywords YAML 외부화
+- `config/nexus_config.yaml`에 `routing.tool_keywords` 리스트 전체를 노출
+- `RoutingConfig.classifier_type: str = "heuristic"` + `build_classifier()`
+  팩토리 + `_CLASSIFIER_REGISTRY` — 향후 LLM/임베딩 분류기 확장 지점
+
+### 리팩토링 5 — PgVectorStore 공통 베이스
+- `core/rag/pgvector_base.py` 신설: `format_vector`, `cosine_similarity`,
+  `PgVectorStore` 베이스(`ensure_schema`/`build_vector_index`/`count`)
+- `KnowledgeStore`, `SymbolStore`가 베이스 상속으로 전환 → 두 파일에서 ~80줄씩
+  중복 제거
+
+### 리팩토링 6 — tool_keywords 매칭 규칙 구조화
+- `tool_word_patterns`(단어 경계 `\b`), `tool_regex_patterns`(자유 정규식) 신설
+- 기존 substring에서 `file`이 `filename`에 오탐되던 한계 해소
+- 잘못된 regex는 경고 로그 후 무시(fail-safe)
+
+### M7 — 테넌트별 LoRA 학습 파이프라인
+- **신규** `training/adapter_naming.py` — `normalize_tenant_id`,
+  `compose_adapter_name`, `compose_output_dir`, `compose_data_path`
+- **네이밍 규약**: default → `nexus-phaseN` (기존 호환), 테넌트 →
+  `nexus-{tenant}-phaseN`, `adapter_name_prefix`로 커스텀 우선
+- **수정** `training/trainer.py` — `TrainingConfig.tenant_id/phase` 필드 +
+  `resolved_output_dir()`/`resolved_adapter_name()` + `to_dict()`에 M7 필드 포함
+- **수정** `core/config.py` — `TenantConfig.adapter_name(phase)` +
+  `adapter_name_prefix` 옵션
+- **신규** `scripts/train_tenant_lora.py` — `--tenant-id`/`--phase`/`--data-path`/
+  `--dry-run` CLI. 학습 metadata.json에 tenant_id·adapter_name 기록
+
+### 테스트
+- 신규 `tests/unit/test_adapter_naming.py` — 36 케이스
+- 보강 `tests/unit/test_query_routing.py` — classifier 팩토리 4 + 매칭 타입 5 케이스
+- **최종 734 테스트 통과** (634 → +100)
+
+### 신규/수정 파일
+```
+신규:
+  core/orchestrator/routing.py
+  core/orchestrator/prompt_assembler.py
+  core/rag/pgvector_base.py
+  training/adapter_naming.py
+  scripts/train_tenant_lora.py
+  scripts/_ssh_kowiki_status.py       # γ 진행 점검용
+  tests/unit/test_adapter_naming.py
+  web/prompts/worker_system.md
+
+수정:
+  config/nexus_config.yaml             # tool_keywords YAML 노출
+  core/config.py                       # TenantConfig.adapter_name + classifier_type
+  core/orchestrator/query_engine.py    # submit_message 분해 + bind_request
+  core/rag/knowledge_store.py          # PgVectorStore 상속
+  core/rag/symbol_store.py             # PgVectorStore 상속
+  tests/unit/test_query_routing.py     # 신규 매칭 타입 테스트
+  training/trainer.py                  # TrainingConfig 테넌트 필드
+  web/app.py                           # lifespan 분해 + 프롬프트 외부 로드
+  user_mig/PROJECT_NEXUS_SPEC_v7.0_AMENDMENT.md  # Ch 15(M7) + Part 9(리팩토링)
+```
+
+### 다음 세션에서 이어갈 후보
+1. kowiki C2-γ 적재 완료 대기 → `build_vector_index()` (ivfflat) 실행
+2. M7 후속 — `training/bootstrap_generator.py`에 `--tenant-id` 인자 추가
+3. 테넌트 관리 API — `GET /v1/tenants` 조회 엔드포인트
+4. AgentTool Scout 결과 캐시 (~30s 지연 완화)

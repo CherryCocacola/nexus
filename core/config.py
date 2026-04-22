@@ -142,6 +142,35 @@ class ScoutConfig(BaseModel):
 # 조치: 질의 타입에 따라 런타임에 모델(LoRA ON/OFF)과 temperature를 분기한다.
 # 이 분기는 TIER_S 한정 최적화이며, TIER_M 이상에서는 enabled=false로 끈다
 # (베이스 모델 + 24개 도구 + 긴 컨텍스트가 이미 기본값이 되기 때문).
+# ─────────────────────────────────────────────
+# 기본 tool_keywords — yaml 누락 시 폴백 (2026-04-22 리팩토링 4)
+# ─────────────────────────────────────────────
+# yaml(config/nexus_config.yaml#routing.tool_keywords)이 단일 소스이나,
+# 테스트/경량 실행 환경에서 yaml 로드 없이 RoutingConfig()를 만드는 경우를 위해
+# 동일 리스트를 모듈 상수로 유지한다. 추가/변경은 양쪽 모두에 반영해야 한다.
+_DEFAULT_TOOL_KEYWORDS: list[str] = [
+    # 한국어 — 파일/프로젝트/도구 명시 힌트
+    "파일", "첨부", "업로드", "이 프로젝트", "코드베이스",
+    "디렉토리", "폴더", "리포지토리", "리포지터리",
+    "읽어줘", "읽어 줘", "편집해", "수정해",
+    "모듈 구조", "디렉토리 구조", "프로젝트 구조",
+    # 영어
+    "file", "attached", "upload", "this project", "codebase",
+    "repository", "directory", "folder",
+    # 도구 이름 — 괄호 포함(함수 호출 스타일)
+    "Read(", "Write(", "Edit(", "Bash(", "Glob(", "Grep(",
+    "Agent(", "DocumentProcess",
+    # 단독 대문자 도구명 + 공백 — "Read 도구", "Edit the file" 등
+    "Read ", "Write ", "Edit ", "Bash ", "Glob ", "Grep ",
+    "Agent ", " LS ",
+    # 확장자 힌트 (공백 뒤 경로 패턴)
+    ".py ", ".md ", ".yaml ", ".json ",
+    # 프로젝트 내부 디렉토리 prefix — core/orchestrator, web/app.py 등
+    "core/", "web/", "tests/", "training/", "deployment/",
+    "cli/", "config/", "scripts/", "tools/",
+]
+
+
 class RoutingProfile(BaseModel):
     """개별 라우팅 프로필 — 질의 타입별 모델/파라미터 조합."""
 
@@ -170,31 +199,23 @@ class RoutingConfig(BaseModel):
 
     enabled: bool = True
     long_input_threshold: int = 500  # 이 글자수 이상이면 TOOL_MODE
+    # 분류기 종류 — 기본은 "heuristic" (HeuristicClassifier).
+    # 향후 "llm_classifier", "embedding_classifier" 추가 시 여기서 선택한다.
+    # 새 분류기를 추가하려면 routing.QueryClassifier를 상속한 뒤
+    # routing._CLASSIFIER_REGISTRY에 매핑을 등록한다.
+    classifier_type: str = "heuristic"
     tool_keywords: list[str] = Field(
-        default_factory=lambda: [
-            # 한국어 — 파일/프로젝트/도구 명시 힌트
-            "파일", "첨부", "업로드", "이 프로젝트", "코드베이스",
-            "디렉토리", "폴더", "리포지토리", "리포지터리",
-            "읽어줘", "읽어 줘", "편집해", "수정해",
-            "모듈 구조", "디렉토리 구조", "프로젝트 구조",
-            # 영어
-            "file", "attached", "upload", "this project", "codebase",
-            "repository", "directory", "folder",
-            # 도구 이름 — 괄호 포함/미포함 양쪽 패턴
-            # 괄호 포함(함수 호출 스타일)
-            "Read(", "Write(", "Edit(", "Bash(", "Glob(", "Grep(",
-            "Agent(", "DocumentProcess",
-            # 단독 대문자 도구명 + 공백 — "Read 도구", "Edit the file" 등
-            "Read ", "Write ", "Edit ", "Bash ", "Glob ", "Grep ",
-            "Agent ", " LS ",
-            # 확장자 힌트 (공백 뒤 경로 패턴)
-            ".py ", ".md ", ".yaml ", ".json ",
-            # 프로젝트 내부 디렉토리 prefix — core/orchestrator, web/app.py 등
-            # 사용자가 특정 경로를 언급하면 코드 작업으로 간주
-            "core/", "web/", "tests/", "training/", "deployment/",
-            "cli/", "config/", "scripts/", "tools/",
-        ]
+        # yaml(config/nexus_config.yaml#routing.tool_keywords)이 단일 소스.
+        # 이 default_factory는 yaml 없이 RoutingConfig()를 만드는 테스트·경량 환경용 폴백.
+        default_factory=lambda: list(_DEFAULT_TOOL_KEYWORDS)
     )
+    # 단어 경계 매칭 (2026-04-22 리팩토링 6) — "file"이 "filename"에 오탐되는 문제 해소.
+    # 예: "file"을 등록하면 " file ", " file." 등 단어 경계에서만 매칭된다.
+    # 한국어는 단어 경계 개념이 달라 주로 영어/코드 용어에 쓰인다.
+    tool_word_patterns: list[str] = Field(default_factory=list)
+    # 정규식 매칭 — 복잡한 패턴이 필요한 경우 (예: 함수 호출 `Read\s*\(`).
+    # 운영자 책임으로 유효한 regex를 제공 — 잘못된 regex는 로드 시 경고 후 무시.
+    tool_regex_patterns: list[str] = Field(default_factory=list)
     knowledge_mode: RoutingProfile = Field(
         default_factory=lambda: RoutingProfile(
             model="qwen3.5-27b",
@@ -247,6 +268,27 @@ class TenantConfig(BaseModel):
 
     # 추가 메타데이터 (부서·계약정보 등)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    # M7: LoRA 학습 어댑터 이름 접두사 (선택)
+    # 값이 있으면 adapter_name(phase)이 이 접두사를 우선 사용한다.
+    # 예: "hy-custom" → hy-custom-phase3 (브랜딩·계약상 이름 규약용)
+    adapter_name_prefix: str | None = None
+
+    def adapter_name(self, phase: int) -> str:
+        """이 테넌트의 phaseN LoRA 어댑터 이름을 반환한다 (M7).
+
+        컴포지션은 `training.adapter_naming.compose_adapter_name`에 위임한다.
+        default 테넌트는 `nexus-phaseN` (기존 호환), 그 외는 `nexus-{id}-phaseN`.
+        `adapter_name_prefix`가 설정되면 해당 값이 우선.
+        """
+        # 순환 import 방지 — 함수 호출 시점에 지연 임포트
+        from training.adapter_naming import compose_adapter_name
+
+        return compose_adapter_name(
+            self.id,
+            phase,
+            custom_prefix=self.adapter_name_prefix,
+        )
 
 
 class TenantRegistry(BaseModel):

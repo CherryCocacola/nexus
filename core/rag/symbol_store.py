@@ -51,6 +51,10 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
+from core.rag.pgvector_base import PgVectorStore
+from core.rag.pgvector_base import cosine_similarity as _cosine
+from core.rag.pgvector_base import format_vector as _format_vector
+
 logger = logging.getLogger("nexus.rag.symbol_store")
 
 
@@ -122,33 +126,17 @@ class SymbolEntry:
         return hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
 
 
-class SymbolStore:
+class SymbolStore(PgVectorStore):
     """tb_symbols 기반 심볼 저장소.
 
     pg_pool이 None이면 인메모리 폴백 — 테스트/경량 개발 환경에서 쓰인다.
+    공통 로직(ensure_schema/build_vector_index/count)은 PgVectorStore에서 상속.
     """
 
-    def __init__(self, pg_pool: Any | None = None) -> None:
-        self._pg = pg_pool
-        self._store: dict[str, SymbolEntry] = {}
-
-    # ─── 스키마 관리 ─────────────────────────────────────
-    async def ensure_schema(self) -> None:
-        """tb_symbols + 보조 인덱스를 생성한다 (멱등, pg_trgm·vector 확장 포함)."""
-        if self._pg is None:
-            logger.info("SymbolStore: pg_pool 없음 — 스키마 건너뜀 (인메모리)")
-            return
-        async with self._pg.acquire() as conn:
-            await conn.execute(_DDL_SCHEMA)
-        logger.info("tb_symbols 스키마 확인/생성 완료")
-
-    async def build_vector_index(self) -> None:
-        """대량 적재 후 ivfflat 벡터 인덱스를 만든다."""
-        if self._pg is None:
-            return
-        async with self._pg.acquire() as conn:
-            await conn.execute(_DDL_IVFFLAT)
-        logger.info("tb_symbols 벡터 인덱스 생성 완료 (ivfflat cosine)")
+    # PgVectorStore 계약
+    TABLE_NAME = "tb_symbols"
+    DDL_SCHEMA = _DDL_SCHEMA
+    DDL_IVFFLAT = _DDL_IVFFLAT
 
     # ─── 적재 ────────────────────────────────────────────
     async def add(self, entry: SymbolEntry) -> str:
@@ -322,39 +310,12 @@ class SymbolStore:
         return [_row_to_dict(r) for r in rows]
 
     # ─── 운영 유틸 ───────────────────────────────────────
-    async def count(self, source: str | None = None) -> int:
-        if self._pg is None:
-            if source is None:
-                return len(self._store)
-            return sum(1 for e in self._store.values() if e.source == source)
-        async with self._pg.acquire() as conn:
-            if source is None:
-                return await conn.fetchval("SELECT COUNT(*) FROM tb_symbols")
-            return await conn.fetchval(
-                "SELECT COUNT(*) FROM tb_symbols WHERE source = $1", source
-            )
+    # count()는 PgVectorStore에서 상속한다.
 
 
 # ─────────────────────────────────────────────
-# 헬퍼
+# 헬퍼 — _format_vector / _cosine은 core.rag.pgvector_base에서 import (위 상단)
 # ─────────────────────────────────────────────
-def _format_vector(vec: list[float] | tuple[float, ...] | None) -> str | None:
-    if vec is None:
-        return None
-    return "[" + ",".join(f"{x:.6f}" for x in vec) + "]"
-
-
-def _cosine(a: list[float], b: list[float] | tuple[float, ...]) -> float:
-    if not a or not b or len(a) != len(b):
-        return 0.0
-    dot = sum(x * y for x, y in zip(a, b, strict=False))
-    na = (sum(x * x for x in a)) ** 0.5
-    nb = (sum(y * y for y in b)) ** 0.5
-    if na == 0 or nb == 0:
-        return 0.0
-    return dot / (na * nb)
-
-
 def _entry_to_row(e: SymbolEntry, sim: float) -> dict[str, Any]:
     return {
         "source": e.source, "path": e.path, "module": e.module, "kind": e.kind,

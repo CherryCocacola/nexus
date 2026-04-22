@@ -72,6 +72,29 @@ class TrainingConfig:
     save_steps: int = 100  # 체크포인트 저장 간격 (스텝)
     logging_steps: int = 10  # 로그 출력 간격 (스텝)
 
+    # M7: 멀티테넌시 — tenant 식별자. None이면 default 테넌트(기존 호환).
+    tenant_id: str | None = None
+    # M7: 학습 Phase (0~4). output_dir 자동 해석에 쓰인다.
+    phase: int | None = None
+
+    def resolved_output_dir(self, base_dir: str = "/opt/nexus-gpu/checkpoints") -> str:
+        """M7: tenant_id + phase로 출력 디렉토리 경로를 해석한다.
+
+        tenant_id나 phase가 None이면 `self.output_dir`을 그대로 돌려준다
+        (하위 호환 — 직접 output_dir을 지정한 경우).
+        """
+        if self.tenant_id is None or self.phase is None:
+            return self.output_dir
+        from training.adapter_naming import compose_output_dir
+        return compose_output_dir(self.tenant_id, self.phase, base_dir=base_dir)
+
+    def resolved_adapter_name(self) -> str | None:
+        """M7: tenant_id + phase로 어댑터 이름을 해석한다. 둘 중 하나라도 없으면 None."""
+        if self.tenant_id is None or self.phase is None:
+            return None
+        from training.adapter_naming import compose_adapter_name
+        return compose_adapter_name(self.tenant_id, self.phase)
+
     def to_dict(self) -> dict[str, Any]:
         """학습 설정을 딕셔너리로 변환한다 (API 전송용)."""
         return {
@@ -91,6 +114,10 @@ class TrainingConfig:
             "weight_decay": self.weight_decay,
             "save_steps": self.save_steps,
             "logging_steps": self.logging_steps,
+            # M7 멀티테넌시 필드는 GPU 서버 API가 라우팅에 쓸 수 있도록 함께 전송
+            "tenant_id": self.tenant_id,
+            "phase": self.phase,
+            "adapter_name": self.resolved_adapter_name(),
         }
 
 

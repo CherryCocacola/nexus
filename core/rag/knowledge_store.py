@@ -44,6 +44,10 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from core.rag.pgvector_base import PgVectorStore
+from core.rag.pgvector_base import cosine_similarity as _cosine
+from core.rag.pgvector_base import format_vector as _format_vector
+
 logger = logging.getLogger("nexus.rag.knowledge_store")
 
 
@@ -101,40 +105,20 @@ class KnowledgeEntry:
         return hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
 
 
-class KnowledgeStore:
+class KnowledgeStore(PgVectorStore):
     """tb_knowledge 기반 지식 베이스 — add/search/list 래퍼.
 
     DB 연결이 없으면 인메모리 폴백으로 동작하여 테스트/개발 환경에서도 쓰인다.
     장기 메모리(tb_memories)와 별도로 운영하여 대용량 지식 데이터가 대화
     히스토리 검색과 섞이지 않게 한다.
+
+    공통 로직(ensure_schema/build_vector_index/count)은 PgVectorStore에서 상속.
     """
 
-    def __init__(self, pg_pool: Any | None = None) -> None:
-        self._pg = pg_pool
-        # 인메모리 폴백: (id → KnowledgeEntry)
-        self._store: dict[str, KnowledgeEntry] = {}
-
-    # ─── 스키마 관리 ──────────────────────────────────
-    async def ensure_schema(self) -> None:
-        """tb_knowledge 테이블과 기본 인덱스를 생성한다 (멱등).
-
-        ivfflat 벡터 인덱스는 데이터 분포가 확보된 뒤 build_vector_index()로
-        따로 만드는 것을 권장 — 초기에는 Seq Scan이 빠르기 때문이다.
-        """
-        if self._pg is None:
-            logger.info("KnowledgeStore: pg_pool 없음 — 스키마 생성 건너뜀 (인메모리 폴백)")
-            return
-        async with self._pg.acquire() as conn:
-            await conn.execute(_DDL_SCHEMA)
-        logger.info("tb_knowledge 스키마 확인/생성 완료")
-
-    async def build_vector_index(self) -> None:
-        """벡터 검색 인덱스(ivfflat)를 만든다. 대량 적재 후 호출 권장."""
-        if self._pg is None:
-            return
-        async with self._pg.acquire() as conn:
-            await conn.execute(_DDL_IVFFLAT)
-        logger.info("tb_knowledge 벡터 인덱스 생성 완료 (ivfflat cosine)")
+    # PgVectorStore 계약 — 베이스가 DDL 실행과 COUNT 쿼리에 사용한다.
+    TABLE_NAME = "tb_knowledge"
+    DDL_SCHEMA = _DDL_SCHEMA
+    DDL_IVFFLAT = _DDL_IVFFLAT
 
     # ─── 쓰기 ───────────────────────────────────────
     async def add(self, entry: KnowledgeEntry) -> str:
@@ -309,18 +293,7 @@ class KnowledgeStore:
         ]
 
     # ─── 운영 유틸 ──────────────────────────────────
-    async def count(self, source: str | None = None) -> int:
-        """전체 또는 특정 소스 레코드 수."""
-        if self._pg is None:
-            if source is None:
-                return len(self._store)
-            return sum(1 for e in self._store.values() if e.source == source)
-        async with self._pg.acquire() as conn:
-            if source is None:
-                return await conn.fetchval("SELECT COUNT(*) FROM tb_knowledge")
-            return await conn.fetchval(
-                "SELECT COUNT(*) FROM tb_knowledge WHERE source = $1", source
-            )
+    # count()는 PgVectorStore에서 상속한다.
 
     async def list_sources(self) -> list[dict[str, Any]]:
         """적재된 소스별 문서 수 요약."""
@@ -337,27 +310,8 @@ class KnowledgeStore:
 
 
 # ─────────────────────────────────────────────
-# 헬퍼
+# 헬퍼 — _format_vector / _cosine은 core.rag.pgvector_base에서 import (위 상단)
 # ─────────────────────────────────────────────
-def _format_vector(vec: list[float] | tuple[float, ...] | None) -> str | None:
-    """pgvector의 VECTOR 타입은 '[v1,v2,...]' 문자열 형식을 받는다."""
-    if vec is None:
-        return None
-    return "[" + ",".join(f"{x:.6f}" for x in vec) + "]"
-
-
-def _cosine(a: list[float], b: list[float] | tuple[float, ...]) -> float:
-    """인메모리 폴백용 코사인 유사도. numpy 의존 없이 순수 파이썬."""
-    if not a or not b or len(a) != len(b):
-        return 0.0
-    dot = sum(x * y for x, y in zip(a, b, strict=False))
-    na = (sum(x * x for x in a)) ** 0.5
-    nb = (sum(y * y for y in b)) ** 0.5
-    if na == 0 or nb == 0:
-        return 0.0
-    return dot / (na * nb)
-
-
 def _inmemory_search(
     store: dict[str, KnowledgeEntry],
     embedding: list[float],

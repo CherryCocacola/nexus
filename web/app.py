@@ -113,6 +113,140 @@ def _resolve_tenant(
     return found
 
 
+def _build_transcript(session_id: str) -> Any:
+    """세션 ID별 SessionTranscript 인스턴스를 만든다. config 실패 시 None 반환.
+
+    /v1/chat과 /v1/chat/stream 두 핸들러에서 중복되던 로직을 한 지점으로 모음
+    (2026-04-21 리팩토링).
+    """
+    try:
+        from core.memory.transcript import SessionTranscript as _Trans
+        cfg = _app_state.get("config")
+        sessions_dir = cfg.session.sessions_dir if cfg else ".nexus/sessions"
+        transcript_enabled = cfg.session.transcript_enabled if cfg else True
+        return _Trans(
+            sessions_dir=sessions_dir,
+            session_id=session_id,
+            enabled=transcript_enabled,
+        )
+    except Exception as e:
+        logger.warning("트랜스크립트 생성 실패 (%s): %s", session_id, e)
+        return None
+
+
+# ─────────────────────────────────────────────
+# 웹 QueryEngine 조립 헬퍼 (2026-04-21 리팩토링 3)
+# ─────────────────────────────────────────────
+# lifespan() 한 함수에 뭉쳐 있던 Scout 풀 합치기·시스템 프롬프트 빌드·ModelDispatcher
+# 구성을 독립 함수로 분리해 가독성과 테스트 용이성을 확보한다.
+def _combine_scout_pool(web_tools: list, scout_tools: list) -> list:
+    """웹 도구 + Scout 도구를 name 중복 제거 후 하나의 풀로 합친다."""
+    combined: list = []
+    seen: set[str] = set()
+    for t in [*web_tools, *scout_tools]:
+        if t.name not in seen:
+            combined.append(t)
+            seen.add(t.name)
+    return combined
+
+
+def _load_worker_system_prompt(agent_registry: Any | None) -> str:
+    """
+    Worker 시스템 프롬프트를 `web/prompts/worker_system.md`에서 로드하고
+    AgentRegistry로부터 서브에이전트 가이드를 동적으로 추가한다.
+
+    프롬프트 파일이 없거나 읽기에 실패해도 안전한 폴백 문자열을 돌려준다.
+    """
+    prompt_path = Path(__file__).parent / "prompts" / "worker_system.md"
+    try:
+        base = prompt_path.read_text(encoding="utf-8")
+    except OSError as e:
+        logger.warning("Worker 프롬프트 파일 읽기 실패 (%s): %s", prompt_path, e)
+        base = (
+            "You are Nexus, the Worker agent developed by IDINO.\n"
+            "Respond in the user's language. Be helpful and detailed."
+        )
+
+    if agent_registry is not None and len(agent_registry) > 0:
+        agent_lines = [
+            f"  - {name}: {desc}"
+            for name, desc in agent_registry.list_descriptions().items()
+        ]
+        base += (
+            "\n\n## Sub-agents (Agent tool)\n"
+            "Delegate specialized tasks to sub-agents via the Agent tool.\n"
+            "Available sub-agents:\n"
+            + "\n".join(agent_lines)
+            + "\n\nWhen to use sub-agents:\n"
+            "  - Simple questions or greetings → answer directly, NO tools\n"
+            "  - Single file task → use Read/Edit/Write directly\n"
+            "  - Broad project exploration → Agent(subagent_type=\"scout\")\n"
+            "NEVER invoke scout for trivial tasks — it is slow (~30s on CPU)."
+        )
+    return base
+
+
+def _build_web_query_engine(components: dict, state: Any) -> Any:
+    """
+    Phase 2 부트스트랩 결과를 받아 웹 전용 QueryEngine을 조립한다.
+
+    독립 함수로 분리한 이유 (2026-04-21 리팩토링):
+      - lifespan()이 한 함수에 너무 많은 책임을 짊어졌던 것을 분해
+      - 단위 테스트에서 mock components로 QueryEngine 조립 경로를 검증 가능
+
+    반환값: (query_engine, web_dispatcher, combined_pool) — _app_state에 저장할 것들.
+    """
+    from core.bootstrap import _create_web_tool_registry
+    from core.orchestrator.model_dispatcher import ModelDispatcher
+    from core.orchestrator.query_engine import QueryEngine
+    from core.tools.base import ToolUseContext
+
+    web_registry = _create_web_tool_registry()
+    web_tools = web_registry.get_all_tools()
+    scout_tools = components.get("scout_tools") or []
+    combined_pool = _combine_scout_pool(web_tools, scout_tools)
+
+    # AgentTool·SymbolSearchTool이 해석할 의존성 일체를 options에 주입
+    web_context = ToolUseContext(
+        cwd=state.cwd or ".",
+        session_id=state.session_id,
+        permission_mode=state.permission_mode.value,
+        options={
+            "memory_manager": components.get("memory_manager"),
+            "task_manager": components.get("task_manager"),
+            "agent_registry": components.get("agent_registry"),
+            "model_provider": components["model_provider"],
+            "scout_provider": components.get("scout_provider"),
+            "available_tools": combined_pool,
+            "symbol_store": components.get("symbol_store"),  # Phase 10.0
+        },
+    )
+
+    web_dispatcher = ModelDispatcher(
+        tier=components["hardware_tier"],
+        worker_provider=components["model_provider"],
+        worker_tools=web_tools,
+        context=web_context,
+        scout_provider=components.get("scout_provider"),
+        scout_tools=scout_tools,
+        max_turns=200,
+    )
+
+    engine = QueryEngine(
+        model_provider=components["model_provider"],
+        tools=web_tools,
+        context=web_context,
+        model_dispatcher=web_dispatcher,
+        context_manager=components.get("context_manager"),
+        memory_manager=components.get("memory_manager"),
+        knowledge_retriever=components.get("knowledge_retriever"),
+        system_prompt=_load_worker_system_prompt(components.get("agent_registry")),
+        max_turns=200,
+        routing_config=state.config.routing,
+    )
+    return engine, web_dispatcher, web_registry
+
+
 # ─────────────────────────────────────────────
 # 요청/응답 모델 (Pydantic v2)
 # ─────────────────────────────────────────────
@@ -225,132 +359,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # 웹 전용 QueryEngine — 도구 8개로 축소 (토큰 예산 관리)
         # RTX 5090 (8192 ctx)에서 도구 24개(~6,102토큰)는 컨텍스트 초과.
         # 핵심 도구 8개(~1,851토큰)만 사용하여 입력+출력 공간 확보.
-        from core.bootstrap import _create_web_tool_registry
-        from core.orchestrator.model_dispatcher import ModelDispatcher
-        from core.orchestrator.query_engine import QueryEngine
-        from core.tools.base import ToolUseContext
-
-        web_registry = _create_web_tool_registry()
-        web_tools = web_registry.get_all_tools()
-
-        # Scout 후보 도구 풀 — 웹 도구 + Scout 도구 (중복 제거, name 기준)
-        scout_tools = components.get("scout_tools") or []
-        combined_pool: list = []
-        seen_names: set[str] = set()
-        for t in [*web_tools, *scout_tools]:
-            if t.name not in seen_names:
-                combined_pool.append(t)
-                seen_names.add(t.name)
-
-        # AgentTool이 해석할 의존성을 모두 options에 주입한다
-        web_context = ToolUseContext(
-            cwd=state.cwd or ".",
-            session_id=state.session_id,
-            permission_mode=state.permission_mode.value,
-            options={
-                "memory_manager": components.get("memory_manager"),
-                "task_manager": components.get("task_manager"),
-                "agent_registry": components.get("agent_registry"),
-                "model_provider": components["model_provider"],
-                "scout_provider": components.get("scout_provider"),
-                "available_tools": combined_pool,
-                # Phase 10.0 — SymbolSearchTool이 조회하는 경로
-                "symbol_store": components.get("symbol_store"),
-            },
-        )
-        # 웹 전용 ModelDispatcher — Scout 자동 전처리는 Phase 3에서 제거됨.
-        # 웹 경로에서도 Worker는 필요 시 AgentTool로 Scout를 호출한다.
-        web_dispatcher = ModelDispatcher(
-            tier=components["hardware_tier"],
-            worker_provider=components["model_provider"],
-            worker_tools=web_tools,
-            context=web_context,
-            scout_provider=components.get("scout_provider"),
-            scout_tools=scout_tools,
-            max_turns=200,
+        # (2026-04-21 리팩토링 3: 인라인 조립 로직을 _build_web_query_engine으로 분리)
+        web_engine, web_dispatcher, web_registry = _build_web_query_engine(
+            components, state
         )
         _app_state["model_dispatcher"] = web_dispatcher
-
-        # 웹 시스템 프롬프트 — 서브에이전트 가이드를 동적 주입
-        agent_registry = components.get("agent_registry")
-        agent_guide = ""
-        if agent_registry is not None and len(agent_registry) > 0:
-            agent_lines = [
-                f"  - {name}: {desc}"
-                for name, desc in agent_registry.list_descriptions().items()
-            ]
-            agent_guide = (
-                "\n\n## Sub-agents (Agent tool)\n"
-                "Delegate specialized tasks to sub-agents via the Agent tool.\n"
-                "Available sub-agents:\n"
-                + "\n".join(agent_lines)
-                + "\n\nWhen to use sub-agents:\n"
-                "  - Simple questions or greetings → answer directly, NO tools\n"
-                "  - Single file task → use Read/Edit/Write directly\n"
-                "  - Broad project exploration → Agent(subagent_type=\"scout\")\n"
-                "NEVER invoke scout for trivial tasks — it is slow (~30s on CPU)."
-            )
-
-        web_engine = QueryEngine(
-            model_provider=components["model_provider"],
-            tools=web_tools,
-            context=web_context,
-            model_dispatcher=web_dispatcher,
-            context_manager=components.get("context_manager"),  # Ch 6 티어별 전략
-            memory_manager=components.get("memory_manager"),  # Ch 16 Redis+PG 저장
-            knowledge_retriever=components.get("knowledge_retriever"),  # Part 2.5.8
-            # transcript는 세션별로 다르므로 요청 핸들러에서 동적으로 주입한다
-            system_prompt=(
-                "You are Nexus, the Worker agent developed by IDINO.\n"
-                "You are a 27B model — the brain of the system. Scout (a 4B "
-                "assistant) handles all file exploration for you.\n\n"
-                "## Your tools (execution only)\n"
-                "- Edit: edit an existing file\n"
-                "- Write: create a new file (ONLY when the user explicitly asks)\n"
-                "- Bash: run a shell command\n"
-                "- Agent: delegate exploration to Scout (subagent_type='scout')\n\n"
-                "You do NOT have Read/Glob/Grep/LS/DocumentProcess. Scout does.\n"
-                "When you need ANY file information — reading, searching, listing, "
-                "analyzing documents (.pdf/.docx/.xlsx/.hwp/.pptx) — delegate to Scout:\n"
-                "  Agent(prompt='<what you need>', subagent_type='scout')\n\n"
-                "## Handling Scout's response (markdown sections)\n"
-                "Scout returns a markdown report with 4 sections:\n"
-                "  ## relevant_files — list of file paths\n"
-                "  ## file_summaries — one-liner per file\n"
-                "  ## plan — bullet list of the key facts you need\n"
-                "  ## requires_tools — tools you may need to execute\n\n"
-                "Read the ## plan section carefully — those bullets are the factual "
-                "ground truth extracted from the file. Use them as source material. "
-                "Then write a detailed, natural-language answer in the user's "
-                "language (Korean if the user wrote Korean). You have 27B "
-                "intelligence — turn Scout's raw facts into a rich, well-structured "
-                "response.\n\n"
-                "## CRITICAL — Scout invocation limit\n"
-                "You may call Agent(subagent_type='scout') AT MOST ONCE per user "
-                "turn. After Scout returns, you MUST answer the user with whatever "
-                "information Scout provided, even if the plan is sparse. NEVER "
-                "call Scout a second time in the same turn — this creates a loop.\n"
-                "If Scout's plan looks incomplete, work with what you have and tell "
-                "the user in Korean what you found plus any caveats (e.g. '문서의 "
-                "일부만 요약됐을 수 있습니다'). Asking Scout again will not help.\n\n"
-                "## When NOT to use tools\n"
-                "- Greetings, general knowledge, conversational — answer directly\n"
-                "- Questions you already have full context for — answer directly\n\n"
-                "## Hard rules\n"
-                "- NEVER create a file the user didn't ask for (no fake logs, no "
-                "placeholder files)\n"
-                "- NEVER try to Read/Glob/Grep/LS — you don't have those tools, "
-                "those calls will fail. Delegate to Scout instead.\n"
-                "- If the user attached a text file (content inline in user message "
-                "as `[첨부파일: NAME]`), the file content is ALREADY in your context. "
-                "Answer from that inline content directly — do NOT delegate to Scout.\n\n"
-                "Respond in the user's language. Be helpful and detailed.\n"
-                "Do NOT output your thinking process."
-                + agent_guide
-            ),
-            max_turns=200,
-            routing_config=state.config.routing,  # v7.0 Part 2.5 — 지식/도구 분기
-        )
         _app_state["query_engine"] = web_engine
         logger.info(
             "웹 서버 부트스트랩 완료 (Phase 1 + 2, 웹 도구 %d개)",
@@ -419,26 +432,16 @@ async def chat(
             usage=UsageInfo(),
         )
 
-    # Ch 16: 비스트리밍 경로도 세션 ID와 트랜스크립트를 주입한다
-    engine._session_id = session_id
-    # 멀티테넌시: 이 요청의 tenant를 context.options에 주입 (SymbolSearch/RAG 등이 참조)
+    # Ch 16 + 리팩토링 2: 세션/tenant/transcript를 공식 bind_request로 한 번에 주입
+    transcript = _build_transcript(session_id)
+    engine.bind_request(
+        session_id=session_id,
+        tenant=tenant,
+        transcript=transcript,
+    )
     if tenant is not None:
-        engine._context.options["tenant"] = tenant
         logger.info("tenant 해석: %s (sources=%s)", tenant.id,
                     tenant.allowed_knowledge_sources)
-    try:
-        from core.memory.transcript import SessionTranscript as _Trans
-        cfg = _app_state.get("config")
-        sessions_dir = cfg.session.sessions_dir if cfg else ".nexus/sessions"
-        transcript_enabled = cfg.session.transcript_enabled if cfg else True
-        engine._transcript = _Trans(
-            sessions_dir=sessions_dir,
-            session_id=session_id,
-            enabled=transcript_enabled,
-        )
-    except Exception as e:
-        logger.warning("트랜스크립트 주입 실패 (%s): %s", session_id, e)
-        engine._transcript = None
 
     # Ch 16: Redis에서 해당 세션의 이전 히스토리 복원
     memory_manager = _app_state.get("memory_manager")
@@ -576,12 +579,15 @@ async def chat_stream(
             logger.warning("트랜스크립트 주입 실패 (%s): %s", session_id, e)
             engine._transcript = None
 
-        # Ch 16: QueryEngine의 세션 ID를 요청 세션으로 교체 — MemoryManager 키 정합성
-        # (웹은 싱글톤 QueryEngine을 공유하므로 매 요청마다 덮어써야 한다)
-        engine._session_id = session_id
-        # 멀티테넌시: 요청의 tenant를 context.options에 주입 (SymbolSearch/RAG 참조)
+        # 리팩토링 2: 세션/tenant/transcript를 공식 bind_request로 주입
+        # (이전엔 engine._session_id 등 비공개 필드를 직접 치환 — race condition 위험)
+        transcript = _build_transcript(session_id)
+        engine.bind_request(
+            session_id=session_id,
+            tenant=tenant,
+            transcript=transcript,
+        )
         if tenant is not None:
-            engine._context.options["tenant"] = tenant
             logger.info("tenant 해석: %s (sources=%s)", tenant.id,
                         tenant.allowed_knowledge_sources)
 

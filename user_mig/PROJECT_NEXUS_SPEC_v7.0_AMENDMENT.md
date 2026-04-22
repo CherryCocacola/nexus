@@ -1262,6 +1262,68 @@ tenants:
 - `web/app.py` — `_resolve_tenant`, 헤더/Bearer 파싱, per-tenant 호출 카운트
 - `tests/unit/test_tenant_registry.py` (신규, 10 케이스)
 
+#### M7: 테넌트별 LoRA 학습 파이프라인 (2026-04-22 구현)
+
+M1~M6에서 런타임 라우팅·RAG 격리를 확립했으므로, 실제로 테넌트별 LoRA를
+학습하여 배포할 수 있는 파이프라인을 추가한다. 같은 베이스 모델
+(`qwen3.5-27b`) 위에 학교·기업별 어댑터를 분리 학습해 `nexus-{tenant}-phaseN`
+으로 vLLM에 등록한다.
+
+**네이밍 규약** (`training/adapter_naming.py`):
+| tenant_id | phase | adapter_name | output_dir |
+|---|---|---|---|
+| `default` / `None` | 3 | `nexus-phase3` | `/opt/nexus-gpu/checkpoints/qwen35-phase3` |
+| `dongguk` | 3 | `nexus-dongguk-phase3` | `/opt/nexus-gpu/checkpoints/qwen35-dongguk-phase3` |
+| `hanyang` (+ `adapter_name_prefix="hy-custom"`) | 4 | `hy-custom-phase4` | (output_dir은 tenant_id 기준 유지) |
+
+- `default` 테넌트는 접두를 생략해 **기존 운영(nexus-phase3)과 호환** 유지
+- `tenant_id`는 DNS label 수준 문자셋(`[a-z0-9][a-z0-9\-_]{0,62}`)으로 제한 →
+  경로·URL 섞어 써도 안전
+- `adapter_name_prefix`는 계약상 브랜딩·커스텀 이름 규칙이 필요할 때 우선 적용
+
+**데이터·체크포인트 경로**:
+```
+/opt/nexus-gpu/training/
+  bootstrap_data.jsonl                      # default 학습 데이터 (기존)
+  {tenant_id}/bootstrap_data.jsonl          # 테넌트별 격리 데이터
+
+/opt/nexus-gpu/checkpoints/
+  qwen35-phase3/                            # default 체크포인트 (기존)
+  qwen35-{tenant_id}-phase3/                # 테넌트별 체크포인트
+```
+
+**신규/수정 파일**:
+- `training/adapter_naming.py` (신규) — `normalize_tenant_id`,
+  `compose_adapter_name`, `compose_output_dir`, `compose_data_path`
+- `training/trainer.py` — `TrainingConfig.tenant_id`, `.phase` 필드 + 해석
+  메서드 `resolved_output_dir()`, `resolved_adapter_name()`, `to_dict()`에
+  M7 필드 포함
+- `core/config.py` — `TenantConfig.adapter_name(phase)` 편의 메서드 +
+  `adapter_name_prefix` 옵션 필드
+- `scripts/train_tenant_lora.py` (신규) — `--tenant-id`, `--phase`, `--data-path`,
+  `--dry-run` CLI. GPU 서버에서 실행하면 경로·이름을 자동 해석하고 학습 후
+  `metadata.json`에 `tenant_id`·`adapter_name` 기록
+- `tests/unit/test_adapter_naming.py` (신규, 36 케이스) — 네이밍 규약·폴백·
+  오류 경계·TrainingConfig 통합 검증
+
+**vLLM 핫스왑 통합 (운영 지침)**:
+```bash
+# 기존 default 어댑터 유지 + 테넌트 어댑터 추가 등록
+vllm ... \
+  --lora-modules \
+      nexus-phase3=/opt/nexus-gpu/checkpoints/qwen35-phase3 \
+      nexus-dongguk-phase3=/opt/nexus-gpu/checkpoints/qwen35-dongguk-phase3
+```
+
+테넌트의 `TenantConfig.model_override = "nexus-dongguk-phase3"`만 채우면 M3
+라우팅에서 KNOWLEDGE 질의가 자동으로 해당 어댑터로 전환된다.
+
+**하위 호환**:
+- `TrainingConfig(output_dir=...)` 직접 지정은 그대로 유효 — `resolved_*` 메서드가
+  `tenant_id`/`phase` 둘 중 하나라도 None이면 원본 값을 돌려준다
+- 기존 `scripts/train_qwen_lora_phase3.py`는 제거하지 않음 — default 테넌트만
+  필요한 경우 여전히 사용 가능
+
 ### Ch 16: Session Management (2026-04-21 구현)
 
 **구현 상태**: Ch 16 세션 영속화가 완료되어 서버 재기동 후에도 대화 맥락이
@@ -1683,3 +1745,58 @@ H100 → H200:
 *작성일: 2026-04-16*
 *Project Nexus — IDINO*
 *기준 문서: PROJECT_NEXUS_SPEC_v6.1_EN.md*
+
+---
+
+## Part 9: 리팩토링 노트 (2026-04-21 ~ 2026-04-22)
+
+M1~M7 완수 직후, 코드가 초보자도 이해할 수 있는 구조인지 점검하고 중복·과
+책임 파일을 분해했다. 기능 변경은 없으며 전부 **내부 구조 개선**이다.
+
+### 리팩토링 1 — `QueryEngine.submit_message` 분해
+- 기존 210줄의 God-method에서 라우팅/프롬프트 조립을 추출
+- **신규**: `core/orchestrator/routing.py` — `QueryClassifier` ABC +
+  `HeuristicClassifier`, `RoutingDecision` frozen dataclass, `RoutingResolver`
+- **신규**: `core/orchestrator/prompt_assembler.py` — `PromptAssembler.assemble()`
+  가 `base_prompt + TurnState + Project RAG + Knowledge RAG`를 한 지점에서 누적
+- 결과: `submit_message()`가 ~50줄로 축소, 각 단계는 독립 모듈에서 단위 테스트 가능
+
+### 리팩토링 2 — `QueryEngine.bind_request` 공식 메서드
+- 웹 핸들러가 `engine._session_id`, `engine._transcript` 등 비공개 속성을 직접
+  치환하며 race condition 위험이 있었음
+- **추가**: `QueryEngine.bind_request(session_id, tenant, transcript, restore_messages)`
+  — 요청 진입 시 1회 호출로 세션/테넌트/트랜스크립트를 원자적으로 바인딩
+
+### 리팩토링 3 — 웹 lifespan 분해 + 프롬프트 외부화
+- 130줄의 인라인 부트스트랩을 `_build_web_query_engine(components, state)`로 분리
+- 50줄의 인라인 Worker 시스템 프롬프트를 `web/prompts/worker_system.md`로 외부화
+- 운영자가 코드 수정 없이 프롬프트 튜닝 가능
+
+### 리팩토링 4 — QueryClassifier 전략 + YAML 키워드 외부화
+- `routing.tool_keywords` 기본 리스트(~50개)를 `config/nexus_config.yaml`로 이동
+- `RoutingConfig.classifier_type: str = "heuristic"` 필드 신설
+- `routing._CLASSIFIER_REGISTRY` + `build_classifier(routing)` 팩토리 — 향후
+  `llm_classifier`, `embedding_classifier` 등을 등록만 하면 즉시 교체 가능
+- 알 수 없는 타입은 경고 로그 후 heuristic으로 폴백 (fail-safe)
+
+### 리팩토링 5 — `PgVectorStore` 공통 베이스
+- `KnowledgeStore`/`SymbolStore`가 반복하던 로직 추출
+- **신규**: `core/rag/pgvector_base.py`
+  - `format_vector()`, `cosine_similarity()` — 공용 헬퍼
+  - `PgVectorStore` — `TABLE_NAME`, `DDL_SCHEMA`, `DDL_IVFFLAT` 클래스 상수로
+    설정하면 `ensure_schema()`, `build_vector_index()`, `count()` 자동 제공
+- 두 스토어에서 ~80줄씩 중복 제거
+
+### 리팩토링 6 — `tool_keywords` 매칭 규칙 구조화
+- 기존 substring 매칭만으로는 `file`이 `filename`에 오탐되는 한계
+- **신규**: `tool_word_patterns` (단어 경계 `\b`), `tool_regex_patterns` (자유 정규식)
+- `HeuristicClassifier`가 substring → word → regex 순으로 평가하며, 잘못된
+  regex는 경고 로그 후 무시하여 운영 안전성 확보
+
+### 테스트
+- 리팩토링 1~2: 기존 테스트만으로 검증 (시맨틱 변경 없음)
+- 리팩토링 4: `test_query_routing.py` — classifier 팩토리 4 케이스 추가
+- 리팩토링 5: 기존 KnowledgeStore/SymbolStore 테스트 그대로 통과
+- 리팩토링 6: `test_query_routing.py` — 매칭 타입별 5 케이스 추가
+- M7: `test_adapter_naming.py` — 36 케이스 (네이밍 규약·폴백·경계·TrainingConfig)
+- **최종**: 634 → 734 통과 (100개 순증), 전체 리그레션 0 실패

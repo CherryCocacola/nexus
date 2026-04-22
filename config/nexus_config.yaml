@@ -58,6 +58,84 @@ model:
 routing:
   enabled: true
   long_input_threshold: 500   # 이 글자수 이상이면 TOOL_MODE (문서 첨부 간주)
+
+  # 분류기 종류 — 현재 지원: "heuristic" (기본)
+  # 향후 "llm_classifier", "embedding_classifier" 등을 추가할 수 있도록 확장 지점 마련
+  classifier_type: "heuristic"
+
+  # 질의 본문에 아래 키워드 중 하나라도 포함되면 TOOL_MODE로 분류.
+  # 운영자가 코드 변경 없이 튜닝할 수 있도록 yaml에 명시적으로 나열한다
+  # (2026-04-22 리팩토링 4: 외부화). 누락 시 core/config.py의 기본값을 사용.
+  tool_keywords:
+    # 한국어 — 파일/프로젝트/도구 명시 힌트
+    - "파일"
+    - "첨부"
+    - "업로드"
+    - "이 프로젝트"
+    - "코드베이스"
+    - "디렉토리"
+    - "폴더"
+    - "리포지토리"
+    - "리포지터리"
+    - "읽어줘"
+    - "읽어 줘"
+    - "편집해"
+    - "수정해"
+    - "모듈 구조"
+    - "디렉토리 구조"
+    - "프로젝트 구조"
+    # 영어
+    - "file"
+    - "attached"
+    - "upload"
+    - "this project"
+    - "codebase"
+    - "repository"
+    - "directory"
+    - "folder"
+    # 도구 이름 — 괄호 포함(함수 호출 스타일)
+    - "Read("
+    - "Write("
+    - "Edit("
+    - "Bash("
+    - "Glob("
+    - "Grep("
+    - "Agent("
+    - "DocumentProcess"
+    # 도구 이름 — 대문자 + 공백 (Read 도구 / Edit the file 등)
+    - "Read "
+    - "Write "
+    - "Edit "
+    - "Bash "
+    - "Glob "
+    - "Grep "
+    - "Agent "
+    - " LS "
+    # 확장자 힌트 (공백 뒤 경로 패턴)
+    - ".py "
+    - ".md "
+    - ".yaml "
+    - ".json "
+    # 프로젝트 내부 디렉토리 prefix
+    - "core/"
+    - "web/"
+    - "tests/"
+    - "training/"
+    - "deployment/"
+    - "cli/"
+    - "config/"
+    - "scripts/"
+    - "tools/"
+
+  # 단어 경계 매칭 (2026-04-22 리팩토링 6)
+  # substring은 "file"이 "filename"에 오탐하는 한계가 있어, 영어 용어는 여기에 등록한다.
+  # 비어 있으면 단어 경계 규칙을 적용하지 않는다.
+  tool_word_patterns: []
+
+  # 정규식 매칭 — 복잡한 패턴이 필요한 경우에만 사용한다.
+  # 유효성은 운영자 책임 (잘못된 regex는 로드 시 경고 후 무시).
+  tool_regex_patterns: []
+
   knowledge_mode:
     model: "qwen3.5-27b"      # 베이스 — LoRA 어댑터 미적용
     temperature: 0.2

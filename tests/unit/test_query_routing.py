@@ -214,3 +214,117 @@ def test_classify_query_custom_threshold_short_text_stays_knowledge() -> None:
     text = "니체 철학을 풀어서 설명해줘. " * 30
     assert len(text) > 500
     assert classify_query(text, custom) == "KNOWLEDGE"
+
+
+# ─────────────────────────────────────────────
+# 8) classifier 팩토리 — 전략 패턴 확장 지점 (2026-04-22 리팩토링 4)
+# ─────────────────────────────────────────────
+# RoutingConfig.classifier_type 문자열로 어떤 QueryClassifier 구현체가
+# 선택되는지, 알 수 없는 값이 와도 안전하게 heuristic으로 폴백하는지를
+# 검증한다. 새 분류기를 추가할 때 이 테스트가 계약으로 작동한다.
+def test_build_classifier_default_returns_heuristic() -> None:
+    """classifier_type 미지정 시 HeuristicClassifier 인스턴스를 반환."""
+    from core.orchestrator.routing import HeuristicClassifier, build_classifier
+
+    cfg = RoutingConfig()  # classifier_type="heuristic" (기본값)
+    clf = build_classifier(cfg)
+    assert isinstance(clf, HeuristicClassifier)
+
+
+def test_build_classifier_explicit_heuristic() -> None:
+    """classifier_type="heuristic" 명시도 같은 결과를 낸다."""
+    from core.orchestrator.routing import HeuristicClassifier, build_classifier
+
+    cfg = RoutingConfig(classifier_type="heuristic")
+    clf = build_classifier(cfg)
+    assert isinstance(clf, HeuristicClassifier)
+
+
+def test_build_classifier_unknown_type_falls_back_to_heuristic() -> None:
+    """오타/미구현 타입이 들어와도 서버가 죽지 않고 heuristic으로 폴백해야 한다."""
+    from core.orchestrator.routing import HeuristicClassifier, build_classifier
+
+    cfg = RoutingConfig(classifier_type="nonexistent_classifier_xyz")
+    clf = build_classifier(cfg)
+    assert isinstance(clf, HeuristicClassifier)
+
+
+def test_routing_resolver_uses_classifier_type_from_config() -> None:
+    """RoutingResolver가 주입된 config.classifier_type을 존중해야 한다."""
+    from core.orchestrator.routing import HeuristicClassifier, RoutingResolver
+
+    cfg = RoutingConfig(classifier_type="heuristic")
+    resolver = RoutingResolver(cfg)
+    assert isinstance(resolver._classifier, HeuristicClassifier)
+
+
+# ─────────────────────────────────────────────
+# 9) 구조화된 매칭 (2026-04-22 리팩토링 6) — word boundary / regex
+# ─────────────────────────────────────────────
+# substring 매칭은 "file"이 "filename"에 오탐하는 한계가 있다.
+# word-boundary 매칭과 정규식 매칭으로 이를 해소한다.
+def test_word_pattern_matches_whole_word() -> None:
+    """word-boundary 매칭은 단어 경계에서만 TOOL로 분류해야 한다."""
+    cfg = RoutingConfig(
+        enabled=True,
+        long_input_threshold=10_000,
+        tool_keywords=[],
+        tool_word_patterns=["file"],
+    )
+    # 단어 경계에 걸림 → TOOL
+    assert classify_query("Please open this file for me", cfg) == "TOOL"
+    # 더 긴 단어의 부분 → KNOWLEDGE (오탐 방지)
+    assert classify_query("What is a filename", cfg) == "KNOWLEDGE"
+
+
+def test_word_pattern_is_case_insensitive() -> None:
+    """word-boundary 매칭도 대소문자 무시해야 한다."""
+    cfg = RoutingConfig(
+        enabled=True,
+        long_input_threshold=10_000,
+        tool_keywords=[],
+        tool_word_patterns=["read"],
+    )
+    assert classify_query("Please READ the doc", cfg) == "TOOL"
+
+
+def test_regex_pattern_matches_complex_case() -> None:
+    """regex 매칭은 함수 호출 등 복잡 패턴을 구분한다."""
+    cfg = RoutingConfig(
+        enabled=True,
+        long_input_threshold=10_000,
+        tool_keywords=[],
+        tool_regex_patterns=[r"Read\s*\("],
+    )
+    # 괄호 앞 공백 유무 상관없이 모두 잡힘
+    assert classify_query("call Read(path)", cfg) == "TOOL"
+    assert classify_query("call Read (path)", cfg) == "TOOL"
+    # 괄호 없는 경우는 매칭 안 됨
+    assert classify_query("please read the docs", cfg) == "KNOWLEDGE"
+
+
+def test_invalid_regex_is_skipped_not_raising() -> None:
+    """유효하지 않은 regex는 경고 로그 후 무시되고 서버가 죽지 않아야 한다."""
+    cfg = RoutingConfig(
+        enabled=True,
+        long_input_threshold=10_000,
+        tool_keywords=[],
+        tool_regex_patterns=["[invalid(regex"],  # 컴파일 실패 예상
+    )
+    # 예외 없이 KNOWLEDGE로 분류
+    assert classify_query("hello", cfg) == "KNOWLEDGE"
+
+
+def test_all_three_matching_kinds_coexist() -> None:
+    """substring/word/regex가 모두 정의되면 각자 독립적으로 작동한다."""
+    cfg = RoutingConfig(
+        enabled=True,
+        long_input_threshold=10_000,
+        tool_keywords=["첨부"],
+        tool_word_patterns=["file"],
+        tool_regex_patterns=[r"Read\s*\("],
+    )
+    assert classify_query("문서 첨부했어요", cfg) == "TOOL"  # substring
+    assert classify_query("open the file please", cfg) == "TOOL"  # word
+    assert classify_query("call Read(x)", cfg) == "TOOL"  # regex
+    assert classify_query("안녕하세요", cfg) == "KNOWLEDGE"

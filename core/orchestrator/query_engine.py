@@ -29,7 +29,7 @@ import uuid
 from collections.abc import AsyncGenerator
 from typing import Any
 
-from core.config import RoutingConfig, RoutingProfile
+from core.config import RoutingConfig
 from core.message import (
     Message,
     StreamEvent,
@@ -38,59 +38,17 @@ from core.message import (
 )
 from core.model.inference import ModelProvider
 from core.orchestrator.context_manager import ContextManager
+from core.orchestrator.prompt_assembler import PromptAssembler
 from core.orchestrator.query_loop import query_loop
+from core.orchestrator.routing import (
+    RoutingDecision,
+    RoutingResolver,
+    _resolve_profile,  # noqa: F401 — 하위 호환 export
+    classify_query,  # noqa: F401 — 하위 호환 export
+)
 from core.tools.base import BaseTool, ToolUseContext
 
 logger = logging.getLogger("nexus.orchestrator.query_engine")
-
-
-# ─────────────────────────────────────────────
-# v7.0 Part 2.5 — 쿼리 분류기 (2026-04-21)
-# ─────────────────────────────────────────────
-# 짜라투스트라 사건(Phase 3 LoRA가 인문학 지식 표현을 좁힘) 이후 추가된 로직.
-# 실측 A/B 결과: 베이스 Qwen(LoRA OFF) + temp=0.2가 지식 질문에서 압도적 우위.
-# 반대로 도구 호출 질문은 Phase 3 LoRA가 필수 — tool_call 포맷 학습이 담겨 있음.
-# 분류기는 단순 휴리스틱(길이 + 키워드) — 복잡한 LLM 분류기는 오버헤드만 추가.
-def classify_query(user_input: str, routing: RoutingConfig) -> str:
-    """
-    사용자 입력을 "KNOWLEDGE" 또는 "TOOL"로 분류한다.
-
-    분류 규칙:
-      1. enabled=False → 항상 "TOOL" (라우팅 기능 오프)
-      2. 길이가 long_input_threshold 이상 → "TOOL"
-         (문서/로그 첨부는 거의 항상 도구 경로로 처리되어야 함)
-      3. tool_keywords 중 하나 이상 포함 → "TOOL"
-      4. 그 외 → "KNOWLEDGE"
-
-    Args:
-        user_input: 사용자 메시지 원문
-        routing: RoutingConfig (config.routing)
-
-    Returns:
-        "KNOWLEDGE" 또는 "TOOL"
-    """
-    if not routing.enabled:
-        return "TOOL"
-
-    # 1) 길이 기반 — 긴 입력은 첨부/로그 가능성이 높음
-    if len(user_input) >= routing.long_input_threshold:
-        return "TOOL"
-
-    # 2) 키워드 기반 — 대소문자 무시 단순 포함 검사
-    lowered = user_input.lower()
-    for kw in routing.tool_keywords:
-        if kw.lower() in lowered:
-            return "TOOL"
-
-    # 3) 나머지는 일반 지식 질의
-    return "KNOWLEDGE"
-
-
-def _resolve_profile(query_class: str, routing: RoutingConfig) -> RoutingProfile:
-    """분류 결과로 실행 프로필을 골라 돌려준다."""
-    if query_class == "KNOWLEDGE":
-        return routing.knowledge_mode
-    return routing.tool_mode
 
 
 class QueryEngine:
@@ -172,6 +130,14 @@ class QueryEngine:
 
         # v7.0 Part 2.5: 쿼리 라우팅 설정 (None이면 기본값 사용)
         self._routing_config = routing_config or RoutingConfig()
+        # 라우팅·시스템 프롬프트 조립은 별도 객체로 캡슐화 (2026-04-21 리팩토링)
+        # → submit_message()가 조율만 담당, 세부 로직은 Resolver/Assembler가 담당.
+        self._router = RoutingResolver(self._routing_config)
+        self._prompt_assembler = PromptAssembler(
+            turn_state_store=turn_state_store,
+            rag_retriever=rag_retriever,
+            knowledge_retriever=None,  # 아래 setattr 이후 바인딩
+        )
 
         # Ch 16 세션 영속화: MemoryManager와 트랜스크립트
         # - memory_manager: on_turn_end로 Redis 단기 저장 + tb_memories 장기 승격
@@ -183,6 +149,8 @@ class QueryEngine:
         # Part 2.5.8: 지식 RAG — KNOWLEDGE_MODE 진입 시 tb_knowledge에서 검색 주입
         # None이면 주입하지 않음 (tb_knowledge 미구성 환경/테스트)
         self._knowledge_retriever = knowledge_retriever
+        # PromptAssembler에 뒤늦게 knowledge_retriever 바인딩 (생성자 순서 이슈 회피)
+        self._prompt_assembler._knowledge_retriever = knowledge_retriever
 
         # 대화 히스토리 — submit_message() 호출마다 누적
         self._messages: list[Message] = []
@@ -218,25 +186,10 @@ class QueryEngine:
             StreamEvent: 스트리밍 이벤트 (UI 업데이트용)
             Message: assistant/tool_result 메시지 (대화 기록용)
         """
-        # v7.0: TurnState 기반 컨텍스트 복원
-        # TurnStateStore가 있으면 이전 턴의 요약을 시스템 프롬프트에 주입하고,
-        # raw messages는 현재 턴의 사용자 메시지만 유지한다.
-        # 이전 대화 맥락은 TurnState 요약으로 대체된다.
-        effective_system_prompt = self._system_prompt
+        # TurnStateStore가 있으면 raw messages를 비우고 요약만 시스템 프롬프트에 싣는다
+        # (Part 3 상태 외부화). 이 처리는 PromptAssembler의 _attach_turn_state 이전에
+        # 수행해야 한다 — messages 히스토리 정리를 담당하는 건 QueryEngine이다.
         if self._turn_state_store is not None:
-            # 이전 턴 요약을 컨텍스트로 가져온다 (최대 1000토큰)
-            prev_context = self._turn_state_store.get_context(
-                self._session_id, max_tokens=1000
-            )
-            if prev_context:
-                effective_system_prompt = (
-                    self._system_prompt
-                    + "\n\n--- Previous context ---\n"
-                    + prev_context
-                )
-            # messages를 현재 턴만으로 초기화 (이전 raw messages 제거)
-            # 왜: TurnState 요약이 이전 맥락을 대체하므로
-            # raw messages 누적이 불필요하다.
             self._messages.clear()
 
         # 사용자 메시지를 대화 히스토리에 추가
@@ -245,127 +198,44 @@ class QueryEngine:
 
         logger.info(
             "메시지 제출: session=%s, messages=%d개, input='%s'",
-            self._session_id,
-            len(self._messages),
-            user_input[:80],
+            self._session_id, len(self._messages), user_input[:80],
         )
 
-        # RAG: 관련 문서 청크를 시스템 프롬프트에 주입
-        # 사용자 입력을 임베딩으로 변환하여 인덱싱된 청크에서 유사한 것을 검색한다.
-        # 결과를 "--- Relevant files ---" 섹션으로 추가한다.
-        if self._rag_retriever is not None:
-            try:
-                rag_context = await self._rag_retriever.get_context(
-                    user_input, max_tokens=1500
-                )
-                if rag_context:
-                    effective_system_prompt = (
-                        effective_system_prompt
-                        + "\n\n--- Relevant files ---\n"
-                        + rag_context
-                        + "\n--- End of relevant files ---"
-                    )
-            except Exception as e:
-                logger.debug("RAG 검색 실패 (무시): %s", e)
+        # ─── 라우팅 결정 (RoutingResolver) ─────────────────
+        tenant = self._context.options.get("tenant") if self._context else None
+        decision = self._router.resolve(user_input, tenant)
+        if decision.routing_enabled:
+            logger.info(
+                "라우팅: class=%s, model=%s, temp=%.2f, max_tokens=%s, tenant=%s",
+                decision.query_class, decision.model_override,
+                decision.temperature, decision.max_tokens_cap, decision.tenant_id,
+            )
+        else:
+            logger.info("라우팅 비활성 — 프로바이더 기본 설정 사용")
 
-        # v7.0: TurnState 콜백 — query_loop이 턴 완료 시 호출
+        # ─── 시스템 프롬프트 조립 (PromptAssembler) ────────
+        effective_system_prompt = await self._prompt_assembler.assemble(
+            base_prompt=self._system_prompt,
+            session_id=self._session_id,
+            user_input=user_input,
+            decision=decision,
+        )
+
+        # TurnState 저장 콜백 — query_loop이 턴 완료 시 호출
         def _on_turn_complete(turn_state: Any) -> None:
             if self._turn_state_store is not None:
                 self._turn_state_store.save(self._session_id, turn_state)
 
-        # v7.0 Part 2.5: 쿼리 타입 분류 → 프로필 선택
-        # KNOWLEDGE → 베이스 Qwen + temp 0.2 + max_tokens 2048 (일반 지식 QA)
-        # TOOL      → Phase 3 LoRA + temp 0.3 + max_tokens 4096 (도구 호출/프로젝트)
-        # 분류 결과는 로그와 사용량 추적에 남겨 운영자가 오판을 감지할 수 있도록 한다.
-        #
-        # routing_config.enabled=False는 "라우팅 OFF" 모드. 이때는 프로필/프로바이더
-        # 치환을 일체 하지 않고 기본 동작을 따른다. 특히 서브에이전트(Scout 등)는
-        # 자기 전용 프로바이더를 쓰므로 라우팅이 개입하면 model_override로 엉뚱한
-        # 모델명이 주입되어 오작동한다(2026-04-21 α 재진단).
-        if self._routing_config.enabled:
-            query_class = classify_query(user_input, self._routing_config)
-            profile = _resolve_profile(query_class, self._routing_config)
-            active_model_override: str | None = profile.model
-            active_temperature = profile.temperature
-            active_max_tokens_cap: int | None = profile.max_tokens
-            active_enable_thinking: bool | None = profile.enable_thinking
-
-            # 멀티테넌시: tenant.model_override가 있으면 프로필 모델보다 우선 적용.
-            # 이유: tenant 전용 LoRA가 존재하면 QueryEngine이 그 어댑터로 응답해야
-            # 학교/기업별 커스터마이즈가 의미를 갖는다. TOOL 모드에선 Phase LoRA
-            # 호환성이 필요하므로 KNOWLEDGE 질의에만 override를 적용한다.
-            tenant = self._context.options.get("tenant") if self._context else None
-            if (
-                tenant is not None
-                and getattr(tenant, "model_override", None)
-                and query_class == "KNOWLEDGE"
-            ):
-                active_model_override = tenant.model_override
-                logger.info(
-                    "라우팅(tenant): tenant=%s → model=%s",
-                    tenant.id, tenant.model_override,
-                )
-
-            logger.info(
-                "라우팅: class=%s, model=%s, temp=%.2f, max_tokens=%d",
-                query_class,
-                active_model_override,
-                active_temperature,
-                active_max_tokens_cap,
-            )
-
-            # Part 2.5.8: KNOWLEDGE 분류일 때만 tb_knowledge RAG 주입
-            # 일반 지식 질의에 한해 외부 지식 베이스(위키 등)에서 관련 청크를
-            # 검색하여 시스템 프롬프트에 붙인다. TOOL 질의는 도구 호출 흐름이
-            # 우선이므로 주입하지 않는다(지연/컨텍스트 낭비 회피).
-            if query_class == "KNOWLEDGE" and self._knowledge_retriever is not None:
-                try:
-                    # 멀티테넌시 — tenant.allowed_knowledge_sources가 있으면 그 소스만 검색
-                    allowed = None
-                    if tenant is not None:
-                        src = getattr(tenant, "allowed_knowledge_sources", None) or []
-                        # 빈 리스트는 "명시적으로 비허용"이 아니라 "필터 미지정"으로 간주하기
-                        # 위해 None 처리. 단, 명시적 격리를 원하면 tenants.yaml에
-                        # sources=[특정값]을 정의해야 한다.
-                        allowed = list(src) if src else None
-                    kb_ctx = await self._knowledge_retriever.get_context(
-                        user_input, max_tokens=1000,
-                        allowed_sources=allowed,
-                    )
-                    if kb_ctx:
-                        effective_system_prompt = (
-                            effective_system_prompt
-                            + "\n\n--- Knowledge base ---\n"
-                            + kb_ctx
-                            + "\n--- End of knowledge base ---\n"
-                            + "Answer the user using the information above as your "
-                            "primary reference. If the knowledge base does not cover "
-                            "the question, state what you know generally and clearly "
-                            "mark uncertain parts."
-                        )
-                        logger.info("지식 RAG 주입: ~%d자", len(kb_ctx))
-                except Exception as e:
-                    logger.debug("지식 RAG 주입 실패 (무시): %s", e)
-        else:
-            # 라우팅 비활성 — 프로바이더의 기본 설정을 그대로 사용한다
-            active_model_override = None
-            active_temperature = 0.7
-            active_max_tokens_cap = None
-            active_enable_thinking = False
-            logger.info("라우팅 비활성 — 프로바이더 기본 설정 사용")
-
-        # v7.0 Phase 9: dispatcher가 있으면 route() 경유, 없으면 query_loop 직접 호출
-        # dispatcher 경로는 Scout → Worker 2단계(TIER_S)를 포함하며
-        # TIER_M/L에서는 passthrough로 단일 Worker에 직행한다.
+        # ─── Dispatcher / query_loop 경유 ──────────────────
         if self._model_dispatcher is not None:
             stream = self._model_dispatcher.route(
                 messages=self._messages,
                 system_prompt=effective_system_prompt,
                 on_turn_complete=_on_turn_complete,
-                model_override=active_model_override,
-                temperature=active_temperature,
-                max_tokens_cap=active_max_tokens_cap,
-                enable_thinking=active_enable_thinking,
+                model_override=decision.model_override,
+                temperature=decision.temperature,
+                max_tokens_cap=decision.max_tokens_cap,
+                enable_thinking=decision.enable_thinking,
             )
         else:
             # 폴백 — dispatcher 주입이 없는 경우 기존 단일 Worker 경로
@@ -378,10 +248,10 @@ class QueryEngine:
                 context_manager=self._context_manager,
                 max_turns=self._max_turns,
                 on_turn_complete=_on_turn_complete,
-                model_override=active_model_override,
-                temperature=active_temperature,
-                max_tokens_cap=active_max_tokens_cap,
-                enable_thinking=active_enable_thinking,
+                model_override=decision.model_override,
+                temperature=decision.temperature,
+                max_tokens_cap=decision.max_tokens_cap,
+                enable_thinking=decision.enable_thinking,
             )
 
         async for event in stream:
@@ -509,6 +379,48 @@ class QueryEngine:
     def update_system_prompt(self, prompt: str) -> None:
         """시스템 프롬프트를 업데이트한다."""
         self._system_prompt = prompt
+
+    # ─── 요청 단위 바인딩 (2026-04-21 리팩토링) ───
+    def bind_request(
+        self,
+        session_id: str,
+        tenant: Any | None = None,
+        transcript: Any | None = None,
+        restore_messages: list[Message] | None = None,
+    ) -> None:
+        """
+        한 HTTP 요청이 도착했을 때 QueryEngine을 해당 요청에 바인딩한다.
+
+        웹 서버는 QueryEngine을 싱글톤처럼 공유하지만 session/tenant/transcript는
+        요청마다 다르다. 예전엔 `web/app.py`가 `engine._session_id = ...` 식으로
+        비공개 필드를 직접 덮어써서 race condition 위험이 있었다. 이 공식 메서드는
+        그 패턴을 한 지점으로 모아 의도를 명확히 한다.
+
+        **주의**: QueryEngine 인스턴스는 동시 요청에 대해 thread-safe가 아니다.
+        현재 설계는 FastAPI/asyncio 단일 프로세스 순차 처리 가정이다. 진정한 동시
+        요청 처리가 필요해지면 요청당 QueryEngine을 생성하는 팩토리 패턴으로
+        옮겨야 한다 (TODO: core-analysis-specialist 2026-04-21 권고).
+
+        Args:
+            session_id: 이 요청의 세션 ID (Memory/Redis 키 정합성에 사용)
+            tenant: TenantConfig 또는 None
+            transcript: SessionTranscript 인스턴스 또는 None (세션별 동적 주입)
+            restore_messages: 이 요청 시작 시 초기 메시지로 얹을 히스토리.
+                None이면 기존 messages를 유지, [] 이면 clear.
+        """
+        self._session_id = session_id
+        if tenant is not None and self._context is not None:
+            self._context.options["tenant"] = tenant
+            logger.debug(
+                "tenant 바인딩: session=%s, tenant=%s",
+                session_id,
+                getattr(tenant, "id", "?"),
+            )
+        if transcript is not None:
+            self._transcript = transcript
+        if restore_messages is not None:
+            self._messages.clear()
+            self._messages.extend(restore_messages)
 
     def clear_messages(self) -> None:
         """대화 히스토리를 초기화한다 (새 세션 시작)."""
