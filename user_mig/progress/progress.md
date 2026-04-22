@@ -1511,3 +1511,34 @@ v7.0 Phase 9 코드(HardwareTier/TurnState/ModelDispatcher/Scout)는 모듈
 2. M7 후속 — `training/bootstrap_generator.py`에 `--tenant-id` 인자 추가
 3. 테넌트 관리 API — `GET /v1/tenants` 조회 엔드포인트
 4. AgentTool Scout 결과 캐시 (~30s 지연 완화)
+
+---
+
+## v0.14.1 — M7 후속: 부트스트랩 테넌트 분리 (2026-04-22)
+
+v0.14.0 "다음 세션에서 이어갈 후보" 2번 소화.
+
+### 변경
+- **수정** `training/bootstrap_generator.py::BootstrapGenerator.generate()`
+  - `tenant_id: str | None = None` 인자 추가 (키워드 전용 호출 기대)
+  - `normalize_tenant_id()`로 조기 정규화/검증 — 잘못된 값은 `ValueError`로 차단
+  - 출력 경로: `default` → `{output_path}/bootstrap_data.jsonl` (기존 호환),
+    테넌트 → `{output_path}/{tenant_id}/bootstrap_data.jsonl`
+  - 각 샘플 `metadata.tenant_id` 스탬프 — 감사·혼합 학습 시 출처 역추적
+  - stats dict에 `"tenant_id"` 키 추가, 로그 포맷에 `[tenant=...]` 접두
+- **신규** `scripts/generate_bootstrap.py`
+  - `--tenant-id`/`--count`/`--output-root`/`--seed`/`--dry-run` CLI
+  - `scripts/train_tenant_lora.py`와 동일한 경로 규약으로 JSONL 산출
+
+### 테스트
+- `tests/unit/test_training_pipeline.py::TestBootstrapGenerator`에 M7 케이스 4건 추가:
+  1. `tenant_id=None` → 기존 루트 경로 유지 (하위 호환)
+  2. `tenant_id="dongguk"` → `{root}/dongguk/bootstrap_data.jsonl`
+  3. 각 샘플 metadata에 `tenant_id` 스탬프 검증
+  4. 허용 문자셋 위반(한글) → `ValueError` 조기 차단
+- BootstrapGenerator 테스트 9/9 통과, ruff 신규 파일 clean
+  (기존 E501 17건 → 16건, 본 변경은 신규 위반 없음)
+
+### 하위 호환
+- 기존 호출(`generator.generate(count=N, output_path=...)`)은 경로/동작 변경 없음
+- `tenant_id=None`이든 `"default"`든 동일하게 공용 루트로 수렴

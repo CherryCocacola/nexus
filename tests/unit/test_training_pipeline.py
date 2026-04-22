@@ -99,6 +99,59 @@ class TestBootstrapGenerator:
         ):
             assert f1.read() == f2.read()
 
+    # ─────────────────────────────────────────────
+    # M7 — tenant_id 지원 (2026-04-22)
+    # ─────────────────────────────────────────────
+    async def test_generate_default_tenant_uses_root_directory(
+        self, generator, tmp_path
+    ):
+        """tenant_id=None이면 기존 경로(output_path/bootstrap_data.jsonl)를 유지해야 한다."""
+        output_dir = str(tmp_path / "bootstrap")
+        stats = await generator.generate(count=5, output_path=output_dir, tenant_id=None)
+
+        # 하위 호환: 서브디렉토리 없이 output_root 바로 아래에 저장
+        expected = Path(output_dir) / "bootstrap_data.jsonl"
+        assert Path(stats["output_file"]) == expected
+        assert expected.exists()
+        assert stats["tenant_id"] == "default"
+
+    async def test_generate_custom_tenant_goes_to_subdirectory(
+        self, generator, tmp_path
+    ):
+        """tenant_id가 있으면 {output_path}/{tenant_id}/bootstrap_data.jsonl로 격리."""
+        output_dir = str(tmp_path / "bootstrap")
+        stats = await generator.generate(
+            count=5, output_path=output_dir, tenant_id="dongguk"
+        )
+
+        expected = Path(output_dir) / "dongguk" / "bootstrap_data.jsonl"
+        assert Path(stats["output_file"]) == expected
+        assert expected.exists()
+        assert stats["tenant_id"] == "dongguk"
+
+    async def test_generate_stamps_tenant_id_in_sample_metadata(
+        self, generator, tmp_path
+    ):
+        """각 샘플 metadata에 tenant_id가 찍혀야 한다 (감사·분석용)."""
+        output_dir = str(tmp_path / "bootstrap")
+        await generator.generate(
+            count=5, output_path=output_dir, tenant_id="hanyang"
+        )
+
+        path = Path(output_dir) / "hanyang" / "bootstrap_data.jsonl"
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                sample = json.loads(line)
+                assert sample["metadata"]["tenant_id"] == "hanyang"
+
+    async def test_generate_rejects_invalid_tenant_id(self, generator, tmp_path):
+        """허용 문자셋을 벗어난 tenant_id는 ValueError로 조기 차단."""
+        output_dir = str(tmp_path / "bootstrap")
+        with pytest.raises(ValueError):
+            await generator.generate(
+                count=5, output_path=output_dir, tenant_id="동국대"  # 한글 금지
+            )
+
 
 # ─────────────────────────────────────────────
 # DataCollector 테스트

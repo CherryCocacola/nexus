@@ -1134,6 +1134,7 @@ class BootstrapGenerator:
         self,
         count: int = 1000,
         output_path: str = "data/bootstrap/",
+        tenant_id: str | None = None,
     ) -> dict[str, Any]:
         """
         부트스트랩 데이터를 JSONL로 생성한다.
@@ -1143,12 +1144,24 @@ class BootstrapGenerator:
         Args:
             count: 생성할 총 샘플 수
             output_path: 출력 디렉토리 경로
+            tenant_id: M7 멀티테넌시 — 값이 있으면 `{output_path}/{tenant_id}/` 하위에
+                저장하고 각 샘플 metadata에 `tenant_id`를 스탬프한다. None/`"default"`는
+                기존 경로(`{output_path}/bootstrap_data.jsonl`) 그대로 사용해 하위 호환.
 
         Returns:
-            생성 통계: tool_samples, reasoning_samples, total, output_file
+            생성 통계: tool_samples, reasoning_samples, total, output_file, tenant_id
         """
-        # 출력 디렉토리 생성
-        out_dir = Path(output_path)
+        # tenant_id 정규화 — 불허 문자는 ValueError로 조기 차단 (잘못된 경로 생성 방지).
+        # normalize_tenant_id는 None/빈값/'default'를 모두 'default'로 수렴시킨다.
+        from training.adapter_naming import DEFAULT_TENANT_ID, normalize_tenant_id
+        tid = normalize_tenant_id(tenant_id)
+
+        # 출력 디렉토리 해석 — default는 기존 경로, 테넌트는 서브디렉토리로 격리.
+        # 서브디렉토리 격리는 운영자가 `ls data/bootstrap/`만 봐도 테넌트 구분이 되도록
+        # 하고, 학습 스크립트(`scripts/train_tenant_lora.py`)의 기본 데이터 경로 규약과
+        # 모양을 맞추기 위함.
+        base_dir = Path(output_path)
+        out_dir = base_dir if tid == DEFAULT_TENANT_ID else base_dir / tid
         out_dir.mkdir(parents=True, exist_ok=True)
         output_file = out_dir / "bootstrap_data.jsonl"
 
@@ -1188,6 +1201,13 @@ class BootstrapGenerator:
         # 순서를 셔플하여 학습 시 편향 방지
         self._rng.shuffle(samples)
 
+        # M7: 각 샘플 metadata에 tenant_id를 스탬프.
+        # 나중에 공용/테넌트 데이터를 합쳐 학습해도 감사·분석 시 출처를 역추적할 수 있다.
+        # metadata 키가 없는 샘플은 만들어서 주입한다.
+        for s in samples:
+            meta = s.setdefault("metadata", {})
+            meta["tenant_id"] = tid
+
         # JSONL로 저장 — 학습 데이터는 소량이므로 동기 I/O로 충분하다
         with open(output_file, "w", encoding="utf-8") as f:  # noqa: ASYNC230
             for sample in samples:
@@ -1200,10 +1220,13 @@ class BootstrapGenerator:
             "knowledge_samples": knowledge_count,
             "total": len(samples),
             "output_file": str(output_file),
+            "tenant_id": tid,
         }
 
         logger.info(
-            "부트스트랩 데이터 생성 완료: %d개 (도구: %d, 추론: %d, 서브에이전트: %d, 지식: %d) → %s",
+            "부트스트랩 데이터 생성 완료 [tenant=%s]: %d개 "
+            "(도구: %d, 추론: %d, 서브에이전트: %d, 지식: %d) → %s",
+            tid,
             stats["total"],
             stats["tool_samples"],
             stats["reasoning_samples"],
