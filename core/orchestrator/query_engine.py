@@ -254,36 +254,67 @@ class QueryEngine:
                 enable_thinking=decision.enable_thinking,
             )
 
-        async for event in stream:
-            # 사용량 추적 — USAGE_UPDATE 이벤트에서 누적
-            if (
-                isinstance(event, StreamEvent)
-                and event.type == StreamEventType.USAGE_UPDATE
-                and event.usage
-            ):
-                self._cumulative_usage = event.usage
+        # ─── 스트림 소비 ─────────────────────────────────
+        # 이 try/finally 블록은 두 가지를 보장한다:
+        #  1) 정상 종료든 예외든 _finalize_turn이 **반드시** 호출되어 트랜스크립트가
+        #     최소 user 엔트리 한 줄이라도 남는다. 기존 구현은 async for가 예외로
+        #     중단되면 `_finalize_turn`이 스킵되어 "폴더만 있고 transcript.jsonl
+        #     없는 유령 세션"이 생겼다 (2026-04-23 hang 진단).
+        #  2) 예외는 재-raise하여 상위(웹 핸들러)가 인지하게 한다. swallow 금지.
+        finalize_error: BaseException | None = None
+        try:
+            async for event in stream:
+                # 사용량 추적 — USAGE_UPDATE 이벤트에서 누적
+                if (
+                    isinstance(event, StreamEvent)
+                    and event.type == StreamEventType.USAGE_UPDATE
+                    and event.usage
+                ):
+                    self._cumulative_usage = event.usage
 
-            yield event
+                yield event
+        except BaseException as e:  # noqa: BLE001 — 정말로 모두 잡고 싶다
+            # GeneratorExit/CancelledError 포함 — 클라이언트 연결 끊김에도 최소 기록
+            finalize_error = e
+            raise
+        finally:
+            self._total_turns += 1
 
-        self._total_turns += 1
+            if finalize_error is None:
+                logger.info(
+                    "메시지 처리 완료: session=%s, 누적 턴=%d, "
+                    "토큰=%d/%d (input/output)",
+                    self._session_id,
+                    self._total_turns,
+                    self._cumulative_usage.input_tokens,
+                    self._cumulative_usage.output_tokens,
+                )
+            else:
+                logger.warning(
+                    "메시지 처리 중단: session=%s, 누적 턴=%d, error=%s",
+                    self._session_id,
+                    self._total_turns,
+                    type(finalize_error).__name__,
+                )
 
-        logger.info(
-            "메시지 처리 완료: session=%s, 누적 턴=%d, "
-            "토큰=%d/%d (input/output)",
-            self._session_id,
-            self._total_turns,
-            self._cumulative_usage.input_tokens,
-            self._cumulative_usage.output_tokens,
-        )
+            # Ch 16: 턴 종료 훅 — 세션 영속화
+            # (1) MemoryManager.on_turn_end — Redis 단기 + tb_memories 승격
+            # (2) Transcript.append_entry — JSONL 파일에 user/assistant 쌍 기록
+            # 예외 중에도 호출되며 — finalize_error가 있으면 system 에러 엔트리도 남긴다.
+            await self._finalize_turn(user_input, finalize_error=finalize_error)
 
-        # Ch 16: 턴 종료 훅 — 세션 영속화
-        # (1) MemoryManager.on_turn_end — Redis 단기 + 중요도 평가 후 tb_memories 승격
-        # (2) Transcript.append_entry — JSONL 파일에 user/assistant 쌍 기록
-        # 둘 다 실패해도 본류 응답은 이미 yield 완료 상태 — 최대한 안전한 swallow.
-        await self._finalize_turn(user_input)
+    async def _finalize_turn(
+        self,
+        user_input: str,
+        finalize_error: BaseException | None = None,
+    ) -> None:
+        """턴 종료 시 메모리/트랜스크립트 기록을 수행한다 (실패 시 swallow).
 
-    async def _finalize_turn(self, user_input: str) -> None:
-        """턴 종료 시 메모리/트랜스크립트 기록을 수행한다 (실패 시 swallow)."""
+        Args:
+            user_input: 이번 턴의 user 입력(원문)
+            finalize_error: 스트림이 중단된 경우 그 예외. 전달되면 트랜스크립트에
+                role="system" 에러 엔트리도 남겨 hang/에러 세션을 구분할 수 있게 한다.
+        """
         # (1) MemoryManager 연동
         if self._memory_manager is not None:
             try:
@@ -328,6 +359,18 @@ class QueryEngine:
                         content=last_assistant,
                         turn=self._total_turns,
                         usage=usage,
+                    )
+                # 스트림이 비정상 종료됐으면 system 에러 엔트리를 추가로 남긴다.
+                # 이 엔트리가 있으면 "폴더만 있고 파일 없는 hang 세션"과 구분 가능.
+                if finalize_error is not None:
+                    self._transcript.append_entry(
+                        role="system",
+                        content=(
+                            f"[stream aborted] {type(finalize_error).__name__}: "
+                            f"{finalize_error}"
+                        ),
+                        turn=self._total_turns,
+                        extra={"error_type": type(finalize_error).__name__},
                     )
             except Exception as e:
                 logger.warning(

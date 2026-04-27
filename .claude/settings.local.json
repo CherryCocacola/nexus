@@ -47,7 +47,20 @@
       "Bash(where py *)",
       "Bash(grep -l \"TurnState\" core/**/*.py)",
       "Bash(grep -c \"scout_plan\\\\|file_summaries\" core/orchestrator/*.py)",
-      "Bash(:)"
+      "Bash(:)",
+      "Bash(tasklist)",
+      "Bash(wmic process *)",
+      "PowerShell(Get-CimInstance *)",
+      "PowerShell(Get-NetTCPConnection *)",
+      "PowerShell(Get-NetFirewallProfile *)",
+      "PowerShell(Stop-Process *)",
+      "Bash(grep -E \"^\\(web/app\\\\.py|web\\\\\\\\\\\\\\\\app\\\\.py|core|Found\\)\")",
+      "Bash(nohup python *)",
+      "Bash(echo \"pid=$!\")",
+      "Bash(python -m uvicorn web.app:app --host 0.0.0.0 --port 8443 --ssl-keyfile config/ssl/key.pem --ssl-certfile config/ssl/cert.pem)",
+      "Bash(echo \"PID=$!\")",
+      "Bash(cat)",
+      "Read(//tmp/**)"
     ]
   }
 }

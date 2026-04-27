@@ -9,18 +9,23 @@ SSE 스트리밍, 세션 관리, 도구/모델 조회 등을 제공한다.
 엔드포인트:
   POST /v1/chat          — 비스트리밍 채팅
   POST /v1/chat/stream   — SSE 스트리밍 채팅
-  GET  /v1/sessions      — 세션 목록 조회
+  GET  /v1/sessions      — 세션 목록 조회 (title_hint 포함)
+  GET  /v1/sessions/{session_id}/messages — 특정 세션 대화 복원 (Ch 16)
+  DELETE /v1/sessions/{session_id} — 특정 세션 삭제 (Redis + 트랜스크립트)
   GET  /v1/tools         — 도구 목록 조회
   GET  /v1/models        — 모델 목록 조회
+  GET  /v1/tenants       — 테넌트 목록 조회 (멀티테넌시, Part 5 Ch 15)
   GET  /health           — 헬스체크
   GET  /metrics          — 메트릭스 조회
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
+import time
 import uuid
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
@@ -311,6 +316,26 @@ class ModelInfo(BaseModel):
     role: str  # primary, auxiliary, embedding
 
 
+class TenantInfo(BaseModel):
+    """테넌트 정보 (목록 조회용).
+
+    Part 5 Ch 15 멀티테넌시 등록부를 외부에 노출한다.
+    보안상 `api_keys` 원본은 절대 반환하지 않고, 개수(`api_key_count`)만 노출한다.
+    """
+
+    # Pydantic의 model_ 접두사 경고를 막는다 (model_override 필드명 때문).
+    model_config = {"protected_namespaces": ()}
+
+    id: str
+    name: str = ""
+    description: str = ""
+    model_override: str | None = None
+    allowed_knowledge_sources: list[str] = Field(default_factory=list)
+    api_key_count: int = 0  # api_keys 원본은 비노출
+    adapter_name_prefix: str | None = None  # M7
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
 class HealthResponse(BaseModel):
     """헬스체크 응답."""
 
@@ -355,6 +380,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         _app_state["model_provider"] = components.get("model_provider")
         _app_state["memory_manager"] = components.get("memory_manager")  # Ch 16
         _app_state["tenant_registry"] = state.config.tenants  # M2 — 헤더 해석용
+        # v0.14.8: 임베딩 keepalive task — 종료 시 cancel하기 위해 보관
+        _app_state["embedding_keepalive_task"] = components.get(
+            "embedding_keepalive_task"
+        )
 
         # 웹 전용 QueryEngine — 도구 8개로 축소 (토큰 예산 관리)
         # RTX 5090 (8192 ctx)에서 도구 24개(~6,102토큰)는 컨텍스트 초과.
@@ -375,6 +404,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     yield
 
     # 종료: 리소스 정리
+    # v0.14.8 — 임베딩 keepalive task를 깨끗이 취소
+    keepalive = _app_state.get("embedding_keepalive_task")
+    if keepalive is not None and not keepalive.done():
+        keepalive.cancel()
+        try:
+            await keepalive
+        except (asyncio.CancelledError, Exception):
+            # CancelledError 또는 task 내부 예외 모두 swallow — 종료 경로
+            pass
     if _app_state["state"]:
         summary = _app_state["state"].get_session_summary()
         logger.info(f"웹 서버 종료. 세션 요약: {summary}")
@@ -622,30 +660,121 @@ async def chat_stream(
         for msg in restored:
             engine._messages.append(msg)
 
-        # QueryEngine을 통한 전체 에이전트 루프 (도구 사용 포함)
-        async for event in engine.submit_message(request.message):
-            if isinstance(event, StreamEvent):
-                sse_data: dict[str, Any] = {
-                    "type": event.type if isinstance(event.type, str) else event.type.value,
-                    "session_id": engine.session_id,
-                }
-                if event.text:
-                    sse_data["text"] = event.text
-                if event.message:
-                    sse_data["message"] = event.message
-                if event.error_code:
-                    sse_data["error_code"] = event.error_code
-                if event.usage:
-                    sse_data["usage"] = {
-                        "input_tokens": event.usage.input_tokens,
-                        "output_tokens": event.usage.output_tokens,
-                    }
-                if event.stop_reason:
-                    stop_val = event.stop_reason
-                    sse_data["stop_reason"] = (
-                        stop_val if isinstance(stop_val, str) else stop_val.value
+        # ─── 요청 단위 타이밍/관측 로그 ───────────────────
+        # 첨부 파일 경로가 메시지에 포함되면 업로드 케이스로 표시
+        has_attach = (
+            "서버 경로:" in request.message
+            or "[첨부파일:" in request.message
+        )
+        req_start_mono = time.monotonic()
+        event_count = 0
+        stream_abort_error: BaseException | None = None
+
+        logger.info(
+            "SSE 시작: session=%s, message_len=%d, has_attach=%s",
+            session_id, len(request.message), has_attach,
+        )
+
+        # ─── Heartbeat/Producer 분리 구조 ──────────────────
+        # submit_message의 이벤트 yield 사이에 긴 공백(Scout 호출 등)이 있으면
+        # 브라우저/프록시가 연결을 끊거나 사용자가 "무한 로딩"으로 느낀다.
+        # 이벤트는 Queue로 수거하고, 메인 루프는 get에 타임아웃을 걸어 일정 주기
+        # 마다 SSE 주석(`: ping`) 프레임을 전송한다. SSE 주석은 EventSource 클라이언트
+        # 에서 무시되므로 기존 JS 파서에 영향을 주지 않는다.
+        sse_sentinel: tuple[str, Any] = ("done", None)
+        sse_heartbeat_seconds = 20.0  # 20s마다 keep-alive
+
+        event_queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+
+        async def _producer() -> None:
+            """submit_message 스트림을 큐로 옮긴다 (에러까지 포함)."""
+            try:
+                async for ev in engine.submit_message(request.message):
+                    await event_queue.put(("event", ev))
+            except BaseException as e:  # noqa: BLE001 — 모든 예외를 에러 프레임으로
+                await event_queue.put(("error", e))
+            finally:
+                await event_queue.put(sse_sentinel)
+
+        producer_task = asyncio.create_task(_producer())
+        try:
+            while True:
+                try:
+                    kind, payload = await asyncio.wait_for(
+                        event_queue.get(), timeout=sse_heartbeat_seconds
                     )
-                yield f"data: {json.dumps(sse_data, ensure_ascii=False)}\n\n"
+                except TimeoutError:
+                    # 이벤트 공백 → heartbeat. SSE 주석은 data 프레임이 아니므로
+                    # 클라이언트 JSON 파서가 건드리지 않는다.
+                    # (Python 3.11+에서 asyncio.TimeoutError는 builtin TimeoutError의 별칭)
+                    elapsed = time.monotonic() - req_start_mono
+                    yield f": heartbeat {elapsed:.0f}s\n\n"
+                    continue
+
+                if kind == "done":
+                    break
+                if kind == "error":
+                    stream_abort_error = payload
+                    # 에러를 클라이언트가 이해할 수 있는 형태로 변환
+                    err_frame = {
+                        "type": "error",
+                        "session_id": session_id,
+                        "error_code": "stream_aborted",
+                        "message": (
+                            f"{type(payload).__name__}: {payload}"
+                        ),
+                    }
+                    yield (
+                        "data: " + json.dumps(err_frame, ensure_ascii=False)
+                        + "\n\n"
+                    )
+                    break
+
+                event = payload
+                if isinstance(event, StreamEvent):
+                    sse_data: dict[str, Any] = {
+                        "type": event.type if isinstance(event.type, str) else event.type.value,
+                        "session_id": engine.session_id,
+                    }
+                    if event.text:
+                        sse_data["text"] = event.text
+                    if event.message:
+                        sse_data["message"] = event.message
+                    if event.error_code:
+                        sse_data["error_code"] = event.error_code
+                    if event.usage:
+                        sse_data["usage"] = {
+                            "input_tokens": event.usage.input_tokens,
+                            "output_tokens": event.usage.output_tokens,
+                        }
+                    if event.stop_reason:
+                        stop_val = event.stop_reason
+                        sse_data["stop_reason"] = (
+                            stop_val if isinstance(stop_val, str) else stop_val.value
+                        )
+                    yield f"data: {json.dumps(sse_data, ensure_ascii=False)}\n\n"
+                    event_count += 1
+        finally:
+            # producer가 아직 살아 있으면 취소 (클라이언트가 연결을 끊은 경우 등)
+            if not producer_task.done():
+                producer_task.cancel()
+                try:
+                    await producer_task
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001, S110
+                    # producer 취소 시 예외는 이미 stream_abort_error 경로에서 처리됨
+                    pass
+            elapsed_total = time.monotonic() - req_start_mono
+            if stream_abort_error is not None:
+                logger.warning(
+                    "SSE 중단: session=%s, elapsed=%.1fs, events=%d, error=%s",
+                    session_id, elapsed_total, event_count,
+                    type(stream_abort_error).__name__,
+                )
+            else:
+                logger.info(
+                    "SSE 완료: session=%s, elapsed=%.1fs, events=%d",
+                    session_id, elapsed_total, event_count,
+                )
 
         # 이번 턴의 user/assistant 텍스트 메시지만 히스토리에 저장
         # tool_result/tool_use 메시지는 토큰이 크므로 저장하지 않는다
@@ -747,6 +876,161 @@ async def list_sessions() -> dict[str, Any]:
     }
 
 
+@app.get("/v1/sessions/{session_id}/messages")
+async def get_session_messages(session_id: str) -> dict[str, Any]:
+    """
+    특정 세션의 대화 히스토리를 반환한다 (Ch 16 프론트 복원용).
+
+    조회 우선순위:
+      1) Redis 단기 캐시 (TTL 24h) — 가장 최신, JSON 직렬화된 user/assistant 페어
+      2) JSONL 트랜스크립트 (영구 기록) — Redis 만료/없음 시 폴백
+
+    어느 쪽에도 기록이 없으면 404 — UI가 "세션 없음" 분기로 전환할 수 있도록.
+
+    응답:
+      {
+        "session_id": "...",
+        "source": "redis" | "transcript",
+        "messages": [{"role": "user"|"assistant", "content": "...",
+                      "turn": N|None, "ts": ISO-8601|None}, ...],
+        "total": N,
+      }
+
+    경로 파라미터 검증: session_id에 경로 분리자(슬래시/백슬래시/..)가 들어오면
+    거부 — 트랜스크립트 파일 시스템 접근 시 디렉토리 탈출을 막는다.
+    """
+    from fastapi import HTTPException
+
+    # 입력 검증 — 경로 탈출 차단 (파일 시스템 폴백 경로에서만 의미가 있지만
+    # Redis 키 오염 방지 차원에서도 동일하게 적용)
+    if not session_id or any(ch in session_id for ch in ("/", "\\", "..", "\x00")):
+        raise HTTPException(status_code=400, detail="invalid session_id")
+
+    # 1) Redis 우선 (가장 최신 상태)
+    memory_manager = _app_state.get("memory_manager")
+    if memory_manager is not None:
+        try:
+            redis_msgs = await memory_manager.short_term.get_conversation_context(
+                session_id
+            )
+            if redis_msgs:
+                normalized: list[dict[str, Any]] = []
+                for m in redis_msgs:
+                    role = m.get("role")
+                    content = m.get("content")
+                    if role in ("user", "assistant") and content:
+                        normalized.append(
+                            {
+                                "role": role,
+                                "content": content,
+                                "turn": m.get("turn"),
+                                "ts": m.get("ts"),
+                            }
+                        )
+                if normalized:
+                    return {
+                        "session_id": session_id,
+                        "source": "redis",
+                        "messages": normalized,
+                        "total": len(normalized),
+                    }
+        except Exception as e:
+            # Redis 장애는 치명적 아님 — 트랜스크립트 폴백 시도
+            logger.debug("get_session_messages Redis 조회 실패 (%s): %s", session_id, e)
+
+    # 2) JSONL 트랜스크립트 폴백
+    from core.memory.transcript import read_transcript_messages
+
+    cfg = _app_state.get("config")
+    sessions_dir = cfg.session.sessions_dir if cfg else ".nexus/sessions"
+    disk_msgs = read_transcript_messages(sessions_dir, session_id)
+    if disk_msgs:
+        # ts/turn 포함 그대로 반환 (헬퍼가 이미 user/assistant만 필터)
+        return {
+            "session_id": session_id,
+            "source": "transcript",
+            "messages": [
+                {
+                    "role": m["role"],
+                    "content": m["content"],
+                    "turn": m.get("turn"),
+                    "ts": m.get("ts"),
+                }
+                for m in disk_msgs
+            ],
+            "total": len(disk_msgs),
+        }
+
+    # 어느 쪽에도 없음
+    raise HTTPException(status_code=404, detail=f"session not found: {session_id}")
+
+
+@app.delete("/v1/sessions/{session_id}")
+async def delete_session(session_id: str) -> dict[str, Any]:
+    """
+    특정 세션을 Redis(단기) + 트랜스크립트(영구) 양쪽에서 삭제한다 (Ch 16).
+
+    프론트 사이드바의 세션 삭제 버튼이 호출하는 엔드포인트. 각 저장소는
+    독립적이므로 한쪽만 성공해도 응답한다 (best-effort).
+
+    응답:
+      {
+        "session_id": "...",
+        "deleted_redis": bool,     # Redis 키가 실제로 있었고 삭제됐는지
+        "deleted_disk":  bool,     # 트랜스크립트 디렉토리가 있었고 삭제됐는지
+      }
+
+    둘 다 False여도 200 — 이미 없었을 뿐 에러는 아님. 다만 session_id 자체가
+    부적합(슬래시/백슬래시/'..')하면 400.
+    """
+    from fastapi import HTTPException
+
+    if not session_id or any(ch in session_id for ch in ("/", "\\", "..", "\x00")):
+        raise HTTPException(status_code=400, detail="invalid session_id")
+
+    deleted_redis = False
+    deleted_disk = False
+
+    # 1) Redis — clear_session은 존재 여부와 무관하게 DEL을 호출하므로,
+    #    실제 삭제 여부는 사전 존재 조회로 판정한다.
+    memory_manager = _app_state.get("memory_manager")
+    if memory_manager is not None:
+        try:
+            existing = await memory_manager.short_term.get_conversation_context(
+                session_id
+            )
+            if existing:
+                await memory_manager.short_term.clear_session(session_id)
+                deleted_redis = True
+        except Exception as e:
+            # Redis 장애는 치명적 아님 — 디스크 삭제는 독립적으로 시도
+            logger.warning("Redis 세션 삭제 실패 (%s): %s", session_id, e)
+
+    # 2) 디스크 — 트랜스크립트 디렉토리 통째로 제거
+    from core.memory.transcript import delete_transcript_session
+
+    cfg = _app_state.get("config")
+    sessions_dir = cfg.session.sessions_dir if cfg else ".nexus/sessions"
+    try:
+        deleted_disk = delete_transcript_session(sessions_dir, session_id)
+    except ValueError:
+        # delete_transcript_session의 경로 검증 실패 — 이미 위에서 400 처리했지만
+        # 방어적으로 한 번 더
+        raise HTTPException(status_code=400, detail="invalid session_id") from None
+    except OSError as e:
+        logger.warning("트랜스크립트 삭제 실패 (%s): %s", session_id, e)
+
+    logger.info(
+        "세션 삭제: session=%s, redis=%s, disk=%s",
+        session_id, deleted_redis, deleted_disk,
+    )
+    return {
+        "session_id": session_id,
+        "deleted_redis": deleted_redis,
+        "deleted_disk": deleted_disk,
+    }
+
+
 # ─────────────────────────────────────────────
 # 도구 엔드포인트
 # ─────────────────────────────────────────────
@@ -820,6 +1104,50 @@ async def list_models() -> dict[str, Any]:
 
 
 # ─────────────────────────────────────────────
+# 테넌트 목록 엔드포인트 (Part 5 Ch 15)
+# ─────────────────────────────────────────────
+@app.get("/v1/tenants")
+async def list_tenants() -> dict[str, Any]:
+    """등록된 테넌트 목록을 반환한다.
+
+    보안:
+      - `api_keys` 원본은 응답에 포함하지 않는다. 개수(`api_key_count`)만 노출.
+      - 이 엔드포인트는 내부 LAN 관리 용도. 외부 노출 시에는 프록시 단에서
+        인증을 걸어야 한다 (현재 /metrics와 동일한 정책).
+
+    응답 형식:
+        {
+            "tenants": [TenantInfo, ...],
+            "default_tenant": "default",
+            "total": N,
+        }
+    """
+    registry = _app_state.get("tenant_registry")
+    if registry is None:
+        # 레지스트리가 아직 초기화되지 않은 경우 — 빈 목록 반환 (500 대신)
+        return {"tenants": [], "default_tenant": "default", "total": 0}
+
+    tenants = [
+        TenantInfo(
+            id=t.id,
+            name=t.name,
+            description=t.description,
+            model_override=t.model_override,
+            allowed_knowledge_sources=list(t.allowed_knowledge_sources),
+            api_key_count=len(t.api_keys),
+            adapter_name_prefix=t.adapter_name_prefix,
+            metadata=dict(t.metadata),
+        )
+        for t in registry.tenants
+    ]
+    return {
+        "tenants": [t.model_dump() for t in tenants],
+        "default_tenant": registry.default_tenant,
+        "total": len(tenants),
+    }
+
+
+# ─────────────────────────────────────────────
 # 헬스체크 엔드포인트
 # ─────────────────────────────────────────────
 @app.get("/health", response_model=HealthResponse)
@@ -878,6 +1206,8 @@ async def metrics() -> dict[str, Any]:
     from core.tools.implementations.agent_tool import AgentTool
 
     result["agents"] = AgentTool.get_stats()
+    # v0.14.2: Scout 결과 캐시 통계. Scout 반복 호출 회피 효과를 관측한다.
+    result["agent_cache"] = AgentTool.get_cache_stats()
 
     # 하위 호환: 기존 대시보드가 result["scout"]을 참조할 수 있으므로 alias 유지.
     # Scout 자동 전처리가 제거됐으므로 Dispatcher.stats는 0만 반환하지만,

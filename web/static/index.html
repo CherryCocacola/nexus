@@ -178,13 +178,47 @@ body {
   font-size: 13px;
   color: var(--text-secondary);
   margin-bottom: 2px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
   transition: background 0.1s;
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
 .session-item:hover { background: var(--bg-hover); }
 .session-item.active { background: var(--bg-tertiary); color: var(--text-primary); }
+
+/* 세션 항목의 제목 — 긴 텍스트는 말줄임 */
+.session-title {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 세션 삭제 버튼 — 평소엔 숨기고 hover 시 노출 */
+.session-delete-btn {
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  border-radius: 4px;
+  font-size: 14px;
+  line-height: 1;
+  opacity: 0;
+  transition: opacity 0.1s, background 0.1s, color 0.1s;
+}
+.session-item:hover .session-delete-btn,
+.session-item.active .session-delete-btn {
+  opacity: 0.7;
+}
+.session-delete-btn:hover {
+  opacity: 1 !important;
+  background: rgba(220, 38, 38, 0.15);
+  color: #ef4444;
+}
 
 .sidebar-footer {
   padding: 12px 16px;
@@ -574,13 +608,71 @@ let totalOutputTokens = 0;
 window.addEventListener('DOMContentLoaded', () => {
   checkHealth();
   newSession();
+  // Ch 16: 서버에 저장된 과거 세션을 사이드바에 머지
+  loadServerSessions();
+  // 사이드바 클릭 위임 — 인라인 onclick의 escape 취약성 제거 (v0.14.7)
+  setupSessionListDelegation();
   document.getElementById('userInput').focus();
 });
+
+// 사이드바 컨테이너에 단일 click 리스너를 붙여
+// .session-item / .session-delete-btn 클릭을 위임 처리한다.
+// 인라인 onclick + JSON.stringify + escapeHtml 이중 처리는 일부 환경에서
+// 따옴표/특수문자가 깨질 수 있어, 데이터 속성(data-sid) 기반으로 단순화.
+function setupSessionListDelegation() {
+  const list = document.getElementById('sessionList');
+  if (!list) return;
+  list.addEventListener('click', (ev) => {
+    const target = ev.target;
+    // 삭제 버튼이 우선
+    const delBtn = target.closest && target.closest('.session-delete-btn');
+    if (delBtn) {
+      const sid = delBtn.getAttribute('data-sid');
+      console.log('[session] delete click sid=', sid);
+      ev.stopPropagation();
+      if (sid) deleteSession(sid, ev);
+      return;
+    }
+    const item = target.closest && target.closest('.session-item');
+    if (item) {
+      const sid = item.getAttribute('data-sid');
+      console.log('[session] switch click sid=', sid);
+      if (sid) switchSession(sid);
+    }
+  });
+}
+
+// HTML 특수문자 이스케이프 (서버에서 받은 session_id/메시지를 innerHTML에 넣을 때 사용)
+function escapeHtml(s) {
+  if (s === null || s === undefined) return '';
+  return String(s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+// 세션 제목 후보 — 첫 user 메시지 30자 → 없으면 session_id 뒷부분
+function deriveSessionTitle(session) {
+  // 서버에서 title_hint를 받아온 경우 최우선 사용 (파일 한 번 더 읽지 않음)
+  if (session.titleHint) {
+    const t = String(session.titleHint).trim().replace(/\s+/g, ' ');
+    return t.length > 30 ? t.slice(0, 30) + '…' : t;
+  }
+  // 메시지가 이미 로드됐다면 그중 첫 user 메시지를 쓴다
+  const firstUser = (session.messages || []).find(m => m.role === 'user');
+  if (firstUser && firstUser.content) {
+    const t = String(firstUser.content).trim().replace(/\s+/g, ' ');
+    return t.length > 30 ? t.slice(0, 30) + '…' : t;
+  }
+  // session-1776929625 같은 형태면 뒷자리만, UUID면 앞 8자
+  const id = session.id || '';
+  if (id.startsWith('session-')) return id.slice(0, 18);
+  return id.length > 12 ? id.slice(0, 8) + '…' : id;
+}
 
 // ─── 세션 관리 ───
 function newSession() {
   const id = 'session-' + Date.now();
-  const session = { id, title: '새 대화', messages: [] };
+  const session = { id, title: '새 대화', messages: [], source: 'local' };
   sessions.unshift(session);
   currentSessionId = id;
   renderSessionList();
@@ -590,22 +682,145 @@ function newSession() {
   updateTokenDisplay();
 }
 
-function switchSession(id) {
+async function switchSession(id) {
+  console.log('[session] switchSession called id=', id);
   currentSessionId = id;
   renderSessionList();
-  const session = sessions.find(s => s.id === id);
+  let session = sessions.find(s => s.id === id);
   clearMessages();
-  if (session) {
-    session.messages.forEach(m => appendMessage(m.role, m.content, false));
+  if (!session) {
+    console.warn('[session] not in local list — creating shell');
+    session = { id, title: id, messages: [], source: 'server' };
+    sessions.push(session);
+  }
+
+  // 로컬 캐시가 비어 있으면 (source 종류와 무관하게) 무조건 서버에 시도.
+  // 서버에 없으면 404 — 그땐 빈 화면으로 둔다 (새 대화처럼 동작).
+  // v0.14.7: 이전엔 source==='server'일 때만 fetch했으나 race·source 누락 등에서
+  // 안 되는 경우가 있었음. 단순화 — "비어 있으면 일단 서버에 물어본다".
+  if (!session.messages || session.messages.length === 0) {
+    try {
+      const url = `/v1/sessions/${encodeURIComponent(id)}/messages`;
+      console.log('[session] GET', url);
+      const resp = await fetch(url);
+      console.log('[session]   ← status', resp.status);
+      if (resp.ok) {
+        const data = await resp.json();
+        const msgs = (data.messages || []).map(m => ({
+          role: m.role, content: m.content,
+        }));
+        session.messages = msgs;
+        session.title = deriveSessionTitle(session);
+        renderSessionList();
+        console.log('[session] loaded', msgs.length, 'messages from', data.source);
+      } else if (resp.status === 404) {
+        // 새 대화: 사용자에게 굳이 알리지 않는다 (빈 화면이면 충분)
+        console.log('[session] 404 — empty session');
+        return;
+      } else {
+        appendMessage('system', `세션 로드 실패 (HTTP ${resp.status})`, false);
+        return;
+      }
+    } catch (err) {
+      console.error('[session] fetch error', err);
+      appendMessage('system', `세션 로드 오류: ${err && err.message}`, false);
+      return;
+    }
+  }
+
+  session.messages.forEach(m => appendMessage(m.role, m.content, false));
+}
+
+// 페이지 시작 시 서버 세션 목록을 사이드바에 머지한다.
+// 클릭 시점까지 메시지는 로드하지 않음 — 사이드바는 가볍게 유지.
+async function loadServerSessions() {
+  try {
+    const resp = await fetch('/v1/sessions');
+    if (!resp.ok) return;
+    const data = await resp.json();
+    const items = data.sessions || [];
+    const known = new Set(sessions.map(s => s.id));
+    let added = 0;
+    for (const it of items) {
+      const sid = it.session_id;
+      if (!sid || known.has(sid)) continue;
+      const item = {
+        id: sid,
+        titleHint: it.title_hint || null,   // 서버가 계산해준 첫 user 메시지 요약
+        messages: [],                        // 클릭 시점에 lazy-load
+        source: 'server',
+        last_modified: it.last_modified || null,
+        entries: it.entries || null,
+      };
+      item.title = deriveSessionTitle(item);
+      sessions.push(item);
+      added++;
+    }
+    if (added > 0) renderSessionList();
+  } catch (err) {
+    // 서버 세션 머지는 best-effort — 실패해도 신규 채팅은 정상 동작
+    console.warn('서버 세션 목록 로드 실패:', err);
+  }
+}
+
+// 세션 삭제 — 사이드바 X 버튼에서 호출. 서버(Redis + 트랜스크립트) 정리 후
+// 로컬 sessions 배열에서도 제거하고 사이드바를 다시 그린다.
+async function deleteSession(id, event) {
+  // 위임 핸들러가 이미 stopPropagation 했지만 직접 호출 경로 보호용으로 유지
+  if (event && event.stopPropagation) {
+    event.stopPropagation();
+  }
+  const session = sessions.find(s => s.id === id);
+  const label = session ? (session.title || id) : id;
+  if (!confirm(`대화를 삭제하시겠습니까?\n\n${label}`)) return;
+
+  // 서버 세션(과 로컬에서 이미 서버에 저장된 대화)은 DELETE 호출이 필요.
+  // 빈 로컬 세션(아직 서버에 저장된 적 없는 "새 대화")은 서버 호출 생략.
+  const hasServerRecord = !session || session.source === 'server' || (session.messages && session.messages.length > 0);
+  if (hasServerRecord) {
+    try {
+      const resp = await fetch(`/v1/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      if (!resp.ok && resp.status !== 404) {
+        alert(`삭제 실패 (HTTP ${resp.status})`);
+        return;
+      }
+    } catch (err) {
+      alert(`삭제 오류: ${err.message}`);
+      return;
+    }
+  }
+
+  // 로컬 상태 정리
+  const idx = sessions.findIndex(s => s.id === id);
+  if (idx >= 0) sessions.splice(idx, 1);
+
+  // 현재 선택 세션을 지웠다면 새 세션을 연다
+  if (currentSessionId === id) {
+    if (sessions.length > 0) {
+      switchSession(sessions[0].id);
+    } else {
+      newSession();
+    }
+  } else {
+    renderSessionList();
   }
 }
 
 function renderSessionList() {
   const list = document.getElementById('sessionList');
-  list.innerHTML = sessions.map(s =>
-    `<div class="session-item ${s.id === currentSessionId ? 'active' : ''}"
-          onclick="switchSession('${s.id}')">${s.title}</div>`
-  ).join('');
+  // 인라인 onclick 제거 — 컨테이너 위임(setupSessionListDelegation)이 클릭을 잡아간다.
+  // 데이터는 data-sid 속성으로 안전하게 전달 (escape는 escapeHtml 한 번만).
+  list.innerHTML = sessions.map(s => {
+    const cls = s.id === currentSessionId ? 'active' : '';
+    const title = escapeHtml(s.title || s.id);
+    const sid = escapeHtml(s.id);
+    return (
+      `<div class="session-item ${cls}" data-sid="${sid}">
+        <span class="session-title">${title}</span>
+        <button class="session-delete-btn" title="대화 삭제" data-sid="${sid}">×</button>
+       </div>`
+    );
+  }).join('');
 }
 
 function clearMessages() {
@@ -790,6 +1005,12 @@ function escapeHtml(str) {
 }
 
 // ─── 스피너 ───
+// _thinkingStartedAt은 장기 대기 감지용. 60초가 넘으면 안내 문구를 바꿔
+// 사용자가 "무한 로딩"으로 오해하지 않게 한다. _thinkingTimer는 주기 갱신 핸들.
+let _thinkingStartedAt = 0;
+let _thinkingTimer = null;
+const LONG_WAIT_SECONDS = 60;
+
 function showThinking() {
   const welcome = document.getElementById('welcome');
   if (welcome) welcome.remove();
@@ -804,16 +1025,36 @@ function showThinking() {
       <div class="message-sender">Nexus</div>
     </div>
     <div class="thinking">
-      <span>생각하는 중</span>
+      <span id="thinkingLabel">생각하는 중</span>
       <div class="thinking-dots"><span></span><span></span><span></span></div>
     </div>`;
   inner.appendChild(div);
   scrollToBottom();
+
+  // 장기 대기 감지 — 초 단위로 업데이트. 60초 넘으면 문구 전환.
+  _thinkingStartedAt = Date.now();
+  if (_thinkingTimer) clearInterval(_thinkingTimer);
+  _thinkingTimer = setInterval(() => {
+    const label = document.getElementById('thinkingLabel');
+    if (!label) return;
+    const elapsed = Math.floor((Date.now() - _thinkingStartedAt) / 1000);
+    if (elapsed >= LONG_WAIT_SECONDS) {
+      label.textContent =
+        `분석이 오래 걸리고 있습니다 (${elapsed}s). ` +
+        `필요하면 '취소' 버튼을 눌러 중단할 수 있습니다`;
+    } else if (elapsed >= 10) {
+      label.textContent = `생각하는 중 (${elapsed}s)`;
+    }
+  }, 1000);
 }
 
 function hideThinking() {
   const el = document.getElementById('thinkingIndicator');
   if (el) el.remove();
+  if (_thinkingTimer) {
+    clearInterval(_thinkingTimer);
+    _thinkingTimer = null;
+  }
 }
 
 // ─── 스트리밍 메시지 ───
@@ -922,6 +1163,43 @@ function finalizeStreamingMessage() {
 }
 
 // ─── 전송 ───
+// _activeAbortController는 스트리밍 도중 사용자가 '취소'를 눌렀을 때 fetch를
+// 중단하는 AbortController. 취소 시 서버에 의해 producer_task가 CancelledError
+// 로 종료되고 query_engine의 finally 블록에서 트랜스크립트에 에러 엔트리가 남는다.
+let _activeAbortController = null;
+
+function cancelStream() {
+  if (_activeAbortController) {
+    _activeAbortController.abort();
+  }
+}
+
+// 전송 버튼을 '전송'/'취소' 모드로 토글한다. HTML/onclick까지 직접 교체하여
+// 전용 취소 버튼을 추가하지 않고도 같은 자리에서 기능을 스위치한다.
+function setSendButtonMode(mode) {
+  const btn = document.getElementById('sendBtn');
+  if (!btn) return;
+  if (mode === 'cancel') {
+    btn.title = '취소';
+    btn.setAttribute('data-mode', 'cancel');
+    btn.disabled = false;
+    btn.onclick = cancelStream;
+    btn.innerHTML = `
+      <svg viewBox="0 0 24 24" fill="currentColor" stroke="none">
+        <rect x="6" y="6" width="12" height="12" rx="2"/>
+      </svg>`;
+  } else {
+    btn.title = '전송';
+    btn.setAttribute('data-mode', 'send');
+    btn.disabled = false;
+    btn.onclick = sendMessage;
+    btn.innerHTML = `
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="M22 2L11 13M22 2L15 22L11 13L2 9L22 2Z"/>
+      </svg>`;
+  }
+}
+
 async function sendMessage() {
   const input = document.getElementById('userInput');
   let text = input.value.trim();
@@ -941,10 +1219,13 @@ async function sendMessage() {
   appendMessage('user', text);
 
   isStreaming = true;
-  document.getElementById('sendBtn').disabled = true;
+  // 전송 → 취소 모드 전환. 사용자는 같은 버튼으로 중단 가능.
+  setSendButtonMode('cancel');
 
   showThinking();
   let streamStarted = false;
+  let userAborted = false;
+  _activeAbortController = new AbortController();
 
   try {
     const response = await fetch('/v1/chat/stream', {
@@ -954,6 +1235,7 @@ async function sendMessage() {
         message: text,
         session_id: currentSessionId,
       }),
+      signal: _activeAbortController.signal,
     });
 
     const reader = response.body.getReader();
@@ -969,6 +1251,8 @@ async function sendMessage() {
       buffer = lines.pop() || '';
 
       for (const line of lines) {
+        // ':'로 시작하는 라인은 SSE 주석(heartbeat 등). 무시한다.
+        if (line.startsWith(':')) continue;
         if (line.startsWith('data: ')) {
           try {
             const data = JSON.parse(line.substring(6));
@@ -1014,15 +1298,25 @@ async function sendMessage() {
       }
     }
   } catch (error) {
-    if (!streamStarted) startStreamingMessage();
-    appendStreamChunk(`[연결 오류] ${error.message}`);
+    if (error && error.name === 'AbortError') {
+      userAborted = true;
+      if (!streamStarted) startStreamingMessage();
+      appendStreamChunk(`\n[취소됨] 사용자가 요청을 중단했습니다.`);
+    } else {
+      if (!streamStarted) startStreamingMessage();
+      appendStreamChunk(`[연결 오류] ${error.message}`);
+    }
   }
 
   hideThinking();
   if (streamStarted) finalizeStreamingMessage();
   isStreaming = false;
-  document.getElementById('sendBtn').disabled = false;
+  _activeAbortController = null;
+  setSendButtonMode('send');
   input.focus();
+  // 취소로 종료된 경우 사용자가 같은 메시지를 다시 보내도록 입력란에 복원하지는 않는다
+  // (원본 메시지는 이미 화면에 'user' 버블로 남아 있음).
+  void userAborted;
 }
 
 // ─── 헬스체크 ───

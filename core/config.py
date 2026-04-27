@@ -171,6 +171,29 @@ _DEFAULT_TOOL_KEYWORDS: list[str] = [
 ]
 
 
+# ─────────────────────────────────────────────
+# 기본 chat_keywords — 인사·잡담 식별용 (Part 2.5.9, v0.14.6)
+# ─────────────────────────────────────────────
+# kowiki 100만 청크 적재 후 "안녕"·"좋은 아침" 같은 인사도 KNOWLEDGE로 분류되어
+# 가수 "안녕"·"굿모닝 예루살렘" 청크가 RAG로 주입되며 부자연스러운 답변이 발생.
+# CHAT_MODE는 분류기에서만 의미를 가지며 (RoutingProfile 자체는 KNOWLEDGE와 동일
+# 모델을 쓰되) PromptAssembler가 KB RAG 단계를 스킵하도록 신호하는 용도.
+# 길이 임계와 AND 조건으로만 트리거 — 긴 입력이면 인사어가 들어 있어도 CHAT 아님.
+_DEFAULT_CHAT_KEYWORDS: list[str] = [
+    # 한국어 인사·잡담
+    "안녕", "안뇽", "좋은 아침", "좋은 저녁", "좋은 밤", "굿모닝", "굿나잇",
+    "잘 자", "잘자", "반가워", "반갑습니다", "반갑네",
+    "고마워", "고맙습니다", "감사", "땡큐",
+    "잘 가", "잘가", "다음에 봐", "다음에 보자",
+    "별거 없", "ㅋㅋ", "ㅎㅎ",
+    # 영어 인사·잡담
+    "hi", "hello", "hey", "yo", "sup",
+    "good morning", "good evening", "good night",
+    "thanks", "thank you", "thx", "ty",
+    "bye", "goodbye", "see you", "cya",
+]
+
+
 class RoutingProfile(BaseModel):
     """개별 라우팅 프로필 — 질의 타입별 모델/파라미터 조합."""
 
@@ -187,11 +210,13 @@ class RoutingConfig(BaseModel):
     """
     질의 타입별 라우팅 설정.
 
-    분류 규칙:
+    분류 규칙 (v0.14.6, Part 2.5.9):
       1. user_input 길이가 long_input_threshold 이상 → TOOL_MODE
          (첨부 문서/로그 분석 시나리오로 간주)
       2. tool_keywords 중 하나라도 포함 → TOOL_MODE
-      3. 그 외 → KNOWLEDGE_MODE (일반 QA)
+      3. user_input 길이가 chat_max_length 이하 AND chat_keywords 중 하나라도
+         포함 → CHAT_MODE (인사·잡담, KB RAG 미주입)
+      4. 그 외 → KNOWLEDGE_MODE (일반 QA, KB RAG 주입)
 
     enabled=False이면 분류기를 돌리지 않고 항상 tool_mode 프로필을 사용한다
     (하드웨어 업그레이드 또는 문제 발생 시 비상 스위치).
@@ -216,6 +241,13 @@ class RoutingConfig(BaseModel):
     # 정규식 매칭 — 복잡한 패턴이 필요한 경우 (예: 함수 호출 `Read\s*\(`).
     # 운영자 책임으로 유효한 regex를 제공 — 잘못된 regex는 로드 시 경고 후 무시.
     tool_regex_patterns: list[str] = Field(default_factory=list)
+    # CHAT_MODE 식별 임계 (Part 2.5.9, v0.14.6).
+    # 입력이 짧고(chat_max_length 이하) 인사 어휘가 포함되면 CHAT으로 본다.
+    # 너무 길게 잡으면 일반 지식 질의가 잡담으로 오분류될 수 있어 보수적으로 30자.
+    chat_max_length: int = 30
+    chat_keywords: list[str] = Field(
+        default_factory=lambda: list(_DEFAULT_CHAT_KEYWORDS)
+    )
     knowledge_mode: RoutingProfile = Field(
         default_factory=lambda: RoutingProfile(
             model="qwen3.5-27b",
@@ -232,6 +264,18 @@ class RoutingConfig(BaseModel):
             max_tokens=4096,
             enable_thinking=False,
             description="도구 호출 — Phase 3 LoRA + 중간 temperature",
+        )
+    )
+    # CHAT_MODE 프로필 — 모델·온도는 KNOWLEDGE와 같지만 PromptAssembler가
+    # query_class를 보고 KB RAG를 주입하지 않는다. max_tokens는 인사·잡담이
+    # 길게 늘어지지 않도록 더 작게 설정.
+    chat_mode: RoutingProfile = Field(
+        default_factory=lambda: RoutingProfile(
+            model="qwen3.5-27b",
+            temperature=0.5,
+            max_tokens=512,
+            enable_thinking=False,
+            description="인사·잡담 — 베이스 Qwen + RAG 미주입 + 짧은 응답",
         )
     )
 

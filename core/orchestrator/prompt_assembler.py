@@ -10,6 +10,7 @@
   3. RAG 관련 파일 청크               (rag_retriever가 있을 때, 모든 질의)
   4. Knowledge base 청크              (knowledge_retriever가 있고 KNOWLEDGE 질의일 때)
      + tenant.allowed_knowledge_sources 필터 자동 적용
+     + CHAT/TOOL 질의는 자동 스킵 (Part 2.5.9 v0.14.6)
 
 각 단계는 실패해도 조용히 폴백 — 어떤 보조 모듈이 죽어도 본류 응답은 생성된다.
 """
@@ -107,7 +108,9 @@ class PromptAssembler:
     ) -> str:
         if self._knowledge_retriever is None:
             return prompt
-        if decision.query_class != "KNOWLEDGE":
+        # CHAT/TOOL 질의는 KB 단계 자체를 스킵 (Part 2.5.9 v0.14.6).
+        # 인사·잡담에 위키 청크가 주입되어 부자연스러운 답변이 나오는 부작용 차단.
+        if not decision.inject_knowledge_rag:
             return prompt
         try:
             kb_ctx = await self._knowledge_retriever.get_context(
@@ -121,12 +124,17 @@ class PromptAssembler:
         if not kb_ctx:
             return prompt
         logger.info("지식 RAG 주입: ~%d자", len(kb_ctx))
+        # D 보조 — 검색 결과가 질의와 무관할 때 모델이 무리하게 활용하지 않도록 명시.
+        # kowiki 100만 청크 환경에서 어떤 질의든 코사인 유사도로 무언가가 잡히지만
+        # 의미적으로 관련이 없을 수 있다. 이때 "주어진 컨텍스트 = 정답 재료"로 오인
+        # 하지 말 것을 시스템 프롬프트에 명시.
         return (
             prompt
             + "\n\n--- Knowledge base ---\n"
             + kb_ctx
             + "\n--- End of knowledge base ---\n"
-            + "Answer the user using the information above as your primary reference. "
-            "If the knowledge base does not cover the question, state what you know "
-            "generally and clearly mark uncertain parts."
+            + "Use the information above ONLY when it is clearly relevant to the "
+            "user's question. If the snippets above are off-topic, irrelevant, or "
+            "contradict common-sense knowledge, IGNORE them and answer from your "
+            "own general knowledge. Never force-fit the snippets into the answer."
         )

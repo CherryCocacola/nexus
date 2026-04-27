@@ -6,11 +6,517 @@
 
 ## 현재 상태
 
-- **현재 Phase**: Phase 8.0 완료 + 웹 UI + GPU E2E + DocumentProcess
-- **마지막 업데이트**: 2026-04-15
+- **현재 Phase**: v0.14.8 — 임베딩 워밍업/keep-warm + CLI 단계별 status spinner
+- **마지막 업데이트**: 2026-04-27
 - **브랜치**: main
-- **총 테스트**: 400개 (전부 통과) — 단위 316 + 통합 64 + E2E 20
-- **전체 파일**: ~155개 Python/HTML 모듈
+- **총 테스트**: 811 passed / 1 skipped (단위 + 통합, e2e 제외)
+- **전체 파일**: ~170개 Python/HTML 모듈
+
+---
+
+## v0.14.8 — 임베딩 cold start 제거 + CLI 진행 표시 (2026-04-27 야간)
+
+### 배경 — 진단
+
+사용자 보고: "생성 속도가 예전에 비해 너무 느려졌다."
+실측 결과 KNOWLEDGE 첫 호출만 비정상 (CHAT 0.8s, KNOWLEDGE 첫 66s, 두 번째 4.6s).
+
+서버 로그 시간 분해:
+```
+17:57:27 KNOWLEDGE 분류
+17:58:29 지식 RAG 주입: ~3002자   ← 62초 후
+17:58:32 LLM 응답 완료 (3초)
+```
+
+vLLM 큐는 비어 있고 pgvector 검색은 38ms. → **임베딩 서버(e5-large, :8002)가 idle 상태로 빠진 후 첫 호출에서 ~60초 cold start**. kowiki 적재가 끝나고 임베딩 호출이 드물어지면서 매번 cold가 됐음.
+
+### A — 부트스트랩 임베딩 워밍업
+
+`core/bootstrap.py`에 `_warmup_embedding(provider, retries=2)` 추가.
+- KnowledgeStore 초기화 직후 fire-and-forget으로 한 번 호출
+- 짧은 backoff로 2회 재시도 (서버가 아직 안 떴을 가능성)
+- 실패 시 WARNING만, 본류 응답에 무영향
+
+### B — 주기적 keep-warm
+
+`_embedding_keepalive(provider, interval_sec=300)` 추가.
+- 5분 간격으로 짧은 ping 송신
+- `asyncio.CancelledError`로 깨끗 종료
+- 일시 장애는 디버그 로그만, 다음 주기에 재시도
+- 부트스트랩이 task 핸들을 `components["embedding_keepalive_task"]`로 노출
+- `web/app.py` lifespan에서 종료 시 cancel + await로 깔끔 정리
+
+### E — CLI 단계별 spinner
+
+`cli/repl.py::_process_message`에 Rich `Console.status()` 통합.
+- 첫 TEXT_DELTA 도착 전까지 spinner 표시
+- StreamEvent 타입에 따라 단계 텍스트 갱신:
+  - `STREAM_REQUEST_START` → "모델 추론 중..."
+  - `MESSAGE_START` → "응답 생성 중..."
+  - `THINKING_START` → "생각 정리 중..."
+  - `TOOL_USE_START` → "{tool_name} 실행 중..."
+  - `TEXT_DELTA` 첫 도착 → spinner 닫고 본문 출력
+  - `TOOL_USE_STOP` → 다음 응답 대기 spinner 재가동
+- 예외/취소 경로에서도 spinner는 finally에서 안전 종료
+
+사용자 체감 효과: KNOWLEDGE cold start 60초가 "왜 멈췄지?"가 아니라 "지식 검색 중..."으로 가시화 (워밍업이 그 60초를 부트스트랩 시점으로 옮기지만 만약 idle로 떨어졌어도 사용자가 인지 가능).
+
+### 테스트
+
+`tests/unit/test_embedding_warmup.py` 신규 6 케이스:
+- 첫 시도 성공 — 추가 재시도 없음
+- 첫 실패 후 재시도 성공
+- 모든 재시도 실패 → False
+- embed가 빈 리스트 반환 → 실패로 판정
+- keep-alive `CancelledError`로 깨끗 종료
+- keep-alive 일시 장애 후 다음 주기 재시도 (await 횟수 ≥2)
+
+`asyncio.sleep`은 `unittest.mock.patch("core.bootstrap.asyncio.sleep")`로 0초화하여
+테스트 시간 < 1초.
+
+**회귀**: 단위 + 통합 **811 passed / 1 skipped** (v0.14.7 805 → +6, 실패 0,
+ruff 신규 위반 0).
+
+### 신규/수정 파일
+
+```
+신규:
+  tests/unit/test_embedding_warmup.py
+
+수정:
+  core/bootstrap.py            (_warmup_embedding, _embedding_keepalive, 부트스트랩 호출)
+  web/app.py                   (lifespan 종료 시 keepalive task cancel)
+  cli/repl.py                  (Console.status 통합 + _stage_label_for 헬퍼)
+  user_mig/progress/progress.md (이 항목)
+```
+
+### 부수 발견 (별도 작업 후보)
+
+- `_finalize_turn`에서 `WARNING: 1 validation error for TextBlock`이 매 응답마다
+  발생. 응답 본류엔 영향 없으나 로그 노이즈. 향후 추적.
+- vLLM 임베딩 서버 자체 cold start 시간을 줄이려면 GPU 서버 측 `--enforce-eager`
+  해제 + memory pre-allocate 상향이 필요 (운영자 작업 영역).
+
+### 사양서 영향
+
+이번 변경은 인프라 운영 최적화로 사양서 Part 4(GPU 서버) 또는 Part 5 Ch 16에
+짧게 부속 절을 추가할 후보. 현재는 progress.md만 업데이트하고 사양서는
+다음 묶음 커밋 시 함께 정리 예정.
+
+---
+
+## v0.14.6 — CHAT 카테고리 + RAG 무시 지시 강화 (2026-04-27)
+
+### 배경
+
+운영 중 사용자 보고: "안녕"·"좋은 아침이야" 같은 짧은 인사에 대해 가수 "안녕"
+위키 정보·"고도원의 아침편지" 등 무관한 백과사전 내용이 줄줄 답변에 포함됨.
+
+원인 추적:
+- kowiki 적재 종료 (마지막 쓰기 04-24 07:40, **1,067,975 청크 / 461,517 문서**)
+- 분류기는 "TOOL이 아니면 무조건 KNOWLEDGE" 2분류 → 인사도 KNOWLEDGE로 감
+- KNOWLEDGE에서 KnowledgeRetriever가 자동 RAG 주입 (`min_similarity=0.3`)
+- 청크가 100만 단위라 임의 단어로도 매칭이 잘 됨 → 시스템 프롬프트에 ~1KB 주입
+- 27B 모델은 "주어진 컨텍스트는 활용해야 한다"는 압력으로 그 정보를 풀어냄
+
+사용자가 원안(B+D) + 사양서 갱신을 명시 승인하여 진행.
+
+### 변경 (B안 — CHAT 휴리스틱 카테고리)
+
+**1) `core/config.py` — RoutingConfig 확장**
+- `chat_mode: RoutingProfile` 신규 — model=qwen3.5-27b, temp=0.5, max_tokens=512
+- `chat_keywords: list[str]` 신규 — 한/영 인사·잡담 ~38개 (안녕/굿모닝/hi/thanks/bye 등)
+- `chat_max_length: int = 30` — 길이 게이트 (긴 입력 안에 인사어 우연히 들어가도 CHAT 아님)
+
+**2) `config/nexus_config.yaml`**
+- `routing.chat_keywords` / `chat_max_length` / `chat_mode` 섹션 명시
+- 운영자가 코드 변경 없이 키워드 튜닝 가능
+
+**3) `core/orchestrator/routing.py` — 3분류 확장**
+- `HeuristicClassifier.classify()`가 KNOWLEDGE/TOOL/**CHAT** 반환
+- 우선순위: enabled→길이→TOOL→**CHAT(길이+키워드 AND)**→KNOWLEDGE
+- `RoutingResolver._OVERRIDE_ON_CLASSES`에 CHAT 포함 (테넌트 LoRA 적용)
+- `RoutingDecision.inject_knowledge_rag` 프로퍼티 신규 — KNOWLEDGE만 True
+
+**4) `core/orchestrator/prompt_assembler.py` — KB 단계 분기 + IGNORE 지시**
+- `decision.inject_knowledge_rag` 사용 (CHAT/TOOL 자동 스킵)
+- KB 주입 시 끝에 항상 다음 지시 동봉 (D 보조안):
+  > Use the information above ONLY when it is clearly relevant ... If the
+  > snippets are off-topic, irrelevant, or contradict common-sense knowledge,
+  > IGNORE them and answer from your own general knowledge.
+
+**5) 시스템 프롬프트 강화 (D안)**
+- `web/prompts/worker_system.md`: "Conversational style" + "When KB block is
+  present" 섹션 추가
+- `core/bootstrap._build_default_system_prompt()`: CLI 측에도 동일 small-talk
+  가이드 + KB 무시 규칙
+
+### 테스트
+
+- `tests/unit/test_query_routing.py` 갱신/추가:
+  - "안녕"이 KNOWLEDGE 단언인 기존 케이스 → CHAT 단언 케이스로 분리
+  - CHAT 분류 13 케이스 parametrize (안녕/안녕하세요/좋은 아침/굿모닝/잘 자/
+    고마워/감사/hi/Hello/good night/thanks/bye)
+  - 길이 게이트 검증 ("안녕, 오늘 알베르 카뮈…" → KNOWLEDGE)
+  - TOOL 우선순위 검증 ("이 파일 안녕히 처리해줘" → TOOL)
+  - chat_max_length=0 운영자 스위치 → KNOWLEDGE 회귀
+  - RoutingResolver: CHAT 결정 + tenant override 적용 검증
+  - _resolve_profile("CHAT") → chat_mode 폴백
+- `tests/unit/test_prompt_assembler.py` (신규):
+  - CHAT/TOOL → KB 미주입
+  - KNOWLEDGE → KB 주입 + IGNORE 지시 동봉
+  - KB 검색 예외는 swallow
+
+**회귀 결과**: 단위 + 통합 **805 passed / 1 skipped** (v0.14.5 782 대비 +23,
+실패 0, ruff 신규 위반 0).
+
+### 사양서 갱신
+
+`PROJECT_NEXUS_SPEC_v7.0_AMENDMENT.md` Part 2.5.9 신설:
+- 배경 + kowiki 적재 규모 + 실측 증상
+- 3분류 설계 + chat_mode 프로필 + chat_keywords
+- D 보조안 (시스템 프롬프트 강화)
+- 4-Tier 무영향 + 하드웨어 업그레이드 시 자동 회귀 (`routing.enabled=false`)
+- 실측 효과 표 (안녕: 1000+ 토큰 → ~30 토큰)
+
+### 사양서 정합성 (이번 변경)
+
+| 사양서 조항 | 정합 |
+|---|---|
+| Part 2.5.3 "휴리스틱만으로 충분, 상수 시간" | ✓ (CHAT도 substring + 길이 임계) |
+| Part 2.5.5 "기본값으로 v6.1 동일 동작" | ✓ (chat_max_length=0이면 2분류로 회귀) |
+| Part 2.5.6 "TIER_M 이상 자동 비활성화" | ✓ (routing.enabled=false면 CHAT도 무효화) |
+| Part 1·8.1 4-Tier 체인 무결성 | ✓ (체인 시그니처 불변) |
+| Part 2 Scout B 방식 (자동 전처리 폐기) | ✓ (Scout 분류기 사용 안 함, 사용자 직관 회피 근거: 같은 30s 함정) |
+
+### 신규/수정 파일
+
+```
+신규:
+  tests/unit/test_prompt_assembler.py
+
+수정:
+  core/config.py
+  config/nexus_config.yaml
+  core/orchestrator/routing.py
+  core/orchestrator/prompt_assembler.py
+  core/bootstrap.py
+  web/prompts/worker_system.md
+  tests/unit/test_query_routing.py
+  user_mig/PROJECT_NEXUS_SPEC_v7.0_AMENDMENT.md  (Part 2.5.9)
+  user_mig/progress/progress.md                   (이 항목)
+```
+
+### 후순위 (다음 세션 후보)
+
+- 임베딩 기반 분류기(`embedding_classifier`) — 휴리스틱이 놓치는 모호 케이스용
+- CHAT/KNOWLEDGE 경계 데이터 자동 수집 (오분류 모니터링)
+- min_similarity 0.3 → 동적 조정 (RAG 통계 기반)
+
+---
+
+## v0.14.5 — 사이드바 제목 자동화 + 세션 삭제 (2026-04-23 저녁)
+
+### 배경
+
+v0.14.4에서 프론트-백엔드 세션 연동이 완성됐으나 실 사용에서 두 가지 UX 문제:
+
+- 사이드바에 `session-1776930460 ·서버` 형태로 **세션 ID만 노출**되어 어떤
+  대화였는지 식별 불가 (Claude Code UX와 큰 격차)
+- 세션 삭제 수단이 전무 — 누적된 테스트/실험 대화를 정리할 방법이 UI에 없음
+
+또한 기존 20개 디스크 세션 + 8개 Redis 세션은 대부분 개발 테스트 잔여물이어서
+운영자 요청으로 **전체 정리**를 병행했다.
+
+### 변경
+
+**1) `core/memory/transcript.py` — title_hint + 삭제 헬퍼**
+- `list_transcript_sessions()`가 각 세션의 `transcript.jsonl`을 한 번의
+  패스로 스캔하여 라인 수와 **첫 user 메시지**를 동시 추출
+- 응답에 `title_hint` 필드 신규 (60자 초과 시 `…` 절단, 멀티라인은 공백 하나로
+  정규화, user 메시지가 없으면 None)
+- `delete_transcript_session(sessions_dir, session_id) -> bool` 신규
+  - 경로 탈출 검증 (슬래시/백슬래시/`..`/`\x00` → ValueError)
+  - `Path.resolve().relative_to(base)` 재검증으로 이중 방어
+  - 없는 세션 삭제는 False 반환 (에러 아님)
+
+**2) `web/app.py` — `DELETE /v1/sessions/{session_id}` 신규**
+- Redis(`clear_session`) + 디스크(`delete_transcript_session`) 양쪽 best-effort
+- 사전에 `get_conversation_context`로 Redis 존재 여부 확인 후 `deleted_redis`
+  플래그로 보고
+- 한쪽이 장애여도 다른 쪽은 시도 (감사 로그에 WARNING)
+- 응답: `{session_id, deleted_redis, deleted_disk}`
+- 400 — 의심 문자 차단, 404 없음 (멱등 삭제 — 재시도 안전)
+
+**3) `web/static/index.html` — 사이드바 X 버튼 + title_hint 사용**
+- CSS: `.session-item`을 flex 레이아웃으로 변경, `.session-delete-btn`이
+  hover/active 시 opacity 0→0.7, 삭제 버튼 hover 시 빨간 배경 강조
+- `deriveSessionTitle()`이 서버 `title_hint` 최우선 사용 (파일 재파싱 없이 즉시
+  표시). 없으면 첫 user 메시지 → session_id 앞부분 순으로 폴백
+- `deleteSession(id, event)` 신규 — `event.stopPropagation()`로 상위 클릭
+  분리, `confirm()` 다이얼로그 후 `DELETE /v1/sessions/{id}` 호출, 로컬
+  sessions 배열에서도 제거, 현재 세션 삭제 시 새 세션으로 자동 전환
+- 빈 로컬 세션(아직 서버 저장 전)은 서버 호출 생략
+
+**4) 기존 세션 일괄 정리 (운영자 요청)**
+- 디스크: `.nexus/sessions/` 하위 20개 디렉토리 제거 (빈 5 + transcript 15)
+- Redis: `session:*` 8개 키 일괄 DEL (`192.168.10.39:6340`, db=6)
+- 잔존 확인: 디스크 0개, Redis 0개
+
+### 테스트
+
+- `tests/unit/test_session_persistence.py` +12
+  - title_hint 포함 (`니체 철학...` 등 실제 문자열 검증)
+  - title_hint 60자 초과 시 말줄임표 + 길이 61
+  - 멀티라인 → 공백 정규화
+  - user 없는 세션 → None
+  - `delete_transcript_session` 성공/미존재/경계 문자/다른 세션 불영향
+- `tests/integration/test_web_integration.py` +9
+  - `GET /v1/sessions`에 `title_hint` 포함
+  - `DELETE /v1/sessions/{id}` 200 + 디스크 제거 확인
+  - 멱등성 (없는 세션 → 200, 둘 다 False)
+  - 400 — parametrize 3 케이스 (백슬래시/연속 점/NUL)
+
+**회귀 결과**: 단위 + 통합 **782 passed / 1 skipped** (v0.14.4 763 대비 +19,
+실패 0, ruff 신규 위반 0).
+
+### 보안 메모
+
+- `delete_transcript_session`의 경로 검증 — `Path.resolve().relative_to()`로
+  sessions_dir 외부를 가리키는 모든 시도를 ValueError로 차단
+- 의심 문자 400 + 슬래시 라우터 404 두 층 방어 (GET/DELETE 공통)
+- 서버 사이드 log에 삭제 이벤트 기록 (`세션 삭제: session=..., redis=..., disk=...`)
+
+### 서버 재기동 필요
+
+기능 변화 반영과 기존 세션 전면 정리가 동시에 이뤄졌으므로, **현재 백그라운드
+에서 돌고 있는 구(v0.14.3) 서버는 재기동**해야 프론트의 삭제 버튼/title_hint
+가 동작한다. 외부 사용자 세션이 붙어 있어 중단 영향이 있으며 타이밍은 운영자
+확인 후 별도 절차로 진행.
+
+### 신규/수정 파일
+
+```
+신규/수정:
+  core/memory/transcript.py                  (title_hint, delete_transcript_session)
+  web/app.py                                 (DELETE /v1/sessions/{id})
+  web/static/index.html                      (삭제 버튼 + title_hint 사용)
+  tests/unit/test_session_persistence.py     (+12 케이스)
+  tests/integration/test_web_integration.py  (+9 케이스)
+  user_mig/progress/progress.md              (이 항목)
+
+정리 (데이터):
+  .nexus/sessions/*                          (20개 디렉토리 제거)
+  Redis session:*                            (8개 키 제거)
+```
+
+### 남은 후순위
+
+- localStorage에 currentSessionId 영속화 (권고 1번 — 새로고침 자동 복원)
+- 다중 선택 삭제 (Ctrl+클릭으로 여러 세션 한 번에)
+- 로그인/테넌트 선택 UI (공공 납품 단계)
+
+---
+
+## v0.14.4 — 프론트 세션 영속화 연동 (2026-04-23 저녁)
+
+### 배경
+
+Ch 16 세션 영속화는 v0.14.3에서 백엔드(Redis 단기 + transcript.jsonl 영구)
+까지 완성되었으나 프론트가 그 자산을 활용하지 못하던 갭이 있었다:
+
+- `index.html`의 `newSession()`이 매 페이지 로드마다 `session-{Date.now()}`로
+  새 ID를 생성 → 새로고침하면 사이드바가 비어 보이고 과거 대화 흔적이 사라짐
+- `/v1/sessions`는 목록만 반환하고 **특정 세션의 메시지 전체를 돌려주는
+  엔드포인트가 없었음** — 프론트가 과거 대화를 화면에 펼칠 방법 자체가 부재
+- 결과적으로 Ch 16의 ROI가 "재요청 시 같은 session_id로 다음 턴이 이어진다"
+  수준에 머무르고 사용자 체감 가치는 낮았음
+
+### 변경
+
+**1) `core/memory/transcript.py` — `read_transcript_messages()` 추가**
+- `(sessions_dir, session_id, *, roles=("user","assistant"), limit=None)` 시그니처
+- JSONL을 한 줄씩 파싱, role 필터(기본 user/assistant) 적용, 손상 라인은 조용히 스킵
+- limit 지정 시 가장 최근 N개만 반환 (오래된 것부터 순서 유지)
+- 파일 없음/OSError → 빈 리스트로 graceful degrade
+
+**2) `web/app.py` — `GET /v1/sessions/{session_id}/messages` 엔드포인트**
+- 조회 우선순위: Redis `get_conversation_context` → 트랜스크립트 폴백 → 404
+- 응답: `{session_id, source: "redis"|"transcript", messages: [...], total}`
+- 입력 검증: session_id에 `/` `\` `..` `\x00` 포함 시 400 차단
+  (트랜스크립트 디렉토리 탈출 방지). 슬래시는 라우터 단계에서도 자동 404로 1차 차단
+
+**3) `web/static/index.html` — 사이드바 서버 세션 머지 + lazy-load 복원**
+- DOMContentLoaded 시 `loadServerSessions()` 호출 → `/v1/sessions` 결과를
+  로컬 sessions 배열과 병합 (서버 측은 `source: 'server'` 태그 + `·서버` 표시)
+- 서버 세션 클릭 시 메시지가 비어 있으면 `/v1/sessions/{id}/messages` 호출 →
+  로컬 캐시에 채운 뒤 `switchSession`이 화면에 복원 (사이드바는 항상 가볍게 유지)
+- `escapeHtml()` 헬퍼 추가 — 서버에서 받은 session_id/제목을 innerHTML에 넣을
+  때 XSS 방지
+- `deriveSessionTitle()` — 첫 user 메시지 30자 → 없으면 session_id 앞부분으로
+  사이드바 제목 자동 생성
+
+### 테스트
+
+- `tests/unit/test_session_persistence.py` +5
+  - role 필터 (system/에러 엔트리 제외)
+  - 파일 없음 (빈 리스트)
+  - limit (가장 최근 N개)
+  - 손상 JSON 라인 스킵
+  - 명시적 roles로 system 포함
+- `tests/integration/test_web_integration.py` +8 (=4 케이스, parametrize 포함)
+  - 404 — 존재하지 않는 세션
+  - 400 — 핸들러까지 도달하는 의심 문자(`foo\\bar`, `foo..bar`, `\x00`)
+  - 라우터 차단 — 슬래시/단독 `..`는 200이 아님 (디렉토리 탈출 불가)
+  - 200 — 트랜스크립트 파일 폴백 경로 검증 (config.session.sessions_dir 모킹)
+
+**회귀 결과**: 단위 742 + 통합 21 = **763 passed / 1 skipped** (변경 전 736 대비
++27, 신규 13건 외 다른 차이는 컬렉션 변동으로 보이며 실패 0).
+
+### 보안 메모
+
+- session_id에 `/`, `\`, `..`, `\x00` 차단 — `Path(sessions_dir) / session_id`
+  연산 시 디렉토리 탈출 방지의 명시적 1차 검증
+- `api_keys`/`tenant_id` 등 민감 필드는 본 변경에서 새로 노출되지 않음
+- 404 vs 400 분기로 "탈출 시도"와 "단순 조회 미스"를 구분 가능
+
+### 사양서 반영 예정
+
+- Part 5 Ch 16에 신규 엔드포인트 + 프론트 연동 섹션 추가
+- "v0.14.3 다음 후보" 항목에서 "프론트 세션 사이드바" 완료로 표기
+
+### 알려진 후속 이슈 (선택 작업)
+
+- localStorage에 currentSessionId 영속화 → 새로고침 후 자동 같은 세션 복원
+  (현재는 클릭으로만 복원). 권고 1번에 해당, 사용자 결정 시 추가
+- 서버 세션 메시지 로딩 시 스피너 UI 부재 (현재는 무음으로 추가됨)
+- 로그인/테넌트 선택 UI는 공공 납품 단계에서 별도 도입 예정 (권고 3번)
+
+### 신규/수정 파일
+
+```
+신규/수정:
+  core/memory/transcript.py            (read_transcript_messages 추가)
+  web/app.py                            (GET /v1/sessions/{id}/messages)
+  web/static/index.html                 (loadServerSessions, switchSession lazy-load)
+  tests/unit/test_session_persistence.py     (+5 케이스)
+  tests/integration/test_web_integration.py  (+8 케이스)
+  user_mig/progress/progress.md         (이 항목)
+```
+
+---
+
+## v0.14.3 — 업로드 파일 분석 hang 대응 (2026-04-23)
+
+### 배경
+
+사용자 리포트: 15KB xlsx(`AI_서비스_데이터_수집_양식.xlsx`) 업로드 후 "무한
+로딩" 현상. 세션 `session-1776919030600` 디렉토리는 생성됐으나
+`transcript.jsonl` 파일이 없는 "유령 세션" 상태.
+
+### 진단 결과
+
+1. **실행 중인 웹 서버가 04-21 기동 상태** — v0.14.2(04-22)의 `AgentTool`
+   결과 캐시 코드가 아예 로드되지 않았음. `/metrics.agent_cache`가 `null`
+   로 응답한 것이 증거.
+2. **Scout 누적 호출 15회, 평균 48초** — 같은 파일을 여러 턴에 걸쳐 재호출할
+   때 캐시가 없어 매번 48초 비용 발생.
+3. **클라이언트 측 타임아웃/취소 UX 부재** — 사용자가 "무한 로딩"과 "느린
+   정상 처리"를 구분할 방법이 없음.
+4. **`_finalize_turn()`이 async for 예외에 의해 스킵되는 구조** — 스트림이
+   중단되면 트랜스크립트 기록이 전혀 남지 않아 사후 디버깅이 불가능.
+5. **LAN 접속 이슈 (병렬 증상, 서버 무관)** — 이더넷 인터페이스
+   (192.168.22.223)가 "식별 중..." 상태로 192.168.22.10(Wi-Fi)에서만 접속
+   가능. 네트워크 어댑터 재설정 별도 필요.
+
+### 조치 (코드 4파일 + 진행 문서)
+
+**1) `core/orchestrator/query_engine.py` — `_finalize_turn` 보강**
+- `submit_message`의 `async for` 본문을 `try/except/finally`로 감싸 예외/
+  취소 발생 시에도 `_finalize_turn`이 **반드시 호출**되도록 구조 변경
+- `_finalize_turn(finalize_error=...)` 시그니처 확장 — 스트림 중단 시
+  `role="system"` 에러 엔트리를 트랜스크립트에 append하여 "폴더만 있고
+  파일 없는 hang 세션"과 구분 가능하게 함
+- 예외는 re-raise하여 상위 웹 핸들러가 인지하도록 보장
+
+**2) `core/tools/implementations/agent_tool.py` — 장기 실행 관측성**
+- `AgentTool.call()` 진입 시 "실행 중" info 로그 추가 (기존 "실행 시작"
+  로그는 설정 단계만 표시했음)
+- 완료 로그에 `elapsed >= 60s` 임계 체크 — 초과 시 WARNING으로 승격하여
+  로그 필터링만으로 hang 징후 즉시 탐지 가능
+- 실패 로그에도 elapsed + stats_key 포함
+
+**3) `web/app.py` — SSE heartbeat + 요청 타이밍 로그**
+- `/v1/chat/stream` 핸들러를 Producer/Consumer 구조로 재설계:
+  - `asyncio.Queue` + `asyncio.create_task` producer가 `submit_message`를
+    소비하여 큐로 이동
+  - 메인 루프는 `asyncio.wait_for(queue.get(), timeout=20)`로 20초마다
+    SSE 주석 `: heartbeat {elapsed}s\n\n` 프레임 전송
+  - SSE 주석은 EventSource 클라이언트에서 무시되므로 기존 JSON 파서에 영향 X
+- 요청 단위 로그: 진입 시 "SSE 시작: session=..., has_attach=...",
+  종료 시 "SSE 완료: ..., elapsed=..., events=..." (에러면 WARNING)
+- producer 예외는 `{"type": "error", "error_code": "stream_aborted", ...}`
+  데이터 프레임으로 클라이언트에게 전달
+- 핸들러 종료 시점 finally에서 producer_task cancel — 클라이언트 연결 끊김
+  대응
+- import 추가: `asyncio`, `time`
+
+**4) `web/static/index.html` — 장기 대기 UX + 취소 버튼**
+- "생각하는 중" 스피너에 초 단위 경과 시간 표시 — 10초 후 `생각하는 중 (Xs)`,
+  60초 후 `분석이 오래 걸리고 있습니다 (Xs). '취소' 버튼을 눌러 중단할 수
+  있습니다`로 문구 전환
+- 전송 버튼을 **전송/취소 토글**로 개조 — 스트리밍 중에는 중단 아이콘
+  (rect 모양)으로 바뀌어 `AbortController.abort()`를 트리거
+- `fetch(..., {signal})`로 SSE 연결 취소 가능
+- SSE 주석(`:`로 시작) 라인은 클라이언트에서 명시적으로 무시
+- 사용자 취소 시 `AbortError` 분기 → "[취소됨]" 메시지 표시
+
+### 검증
+
+- **회귀 테스트**: 736 passed / 1 skipped (단위 + 통합)
+  - 변경 영향 테스트: `test_agent_tool.py` 22건, `test_session_persistence.py`
+    11건, `test_web_integration.py` 14건 모두 통과
+- **서버 재기동 후 `/metrics.agent_cache`**:
+  ```json
+  {"hits": 0, "misses": 0, "stored": 0, "evicted": 0, "size": 0}
+  ```
+  (이전엔 `null`이었음 — v0.14.2 캐시 코드가 이제 실제로 로드됨을 증명)
+- **ruff check**: 본 변경분 clean. 기존 위반(E402/E501/F401)은 본 변경
+  범위 밖이라 건드리지 않음.
+
+### 구 서버와의 차이 (기동 로그 실측)
+
+```
+2026-04-21 16:20 기동:  AgentTool 캐시 없음, agent_cache: null
+2026-04-23 14:37 기동:  agent_cache: dict, Scout warning 임계 60s,
+                        SSE heartbeat 20s, 취소 UX 활성
+```
+
+### LAN 접속 이슈 (별도 조치 필요)
+
+서버 재기동으로 해결되지 않음. 원인:
+- 이더넷 어댑터 `192.168.22.223`이 "식별 중..." 상태
+- Windows 방화벽 및 서버 바인딩(`0.0.0.0:8443`)은 정상
+- Wi-Fi 쪽 IP `192.168.22.10:8443`은 정상 응답
+
+**즉시 우회**: 다른 PC에서 `https://192.168.22.10:8443`으로 접속
+**근본 해결 (관리자 권한)**:
+```powershell
+Disable-NetAdapter -Name "이더넷" -Confirm:$false
+Enable-NetAdapter -Name "이더넷"
+```
+
+### 남은 작업
+
+- LAN 어댑터 재설정 (사용자 확인 후)
+- 이번 수정으로 **같은 xlsx 재시도** 시나리오에서 Scout 캐시 히트율 실측
+- `transcript.jsonl`에 `[stream aborted]` 시스템 엔트리가 기록되는지 실환경
+  확인 (hang/취소가 발생했을 때)
+
+### 사양서
+
+`PROJECT_NEXUS_SPEC_v7.0_AMENDMENT.md` Part 9(리팩토링 노트) 뒤에 v0.14.3
+관측성 섹션을 추가할 예정.
 
 ---
 
@@ -1542,3 +2048,137 @@ v0.14.0 "다음 세션에서 이어갈 후보" 2번 소화.
 ### 하위 호환
 - 기존 호출(`generator.generate(count=N, output_path=...)`)은 경로/동작 변경 없음
 - `tenant_id=None`이든 `"default"`든 동일하게 공용 루트로 수렴
+
+---
+
+## v0.14.2 — 테넌트 조회 API + Scout 결과 캐시 (2026-04-22)
+
+v0.14.0 "다음 세션 후보" 3·4번 일괄 소화. 동시에 kowiki 전체 덤프(C2-γ)
+적재 현황을 점검했다.
+
+### kowiki 적재 현황 (2026-04-22 04:02 KST)
+`scripts/_ssh_kowiki_status.py`로 GPU 서버(192.168.22.28) 상태 조회:
+- tmux `kowiki_ingest` 세션이 19시간 42분 경과 상태로 진행 중 (PID 206672)
+- `--limit 0 --categories ""` (전체 kowiki) 모드 — 500건 제한 해제 후 재시작된 버전
+- 진행: **처리=182,005 / 적재=93,300 / 청크=291,073**
+- `tb_knowledge`: kowiki 291,109 + sample 3 = **291,112 chunks**
+- `prepare_kowiki.py --build-index`는 적재 완료 **후** 실행해야 인덱스 재빌드
+  오버헤드를 피할 수 있으므로 현 세션에서는 보류 (`TaskList` #4 follow-up)
+
+### 작업 3 — GET /v1/tenants 엔드포인트 (Part 5 Ch 15)
+
+**신규**:
+- `web/app.py` — `TenantInfo` Pydantic 응답 모델 + `@app.get("/v1/tenants")` 핸들러
+- 엔드포인트 주석 갱신 (`/v1/tenants` 추가)
+
+**설계**:
+- 응답 스키마: `{tenants: [TenantInfo], default_tenant: str, total: int}`
+- `TenantInfo`: `id / name / description / model_override / allowed_knowledge_sources /
+  api_key_count / adapter_name_prefix / metadata`
+- **보안**: `api_keys` 원본 비노출 — 길이만 `api_key_count`로 노출
+- 레지스트리 미초기화 시에도 500 대신 빈 목록으로 graceful 응답
+
+**테스트** (`tests/integration/test_web_integration.py` +4):
+- 200 OK + 기본 구조
+- 레지스트리 초기화 시 default 테넌트 포함 (테스트 환경에선 skip)
+- `api_keys` 키 부재 + `api_key_count` 정수 검증
+- **완전한 응답 검증** — 실제 api_keys가 있는 TenantRegistry 주입 후 응답 본문에
+  키 원본이 plaintext로 새어나가지 않는지 `resp.text.find(...)`로 검증
+
+**/metrics와의 관계**: 기존 `/metrics`의 `tenants.registered`는 요약 통계용,
+신규 `/v1/tenants`는 전체 필드 포함한 관리용.
+
+### 작업 4 — AgentTool Scout 결과 캐시
+
+**배경**: Scout 호출은 CPU 4B 모델(llama.cpp)이라 한 번에 ~30초. 같은 문서에
+대해 Worker가 여러 턴에 걸쳐 탐색을 반복하거나 재시도할 때 같은 입력을 다시
+실행하는 건 순수 낭비.
+
+**수정** `core/tools/implementations/agent_tool.py`:
+- 클래스 레벨 `_cache: OrderedDict[str, tuple[text, turns, stored_at]]` + LRU 정책
+- 클래스 레벨 `_cache_stats: {hits, misses, stored, evicted}`
+- 튜닝 상수: `_cache_enabled=True`, `_cache_ttl_seconds=300.0`, `_cache_max_entries=64`
+- 키: `SHA-256(subagent_type | prompt | system_prompt | sorted(tool_names) | max_turns)`
+  — 도구 순서 무관, 필드는 `\0` 구분자
+- `call()` 통합: 캐시 조회 → 히트 시 `_run_subagent` 생략 + `metadata.cache_hit=True`
+- **에러 결과는 저장하지 않음** (일시 장애 고착 방지)
+- **ad-hoc(description) 호출은 캐시 제외** — description이 매번 미세하게 달라지면
+  캐시 일관성이 떨어지므로 Scout 같은 정식 서브에이전트(subagent_type 있음)만 대상
+- `get_cache_stats()`, `reset_cache()` 제공
+
+**/metrics 노출**: `web/app.py`가 `result["agent_cache"] = AgentTool.get_cache_stats()`로
+`hits/misses/stored/evicted/size` 노출.
+
+**테스트** (`tests/unit/test_agent_tool.py` +8):
+- 히트 시 `_run_subagent` 재호출 생략 + `cache_hit` 플래그
+- 다른 prompt는 별도 키 (1차 miss + 저장)
+- `_cache_enabled=False`면 조회 자체 건너뜀
+- TTL 만료 처리 (음수 TTL로 강제 만료)
+- 에러 결과는 `stored=0`
+- ad-hoc 경로는 캐시 제외
+- `_cache_max_entries` 초과 시 LRU 방출
+- 캐시 키는 결정적 + 도구 순서 무관
+
+**/metrics 테스트** (`tests/integration/test_web_integration.py` +1):
+- `agent_cache` 섹션 존재 + 5개 필드(`hits/misses/stored/evicted/size`) 정수 검증
+
+### 테스트 / 회귀
+- 신규 13 케이스 (`test_agent_tool.py` +8, `test_web_integration.py` +5)
+- 회귀 **750 passed / 1 skipped** (단위 + 통합, e2e 제외)
+- ruff: 신규 코드 clean. 기존 위반(E402/E501/F401/I001)은 본 변경 범위 밖.
+
+### 하드웨어 업그레이드 시 영향
+- 캐시는 티어에 독립적 — TIER_M/L에서도 AgentTool이 그대로 쓰이면 동일하게 동작
+- Scout가 없는 환경(TIER_M/L)에서도 code-reviewer 등 향후 서브에이전트에
+  그대로 적용 가능 (`subagent_type` 기반이라 확장성 있음)
+
+### 다음 세션 후보
+1. kowiki 적재 완료 대기 → `prepare_kowiki.py --build-index` 실행 (TaskList #4)
+2. 캐시 실측 — Scout 반복 질의 E2E에서 `agent_cache.hits` 증가 확인
+3. 사양서 Ch 14에 서브에이전트 캐시 공식 명세화 (v0.14.2에서 AMENDMENT 갱신 완료)
+
+---
+
+## kowiki 전체 덤프 적재 경과 기록 (2026-04-22)
+
+C2-γ 확장 적재. 500건(2026-04-21 야간)과 별개로 카테고리/limit 제한 없이 전체
+kowiki 덤프를 돌리는 장기 작업이 GPU 서버(192.168.22.28) tmux `kowiki_ingest`
+세션에서 진행 중.
+
+### 실행 명령
+```bash
+/opt/nexus-gpu/.venv/bin/python3.12 scripts/prepare_kowiki.py \
+  --dump /opt/nexus-gpu/corpora/kowiki/kowiki-latest-pages-articles.xml.bz2 \
+  --categories "" --limit 0 \
+  --embed-url http://192.168.22.28:8002 \
+  --pg postgresql://nexus:idino%4012@192.168.10.39:5440/nexus
+```
+
+### 진행 스냅샷
+
+| 시각 (KST) | 경과 | 처리 | 적재 | 청크 | tb_knowledge (kowiki) |
+|---|---|---|---|---|---|
+| 04-22 04:02 | 19h 42m | 182,005 | 93,300 | 291,073 | 291,109 |
+| 04-22 05:59 | 21h 40m | 211,791 | 104,600 | 318,461 | **318,514** |
+| 04-23 15:17 | **45h 58m** | **769,799** | **281,650** | **686,578** | **686,578** |
+
+**증분 (04-22 05:59 → 04-23 15:17, 약 33h)**: 처리 +558,008 / 적재 +177,050 / 청크 +368,117
+**시간당 처리율 (후반 평균)**: 처리 ~16.9K / 적재 ~5.4K / 청크 ~11.2K
+
+에러·종료 신호 없음. embed 서버(:8002) 200 OK 꾸준. 프로세스 PID 206672,
+CPU 5.7%/RSS 158MB로 안정적. ELAPSED 1d21h58m 시점 기준 여전히 run 상태.
+
+### 확인 도구
+`scripts/_ssh_kowiki_status.py` — paramiko로 GPU 서버 SSH 접속 후 tmux pane +
+프로세스 + `tb_knowledge` row count를 한 번에 조회. 사용자 개입 없이 자동 실행.
+
+### 후속 조치 (적재 완료 후)
+1. `grep -Ei 'complete|finished|done|error|traceback' /tmp/_kowiki_pane.log`로 종료 확인
+2. `python scripts/prepare_kowiki.py --build-index --pg "..."` — ivfflat cosine 인덱스
+   재빌드 (lists=100). 기존 idx_knowledge_embed은 500건 기준이라 수십만 청크
+   환경에서 효율 낮음
+3. KNOWLEDGE 라우팅 E2E로 RAG 적중률 재검증 (기존 "니체/차라투스트라" 질의)
+
+### 설계 기준 (사양서 이탈 없음)
+- Part 2.5.8 지식 RAG 파이프라인 — kowiki 적재 스크립트와 ivfflat 인덱스는 이미 명세
+- 적재 규모 확장은 "한계와 향후 과제" 섹션에서 예고된 작업

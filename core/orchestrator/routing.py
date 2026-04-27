@@ -42,17 +42,23 @@ class HeuristicClassifier(QueryClassifier):
     """
     기본 휴리스틱 분류기.
 
-    규칙 (우선순위 순):
+    규칙 (우선순위 순, Part 2.5.9 v0.14.6):
       1. `routing.enabled=False` → 항상 "TOOL" (비상 스위치)
       2. `len(input) >= long_input_threshold` → "TOOL" (문서 첨부 간주)
       3. `tool_keywords`(substring) / `tool_word_patterns`(word boundary) /
          `tool_regex_patterns`(정규식) 중 하나라도 매치 → "TOOL"
-      4. 그 외 → "KNOWLEDGE"
+      4. `len(input) <= chat_max_length` AND `chat_keywords` 중 하나 매치 →
+         "CHAT" (인사·잡담, KB RAG 미주입)
+      5. 그 외 → "KNOWLEDGE"
 
     매칭 타입 (2026-04-22 리팩토링 6):
       - substring: 가장 빠름, 한국어에 적합. 'file'이 'filename'에 오탐될 수 있음.
       - word: 단어 경계(\\b) 매칭. 영어 용어에 권장. 'file' → "filename" 오탐 방지.
       - regex: 자유 정규식. 복잡한 패턴(예: `Read\\s*\\(`)에 사용.
+
+    CHAT은 길이 임계와 chat_keywords의 AND 조건으로만 트리거된다 — 긴 질의
+    안에 우연히 "안녕"이 들어가도 CHAT이 되지 않는다. TOOL 키워드가 우선
+    검사되므로 "이 파일 안녕히 처리해줘" 같은 입력은 TOOL로 정확히 분류.
     """
 
     def __init__(self, routing: RoutingConfig) -> None:
@@ -61,6 +67,10 @@ class HeuristicClassifier(QueryClassifier):
         self._lowered_keywords = tuple(
             kw.lower() for kw in (routing.tool_keywords or [])
         )
+        # CHAT 키워드도 동일하게 lower-case 사전 변환 (Part 2.5.9).
+        chat_kws = getattr(routing, "chat_keywords", []) or []
+        self._lowered_chat_keywords = tuple(kw.lower() for kw in chat_kws)
+        self._chat_max_length = int(getattr(routing, "chat_max_length", 0) or 0)
         # word-boundary 패턴 사전 컴파일 — 각 단어 패턴을 `\bpattern\b` 형태로.
         # re.IGNORECASE로 대소문자 무시, 잘못된 패턴은 건너뛰며 경고 로그.
         word_patterns = getattr(routing, "tool_word_patterns", []) or []
@@ -105,7 +115,8 @@ class HeuristicClassifier(QueryClassifier):
         if len(user_input) >= self._routing.long_input_threshold:
             return "TOOL"
         lowered = user_input.lower()
-        # 1) substring 매칭 — 가장 빠름
+        # 1) substring 매칭 — 가장 빠름. TOOL 키워드는 CHAT보다 항상 우선
+        #    (예: "이 파일 안녕히 처리해줘" → TOOL).
         for kw in self._lowered_keywords:
             if kw and kw in lowered:
                 return "TOOL"
@@ -117,6 +128,17 @@ class HeuristicClassifier(QueryClassifier):
         for rre in self._regex_res:
             if rre.search(user_input):
                 return "TOOL"
+        # 4) CHAT 분류 (Part 2.5.9 v0.14.6)
+        #    짧은 입력 + 인사 어휘 — 둘 중 하나라도 안 맞으면 KNOWLEDGE.
+        #    chat_max_length가 0이면 CHAT 분류 자체를 비활성 (운영자가 끌 수 있음).
+        if (
+            self._chat_max_length > 0
+            and len(user_input.strip()) <= self._chat_max_length
+        ):
+            stripped_lower = user_input.strip().lower()
+            for kw in self._lowered_chat_keywords:
+                if kw and kw in stripped_lower:
+                    return "CHAT"
         return "KNOWLEDGE"
 
 
@@ -160,9 +182,14 @@ class RoutingDecision:
 
     `query_class`는 관측·로깅용이며, `model_override` 등이 실제 실행에 쓰인다.
     `allowed_knowledge_sources`는 KNOWLEDGE 질의일 때만 의미 있다 (KB RAG 필터).
+
+    query_class 값:
+      - "KNOWLEDGE" : 일반 지식 QA, KB RAG 주입
+      - "TOOL"      : 도구 호출 / 프로젝트 작업
+      - "CHAT"      : 인사·잡담, KB RAG 미주입 (Part 2.5.9, v0.14.6)
     """
 
-    query_class: str                                   # "KNOWLEDGE" | "TOOL"
+    query_class: str                                   # "KNOWLEDGE" | "TOOL" | "CHAT"
     model_override: str | None
     temperature: float
     max_tokens_cap: int | None
@@ -176,6 +203,11 @@ class RoutingDecision:
         """라우팅이 실제로 적용됐는지 (model_override 여부로 판단)."""
         return self.model_override is not None
 
+    @property
+    def inject_knowledge_rag(self) -> bool:
+        """KB RAG 주입 여부 — KNOWLEDGE만 True, CHAT/TOOL은 False (Part 2.5.9)."""
+        return self.query_class == "KNOWLEDGE"
+
 
 # ─────────────────────────────────────────────
 # RoutingResolver — 모든 로직의 집결 지점
@@ -187,10 +219,11 @@ class RoutingResolver:
     호출자는 이 결과만 보고 dispatcher/query_loop에 파라미터를 전달한다.
     """
 
-    # KNOWLEDGE 질의에만 테넌트 model_override를 적용한다. TOOL 질의는 Phase LoRA
-    # (nexus-phaseN)가 tool_call XML 포맷 학습을 담고 있어 override하면 도구 호출이
-    # 깨지기 때문 (2026-04-21 멀티테넌시 설계 결정).
-    _OVERRIDE_ON_CLASSES = frozenset({"KNOWLEDGE"})
+    # KNOWLEDGE/CHAT 질의에만 테넌트 model_override를 적용한다. TOOL 질의는 Phase
+    # LoRA(nexus-phaseN)가 tool_call XML 포맷 학습을 담고 있어 override하면 도구 호출이
+    # 깨지기 때문 (2026-04-21 멀티테넌시 설계 결정). CHAT은 KNOWLEDGE와 동일한
+    # 베이스 모델 경로를 쓰므로 같은 분기에 포함 (Part 2.5.9 v0.14.6).
+    _OVERRIDE_ON_CLASSES = frozenset({"KNOWLEDGE", "CHAT"})
 
     def __init__(
         self,
@@ -225,16 +258,22 @@ class RoutingResolver:
             )
 
         query_class = self._classifier.classify(user_input)
-        profile = (
-            self._routing.knowledge_mode
-            if query_class == "KNOWLEDGE"
-            else self._routing.tool_mode
-        )
+        # CHAT 프로필은 v0.14.6 신규 — 구버전 RoutingConfig 객체에 chat_mode가
+        # 없을 수도 있으므로 getattr로 안전하게 폴백한다 (없으면 KNOWLEDGE 사용).
+        if query_class == "KNOWLEDGE":
+            profile = self._routing.knowledge_mode
+        elif query_class == "CHAT":
+            profile = (
+                getattr(self._routing, "chat_mode", None)
+                or self._routing.knowledge_mode
+            )
+        else:
+            profile = self._routing.tool_mode
 
         model = profile.model
         allowed_sources: list[str] | None = None
 
-        # 테넌트 override — KNOWLEDGE에만 적용
+        # 테넌트 override — KNOWLEDGE/CHAT에 적용 (TOOL은 Phase LoRA 보존)
         if (
             tenant is not None
             and query_class in self._OVERRIDE_ON_CLASSES
@@ -246,7 +285,8 @@ class RoutingResolver:
                 tenant.id, tenant.model_override,
             )
 
-        # 테넌트 allowed_sources — KNOWLEDGE에서 KB 필터로 쓰인다
+        # 테넌트 allowed_sources — KNOWLEDGE에서만 KB 필터로 쓰인다.
+        # CHAT은 PromptAssembler가 KB 단계 자체를 스킵하므로 의미 없음.
         if tenant is not None and query_class == "KNOWLEDGE":
             src = getattr(tenant, "allowed_knowledge_sources", None) or []
             allowed_sources = list(src) if src else None
@@ -276,7 +316,13 @@ def classify_query(user_input: str, routing: RoutingConfig) -> str:
 
 
 def _resolve_profile(query_class: str, routing: RoutingConfig) -> Any:
-    """하위 호환용 — 분류 결과 → RoutingProfile 직접 반환."""
+    """하위 호환용 — 분류 결과 → RoutingProfile 직접 반환.
+
+    CHAT 분류는 v0.14.6 신규. 구버전 routing 객체에 chat_mode가 없으면
+    knowledge_mode로 폴백한다 (안전).
+    """
     if query_class == "KNOWLEDGE":
         return routing.knowledge_mode
+    if query_class == "CHAT":
+        return getattr(routing, "chat_mode", None) or routing.knowledge_mode
     return routing.tool_mode

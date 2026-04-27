@@ -136,6 +136,53 @@ routing:
   # 유효성은 운영자 책임 (잘못된 regex는 로드 시 경고 후 무시).
   tool_regex_patterns: []
 
+  # CHAT_MODE 분류 임계 (Part 2.5.9, v0.14.6)
+  # 입력이 짧고(chat_max_length 이하) 인사 어휘가 들어 있으면 CHAT으로 분류.
+  # CHAT은 KB RAG를 주입하지 않는다 — kowiki 100만 청크에서 "안녕"으로
+  # 가수 "안녕" 청크가 잡혀 인사에 위키 정보를 붙이는 부작용을 차단.
+  chat_max_length: 30
+  chat_keywords:
+    # 한국어 인사·잡담
+    - "안녕"
+    - "안뇽"
+    - "좋은 아침"
+    - "좋은 저녁"
+    - "좋은 밤"
+    - "굿모닝"
+    - "굿나잇"
+    - "잘 자"
+    - "잘자"
+    - "반가워"
+    - "반갑습니다"
+    - "반갑네"
+    - "고마워"
+    - "고맙습니다"
+    - "감사"
+    - "땡큐"
+    - "잘 가"
+    - "잘가"
+    - "다음에 봐"
+    - "다음에 보자"
+    - "ㅋㅋ"
+    - "ㅎㅎ"
+    # 영어 인사·잡담
+    - "hi"
+    - "hello"
+    - "hey"
+    - "yo"
+    - "sup"
+    - "good morning"
+    - "good evening"
+    - "good night"
+    - "thanks"
+    - "thank you"
+    - "thx"
+    - "ty"
+    - "bye"
+    - "goodbye"
+    - "see you"
+    - "cya"
+
   knowledge_mode:
     model: "qwen3.5-27b"      # 베이스 — LoRA 어댑터 미적용
     temperature: 0.2
@@ -148,6 +195,12 @@ routing:
     max_tokens: 4096
     enable_thinking: false
     description: "도구 호출 / 프로젝트 작업"
+  chat_mode:
+    model: "qwen3.5-27b"      # 베이스 — KNOWLEDGE와 동일 모델
+    temperature: 0.5
+    max_tokens: 512           # 인사·잡담은 짧게
+    enable_thinking: false
+    description: "인사·잡담 — RAG 미주입, 짧은 응답"
 
 # 세션 설정
 session:

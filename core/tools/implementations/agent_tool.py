@@ -23,8 +23,10 @@ v7.0 Phase 9 재설계: AgentDefinition 기반 호출을 지원한다.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
+from collections import OrderedDict
 from typing import Any, ClassVar
 
 from core.tools.base import (
@@ -69,6 +71,96 @@ class AgentTool(BaseTool):
     # 클래스 레벨 호출 통계 — Ch 17 /metrics가 참조한다.
     # agent_name(또는 "default") → {"calls": int, "total_latency_ms": float}
     _stats: ClassVar[dict[str, dict[str, Any]]] = {}
+
+    # ─────────────────────────────────────────────
+    # 결과 캐시 (2026-04-22, v0.14.2)
+    # ─────────────────────────────────────────────
+    # Scout 호출은 CPU 4B 모델 + llama.cpp라 한 번에 ~30초가 걸린다.
+    # 같은 질문이 짧은 시간 안에 반복되면 (예: 사용자가 동일 문서를 여러 턴에 걸쳐
+    # 질문하거나 Worker가 재시도하는 경우) 매번 Scout를 다시 돌리는 건 낭비다.
+    # 여기서는 (subagent_type, prompt, system_prompt, 도구 조합, max_turns)를
+    # 해시 키로 하여 결과 텍스트를 짧은 TTL 동안만 캐시한다.
+    #
+    # 주의:
+    #   - subagent_type이 있는 호출만 캐시한다. 하위 호환 ad-hoc 경로는
+    #     description이 매번 다를 수 있어 캐시 효과가 낮고 일관성 위험만 크다.
+    #   - 에러 결과는 캐시하지 않는다 (일시적 장애가 장기간 캐시되면 안 됨).
+    #   - TTL은 짧게(기본 5분). 도구가 파일 시스템에 의존하므로 길면 stale 위험.
+    _cache: ClassVar[OrderedDict[str, tuple[str, int, float]]] = OrderedDict()
+    _cache_stats: ClassVar[dict[str, int]] = {
+        "hits": 0,
+        "misses": 0,
+        "stored": 0,
+        "evicted": 0,
+    }
+    _cache_enabled: ClassVar[bool] = True
+    _cache_ttl_seconds: ClassVar[float] = 300.0  # 5분
+    _cache_max_entries: ClassVar[int] = 64
+
+    @classmethod
+    def _compute_cache_key(
+        cls,
+        subagent_type: str,
+        prompt: str,
+        system_prompt: str,
+        tool_names: list[str],
+        max_turns: int,
+    ) -> str:
+        """호출 입력으로부터 결정적 캐시 키를 계산한다.
+
+        `\\0` 구분자로 필드를 이어 붙여 입력 경계를 명확히 한다.
+        도구 순서는 정렬하여 동일 조합이 같은 키로 귀결되게 한다.
+        """
+        payload = "\0".join(
+            [
+                subagent_type,
+                prompt,
+                system_prompt,
+                ",".join(sorted(tool_names)),
+                str(max_turns),
+            ]
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def _cache_lookup(cls, key: str) -> tuple[str, int] | None:
+        """TTL 안의 유효한 엔트리를 반환. 없거나 만료면 None."""
+        entry = cls._cache.get(key)
+        if entry is None:
+            cls._cache_stats["misses"] += 1
+            return None
+        text, turns, stored_at = entry
+        if time.monotonic() - stored_at > cls._cache_ttl_seconds:
+            # 만료 — 제거 후 miss로 취급
+            del cls._cache[key]
+            cls._cache_stats["misses"] += 1
+            return None
+        # LRU 갱신 — 최근 사용으로 이동
+        cls._cache.move_to_end(key)
+        cls._cache_stats["hits"] += 1
+        return text, turns
+
+    @classmethod
+    def _cache_store(cls, key: str, text: str, turns: int) -> None:
+        """결과를 캐시에 저장. 크기 초과 시 가장 오래된 항목 제거."""
+        cls._cache[key] = (text, turns, time.monotonic())
+        cls._cache.move_to_end(key)
+        cls._cache_stats["stored"] += 1
+        while len(cls._cache) > cls._cache_max_entries:
+            cls._cache.popitem(last=False)
+            cls._cache_stats["evicted"] += 1
+
+    @classmethod
+    def get_cache_stats(cls) -> dict[str, int]:
+        """/metrics 등이 조회할 캐시 통계."""
+        return {**cls._cache_stats, "size": len(cls._cache)}
+
+    @classmethod
+    def reset_cache(cls) -> None:
+        """테스트 격리용 — 캐시와 통계를 모두 비운다."""
+        cls._cache.clear()
+        for k in cls._cache_stats:
+            cls._cache_stats[k] = 0
 
     # ═══ 1. Identity ═══
 
@@ -184,25 +276,69 @@ class AgentTool(BaseTool):
             config.model_override_label,
         )
 
-        # ② 실행 + 통계 누적
+        # ② 캐시 조회 — subagent_type이 있을 때만 시도한다.
+        # ad-hoc(description) 호출은 description이 매번 미묘하게 달라질 수 있어
+        # 캐시 일관성이 떨어진다. Scout 같은 정식 서브에이전트만 캐시 대상.
+        cache_key: str | None = None
         stats_key = subagent_type or "ad-hoc"
+        if subagent_type and self._cache_enabled:
+            cache_key = self._compute_cache_key(
+                subagent_type=subagent_type,
+                prompt=prompt,
+                system_prompt=config.system_prompt,
+                tool_names=[t.name for t in config.tools],
+                max_turns=config.max_turns,
+            )
+            cached = self._cache_lookup(cache_key)
+            if cached is not None:
+                text, turns = cached
+                logger.info(
+                    "Agent: 캐시 히트 (type=%s, %d자, %d턴) — Scout 재실행 생략",
+                    subagent_type, len(text), turns,
+                )
+                # 캐시 히트도 관측성을 위해 latency=0으로 stats에 기록한다.
+                self._record_stats(stats_key, 0.0)
+                return ToolResult.success(text, turns=turns, cache_hit=True)
+
+        # ③ 실행 + 통계 누적
+        # 장기 실행 임계(60초)를 넘기면 완료 로그를 WARNING으로 승격하여
+        # 운영자가 로그에서 hang 징후를 빠르게 발견할 수 있게 한다.
+        # Scout(CPU 4B)는 평균 30~50초이므로 60초는 이상 징후 경계선으로 적절.
+        long_running_threshold_s = 60.0
         start_time = time.monotonic()
+        logger.info(
+            "Agent: 실행 중 (type=%s, prompt_len=%d)",
+            stats_key, len(prompt),
+        )
         try:
             result_text, turns = await self._run_subagent(prompt, config, context)
             elapsed_ms = (time.monotonic() - start_time) * 1000.0
             self._record_stats(stats_key, elapsed_ms)
+            elapsed_s = elapsed_ms / 1000.0
 
-            logger.info(
-                "Agent: 완료 (%.1fs, %d턴, %d자)",
-                elapsed_ms / 1000.0,
-                turns,
-                len(result_text),
-            )
+            if elapsed_s >= long_running_threshold_s:
+                logger.warning(
+                    "Agent: 장기 실행 완료 (type=%s, %.1fs, %d턴, %d자) — "
+                    "임계 %ds 초과",
+                    stats_key, elapsed_s, turns, len(result_text),
+                    int(long_running_threshold_s),
+                )
+            else:
+                logger.info(
+                    "Agent: 완료 (type=%s, %.1fs, %d턴, %d자)",
+                    stats_key, elapsed_s, turns, len(result_text),
+                )
+            # 성공한 결과만 캐시한다 (에러 결과는 일시 장애일 수 있어 캐시 금지).
+            if cache_key is not None:
+                self._cache_store(cache_key, result_text, turns)
             return ToolResult.success(result_text, turns=turns)
         except Exception as e:
             elapsed_ms = (time.monotonic() - start_time) * 1000.0
             self._record_stats(stats_key, elapsed_ms)
-            logger.error("Agent: 실행 실패: %s", e)
+            logger.error(
+                "Agent: 실행 실패 (type=%s, %.1fs): %s",
+                stats_key, elapsed_ms / 1000.0, e,
+            )
             return ToolResult.error(f"서브 에이전트 실행 실패: {e}")
 
     # ─── 내부 헬퍼: 설정 결정 ───────────────────────

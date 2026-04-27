@@ -345,6 +345,227 @@ class TestAgentToolStats:
 
 
 # ─────────────────────────────────────────────
+# Scout 결과 캐시 (v0.14.2, 2026-04-22)
+# ─────────────────────────────────────────────
+@pytest.fixture(autouse=True)
+def reset_cache():
+    """각 테스트 전에 AgentTool 클래스 캐시를 초기화한다."""
+    AgentTool.reset_cache()
+    yield
+    AgentTool.reset_cache()
+
+
+class TestAgentToolCache:
+    """동일 입력에 대한 Scout 호출이 캐시로 반복 실행을 회피하는지 검증한다."""
+
+    async def test_cache_hit_skips_run_subagent(
+        self, context: ToolUseContext
+    ):
+        """같은 입력의 2차 호출은 `_run_subagent`를 재호출하지 않는다."""
+        tool = AgentTool()
+        call_count = 0
+
+        async def counting_run(self, prompt, config, parent_context):
+            nonlocal call_count
+            call_count += 1
+            return f"결과 {call_count}", 1
+
+        with patch.object(AgentTool, "_run_subagent", counting_run):
+            r1 = await tool.call(
+                {"prompt": "동일 질문", "subagent_type": "scout"}, context
+            )
+            r2 = await tool.call(
+                {"prompt": "동일 질문", "subagent_type": "scout"}, context
+            )
+
+        assert not r1.is_error and not r2.is_error
+        # 2차 호출은 캐시 히트로 실제 서브에이전트 실행을 건너뛰었다
+        assert call_count == 1
+        assert r1.data == r2.data == "결과 1"
+        # 2차 호출 결과에 cache_hit 플래그가 있다
+        assert r2.metadata.get("cache_hit") is True
+
+        stats = AgentTool.get_cache_stats()
+        assert stats["hits"] == 1
+        assert stats["misses"] == 1
+        assert stats["stored"] == 1
+        assert stats["size"] == 1
+
+    async def test_different_prompts_do_not_collide(
+        self, context: ToolUseContext
+    ):
+        """prompt가 다르면 캐시 키도 달라져 각각 실행되어야 한다."""
+        tool = AgentTool()
+        run_count = 0
+
+        async def counting_run(self, prompt, config, parent_context):
+            nonlocal run_count
+            run_count += 1
+            return f"answer-{run_count}", 1
+
+        with patch.object(AgentTool, "_run_subagent", counting_run):
+            await tool.call(
+                {"prompt": "질문 A", "subagent_type": "scout"}, context
+            )
+            await tool.call(
+                {"prompt": "질문 B", "subagent_type": "scout"}, context
+            )
+
+        assert run_count == 2
+        stats = AgentTool.get_cache_stats()
+        assert stats["size"] == 2
+        assert stats["hits"] == 0
+        assert stats["misses"] == 2
+
+    async def test_cache_disabled_bypasses_lookup(
+        self, context: ToolUseContext
+    ):
+        """`_cache_enabled=False`이면 같은 입력도 매번 실행된다."""
+        tool = AgentTool()
+        run_count = 0
+
+        async def counting_run(self, prompt, config, parent_context):
+            nonlocal run_count
+            run_count += 1
+            return "same", 1
+
+        saved = AgentTool._cache_enabled
+        AgentTool._cache_enabled = False
+        try:
+            with patch.object(AgentTool, "_run_subagent", counting_run):
+                await tool.call(
+                    {"prompt": "p", "subagent_type": "scout"}, context
+                )
+                await tool.call(
+                    {"prompt": "p", "subagent_type": "scout"}, context
+                )
+        finally:
+            AgentTool._cache_enabled = saved
+
+        assert run_count == 2
+        # 조회 자체를 건너뛰므로 hit/miss 둘 다 0이어야 한다
+        stats = AgentTool.get_cache_stats()
+        assert stats["hits"] == 0
+        assert stats["misses"] == 0
+
+    async def test_cache_expires_after_ttl(
+        self, context: ToolUseContext
+    ):
+        """TTL을 넘긴 엔트리는 만료 처리되어 재실행된다."""
+        tool = AgentTool()
+        run_count = 0
+
+        async def counting_run(self, prompt, config, parent_context):
+            nonlocal run_count
+            run_count += 1
+            return "x", 1
+
+        saved = AgentTool._cache_ttl_seconds
+        # 음수 TTL → `elapsed > ttl` 비교가 항상 True라 어느 시점 조회든 만료 처리.
+        # 0.0은 고해상도 monotonic 환경에서 동일 tick 내에 저장/조회가 끝나면
+        # elapsed==0이 되어 만료되지 않을 수 있다.
+        AgentTool._cache_ttl_seconds = -1.0
+        try:
+            with patch.object(AgentTool, "_run_subagent", counting_run):
+                await tool.call(
+                    {"prompt": "p", "subagent_type": "scout"}, context
+                )
+                await tool.call(
+                    {"prompt": "p", "subagent_type": "scout"}, context
+                )
+        finally:
+            AgentTool._cache_ttl_seconds = saved
+
+        # 두 번 모두 만료로 처리되어 재실행
+        assert run_count == 2
+        stats = AgentTool.get_cache_stats()
+        # 두 번째 호출에서 기존 엔트리가 만료되어 miss로 전환됐다
+        assert stats["misses"] == 2
+
+    async def test_cache_errors_not_stored(self, context: ToolUseContext):
+        """에러 결과는 캐시에 들어가지 않는다 (일시 장애가 고착되면 안 됨)."""
+        tool = AgentTool()
+
+        async def failing_run(self, prompt, config, parent_context):
+            raise RuntimeError("fail")
+
+        with patch.object(AgentTool, "_run_subagent", failing_run):
+            r = await tool.call(
+                {"prompt": "p", "subagent_type": "scout"}, context
+            )
+
+        assert r.is_error
+        stats = AgentTool.get_cache_stats()
+        assert stats["stored"] == 0
+        assert stats["size"] == 0
+
+    async def test_adhoc_path_not_cached(self, context: ToolUseContext):
+        """subagent_type 없는 ad-hoc 호출은 캐시 대상이 아니다."""
+        tool = AgentTool()
+        run_count = 0
+
+        async def counting_run(self, prompt, config, parent_context):
+            nonlocal run_count
+            run_count += 1
+            return "x", 1
+
+        with patch.object(AgentTool, "_run_subagent", counting_run):
+            await tool.call(
+                {"prompt": "p", "description": "helper"}, context
+            )
+            await tool.call(
+                {"prompt": "p", "description": "helper"}, context
+            )
+
+        # 두 번 모두 실행 (캐시 건너뜀)
+        assert run_count == 2
+        stats = AgentTool.get_cache_stats()
+        # 조회 자체를 건너뛰므로 hit/miss 둘 다 0
+        assert stats["hits"] == 0
+        assert stats["misses"] == 0
+
+    async def test_cache_evicts_oldest_when_full(
+        self, context: ToolUseContext
+    ):
+        """`_cache_max_entries`를 초과하면 LRU로 가장 오래된 것이 밀려난다."""
+        tool = AgentTool()
+
+        async def echo_run(self, prompt, config, parent_context):
+            return f"r({prompt})", 1
+
+        saved = AgentTool._cache_max_entries
+        AgentTool._cache_max_entries = 2
+        try:
+            with patch.object(AgentTool, "_run_subagent", echo_run):
+                for i in range(3):
+                    await tool.call(
+                        {"prompt": f"q{i}", "subagent_type": "scout"}, context
+                    )
+        finally:
+            AgentTool._cache_max_entries = saved
+
+        stats = AgentTool.get_cache_stats()
+        assert stats["size"] == 2
+        assert stats["evicted"] == 1
+        assert stats["stored"] == 3
+
+    def test_cache_key_deterministic_and_order_insensitive(self):
+        """도구 순서가 달라도 같은 조합이면 같은 키가 나와야 한다."""
+        key_a = AgentTool._compute_cache_key(
+            "scout", "p", "sys", ["Read", "Glob", "Grep"], 5
+        )
+        key_b = AgentTool._compute_cache_key(
+            "scout", "p", "sys", ["Grep", "Read", "Glob"], 5
+        )
+        assert key_a == key_b
+
+        key_diff = AgentTool._compute_cache_key(
+            "scout", "p", "sys", ["Read", "Glob", "Grep"], 10
+        )
+        assert key_a != key_diff
+
+
+# ─────────────────────────────────────────────
 # DISALLOWED 도구 제외
 # ─────────────────────────────────────────────
 class TestDisallowedToolsFilter:

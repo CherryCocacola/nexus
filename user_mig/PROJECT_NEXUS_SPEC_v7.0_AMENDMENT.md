@@ -555,6 +555,120 @@ Tier 4: httpx             ← 불변
 
 **기존 테스트 영향**: 600개 테스트(단위 535 + 통합 65) 전부 통과 유지.
 
+### 2.5.9 CHAT 카테고리 (2026-04-27, v0.14.6)
+
+#### 배경
+
+Part 2.5 라우팅과 Part 2.5.8 지식 RAG 도입 후 kowiki 적재가 풍부해질수록
+**짧은 인사·잡담에서 의도치 않은 위키 정보가 답변에 섞이는 현상**이 두드러짐.
+
+실측 (2026-04-27, kowiki 1,067,975 청크 적재 후):
+- 사용자 입력 `안녕` → 분류기 KNOWLEDGE → KnowledgeRetriever가 가수 "안녕" /
+  "굿모닝 예루살렘" / "고도원의 아침편지" 청크를 유사도 0.3 이상으로 회수 →
+  시스템 프롬프트에 ~1KB 주입 → 27B 모델이 그 정보를 풀어 답변 ("안녕은
+  1992년생 가수로 …" 1,000+ 토큰)
+
+원인은 휴리스틱 분류기가 **"TOOL이 아니면 무조건 KNOWLEDGE"** 2분류만 가졌고,
+KNOWLEDGE는 KB RAG가 자동 주입되도록 설계됐기 때문. kowiki 적재가 적을 때는
+드러나지 않다가 청크가 100만 단위로 늘면서 임의 단어가 거의 모두 매칭됨.
+
+#### 설계: 3분류 확장 (KNOWLEDGE / TOOL / **CHAT**)
+
+```
+HeuristicClassifier.classify(user_input):
+  1) routing.enabled=False                              → TOOL
+  2) len(input) >= long_input_threshold (500)           → TOOL
+  3) tool_keywords / word / regex 매치                   → TOOL
+  4) len(input.strip()) <= chat_max_length (30)
+     AND chat_keywords 매치                             → CHAT   ← 신규
+  5) 그 외                                               → KNOWLEDGE
+```
+
+**휴리스틱만으로 충분** (Part 2.5.3 원칙 유지) — LLM 호출 없이 substring + 길이
+임계로 상수 시간 분류. TOOL 키워드는 CHAT보다 항상 우선이라 "이 파일 안녕히
+처리해줘" 같은 입력은 정확히 TOOL로 분류.
+
+#### CHAT 프로필
+
+```yaml
+chat_mode:
+  model: "qwen3.5-27b"      # KNOWLEDGE와 같은 베이스 모델
+  temperature: 0.5          # KNOWLEDGE(0.2)보다 높여 자연스러운 어투
+  max_tokens: 512           # 인사·잡담은 짧게
+  enable_thinking: false
+```
+
+`RoutingDecision`에 `inject_knowledge_rag: bool` 프로퍼티 신규 — `query_class
+== "KNOWLEDGE"`일 때만 True. PromptAssembler가 이 값을 보고 KB 단계 자체를
+스킵하므로 CHAT 질의는 임베딩 검색·DB 조회 비용도 들지 않는다.
+
+#### chat_keywords 기본값 (한국어/영어 조합)
+
+```
+한국어: 안녕, 안뇽, 좋은 아침, 좋은 저녁, 좋은 밤, 굿모닝, 굿나잇,
+       잘 자, 잘자, 반가워, 반갑습니다, 반갑네, 고마워, 고맙습니다,
+       감사, 땡큐, 잘 가, 잘가, 다음에 봐, 다음에 보자, ㅋㅋ, ㅎㅎ
+영어:   hi, hello, hey, yo, sup, good morning, good evening, good night,
+       thanks, thank you, thx, ty, bye, goodbye, see you, cya
+```
+
+`config/nexus_config.yaml#routing.chat_keywords`로 운영자가 코드 수정 없이
+확장 가능. `chat_max_length: 0`으로 설정하면 CHAT 분류 자체가 비활성화되어
+v0.14.5와 동일한 2분류 동작으로 회귀 — 비상 스위치.
+
+#### 시스템 프롬프트 보조 강화 (D 보조안)
+
+`PromptAssembler._attach_knowledge_base()`가 KB 블록 끝에 다음 지시를 항상
+함께 주입한다:
+
+```
+Use the information above ONLY when it is clearly relevant to the user's
+question. If the snippets above are off-topic, irrelevant, or contradict
+common-sense knowledge, IGNORE them and answer from your own general
+knowledge. Never force-fit the snippets into the answer.
+```
+
+또한 `web/prompts/worker_system.md` / `_build_default_system_prompt()`에
+"인사·잡담은 짧게 답하고 백과사전 정보를 자발적으로 풀지 말 것" + "KB 블록이
+주제와 무관하면 무시" 지시를 명시. CHAT 분류기와 다층 방어 (분류기가 놓쳐도
+27B 모델이 자체 판단으로 거를 수 있도록).
+
+#### 4-Tier 체인 영향: 없음
+
+체인 구조와 파라미터 시그니처(`model_override`, `temperature`, `max_tokens_cap`,
+`enable_thinking`) 불변. RoutingDecision의 query_class 종류만 늘어남.
+
+#### 하드웨어 업그레이드 시 자동 비활성화
+
+`routing.enabled=false`로 전환하면 분류기 자체가 우회되어 CHAT 분기도 함께
+비활성. TIER_M(H100) 이상에서는 KB RAG보다 긴 컨텍스트 안 다중턴 추론이
+기본 전략이 되므로 자연스러운 회귀 경로다 (Part 2.5.6과 동일).
+
+#### 구현 범위 (v0.14.6, 2026-04-27)
+
+```
+신규/수정:
+  core/config.py                            (chat_mode, chat_keywords, chat_max_length)
+  config/nexus_config.yaml                  (routing.chat_* 섹션)
+  core/orchestrator/routing.py              (3분류, RoutingDecision.inject_knowledge_rag)
+  core/orchestrator/prompt_assembler.py     (CHAT 스킵 + IGNORE 지시 강화)
+  core/bootstrap.py                         (CLI 시스템 프롬프트에 small-talk 가이드)
+  web/prompts/worker_system.md              (Web 시스템 프롬프트에 동일 가이드)
+  tests/unit/test_query_routing.py          (CHAT 분류 케이스 +RoutingResolver 검증)
+  tests/unit/test_prompt_assembler.py       (CHAT/KNOWLEDGE 분기 4 케이스, 신규 파일)
+```
+
+#### 실측 효과 (v0.14.6 적용 후 — 동일 입력)
+
+| 입력 | v0.14.5 | v0.14.6 |
+|---|---|---|
+| `안녕` | 1,000+ 토큰 ("가수 안녕은 1992년생…") | ~30 토큰 ("안녕하세요! 무엇을 도와드릴까요?") |
+| `좋은 아침이야` | "고도원의 아침편지·모닝글로리…" | "좋은 아침입니다! 오늘 하루도…" |
+| `니체 철학 요약` | KB 주입 + 정확 답변 | KB 주입 + 정확 답변 (변화 없음) |
+| `이 파일 안녕히 처리해줘` | TOOL (변화 없음) | TOOL (변화 없음) |
+
+---
+
 ### 2.5.8 지식 RAG (2026-04-21 구현)
 
 KNOWLEDGE_MODE 질의의 정확도를 한 단계 더 끌어올리기 위해 외부 지식 베이스
@@ -1158,6 +1272,45 @@ Worker가 Agent 도구를 호출할 때 경로:
 이들은 TaskManager 아래에서 장기 실행 태스크(LOCAL_AGENT 등)를 관리하며,
 지금 재설계는 그 상위의 AgentDefinition 정의만 건드린다.
 
+#### Ch 14 확장 — 서브에이전트 결과 캐시 (2026-04-22, v0.14.2)
+
+**배경**: Scout는 CPU 4B 모델(llama.cpp)이라 한 번에 ~30초가 걸린다. Worker가
+같은 문서 분석을 여러 턴에 걸쳐 반복하거나, 재시도 상황에서 동일 입력을 다시
+호출하면 그만큼 고정 비용이 반복된다.
+
+**설계**: `AgentTool`에 클래스 레벨 LRU+TTL 캐시를 추가하여 같은 입력의 재호출
+시 `_run_subagent`를 건너뛴다.
+
+```python
+class AgentTool(BaseTool):
+    _cache: OrderedDict[str, tuple[str, int, float]]  # key → (text, turns, stored_at)
+    _cache_stats: dict[str, int]  # hits / misses / stored / evicted
+    _cache_enabled: bool = True
+    _cache_ttl_seconds: float = 300.0   # 5분
+    _cache_max_entries: int = 64
+```
+
+**캐시 키**: `SHA-256(subagent_type | prompt | system_prompt |
+sorted(tool_names) | max_turns)`. 필드는 `\0`로 구분하여 경계가 명확하고,
+도구 순서는 정렬되어 동일 조합이 같은 키로 귀결된다.
+
+**규칙**:
+- `subagent_type`이 있는 호출만 캐시 (정식 서브에이전트). ad-hoc(description)
+  경로는 매번 달라질 수 있어 캐시 일관성이 떨어지므로 대상에서 제외.
+- **에러 결과는 캐시하지 않는다** — 일시적 장애(Scout 서버 hiccup 등)가 TTL
+  동안 고착되면 치명적.
+- TTL 만료 시 `elapsed > ttl` 비교로 제거. LRU로 용량 초과 시 가장 오래된
+  엔트리를 밀어낸다.
+- 히트 시 `ToolResult.success(..., cache_hit=True)` 메타데이터로 호출자에게
+  알린다. `_stats`에도 latency=0으로 기록하여 관측성을 유지.
+
+**메트릭**: `/metrics`의 `agent_cache` 섹션이 `hits/misses/stored/evicted/size`
+정수를 노출한다 (`AgentTool.get_cache_stats()`).
+
+**하드웨어 업그레이드 시**: 캐시는 티어와 독립적. TIER_M/L로 Scout가 비활성화
+돼도 코드 자체는 남고, 향후 다른 `subagent_type`(code-reviewer 등)이 추가되면
+그대로 활용된다.
+
 ### Ch 15: State Management + 멀티테넌시 (2026-04-21 확장)
 
 **GlobalState에 필드 추가**:
@@ -1246,6 +1399,38 @@ tenants:
   }
 }
 ```
+
+**M8 — /v1/tenants 조회 API (2026-04-22, v0.14.2)**:
+`GET /v1/tenants`가 등록된 테넌트 전체 목록을 관리자용 필드까지 포함하여 반환
+한다. `/metrics`의 `tenants.registered`가 요약(`id/name/has_model_override/
+allowed_source_count/api_key_count`)을 제공하는 반면, `/v1/tenants`는 테넌트
+운영 상세(`description/model_override/allowed_knowledge_sources/adapter_name_prefix/metadata`)
+까지 노출한다.
+
+```json
+GET /v1/tenants →
+{
+  "tenants": [
+    {
+      "id": "default",
+      "name": "Default",
+      "description": "공통 테넌트",
+      "model_override": null,
+      "allowed_knowledge_sources": ["kowiki", "sample"],
+      "api_key_count": 0,
+      "adapter_name_prefix": null,
+      "metadata": {}
+    },
+    ...
+  ],
+  "default_tenant": "default",
+  "total": N
+}
+```
+
+**보안 계약**: `api_keys` 원본은 응답 본문 어디에도 포함되지 않는다. 길이만
+`api_key_count` 필드로 노출. 인증은 현 단계에서 프록시/네트워크 레벨(내부
+LAN 전용)에 위임하며, 엔드포인트 자체에는 토큰 검증이 없다.
 
 **하위 호환**: 모든 기존 호출(tenant 없음)은 `default` 테넌트로 해석되며 기존
 동작(`allowed_sources=[kowiki, sample]`) 유지. tenant 기능을 쓰지 않으려면

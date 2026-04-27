@@ -220,14 +220,90 @@ class NexusREPL:
             )
             return
 
-        # QueryEngine에서 AsyncGenerator로 StreamEvent를 수신하여 표시한다
+        # QueryEngine에서 AsyncGenerator로 StreamEvent를 수신하여 표시한다.
+        # v0.14.8 — Console.status() spinner로 단계별 진행을 시각화.
+        # 첫 TEXT_DELTA가 도착하면 spinner를 닫고 본문 출력으로 넘어간다.
+        # 도구 호출이 시작되면 다시 spinner로 전환해 "Reading X.py..." 같은
+        # 단계 표시를 띄운다 — 사용자가 cold start 60초도 "분석 중"으로 인지.
+        status_ctx = self.console.status(
+            "[cyan]요청 분석 중...[/cyan]", spinner="dots"
+        )
+        status_ctx.__enter__()
+        status_active = True
         try:
             async for event in self._query_engine.submit_message(user_input):
+                # spinner를 켤지/끌지/문구를 갱신할지 결정
+                next_label = self._stage_label_for(event)
+                if next_label == "_TEXT_":
+                    # 첫 본문 토큰이 도착 — spinner를 닫고 print로 전환
+                    if status_active:
+                        status_ctx.__exit__(None, None, None)
+                        status_active = False
+                elif next_label == "_TOOL_DONE_":
+                    # 도구가 끝나고 다음 LLM 응답 대기 — spinner 재가동
+                    if not status_active:
+                        status_ctx = self.console.status(
+                            "[cyan]응답 생성 중...[/cyan]", spinner="dots"
+                        )
+                        status_ctx.__enter__()
+                        status_active = True
+                elif next_label is not None:
+                    # 단계 텍스트 갱신 (TURN_START/TOOL_USE_START 등)
+                    if status_active:
+                        status_ctx.update(next_label)
+                    else:
+                        # spinner가 닫혀 있으면 다시 연다 (도구 호출 시작 등)
+                        status_ctx = self.console.status(
+                            next_label, spinner="dots"
+                        )
+                        status_ctx.__enter__()
+                        status_active = True
+
                 self.display_stream_event(event)
         except asyncio.CancelledError:
+            if status_active:
+                status_ctx.__exit__(None, None, None)
+                status_active = False
             self.console.print("[yellow]요청이 취소되었습니다.[/yellow]")
         except Exception as e:
+            if status_active:
+                status_ctx.__exit__(None, None, None)
+                status_active = False
             self.console.print(self._formatter.format_error(str(e)))
+        finally:
+            # 안전하게 닫기 — TEXT가 안 도착했거나 예외 직후
+            if status_active:
+                status_ctx.__exit__(None, None, None)
+
+    def _stage_label_for(self, event: Any) -> str | None:
+        """StreamEvent를 보고 spinner 상태/문구를 결정한다.
+
+        반환값:
+          - "_TEXT_"        : TEXT_DELTA 도착 — spinner 닫고 본문 출력 모드
+          - "_TOOL_DONE_"   : 도구 종료 — 다음 LLM 응답 대기 spinner
+          - "[..]label[..]" : spinner 문구를 이 텍스트로 갱신
+          - None            : 변동 없음 (현재 spinner 그대로)
+
+        StreamEvent가 아닌 객체(Message 등)는 None을 돌려 변경 없음.
+        """
+        if not isinstance(event, StreamEvent):
+            return None
+        et = event.type
+        if et == StreamEventType.TEXT_DELTA:
+            return "_TEXT_"
+        if et == StreamEventType.STREAM_REQUEST_START:
+            # GPU 서버에 요청을 막 보낸 시점 — KB 검색이 끝난 직후
+            return "[cyan]모델 추론 중...[/cyan]"
+        if et == StreamEventType.MESSAGE_START:
+            return "[cyan]응답 생성 중...[/cyan]"
+        if et == StreamEventType.THINKING_START:
+            return "[magenta]생각 정리 중...[/magenta]"
+        if et == StreamEventType.TOOL_USE_START:
+            tool_name = getattr(event, "tool_name", None) or "도구"
+            return f"[yellow]{tool_name} 실행 중...[/yellow]"
+        if et == StreamEventType.TOOL_USE_STOP:
+            return "_TOOL_DONE_"
+        return None
 
     # ─── StreamEvent 표시 ───
 

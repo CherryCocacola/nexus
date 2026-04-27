@@ -22,7 +22,12 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from core.memory.short_term import ShortTermMemory
-from core.memory.transcript import SessionTranscript, list_transcript_sessions
+from core.memory.transcript import (
+    SessionTranscript,
+    delete_transcript_session,
+    list_transcript_sessions,
+    read_transcript_messages,
+)
 from core.message import Message
 
 
@@ -97,6 +102,164 @@ def test_list_transcript_sessions_empty_dir(tmp_path: Path) -> None:
     """디렉토리 자체가 비어 있으면 빈 리스트."""
     assert list_transcript_sessions(tmp_path / "nonexistent") == []
     assert list_transcript_sessions(tmp_path) == []
+
+
+# ─────────────────────────────────────────────
+# read_transcript_messages (Ch 16 프론트 복원용)
+# ─────────────────────────────────────────────
+def test_read_transcript_messages_filters_by_role(tmp_path: Path) -> None:
+    """기본 호출은 user/assistant만 반환하고 system/에러 엔트리는 제외한다."""
+    t = SessionTranscript(sessions_dir=tmp_path, session_id="sx", enabled=True)
+    t.append_entry(role="user", content="hi", turn=1)
+    t.append_entry(role="assistant", content="hello", turn=1)
+    t.append_entry(
+        role="system", content="[stream aborted]", turn=2,
+        extra={"error": "TimeoutError"},
+    )
+    t.append_entry(role="user", content="again", turn=3)
+
+    msgs = read_transcript_messages(tmp_path, "sx")
+    roles = [m["role"] for m in msgs]
+    contents = [m["content"] for m in msgs]
+    assert roles == ["user", "assistant", "user"]
+    assert contents == ["hi", "hello", "again"]
+    # 필드 보존
+    assert msgs[0]["turn"] == 1
+    assert msgs[0]["ts"] is not None
+
+
+def test_read_transcript_messages_missing_file(tmp_path: Path) -> None:
+    """파일이 없으면 빈 리스트 — 404 분기와 별개로 예외 없이 처리된다."""
+    assert read_transcript_messages(tmp_path, "unknown-session") == []
+
+
+def test_read_transcript_messages_limit_recent(tmp_path: Path) -> None:
+    """limit 지정 시 가장 최근 N개만 반환 (오래된 것부터 순서 유지)."""
+    t = SessionTranscript(sessions_dir=tmp_path, session_id="sy", enabled=True)
+    for i in range(5):
+        t.append_entry(role="user", content=f"q{i}", turn=i)
+    msgs = read_transcript_messages(tmp_path, "sy", limit=2)
+    assert [m["content"] for m in msgs] == ["q3", "q4"]
+
+
+def test_read_transcript_messages_skips_corrupt_lines(tmp_path: Path) -> None:
+    """손상된 JSON 라인은 조용히 스킵되고 정상 라인은 그대로 반환된다."""
+    t = SessionTranscript(sessions_dir=tmp_path, session_id="sz", enabled=True)
+    t.append_entry(role="user", content="ok1", turn=1)
+
+    # 정상 라인 사이에 손상된 라인을 끼워 넣는다
+    path = tmp_path / "sz" / "transcript.jsonl"
+    with path.open("a", encoding="utf-8") as f:
+        f.write("THIS IS NOT JSON\n")
+
+    t.append_entry(role="assistant", content="ok2", turn=1)
+
+    msgs = read_transcript_messages(tmp_path, "sz")
+    assert [m["content"] for m in msgs] == ["ok1", "ok2"]
+
+
+def test_read_transcript_messages_custom_roles(tmp_path: Path) -> None:
+    """roles 인자를 명시하면 system 엔트리도 포함된다."""
+    t = SessionTranscript(sessions_dir=tmp_path, session_id="sw", enabled=True)
+    t.append_entry(role="user", content="hi", turn=1)
+    t.append_entry(role="system", content="[info]", turn=1)
+
+    msgs = read_transcript_messages(
+        tmp_path, "sw", roles=("user", "assistant", "system")
+    )
+    assert [m["role"] for m in msgs] == ["user", "system"]
+
+
+# ─────────────────────────────────────────────
+# list_transcript_sessions — title_hint (v0.14.5)
+# ─────────────────────────────────────────────
+def test_list_transcript_sessions_includes_title_hint(tmp_path: Path) -> None:
+    """첫 user 메시지를 title_hint로 포함하여 사이드바에서 대화 식별이 가능하다."""
+    t = SessionTranscript(sessions_dir=tmp_path, session_id="s1", enabled=True)
+    t.append_entry(role="user", content="니체 철학에 대해 설명해줘", turn=1)
+    t.append_entry(role="assistant", content="위버멘쉬...", turn=1)
+
+    out = list_transcript_sessions(tmp_path, limit=10)
+    assert len(out) == 1
+    assert out[0]["title_hint"] == "니체 철학에 대해 설명해줘"
+
+
+def test_list_transcript_sessions_title_hint_truncated(tmp_path: Path) -> None:
+    """title_hint는 60자를 넘으면 말줄임표가 붙는다."""
+    long_msg = "가" * 80
+    t = SessionTranscript(sessions_dir=tmp_path, session_id="s2", enabled=True)
+    t.append_entry(role="user", content=long_msg, turn=1)
+
+    out = list_transcript_sessions(tmp_path, limit=10)
+    hint = out[0]["title_hint"]
+    assert hint is not None
+    assert hint.endswith("…")
+    # 60자 + 말줄임표 1자
+    assert len(hint) == 61
+
+
+def test_list_transcript_sessions_title_hint_skips_newlines(tmp_path: Path) -> None:
+    """멀티라인 첫 메시지도 공백 하나로 정규화된 title_hint로 나온다."""
+    t = SessionTranscript(sessions_dir=tmp_path, session_id="s3", enabled=True)
+    t.append_entry(role="user", content="첫줄\n둘째줄", turn=1)
+
+    out = list_transcript_sessions(tmp_path, limit=10)
+    assert out[0]["title_hint"] == "첫줄 둘째줄"
+
+
+def test_list_transcript_sessions_title_hint_none_if_no_user(tmp_path: Path) -> None:
+    """assistant만 있고 user 메시지가 없으면 title_hint는 None."""
+    t = SessionTranscript(sessions_dir=tmp_path, session_id="s4", enabled=True)
+    t.append_entry(role="assistant", content="먼저 말을 걸었음", turn=1)
+
+    out = list_transcript_sessions(tmp_path, limit=10)
+    assert out[0]["title_hint"] is None
+
+
+# ─────────────────────────────────────────────
+# delete_transcript_session (v0.14.5)
+# ─────────────────────────────────────────────
+def test_delete_transcript_session_removes_dir(tmp_path: Path) -> None:
+    """세션 디렉토리가 통째로 지워진다."""
+    t = SessionTranscript(sessions_dir=tmp_path, session_id="del1", enabled=True)
+    t.append_entry(role="user", content="bye", turn=1)
+    sdir = tmp_path / "del1"
+    assert sdir.exists()
+
+    deleted = delete_transcript_session(tmp_path, "del1")
+    assert deleted is True
+    assert not sdir.exists()
+
+
+def test_delete_transcript_session_returns_false_if_missing(tmp_path: Path) -> None:
+    """없는 세션 삭제는 False 반환 (에러 아님)."""
+    assert delete_transcript_session(tmp_path, "never-existed") is False
+
+
+@pytest.mark.parametrize(
+    "bad_id", ["../etc", "a/b", "a\\b", "..", "\x00evil", "sess/\x00"],
+)
+def test_delete_transcript_session_rejects_path_traversal(
+    tmp_path: Path, bad_id: str
+) -> None:
+    """경로 분리자/'..'/'NUL'이 들어온 session_id는 ValueError로 거부."""
+    with pytest.raises(ValueError):
+        delete_transcript_session(tmp_path, bad_id)
+
+
+def test_delete_transcript_session_does_not_touch_sibling(tmp_path: Path) -> None:
+    """한 세션 삭제가 다른 세션 파일에 영향을 주지 않는다 (디렉토리 고립)."""
+    t_a = SessionTranscript(sessions_dir=tmp_path, session_id="a", enabled=True)
+    t_a.append_entry(role="user", content="hi-a", turn=1)
+    t_b = SessionTranscript(sessions_dir=tmp_path, session_id="b", enabled=True)
+    t_b.append_entry(role="user", content="hi-b", turn=1)
+
+    assert delete_transcript_session(tmp_path, "a") is True
+    assert not (tmp_path / "a").exists()
+    # b는 그대로
+    assert (tmp_path / "b" / "transcript.jsonl").exists()
+    msgs = read_transcript_messages(tmp_path, "b")
+    assert msgs[0]["content"] == "hi-b"
 
 
 # ─────────────────────────────────────────────

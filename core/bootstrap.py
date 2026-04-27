@@ -298,6 +298,20 @@ async def init_phase2(state: GlobalState) -> dict:
             "[Phase 2] KnowledgeStore 초기화: 레코드=%d (pg=%s)",
             count, "connected" if pg_pool else "in-memory",
         )
+
+        # v0.14.8 — 임베딩 서버 워밍업(A) + 주기적 keep-warm(B)
+        # 배경: e5-large 서버(:8002)가 idle 상태로 빠지면 첫 호출에서 ~60초의
+        # cold start가 발생해 KNOWLEDGE_MODE 첫 호출이 매우 느려진다. 부트스트랩
+        # 시점에 한 번 ping해 모델·CUDA 컨텍스트를 따뜻하게 만들고, 이후 주기적
+        # ping으로 cold 상태로 떨어지지 않게 유지한다.
+        # 둘 다 fire-and-forget — 워밍업·keepalive 실패는 본류 응답에 무영향.
+        asyncio.create_task(_warmup_embedding(provider))
+        keepalive_task = asyncio.create_task(_embedding_keepalive(provider))
+        components["embedding_keepalive_task"] = keepalive_task
+        logger.info(
+            "[Phase 2] 임베딩 서버 워밍업 + keep-warm 시작 (interval=%ds)",
+            _EMBEDDING_KEEPALIVE_INTERVAL_SEC,
+        )
     except Exception as e:
         logger.warning("[Phase 2] 지식 베이스 초기화 실패 (무시): %s", e)
 
@@ -428,6 +442,64 @@ async def _background_index(indexer: Any, cwd: str) -> None:
         )
     except Exception as e:
         logger.warning("[RAG] 백그라운드 인덱싱 실패: %s", e)
+
+
+# ─────────────────────────────────────────────
+# v0.14.8 — 임베딩 서버 워밍업/keep-warm
+# ─────────────────────────────────────────────
+# e5-large 임베딩 서버(:8002)는 idle 상태로 빠지면 다음 호출에서 모델·CUDA
+# 컨텍스트 워밍업으로 ~60초가 추가로 걸린다. 사용자 첫 KNOWLEDGE 질의가
+# 그 비용을 그대로 떠안는 일을 막기 위해 부트스트랩 직후 한 번 워밍업하고,
+# 이후 주기적으로 ping을 보내 cold 상태로 떨어지지 않게 유지한다.
+
+# keep-warm ping 간격(초). 5분 — kowiki 적재 후 임베딩이 자주 안 쓰이는
+# 운영 패턴에서도 cold로 떨어지지 않을 정도로 짧고, 부담은 거의 없다.
+_EMBEDDING_KEEPALIVE_INTERVAL_SEC: int = 300
+
+# 워밍업 입력 — 의미와 무관한 짧은 토큰. 짧을수록 비용이 작다.
+_EMBEDDING_WARMUP_TEXT: str = "warmup"
+
+
+async def _warmup_embedding(provider: Any, retries: int = 2) -> bool:
+    """첫 호출 cold start 비용을 부트스트랩 시점에 흡수한다.
+
+    임베딩 서버가 아직 안 떴을 가능성을 고려해 짧은 backoff로 재시도한다.
+    실패해도 본류 응답에 영향 없으므로 조용히 False 반환.
+    """
+    for attempt in range(retries + 1):
+        try:
+            vecs = await provider.embed([_EMBEDDING_WARMUP_TEXT])
+            if vecs:
+                logger.info("[Phase 2] 임베딩 서버 워밍업 성공 (시도 %d)", attempt + 1)
+                return True
+        except Exception as e:
+            if attempt < retries:
+                await asyncio.sleep(2)
+            else:
+                logger.warning("[Phase 2] 임베딩 서버 워밍업 실패: %s", e)
+                return False
+    return False
+
+
+async def _embedding_keepalive(
+    provider: Any,
+    interval_sec: int = _EMBEDDING_KEEPALIVE_INTERVAL_SEC,
+) -> None:
+    """주기적으로 임베딩 서버에 짧은 ping을 보내 cold 상태를 회피한다.
+
+    asyncio.CancelledError로 깨끗하게 종료되며, 그 외 예외는 디버그 로그만.
+    """
+    while True:
+        try:
+            await asyncio.sleep(interval_sec)
+            await provider.embed([_EMBEDDING_WARMUP_TEXT])
+            logger.debug("[Phase 2] 임베딩 keepalive ping 성공")
+        except asyncio.CancelledError:
+            logger.info("[Phase 2] 임베딩 keepalive 종료")
+            return
+        except Exception as e:
+            # 일시 장애는 다음 주기에 재시도 — 본류 응답에 영향 없으므로 debug만.
+            logger.debug("[Phase 2] 임베딩 keepalive 실패 (다음 주기 재시도): %s", e)
 
 
 async def _create_redis_client(config: Any) -> Any:
@@ -698,6 +770,19 @@ def _build_default_system_prompt(agent_registry: Any | None = None) -> str:
         "returns, answer the user with whatever information you received. NEVER "
         "call Scout a second time in the same turn — it loops. If the plan seems "
         "sparse, mention that to the user and work with what you have.\n\n"
+        "## Conversational style (greetings & small talk)\n"
+        "For a short greeting or small talk (안녕, 좋은 아침, hi, thanks, 잘 자 등):\n"
+        "- Reply briefly and warmly in the user's language — one or two short "
+        "sentences — and stop.\n"
+        "- Do NOT volunteer encyclopedic facts, song/movie/book references, or "
+        "trivia even if the words look like a title.\n"
+        "- Do NOT pivot to a topic the user did not ask about.\n\n"
+        "## When a `--- Knowledge base ---` block is present\n"
+        "Treat the snippets as a candidate reference, NOT as the answer:\n"
+        "- Use them ONLY when clearly on-topic.\n"
+        "- If the snippets are off-topic, irrelevant, or contradict common-sense, "
+        "IGNORE them and answer from your own general knowledge.\n"
+        "- Never quote/list off-topic snippets just because they were retrieved.\n\n"
         "## Hard rules\n"
         "- NEVER create a file the user didn't ask for.\n"
         "- NEVER attempt Read/Glob/Grep/LS — those tools aren't available to you.\n"

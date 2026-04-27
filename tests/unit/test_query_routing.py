@@ -4,11 +4,12 @@
 QueryEngine의 classify_query() 함수가 입력 특성에 따라 적절히
 KNOWLEDGE / TOOL 프로필로 분기하는지 검증한다.
 
-분류 규칙(우선순위):
-  1. routing.enabled=False       → 항상 TOOL
-  2. len(input) >= threshold     → TOOL (문서/로그 첨부 가정)
-  3. tool_keywords 중 하나 포함   → TOOL
-  4. 그 외                        → KNOWLEDGE
+분류 규칙(우선순위, Part 2.5.9 v0.14.6 갱신):
+  1. routing.enabled=False                           → 항상 TOOL
+  2. len(input) >= long_input_threshold              → TOOL (문서/로그 첨부 가정)
+  3. tool_keywords 중 하나 포함                       → TOOL
+  4. len(input) <= chat_max_length AND chat_keywords → CHAT (인사·잡담)
+  5. 그 외                                            → KNOWLEDGE
 """
 from __future__ import annotations
 
@@ -47,14 +48,75 @@ def disabled_routing() -> RoutingConfig:
         "경제 공황의 원인이 뭐야?",
         "Python GIL이 뭔가요",
         "Explain the eternal recurrence concept",
-        "안녕",
     ],
 )
 def test_classify_query_general_knowledge_returns_knowledge(
     user_input: str, default_routing: RoutingConfig
 ) -> None:
-    """일반 교양/인사/개념 설명은 KNOWLEDGE 경로로 가야 한다."""
+    """일반 교양/개념 설명은 KNOWLEDGE 경로로 가야 한다.
+
+    참고: v0.14.6부터 짧은 인사("안녕")는 CHAT으로 분리됨 (Part 2.5.9).
+    """
     assert classify_query(user_input, default_routing) == "KNOWLEDGE"
+
+
+# ─────────────────────────────────────────────
+# 1-b) 짧은 인사·잡담은 CHAT으로 분류 (Part 2.5.9 v0.14.6)
+# ─────────────────────────────────────────────
+@pytest.mark.parametrize(
+    "user_input",
+    [
+        "안녕",
+        "안녕!",
+        "안녕하세요",
+        "좋은 아침이야",
+        "굿모닝",
+        "잘 자",
+        "고마워",
+        "감사합니다",
+        "hi",
+        "Hello there",
+        "good night",
+        "thanks!",
+        "bye",
+    ],
+)
+def test_classify_query_short_greeting_returns_chat(
+    user_input: str, default_routing: RoutingConfig
+) -> None:
+    """짧은 인사·잡담은 CHAT 경로로 분류되어야 한다.
+
+    CHAT은 PromptAssembler에서 KB RAG 단계를 스킵 — kowiki 100만 청크 환경에서
+    "안녕" → 가수 "안녕" 청크 주입 같은 부작용을 차단한다.
+    """
+    assert classify_query(user_input, default_routing) == "CHAT"
+
+
+def test_classify_query_long_input_with_greeting_is_not_chat(
+    default_routing: RoutingConfig,
+) -> None:
+    """긴 입력 안에 인사어가 우연히 들어 있어도 CHAT이 되지 않는다.
+
+    chat_max_length 임계가 길이 게이트로 작동 — 30자를 넘으면 KNOWLEDGE 경로.
+    """
+    long_with_greeting = (
+        "안녕, 오늘 알베르 카뮈의 이방인 줄거리를 자세히 알려줘"
+    )
+    assert len(long_with_greeting) > default_routing.chat_max_length
+    assert classify_query(long_with_greeting, default_routing) == "KNOWLEDGE"
+
+
+def test_classify_query_tool_keyword_beats_chat(
+    default_routing: RoutingConfig,
+) -> None:
+    """TOOL 키워드는 CHAT보다 우선 — '이 파일 안녕히 처리'는 TOOL."""
+    assert classify_query("이 파일 안녕히 처리해줘", default_routing) == "TOOL"
+
+
+def test_classify_query_disabled_chat_via_zero_max_length() -> None:
+    """chat_max_length=0이면 CHAT 분류 자체가 비활성 (운영자 스위치)."""
+    routing = RoutingConfig(chat_max_length=0)
+    assert classify_query("안녕", routing) == "KNOWLEDGE"
 
 
 # ─────────────────────────────────────────────
@@ -176,6 +238,21 @@ def test_resolve_profile_tool_returns_tool_mode(
     assert profile is default_routing.tool_mode
     assert profile.model == "nexus-phase3"
     assert profile.temperature == pytest.approx(0.3)
+
+
+def test_resolve_profile_chat_returns_chat_mode(
+    default_routing: RoutingConfig,
+) -> None:
+    """CHAT 분류 → chat_mode 프로필 (Part 2.5.9 v0.14.6).
+
+    chat_mode는 KNOWLEDGE와 같은 베이스 모델을 쓰지만 max_tokens가 작고
+    PromptAssembler가 KB RAG를 주입하지 않는다.
+    """
+    profile = _resolve_profile("CHAT", default_routing)
+    assert profile is default_routing.chat_mode
+    assert profile.model == "qwen3.5-27b"
+    # 짧은 응답 유도
+    assert profile.max_tokens <= 1024
 
 
 def test_resolve_profile_unknown_class_falls_back_to_tool(
@@ -311,8 +388,8 @@ def test_invalid_regex_is_skipped_not_raising() -> None:
         tool_keywords=[],
         tool_regex_patterns=["[invalid(regex"],  # 컴파일 실패 예상
     )
-    # 예외 없이 KNOWLEDGE로 분류
-    assert classify_query("hello", cfg) == "KNOWLEDGE"
+    # 예외 없이 KNOWLEDGE로 분류 (인사어가 아니므로 CHAT 분기에도 안 걸림)
+    assert classify_query("what is python GIL", cfg) == "KNOWLEDGE"
 
 
 def test_all_three_matching_kinds_coexist() -> None:
@@ -327,4 +404,55 @@ def test_all_three_matching_kinds_coexist() -> None:
     assert classify_query("문서 첨부했어요", cfg) == "TOOL"  # substring
     assert classify_query("open the file please", cfg) == "TOOL"  # word
     assert classify_query("call Read(x)", cfg) == "TOOL"  # regex
-    assert classify_query("안녕하세요", cfg) == "KNOWLEDGE"
+    # 인사어가 아닌 일반 지식 질의 → KNOWLEDGE
+    assert classify_query("니체 철학 요약해줘", cfg) == "KNOWLEDGE"
+
+
+# ─────────────────────────────────────────────
+# 10) RoutingResolver — CHAT 결과 (Part 2.5.9 v0.14.6)
+# ─────────────────────────────────────────────
+def test_resolver_chat_decision_uses_chat_mode_and_no_kb() -> None:
+    """CHAT 분류 시 RoutingDecision이 chat_mode 모델을 쓰고 KB 미주입."""
+    from core.orchestrator.routing import RoutingResolver
+
+    cfg = RoutingConfig()
+    resolver = RoutingResolver(cfg)
+    decision = resolver.resolve("안녕")
+
+    assert decision.query_class == "CHAT"
+    assert decision.model_override == cfg.chat_mode.model
+    assert decision.max_tokens_cap == cfg.chat_mode.max_tokens
+    assert decision.allowed_knowledge_sources is None
+    assert decision.inject_knowledge_rag is False
+
+
+def test_resolver_knowledge_decision_keeps_inject_kb_true() -> None:
+    """KNOWLEDGE 분류는 inject_knowledge_rag=True (기존 동작 유지)."""
+    from core.orchestrator.routing import RoutingResolver
+
+    cfg = RoutingConfig()
+    resolver = RoutingResolver(cfg)
+    decision = resolver.resolve("니체 철학 요약해줘")
+
+    assert decision.query_class == "KNOWLEDGE"
+    assert decision.inject_knowledge_rag is True
+
+
+def test_resolver_chat_with_tenant_override_applies_lora() -> None:
+    """CHAT도 KNOWLEDGE처럼 tenant.model_override를 적용한다 (Part 2.5.9)."""
+    from core.config import TenantConfig
+    from core.orchestrator.routing import RoutingResolver
+
+    cfg = RoutingConfig()
+    resolver = RoutingResolver(cfg)
+    tenant = TenantConfig(
+        id="school-a",
+        name="A학교",
+        model_override="nexus-school-a",
+    )
+    decision = resolver.resolve("안녕", tenant=tenant)
+
+    assert decision.query_class == "CHAT"
+    assert decision.model_override == "nexus-school-a"
+    # CHAT에서도 KB는 안 주입
+    assert decision.inject_knowledge_rag is False

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -126,11 +127,33 @@ def list_transcript_sessions(
             continue
         try:
             stat = tfile.stat()
-            # 라인 수 = 기록된 엔트리 수 (턴 + 메시지 기준, 빠른 근사치)
+            # 한 번의 패스로 라인 수 + 첫 user 메시지를 동시에 추출 (I/O 절약).
+            # title_hint는 사이드바에 "무슨 대화였는지" 즉시 보여주기 위해
+            # 첫 user 메시지 앞 60자 정도를 돌려준다.
+            lines = 0
+            first_user: str | None = None
             with tfile.open("r", encoding="utf-8") as f:
-                lines = sum(1 for _ in f)
+                for raw in f:
+                    lines += 1
+                    if first_user is not None:
+                        continue  # 라인 수 세기만 계속
+                    stripped = raw.strip()
+                    if not stripped:
+                        continue
+                    try:
+                        entry = json.loads(stripped)
+                    except json.JSONDecodeError:
+                        continue
+                    if entry.get("role") == "user":
+                        content = entry.get("content") or ""
+                        if isinstance(content, str):
+                            first_user = content.strip().replace("\n", " ")
         except OSError:
             continue
+        title_hint = None
+        if first_user:
+            # 60자를 넘기면 절단하고 말줄임표
+            title_hint = first_user[:60] + ("…" if len(first_user) > 60 else "")
         out.append(
             {
                 "session_id": sub.name,
@@ -139,8 +162,121 @@ def list_transcript_sessions(
                 ).isoformat(),
                 "entries": lines,
                 "path": str(tfile.resolve()),
+                "title_hint": title_hint,
             }
         )
 
     out.sort(key=lambda x: x["last_modified"], reverse=True)
     return out[:limit]
+
+
+def read_transcript_messages(
+    sessions_dir: str | Path,
+    session_id: str,
+    *,
+    roles: tuple[str, ...] = ("user", "assistant"),
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    """
+    특정 세션의 트랜스크립트(JSONL)를 읽어 메시지 리스트로 반환한다.
+
+    Ch 16 세션 영속화 — 프론트엔드가 과거 대화를 화면에 복원할 때 사용한다.
+
+    필터:
+      - roles에 포함된 role만 반환 (기본 user/assistant). system 에러 엔트리는
+        기본 필터에서 제외되며, 명시적으로 ("user", "assistant", "system")을
+        넘기면 포함된다.
+      - 손상된 JSON 라인은 조용히 스킵 (감사 기록은 best-effort 복원).
+      - limit가 지정되면 가장 최근 limit개만 반환 (오래된 것부터 순서 유지).
+
+    Returns:
+      [
+        {"role": "user", "content": "...", "turn": N, "ts": "ISO-8601",
+         "usage": {...}|None, "extra": {...}|None},
+        ...
+      ]
+
+    파일이 없으면 빈 리스트.
+    """
+    base = Path(sessions_dir) / session_id
+    tfile = base / "transcript.jsonl"
+    if not tfile.exists():
+        return []
+
+    role_filter = set(roles)
+    out: list[dict[str, Any]] = []
+    try:
+        with tfile.open("r", encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    # 손상된 라인은 무시 (감사 기록의 best-effort 원칙)
+                    continue
+                role = entry.get("role")
+                content = entry.get("content")
+                if role not in role_filter or not content:
+                    continue
+                out.append(
+                    {
+                        "role": role,
+                        "content": content,
+                        "turn": entry.get("turn"),
+                        "ts": entry.get("ts"),
+                        "usage": entry.get("usage"),
+                        "extra": entry.get("extra"),
+                    }
+                )
+    except OSError as e:
+        logger.warning("트랜스크립트 읽기 실패 (%s): %s", tfile, e)
+        return []
+
+    if limit is not None and limit > 0 and len(out) > limit:
+        out = out[-limit:]
+    return out
+
+
+def delete_transcript_session(
+    sessions_dir: str | Path,
+    session_id: str,
+) -> bool:
+    """
+    특정 세션의 트랜스크립트 디렉토리를 통째로 삭제한다.
+
+    사용처: Ch 16 세션 삭제 API. 프론트가 사이드바에서 세션을 제거할 때 호출.
+
+    안전장치:
+      - 경로 탈출 방지 — session_id에 슬래시/백슬래시/'..' 포함 시 거부
+      - 대상이 sessions_dir의 직계 자식 디렉토리인지 resolve 후 재검증
+      - shutil.rmtree(missing_ok=True) — 없는 세션 삭제는 성공으로 처리
+
+    Returns:
+      실제로 디렉토리를 지웠으면 True, 애초에 없었으면 False.
+      검증 실패 시 ValueError.
+    """
+    if not session_id or any(ch in session_id for ch in ("/", "\\", "..", "\x00")):
+        raise ValueError(f"invalid session_id: {session_id!r}")
+
+    base = Path(sessions_dir).resolve()
+    target = (base / session_id).resolve()
+
+    # 탈출 방지 이중 검증 — target이 실제로 base의 자식인지
+    try:
+        target.relative_to(base)
+    except ValueError as e:
+        raise ValueError(
+            f"session_id가 sessions_dir 바깥을 가리킴: {session_id!r}"
+        ) from e
+
+    if not target.exists() or not target.is_dir():
+        return False
+
+    try:
+        shutil.rmtree(target)
+    except OSError as e:
+        logger.warning("트랜스크립트 디렉토리 삭제 실패 (%s): %s", target, e)
+        raise
+    return True
