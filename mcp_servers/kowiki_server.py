@@ -107,8 +107,11 @@ class KowikiSearchTool(McpServerTool):
         if not isinstance(query, str) or not query.strip():
             raise ValueError("필수 인자 'query'(비어 있지 않은 문자열)가 없습니다.")
 
-        top_k = arguments.get("top_k") or _DEFAULT_TOP_K
-        if not isinstance(top_k, int) or top_k < 1:
+        # top_k 는 미지정 시에만 기본값 — `or` 관용구는 0 을 falsy 로 보아
+        # 기본값으로 조용히 치환하므로, get(키, 기본값) 으로 명시적으로 처리한다.
+        # (top_k=0/음수는 잘못된 입력이므로 기본값 대체가 아니라 거부해야 한다.)
+        top_k = arguments.get("top_k", _DEFAULT_TOP_K)
+        if not isinstance(top_k, int) or isinstance(top_k, bool) or top_k < 1:
             raise ValueError("top_k 는 1 이상의 정수여야 합니다.")
         top_k = min(top_k, _MAX_TOP_K)
 

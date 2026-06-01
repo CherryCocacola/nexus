@@ -383,9 +383,20 @@ async def init_phase2(state: GlobalState) -> dict:
             # 등록된 MCP 도구가 worker/QueryEngine 도구 풀에 포함되도록 재취득
             # (get_all_tools는 이름순 정렬을 보장 → prompt cache 안정성 P5 유지)
             cli_tools = cli_registry.get_all_tools()
+            # GlobalState 에 MCP 가시성 정보를 채운다(메트릭/진단 노출용).
+            #   mcp_servers: 서버명 → {등록 도구 목록, 개수} 상세.
+            #   mcp_connected: 도구가 1개 이상 등록되어 "살아 있는" 서버명 집합.
+            # connect_and_register 가 실패 서버를 빈 리스트로 돌려주므로,
+            # 빈 리스트는 connected 에서 자연히 제외된다(fail-closed 요약).
+            state.mcp_servers = {
+                name: {"tools": list(tools), "tool_count": len(tools)}
+                for name, tools in registered.items()
+            }
+            state.mcp_connected = {name for name, tools in registered.items() if len(tools) >= 1}
             logger.info(
-                "[Phase 2] MCP 연결: %s (cli_tools=%d개)",
+                "[Phase 2] MCP 연결: %s (연결 서버=%d개, cli_tools=%d개)",
                 {s: len(t) for s, t in registered.items()},
+                len(state.mcp_connected),
                 len(cli_tools),
             )
         except Exception as e:

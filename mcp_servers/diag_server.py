@@ -258,8 +258,11 @@ class RagLatencyTool(McpServerTool):
             }
         """
         query_text = arguments.get("query") or "이기이원론"
-        top_k = arguments.get("top_k") or 5
-        if not isinstance(top_k, int) or top_k < 1:
+        # top_k 는 미지정 시에만 기본값 — `or` 관용구는 0 을 falsy 로 보아
+        # 기본값으로 조용히 치환하므로, get(키, 기본값) 으로 명시적으로 처리한다.
+        # (top_k=0/음수는 잘못된 입력이므로 기본값 대체가 아니라 거부해야 한다.)
+        top_k = arguments.get("top_k", 5)
+        if not isinstance(top_k, int) or isinstance(top_k, bool) or top_k < 1:
             raise ValueError("top_k 는 1 이상의 정수여야 합니다.")
 
         # 1) 임베딩 지연 측정(블로킹 → 워커 스레드).

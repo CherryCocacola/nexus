@@ -29,6 +29,7 @@ class GPUTier(str, Enum):
     """GPU 티어. VRAM 크기에 따라 자동 결정된다."""
 
     RTX_5090 = "rtx5090"  # 32GB — 기본 타겟
+    A100 = "a100"  # 80GB — H100 과 VRAM 동일하나 Ampere(BF16, FP8 미지원)
     H100 = "h100"  # 80GB
     H200 = "h200"  # 141GB
     MULTI_GPU = "multi_gpu"  # 2+ GPU
@@ -160,6 +161,11 @@ def detect_gpu_tier() -> GPUTier:
     elif vram_gb > 120:
         return GPUTier.H200
     elif vram_gb > 60:
+        # A100 80GB 와 H100 80GB 는 VRAM 이 동일해 용량만으로는 구분되지 않는다.
+        # 따라서 GPU 이름에 "A100" 이 포함되면 A100 으로 판정하고,
+        # 그렇지 않으면 기존대로 H100 으로 폴백한다(Ampere vs Hopper 구분).
+        if "a100" in gpu_name.lower():
+            return GPUTier.A100
         return GPUTier.H100
     else:
         return GPUTier.RTX_5090
@@ -210,6 +216,49 @@ def get_tier_config(tier: GPUTier) -> GPUTierConfig:
             ),
             concurrent_models=False,
             notes="Primary/Auxiliary 동시 로딩 불가. hot-swap 방식 사용.",
+        ),
+        # ── A100 (80GB) — BF16 풀 프리시전(Ampere) ──
+        # H100 80GB 와 VRAM 동일 → 프로파일을 거의 공유한다. 다만 A100 은
+        # Hopper 가 아니라 Ampere 라 FP8/Transformer Engine 이 없으므로
+        # 양자화 없이 BF16 으로만 서빙한다(H100 도 여기서는 NONE 이라 동일).
+        # H100 대비 메모리 대역폭(HBM2e)이 낮아 max_num_seqs 를 보수적으로 둔다.
+        GPUTier.A100: GPUTierConfig(
+            tier=GPUTier.A100,
+            primary=ModelSpec(
+                name="qwen3.5-27b",
+                path="./models/qwen3.5-27b",
+                quantization=QuantizationMethod.NONE,
+                dtype="bfloat16",
+                max_model_len=8192,
+                gpu_memory_utilization=0.85,
+                max_num_seqs=4,
+                enable_lora=True,
+                max_lora_rank=64,
+                max_loras=4,
+                enforce_eager=False,
+            ),
+            auxiliary=ModelSpec(
+                name="exaone-32b",
+                path="./models/exaone-32b",
+                quantization=QuantizationMethod.NONE,
+                dtype="bfloat16",
+                max_model_len=8192,
+                gpu_memory_utilization=0.85,
+                max_num_seqs=4,
+                enable_lora=True,
+                max_lora_rank=64,
+            ),
+            training=TrainingSpec(
+                method="lora",
+                lora_rank=64,
+                lora_alpha=128,
+                batch_size=4,
+                gradient_accumulation_steps=4,
+                gradient_checkpointing=False,
+                max_seq_length=4096,
+            ),
+            concurrent_models=False,
+            notes="A100 80GB(Ampere). 58+32>80GB이므로 hot-swap 필요. FP8 미지원.",
         ),
         # ── H100 (80GB) — BF16 풀 프리시전 ──
         GPUTier.H100: GPUTierConfig(

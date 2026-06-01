@@ -1200,6 +1200,20 @@ async def metrics() -> dict[str, Any]:
     if state:
         result["session"] = state.get_session_summary()
 
+        # MCP 가시성 — Phase 2 부트스트랩이 GlobalState 에 채운 등록 결과를
+        # 간단히 노출한다(연결 서버 수 + 서버별 도구 개수). 과설계 없이
+        # "몇 개 서버가 살아 있고 각자 도구가 몇 개인가" 만 보여준다.
+        mcp_servers = getattr(state, "mcp_servers", {}) or {}
+        mcp_connected = getattr(state, "mcp_connected", set()) or set()
+        result["mcp"] = {
+            "connected_count": len(mcp_connected),
+            "connected": sorted(mcp_connected),
+            "tool_counts": {
+                name: info.get("tool_count", 0)
+                for name, info in mcp_servers.items()
+            },
+        }
+
     # 서브에이전트 메트릭스 — Ch 17 (v7.0 Phase 9 재설계)
     # AgentTool.get_stats()가 subagent_type별 호출 통계를 집계한다.
     # 예: {"scout": {"calls": 3, "total_latency_ms": 99000, "avg_latency_ms": 33000}}
