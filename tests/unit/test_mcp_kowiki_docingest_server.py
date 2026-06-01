@@ -120,26 +120,56 @@ class TestKowikiSearchTool:
             await tool.call({})
 
     async def test_search_negative_top_k_raises_value_error(self):
-        """음수 top_k 는 ValueError 여야 한다.
+        """음수 top_k 는 ValueError 여야 한다(1 미만 거부)."""
+        tool = KowikiSearchTool(_FakeEmbedProvider(), KnowledgeStore(pg_pool=None))
+        with pytest.raises(ValueError):
+            await tool.call({"query": "x", "top_k": -3})
 
-        주의: top_k=0 은 `arguments.get('top_k') or _DEFAULT_TOP_K` 의 falsy 처리로
-        기본값(5)으로 치환되어 거부되지 않는다(아래 별도 테스트로 명시). 따라서
-        '1 미만 거부'를 확실히 트리거하려면 truthy 한 음수(-1)를 쓴다.
+    async def test_search_zero_top_k_raises_value_error(self):
+        """top_k=0 은 거부되어야 한다(v7.3 견고화 — falsy 치환 폐기).
+
+        과거 `arguments.get('top_k') or _DEFAULT_TOP_K` 관용구는 0 을 falsy 로
+        보아 기본값(5)으로 조용히 치환했다. 이제는 `get(키, 기본값)` + 정수/범위
+        검증으로 바뀌어, 0 은 '잘못된 입력'으로 ValueError(프레임워크 -32602)가 된다.
         """
         tool = KowikiSearchTool(_FakeEmbedProvider(), KnowledgeStore(pg_pool=None))
         with pytest.raises(ValueError):
-            await tool.call({"query": "x", "top_k": -1})
+            await tool.call({"query": "x", "top_k": 0})
 
-    async def test_search_zero_top_k_falls_back_to_default(self):
-        """top_k=0 은 falsy 라 기본값으로 치환된다(현 구현 동작 — 보고 대상).
+    async def test_search_bool_top_k_raises_value_error(self):
+        """top_k=True(bool)는 거부되어야 한다.
 
-        `top_k = arguments.get('top_k') or _DEFAULT_TOP_K` 이므로 0 은 5가 된다.
-        의도된 동작이라기보단 falsy 관용구의 부수효과 — 거부되지 않고 검색이 수행된다.
+        파이썬에서 bool 은 int 의 하위형이라 isinstance(True, int) 가 True 다.
+        견고화 코드는 `isinstance(top_k, bool)` 가드로 bool 을 명시적으로 배제한다
+        (True 가 1 로 통과해 의미가 모호해지는 것을 막는다).
         """
         tool = KowikiSearchTool(_FakeEmbedProvider(), KnowledgeStore(pg_pool=None))
-        result = await tool.call({"query": "x", "top_k": 0})
-        # 예외 없이 정상 반환되어야 한다(0 → 기본 5).
+        with pytest.raises(ValueError):
+            await tool.call({"query": "x", "top_k": True})
+
+    async def test_search_default_top_k_when_unspecified(self):
+        """top_k 미지정 시 기본값(_DEFAULT_TOP_K=5)으로 정상 동작해야 한다."""
+        tool = KowikiSearchTool(_FakeEmbedProvider(), KnowledgeStore(pg_pool=None))
+        # 예외 없이 정상 반환(미지정 → 기본 5, 거부 아님).
+        result = await tool.call({"query": "x"})
         assert result["query"] == "x"
+        assert result["count"] == 0  # 인메모리 빈 store
+
+    async def test_search_top_k_clamped_to_max(self):
+        """top_k 가 상한(_MAX_TOP_K=50)을 넘으면 클램프되어 검색이 수행돼야 한다.
+
+        store 가 top_k 를 그대로 검색에 넘기므로, 거대한 top_k(100)도 예외 없이
+        50 으로 잘려 정상 동작한다. 검증은 '예외 없이 반환' 으로 충분하다
+        (인메모리 store 결과 수는 적재량에 종속이라 상한 자체를 직접 보긴 어렵다)."""
+        tool = KowikiSearchTool(_FakeEmbedProvider(), KnowledgeStore(pg_pool=None))
+        result = await tool.call({"query": "x", "top_k": 100})
+        assert result["query"] == "x"
+
+    async def test_search_string_top_k_raises_value_error(self):
+        """top_k 가 정수가 아닌 문자열이면 ValueError(타입 가드)."""
+        tool = KowikiSearchTool(_FakeEmbedProvider(), KnowledgeStore(pg_pool=None))
+        with pytest.raises(ValueError):
+            await tool.call({"query": "x", "top_k": "5"})
 
     async def test_search_embed_failure_normalized_to_runtime_error(self):
         """임베딩 실패는 RuntimeError 로 정규화되어야 한다(프레임워크 -32603)."""
@@ -292,6 +322,34 @@ class TestDocIngestAndSearch:
         with pytest.raises(ValueError):
             await tool.call({})
 
+    @pytest.mark.parametrize("bad_top_k", [0, -3, True, "5"])
+    async def test_docsearch_invalid_top_k_raises_value_error(self, bad_top_k):
+        """DocSearchTool 도 top_k 견고화를 공유한다: 0/음수/bool/문자열 → ValueError.
+
+        kowiki 와 동일한 검증 로직(get(키, 기본값) + isinstance(int) + bool 가드 +
+        <1 거부)을 docingest 검색에도 적용한다."""
+        _pipeline, provider, store = _make_pipeline()
+        tool = DocSearchTool(provider, store)
+        with pytest.raises(ValueError):
+            await tool.call({"query": "x", "top_k": bad_top_k})
+
+    async def test_docsearch_top_k_clamped_to_max(self):
+        """DocSearchTool: top_k=100 은 _MAX_TOP_K(=50)으로 클램프되어 store 에 전달돼야 한다.
+
+        store 를 spy 로 감싸 search_by_vector 에 실제로 넘어간 top_k 가 50 인지
+        직접 확인한다(상한 클램프의 강한 검증)."""
+        from unittest.mock import AsyncMock
+
+        _pipeline, provider, store = _make_pipeline()
+        spy = AsyncMock(return_value=[])
+        store.search_by_vector = spy  # type: ignore[assignment]
+        tool = DocSearchTool(provider, store)
+
+        await tool.call({"query": "x", "top_k": 100})
+
+        # top_k 는 키워드 인자로 전달된다(코드: search_by_vector(emb, top_k=..., source=...)).
+        assert spy.await_args.kwargs["top_k"] == 50
+
 
 # ─────────────────────────────────────────────
 # diag — reachability / rag_latency (네트워크 patch)
@@ -368,10 +426,30 @@ class TestDiagRagLatencyTool:
             with pytest.raises(RuntimeError):
                 await tool.call({"query": "x"})
 
-    async def test_rag_latency_negative_top_k_raises_value_error(self):
-        """음수 top_k 는 ValueError. (top_k=0 은 falsy 라 기본 5로 치환되어 거부 안 됨)"""
+    @pytest.mark.parametrize("bad_top_k", [0, -3, True, "5"])
+    async def test_rag_latency_invalid_top_k_raises_value_error(self, bad_top_k):
+        """rag_latency 도 top_k 견고화를 공유한다: 0/음수/bool/문자열 → ValueError.
+
+        v7.3 견고화 전에는 top_k=0 이 falsy 라 기본값(5)으로 치환되어 거부되지
+        않았다. 이제는 0 도 명시적으로 거부된다(get(키, 기본값) + 정수/범위 검증).
+        검증이 임베딩 호출보다 먼저 일어나므로, _embed_query_blocking 을 patch 하지
+        않아도 네트워크 접근 없이 ValueError 가 난다."""
         from mcp_servers.diag_server import RagLatencyTool
 
         tool = RagLatencyTool(pg_pool=None)
         with pytest.raises(ValueError):
-            await tool.call({"top_k": -1})
+            await tool.call({"top_k": bad_top_k})
+
+    async def test_rag_latency_default_top_k_when_unspecified(self):
+        """top_k 미지정 시 기본값(5)으로 정상 동작해야 한다(거부 아님)."""
+        from mcp_servers.diag_server import RagLatencyTool
+
+        with patch(
+            "mcp_servers.diag_server._embed_query_blocking",
+            return_value=([0.1] * 1024, 5.0),
+        ):
+            tool = RagLatencyTool(pg_pool=None)
+            result = await tool.call({"query": "x"})  # top_k 미지정
+        # 예외 없이 임베딩 지연을 측정해야 한다.
+        assert result["embed_dim"] == 1024
+        assert "skipped" in result["search"]

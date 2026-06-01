@@ -137,3 +137,35 @@ class TestTurnManagement:
         assert summary["total_tool_calls"] == 3
         assert summary["permission_mode"] == "default"
         assert "session_id" in summary
+
+
+class TestMcpVisibilityFields:
+    """MCP 가시성 필드(mcp_servers/mcp_connected)의 기본값과 인스턴스 격리를 검증한다.
+
+    Phase 2 부트스트랩이 채우기 전에는 빈 컨테이너여야 하고, default_factory 로
+    선언되어 인스턴스마다 별개의 객체를 가져야 한다(가변 기본값 공유 버그 방지)."""
+
+    def test_mcp_fields_default_empty(self):
+        """기본값: mcp_servers=={} 이고 mcp_connected==set() 이어야 한다."""
+        state = get_initial_state()
+        assert state.mcp_servers == {}
+        assert state.mcp_connected == set()
+
+    def test_mcp_fields_isolated_per_instance(self):
+        """두 GlobalState 인스턴스가 mcp_servers/mcp_connected 객체를 공유하면 안 된다.
+
+        dataclass 의 default_factory(dict/set) 가 인스턴스마다 새 객체를 만드는지
+        확인한다. 한 인스턴스에 추가해도 다른 인스턴스에는 영향이 없어야 한다."""
+        # 싱글톤을 우회해 직접 두 인스턴스를 만든다(격리 검증 목적).
+        from core.state import GlobalState
+
+        a = GlobalState()
+        b = GlobalState()
+        a.mcp_servers["kowiki"] = {"tool_count": 1}
+        a.mcp_connected.add("kowiki")
+
+        assert b.mcp_servers == {}
+        assert b.mcp_connected == set()
+        # 같은 객체를 공유하지 않아야 한다(가변 기본값 공유 안티패턴 방지).
+        assert a.mcp_servers is not b.mcp_servers
+        assert a.mcp_connected is not b.mcp_connected
