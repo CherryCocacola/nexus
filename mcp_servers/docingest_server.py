@@ -8,8 +8,9 @@ docingest MCP 서버 — 문서 인제스트 파이프라인을 도구로 노출
   search (read-only) — 적재된 문서를 의미 기반 검색한다(source="docingest" 필터).
 
 core 재사용:
-  DocumentIngestPipeline(parse/chunk/embed/적재) + ParserRegistry + PptxParser +
-  LocalModelProvider(embed) + KnowledgeStore 를 그대로 조립한다.
+  DocumentIngestPipeline(parse/chunk/embed/적재) + ParserRegistry +
+  PptxParser/PdfPlumberParser/HwpxParser + LocalModelProvider(embed) +
+  KnowledgeStore 를 그대로 조립한다.
 
 read-only 구분 (fail-closed 정신):
   parse/search 는 부작용이 없고, ingest 만 DB 에 쓴다. 도구 설명에 명시해 호출
@@ -160,8 +161,11 @@ class DocSearchTool(McpServerTool):
         if not isinstance(query, str) or not query.strip():
             raise ValueError("필수 인자 'query'(비어 있지 않은 문자열)가 없습니다.")
 
-        top_k = arguments.get("top_k") or _DEFAULT_TOP_K
-        if not isinstance(top_k, int) or top_k < 1:
+        # top_k 는 미지정 시에만 기본값 — `or` 관용구는 0 을 falsy 로 보아
+        # 기본값으로 조용히 치환하므로, get(키, 기본값) 으로 명시적으로 처리한다.
+        # (top_k=0/음수는 잘못된 입력이므로 기본값 대체가 아니라 거부해야 한다.)
+        top_k = arguments.get("top_k", _DEFAULT_TOP_K)
+        if not isinstance(top_k, int) or isinstance(top_k, bool) or top_k < 1:
             raise ValueError("top_k 는 1 이상의 정수여야 합니다.")
         top_k = min(top_k, _MAX_TOP_K)
 
@@ -189,12 +193,14 @@ async def build_app(api_key: str = "local-key") -> FastAPI:
 
     동작:
       1) core/config 로드.
-      2) ParserRegistry 에 PptxParser 등록.
+      2) ParserRegistry 에 PptxParser/PdfPlumberParser/HwpxParser 등록.
       3) LocalModelProvider(embed) + KnowledgeStore(pg_pool) 구성.
       4) DocumentIngestPipeline 조립 → parse/ingest/search 도구 등록.
     """
     from core.config import load_and_validate_config
     from core.ingest.parser_base import ParserRegistry
+    from core.ingest.parsers.hwpx import HwpxParser
+    from core.ingest.parsers.pdf_plumber import PdfPlumberParser
     from core.ingest.parsers.pptx import PptxParser
     from core.ingest.pipeline import DocumentIngestPipeline
     from core.model.inference import LocalModelProvider
@@ -202,9 +208,13 @@ async def build_app(api_key: str = "local-key") -> FastAPI:
 
     config = load_and_validate_config()
 
-    # 파서 레지스트리 — 청정(MIT) PptxParser 등록(어댑터 슬롯 구조).
+    # 파서 레지스트리 — 청정(MIT/OWPML) 기본 파서들을 등록(어댑터 슬롯 구조).
+    # 같은 확장자에 상용 고품질 파서를 더 높은 priority 로 끼우면 그것이 우선되고,
+    # 미등록 시 자동으로 이 청정 기본 파서로 폴백된다(parser_base 우선순위 규칙).
     parser_registry = ParserRegistry()
-    parser_registry.register(PptxParser(), priority=0)
+    parser_registry.register(PptxParser(), priority=0)  # .pptx
+    parser_registry.register(PdfPlumberParser(), priority=0)  # .pdf (경량)
+    parser_registry.register(HwpxParser(), priority=0)  # .hwpx
 
     # 임베딩 프로바이더(embed 전용).
     model_provider = LocalModelProvider(
