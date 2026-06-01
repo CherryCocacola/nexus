@@ -155,8 +155,10 @@ async def init_phase2(state: GlobalState) -> dict:
     components["memory_manager"] = memory_manager
     components["redis_client"] = redis_client
     components["pg_pool"] = pg_pool
-    mode = "Redis+PG" if (redis_client and pg_pool) else (
-        "Redis만" if redis_client else ("PG만" if pg_pool else "인메모리 폴백")
+    mode = (
+        "Redis+PG"
+        if (redis_client and pg_pool)
+        else ("Redis만" if redis_client else ("PG만" if pg_pool else "인메모리 폴백"))
     )
     logger.info("[Phase 2] MemoryManager 초기화: %s", mode)
 
@@ -305,7 +307,8 @@ async def init_phase2(state: GlobalState) -> dict:
         count = await knowledge_store.count()
         logger.info(
             "[Phase 2] KnowledgeStore 초기화: 레코드=%d (pg=%s)",
-            count, "connected" if pg_pool else "in-memory",
+            count,
+            "connected" if pg_pool else "in-memory",
         )
 
         # v0.14.8 — 임베딩 서버 워밍업(A) + 주기적 keep-warm(B)
@@ -354,11 +357,52 @@ async def init_phase2(state: GlobalState) -> dict:
         count = await symbol_store.count()
         logger.info(
             "[Phase 2] SymbolStore 초기화: 레코드=%d (pg=%s, 백그라운드 인덱싱 시작)",
-            count, "connected" if pg_pool else "in-memory",
+            count,
+            "connected" if pg_pool else "in-memory",
         )
     except Exception as e:
         logger.warning("[Phase 2] 심볼 인덱스 초기화 실패 (무시): %s", e)
         components["symbol_store"] = None
+
+    # ⑨-d v7.2 MCP 연결 — LAN 내부 MCP 서버 도구를 cli_registry에 흡수
+    # KnowledgeStore/SymbolStore 초기화 직후, 동일한 fire-and-forget + 실패 격리
+    # 패턴. config.mcp.enabled가 켜져 있을 때만 시도하며, 전체 실패도 본류 무영향.
+    #
+    # 왜 cli_registry인가: 아래 ⑩ ModelDispatcher(worker_tools)와 ⑫ QueryEngine
+    # (tools)에 실제로 전달되는 도구 풀은 ⑧에서 만든 cli_tools다(line 240).
+    # 따라서 MCP 도구가 모델에 노출되려면 cli_registry에 등록한 뒤 cli_tools를
+    # 다시 취득해야 한다(:132의 registry에 넣으면 QueryEngine까지 전달되지 않음).
+    if config.mcp.enabled:
+        try:
+            # lazy import — Phase 2 모듈 패턴(필요 시점 import)을 따른다
+            from core.tools.mcp import McpConnectionManager
+
+            mcp_manager = McpConnectionManager(config.mcp)
+            registered = await mcp_manager.connect_and_register(cli_registry)
+            components["mcp_manager"] = mcp_manager
+            # 등록된 MCP 도구가 worker/QueryEngine 도구 풀에 포함되도록 재취득
+            # (get_all_tools는 이름순 정렬을 보장 → prompt cache 안정성 P5 유지)
+            cli_tools = cli_registry.get_all_tools()
+            logger.info(
+                "[Phase 2] MCP 연결: %s (cli_tools=%d개)",
+                {s: len(t) for s, t in registered.items()},
+                len(cli_tools),
+            )
+        except Exception as e:
+            # 최후 방어선(intentional broad except) — 여기서는 broad가 옳다.
+            # 이유: MCP는 선택적 보조 기능이므로, 어떤 예외가 나더라도 부트스트랩
+            # 본류(채팅·도구 풀)는 멈추면 안 된다(fail-closed로 MCP만 끈다).
+            #
+            # 설계 분담:
+            #   - connect_and_register는 "예상 가능한 운영 실패"(연결/타임아웃/
+            #     비-LAN/소켓)만 좁혀 서버별로 격리한다. 예상치 못한 버그
+            #     (AttributeError 등)는 거기서 전파시켜 결함이 묻히지 않게 한다.
+            #   - 그렇게 전파된 예외를 이 broad except가 최종 흡수해 본류를 보호한다.
+            # 즉 "결함 가시성(좁은 except)"과 "본류 보호(넓은 최후 except)"를 양립시킨다.
+            logger.warning("[Phase 2] MCP 초기화 실패 (무시): %s", e)
+            components["mcp_manager"] = None
+    else:
+        components["mcp_manager"] = None
 
     # ⑩ ModelDispatcher — v7.0 Phase 9 멀티모델 라우터
     # TIER_S: Scout(CPU 4B) → Worker(GPU 27B) 2단계 실행
@@ -396,7 +440,8 @@ async def init_phase2(state: GlobalState) -> dict:
     components["context_manager"] = context_manager
     logger.info(
         "[Phase 2] ContextManager 초기화: tier=%s, passthrough=%s",
-        tier.value, context_manager.passthrough,
+        tier.value,
+        context_manager.passthrough,
     )
 
     # ⑫ QueryEngine — Tier 1 세션 오케스트레이터
@@ -428,7 +473,9 @@ async def init_phase2(state: GlobalState) -> dict:
     components["query_engine"] = engine
     logger.info(
         "[Phase 2] QueryEngine 초기화: session=%s, 도구=%d개, tier=%s, rag=%s",
-        engine.session_id, len(cli_tools), tier.value,
+        engine.session_id,
+        len(cli_tools),
+        tier.value,
         "활성" if rag_retriever else "비활성",
     )
 
@@ -601,39 +648,41 @@ def _create_tool_registry():  # noqa: ANN202 — ToolRegistry는 함수 내부�
     from core.tools.registry import ToolRegistry
 
     registry = ToolRegistry()
-    registry.register_many([
-        # 파일 시스템 (4개)
-        ReadTool(),
-        WriteTool(),
-        EditTool(),
-        MultiEditTool(),
-        # 실행 (1개)
-        BashTool(),
-        # 검색 (3개)
-        GlobTool(),
-        GrepTool(),
-        LSTool(),
-        # Git (6개)
-        GitLogTool(),
-        GitDiffTool(),
-        GitStatusTool(),
-        GitCommitTool(),
-        GitBranchTool(),
-        GitCheckoutTool(),
-        # 노트북 (2개)
-        NotebookReadTool(),
-        NotebookEditTool(),
-        # 태스크 (3개)
-        TodoReadTool(),
-        TodoWriteTool(),
-        TaskTool(),
-        # 메모리 (2개)
-        MemoryReadTool(),
-        MemoryWriteTool(),
-        # Docker (2개)
-        DockerBuildTool(),
-        DockerRunTool(),
-    ])
+    registry.register_many(
+        [
+            # 파일 시스템 (4개)
+            ReadTool(),
+            WriteTool(),
+            EditTool(),
+            MultiEditTool(),
+            # 실행 (1개)
+            BashTool(),
+            # 검색 (3개)
+            GlobTool(),
+            GrepTool(),
+            LSTool(),
+            # Git (6개)
+            GitLogTool(),
+            GitDiffTool(),
+            GitStatusTool(),
+            GitCommitTool(),
+            GitBranchTool(),
+            GitCheckoutTool(),
+            # 노트북 (2개)
+            NotebookReadTool(),
+            NotebookEditTool(),
+            # 태스크 (3개)
+            TodoReadTool(),
+            TodoWriteTool(),
+            TaskTool(),
+            # 메모리 (2개)
+            MemoryReadTool(),
+            MemoryWriteTool(),
+            # Docker (2개)
+            DockerBuildTool(),
+            DockerRunTool(),
+        ]
+    )
 
     return registry
 
@@ -662,15 +711,17 @@ def _create_scout_tool_registry():  # noqa: ANN202
     from core.tools.registry import ToolRegistry
 
     registry = ToolRegistry()
-    registry.register_many([
-        ReadTool(),
-        GlobTool(),
-        GrepTool(),
-        LSTool(),
-        DocumentProcessTool(),
-        # Phase 10.0 — 심볼 단위 인덱스 기반 함수/클래스 위치 검색
-        SymbolSearchTool(),
-    ])
+    registry.register_many(
+        [
+            ReadTool(),
+            GlobTool(),
+            GrepTool(),
+            LSTool(),
+            DocumentProcessTool(),
+            # Phase 10.0 — 심볼 단위 인덱스 기반 함수/클래스 위치 검색
+            SymbolSearchTool(),
+        ]
+    )
     return registry
 
 
@@ -695,18 +746,20 @@ def _create_cli_tool_registry():  # noqa: ANN202
     from core.tools.registry import ToolRegistry
 
     registry = ToolRegistry()
-    registry.register_many([
-        # 실행 전용 도구 (Part 2.4 원본)
-        EditTool(),
-        WriteTool(),
-        BashTool(),
-        GitCommitTool(),
-        GitDiffTool(),
-        # 서브에이전트 호출 — Worker가 Scout 등 탐색자/전문가에 위임
-        AgentTool(),
-        # Phase 10.0 — Worker도 심볼 위치 빠르게 찾을 수 있도록 추가
-        SymbolSearchTool(),
-    ])
+    registry.register_many(
+        [
+            # 실행 전용 도구 (Part 2.4 원본)
+            EditTool(),
+            WriteTool(),
+            BashTool(),
+            GitCommitTool(),
+            GitDiffTool(),
+            # 서브에이전트 호출 — Worker가 Scout 등 탐색자/전문가에 위임
+            AgentTool(),
+            # Phase 10.0 — Worker도 심볼 위치 빠르게 찾을 수 있도록 추가
+            SymbolSearchTool(),
+        ]
+    )
 
     return registry
 
@@ -734,13 +787,15 @@ def _create_web_tool_registry():  # noqa: ANN202
     from core.tools.registry import ToolRegistry
 
     registry = ToolRegistry()
-    registry.register_many([
-        EditTool(),           # 편집 (~325 토큰)
-        WriteTool(),          # 쓰기 (~225 토큰)
-        BashTool(),           # 실행 (~275 토큰)
-        AgentTool(),          # 서브에이전트 호출 (~300 토큰)
-        SymbolSearchTool(),   # Phase 10.0 심볼 검색 (~200 토큰)
-    ])
+    registry.register_many(
+        [
+            EditTool(),  # 편집 (~325 토큰)
+            WriteTool(),  # 쓰기 (~225 토큰)
+            BashTool(),  # 실행 (~275 토큰)
+            AgentTool(),  # 서브에이전트 호출 (~300 토큰)
+            SymbolSearchTool(),  # Phase 10.0 심볼 검색 (~200 토큰)
+        ]
+    )
 
     return registry
 
@@ -806,11 +861,7 @@ def _build_default_system_prompt(agent_registry: Any | None = None) -> str:
     for name, desc in agent_registry.list_descriptions().items():
         agent_lines.append(f"  - {name}: {desc}")
 
-    subagent_guide = (
-        "\n## Registered sub-agents\n"
-        + "\n".join(agent_lines)
-        + "\n"
-    )
+    subagent_guide = "\n## Registered sub-agents\n" + "\n".join(agent_lines) + "\n"
     return base + subagent_guide
 
 
@@ -913,17 +964,14 @@ async def _preconnect_gpu_server(gpu_server_url: str) -> None:
                 if resp.text.strip():
                     data = resp.json()
                     logger.info(
-                        "[Phase 1] GPU 서버 사전 연결 성공: "
-                        "gpu=%s, tier=%s",
+                        "[Phase 1] GPU 서버 사전 연결 성공: gpu=%s, tier=%s",
                         data.get("gpu", "unknown"),
                         data.get("gpu_tier", "unknown"),
                     )
                 else:
                     logger.info("[Phase 1] GPU 서버 사전 연결 성공 (vLLM healthy)")
             else:
-                logger.warning(
-                    f"[Phase 1] GPU 서버 상태 이상: status={resp.status_code}"
-                )
+                logger.warning(f"[Phase 1] GPU 서버 상태 이상: status={resp.status_code}")
     except ImportError:
         logger.warning("[Phase 1] httpx가 설치되지 않아 사전 연결을 건너뜁니다")
     except Exception as e:
