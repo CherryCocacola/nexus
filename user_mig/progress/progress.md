@@ -2438,3 +2438,75 @@ CPU 5.7%/RSS 158MB로 안정적. ELAPSED 1d21h58m 시점 기준 여전히 run �
 ### 설계 기준 (사양서 이탈 없음)
 - Part 2.5.8 지식 RAG 파이프라인 — kowiki 적재 스크립트와 ivfflat 인덱스는 이미 명세
 - 적재 규모 확장은 "한계와 향후 과제" 섹션에서 예고된 작업
+
+---
+
+## MCP 도입 PoC — v7.2 사양서 amendment 작성 (2026-06-01)
+
+### 배경
+
+사내 시스템 한두 개를 LAN MCP 서버로 떼어내고 Nexus에 MCP 클라이언트 어댑터를
+추가하는 PoC를 시작. 첫 단계로 기술 사양서 v7.2 개정안을 작성.
+
+### 산출물
+
+`user_mig/PROJECT_NEXUS_SPEC_v7.2_AMENDMENT.md` (약 580라인, enterprise-architect
+위임 작성 → 핵심 인용 실측 검증 완료).
+
+### 핵심 정합화 논점
+
+- v6.1은 MCP를 "외부 SaaS 의존 → 에어갭 불가, Phase 2 연기"로 보류(Removed/Disabled).
+- v7.2 정정: **외부 SaaS MCP는 여전히 금지, 사내 LAN MCP 서버는 허용**.
+  근거 — v6.1 라인 402가 "Machine A↔B (LAN, HTTP/SSE)"를 ALLOWED로 명시(자기모순 해소).
+- 권한 인프라는 **이미 코드에 존재**: `ToolCategory.MCP`(types.py:117),
+  `mcp__` 식별(pipeline.py:191), MODE_BEHAVIOR_MAP MCP 열, Layer5 PLAN 보정(:368).
+  → v7.2 신규 추가는 **MCP 클라이언트 어댑터 + 연결 관리자**(`core/tools/mcp/`)와
+  `McpConfig` 뿐. 4-Tier·권한·Hook 불변.
+
+### PoC 대상 4종 (전부 read-only, LAN HTTP/SSE)
+
+| 서버 | 도구 | LAN 위치 |
+|---|---|---|
+| DB 조회 | `mcp__db__query` | PG 192.168.10.39 (SELECT 전용) |
+| 진단/모니터링 | `mcp__diag__reachability`, `mcp__diag__rag_latency` | 웹/GPU 22.28/DB 10.39 |
+| DocUtil 문서 | `mcp__docutil__search`, `mcp__docutil__get` | DocUtil 192.168.10.39 |
+| kowiki RAG | `mcp__kowiki__search` | tb_knowledge + 임베딩 22.28:8002 |
+
+### 미확정 (사용자 확인 필요)
+
+1. GlobalState `mcp_servers`/`mcp_connected` 필드는 **실제 코드엔 미존재**
+   (초기 grep은 v6.1 문서 내 코드였음) — 정식 도입 시 신규 추가 대상으로 표기.
+2. MCP 서버 포트 8810~8813은 placeholder — 운영 배치 확정 필요.
+3. kowiki MCP(명시 호출) vs 기존 자동 RAG 주입(v7.0 Part 2.5.8) 통합 여부 — PoC 후 결정.
+
+### 구현 완료 (2026-06-01, 제품화 기준 전환)
+
+**코드 구현**: `core/tools/mcp/`(client/adapter/connection_manager) + `core/config.py`
+McpConfig/McpServerConfig + `core/security/network_guard.py`(is_lan_hostname, config에서
+이전) + `core/bootstrap.py` Phase 2 ⑨-d 배선 + `config/nexus_config.yaml` mcp 섹션.
+
+**부트스트랩 배선 버그 수정**: MCP 도구를 메인 registry(:132)가 아니라 **cli_registry**에
+등록 + cli_tools 재취득해야 ModelDispatcher/QueryEngine에 전달됨(QA 발견).
+
+**제품 보안 강화 (PoC→제품)**: read-only MCP만 자동 등록(쓰기는 `allow_write=True`
+명시 필요), `check_permissions` 항상 ALLOW로 일원화(5계층 위임 → PLAN=DENY/BYPASS=ALLOW
+정상화), `validate_input` 스키마 검증, 예외 범위 축소(버그 은폐 방지).
+
+**테스트**: MCP 단위/통합 **81 passed**, 전체 회귀 **916 passed/1 skipped**(1 failed는
+GPU 의존 e2e로 무관).
+
+**사양서**: v7.2를 PoC→**제품 사양**으로 개정. v7.3(문서 양식 인식 임베딩 설계) 신규
+작성 — HWP/PDF/PPT 레이아웃 인식 + 구조 보존 청킹 + 임베딩 적재, 청정(MIT/Apache)
+라이선스 기본 + 상용 어댑터 슬롯, 티어별(5090/A100/H200) 스택.
+
+### 결정 사항 (2026-06-01)
+
+- 쓰기 MCP 정책: read-only만 허용(PLAN 안전성)
+- 라이선스: 추상 인터페이스 + 청정 기본(AGPL/GPL 배제)
+- HWP: **구포맷 .hwp 비중 높음** → LibreOffice 필수 번들, .hwp 처리 우선순위 상향
+
+### 다음 단계 (미착수)
+
+- v7.3 구현: PPTX 파서부터 단계적(`core/ingest/`). GPUTier.A100 추가 검토.
+- 실 LAN MCP 서버 4종(db/diag/docutil/kowiki) + 문서 인제스트 서버 구현 → e2e.
+- GlobalState mcp_servers/mcp_connected 가시성 필드(운영 /metrics 노출용).
