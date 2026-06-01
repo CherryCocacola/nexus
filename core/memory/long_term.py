@@ -27,6 +27,45 @@ from core.memory.types import MemoryEntry, MemoryType
 logger = logging.getLogger("nexus.memory.long_term")
 
 
+# ─────────────────────────────────────────────
+# tb_memories DDL — 운영 정의(2026-06-01 추출) 1:1
+# ─────────────────────────────────────────────
+# id 길이 12는 importance.ImportanceAssessor가 만드는 sha 12자리와 호환.
+# importance CHECK는 점수 정규화(0~1) 위반 방지 — 기존 운영 제약 그대로.
+# embedding vector(1024)는 e5-large 차원 — 사양서 Ch 4.5 일치.
+_DDL_TB_MEMORIES = """
+CREATE TABLE IF NOT EXISTS tb_memories (
+    id            varchar(12) PRIMARY KEY,
+    memory_type   varchar(50) NOT NULL,
+    content       text NOT NULL,
+    key           varchar(255),
+    tags          text[],
+    importance    double precision,
+    access_count  integer DEFAULT 0,
+    created_at    timestamptz DEFAULT now(),
+    last_accessed timestamptz DEFAULT now(),
+    embedding     vector(1024),
+    metadata      jsonb DEFAULT '{}'::jsonb,
+    CONSTRAINT tb_memories_importance_check
+        CHECK (importance >= 0.0 AND importance <= 1.0)
+);
+"""
+
+# 보조 인덱스 6종 — 운영 DB와 동일. PK는 테이블 정의에서 자동 생성됨.
+# hnsw 선택 근거: 200K+ 행 규모에서 ivfflat 대비 정확도·재현율 모두 우수.
+# 인덱스 빌드는 행이 적을 때(빈 테이블)는 즉시, 많을 땐 시간 소요.
+_DDL_TB_MEMORIES_INDEXES = [
+    "CREATE INDEX IF NOT EXISTS idx_memories_type ON tb_memories (memory_type)",
+    "CREATE INDEX IF NOT EXISTS idx_memories_tags ON tb_memories USING gin (tags)",
+    "CREATE INDEX IF NOT EXISTS idx_memories_created_at "
+    "ON tb_memories (created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_memories_importance "
+    "ON tb_memories (importance DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_memories_embedding "
+    "ON tb_memories USING hnsw (embedding vector_cosine_ops)",
+]
+
+
 class LongTermMemory:
     """
     PostgreSQL + pgvector 기반 장기 메모리.
@@ -48,6 +87,36 @@ class LongTermMemory:
 
         if self._pg is None:
             logger.info("PostgreSQL 풀 없음 — 인메모리 폴백 모드로 동작")
+
+    # ─── 스키마 관리 ───
+    # 운영 환경(2026-06-01 기준)에서 추출한 tb_memories 정의를 멱등 생성한다.
+    # 이전엔 DDL이 nexus 코드에 없어서 새 환경 셋업 시 수동 마이그레이션이
+    # 필요했다(예: 컨테이너 재빌드 후 새 PG 인스턴스). 이 메서드를 부트스트랩
+    # Phase 2에서 호출하면 다음을 자동으로 보장한다:
+    #   - tb_memories 테이블 (id varchar(12) PK, importance 0~1 CHECK 등)
+    #   - 보조 인덱스 5종 (created_at·importance DESC, tags GIN, type, hnsw)
+    # hnsw(embedding vector_cosine_ops)를 선택한 이유: 운영 DB가 이미 hnsw로
+    # 운영 중이고 200K+ 행 규모에서 ivfflat보다 검색 정확도/지연 모두 우수.
+    # pgvector >= 0.5.0 필요 — 운영은 0.8.0(pgvector/pgvector:pg17).
+    async def ensure_schema(self) -> None:
+        """
+        tb_memories 스키마와 인덱스를 멱등적으로 보장한다.
+
+        pg_pool이 None이면(인메모리 폴백) 아무 작업도 하지 않는다.
+        """
+        if self._pg is None:
+            logger.debug("ensure_schema 건너뜀 (인메모리 폴백)")
+            return
+
+        async with self._pg.acquire() as conn:
+            # 확장 보장 — pgvector가 없으면 인덱스가 못 만들어짐
+            await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+            # 테이블 — 운영 정의와 1:1
+            await conn.execute(_DDL_TB_MEMORIES)
+            # 보조 인덱스 — 각각 IF NOT EXISTS로 멱등
+            for ddl in _DDL_TB_MEMORIES_INDEXES:
+                await conn.execute(ddl)
+        logger.info("tb_memories 스키마 확인/생성 완료")
 
     # ─── CRUD 기본 연산 ───
 

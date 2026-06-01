@@ -138,6 +138,15 @@ async def init_phase2(state: GlobalState) -> dict:
     pg_pool = await _create_pg_pool(config)
     stm = ShortTermMemory(redis_client=redis_client)
     ltm = LongTermMemory(pg_pool=pg_pool)
+    # tb_memories 스키마·인덱스 멱등 보장 — 새 PG 인스턴스(컨테이너 교체/재해
+    # 복구)에서도 자동으로 운영 정의(varchar(12) PK + hnsw 인덱스)를 재현한다.
+    # pg_pool=None이면 no-op이므로 인메모리 테스트는 영향 없음.
+    if pg_pool is not None:
+        try:
+            await ltm.ensure_schema()
+        except Exception as e:
+            # 실패해도 인메모리 폴백으로 본류 응답 가능하므로 WARNING만.
+            logger.warning("[Phase 2] tb_memories ensure_schema 실패 (무시): %s", e)
     memory_manager = MemoryManager(
         short_term=stm,
         long_term=ltm,
