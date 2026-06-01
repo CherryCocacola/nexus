@@ -20,6 +20,7 @@ import pytest
 
 from core.rag.symbol_indexer import (
     SymbolProjectIndexer,
+    background_index,
     extract_symbols_from_source,
 )
 from core.rag.symbol_store import SymbolEntry, SymbolStore
@@ -208,6 +209,61 @@ async def test_project_indexer_reembeds_with_embedder(tmp_path: Path) -> None:
     # 내부 저장소 확인
     embedded = [e for e in store._store.values() if e.embedding is not None]
     assert len(embedded) == 5
+
+
+# ─────────────────────────────────────────────
+# background_index — 인덱싱 완료 후 ivfflat 조건부 빌드
+# ─────────────────────────────────────────────
+@pytest.mark.asyncio
+async def test_background_index_skips_vector_index_below_threshold(
+    tmp_path: Path,
+) -> None:
+    """행수가 임계치(1000) 미만이면 build_vector_index를 호출하지 않는다."""
+    (tmp_path / "m.py").write_text(SAMPLE_PY, encoding="utf-8")
+    store = SymbolStore(pg_pool=None)
+    # build_vector_index 호출 추적용 spy — 인메모리 폴백이라 원래는 no-op
+    store.build_vector_index = AsyncMock()  # type: ignore[method-assign]
+
+    indexer = SymbolProjectIndexer(store=store, embedder=None, project_source="t")
+    await background_index(indexer, tmp_path)
+
+    assert await store.count("t") == 5  # SAMPLE_PY가 5개 심볼
+    # 5건 << 1000 임계치 → build_vector_index 미호출
+    store.build_vector_index.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_background_index_builds_vector_index_above_threshold(
+    tmp_path: Path,
+) -> None:
+    """행수가 임계치(1000) 이상이면 build_vector_index를 자동 호출한다."""
+    (tmp_path / "m.py").write_text(SAMPLE_PY, encoding="utf-8")
+    store = SymbolStore(pg_pool=None)
+    # count()가 임계치를 넘긴 값을 반환하도록 mock — 임계치 분기만 검증
+    store.count = AsyncMock(return_value=2000)  # type: ignore[method-assign]
+    store.build_vector_index = AsyncMock()  # type: ignore[method-assign]
+
+    indexer = SymbolProjectIndexer(store=store, embedder=None, project_source="t")
+    await background_index(indexer, tmp_path)
+
+    # 행수 2000 ≥ 1000 → build_vector_index 한 번 호출
+    store.build_vector_index.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_background_index_swallows_indexing_errors(
+    tmp_path: Path,
+) -> None:
+    """index_project가 실패해도 bootstrap을 중단시키지 않는다."""
+    store = SymbolStore(pg_pool=None)
+    store.build_vector_index = AsyncMock()  # type: ignore[method-assign]
+
+    indexer = SymbolProjectIndexer(store=store, embedder=None, project_source="t")
+    # 존재하지 않는 경로 — index_project가 내부에서 raise하든 빈 결과든 무중단
+    bad_path = tmp_path / "does_not_exist"
+
+    # 예외 없이 통과해야 한다 (background_index는 try/except로 감쌈)
+    await background_index(indexer, bad_path)
 
 
 # ─────────────────────────────────────────────
