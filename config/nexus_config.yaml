@@ -239,7 +239,7 @@ mcp:
   enabled: false              # 전역 마스터 스위치 (에어갭 fail-closed)
   connect_timeout_sec: 5.0    # 연결/요청 타임아웃 (실패 시 fail-closed)
   servers:
-    # ⚠ 포트 8810~8813은 모두 placeholder다 (v7.2 Part 8 미확정). 운영 확정 전까지 임시값.
+    # ⚠ 포트 8810~8814는 모두 placeholder다 (v7.2 Part 8 미확정). 운영 확정 전까지 임시값.
     - name: "db"
       transport: "http_sse"
       base_url: "http://192.168.10.39:8810"   # 사내 DB MCP (LAN, 포트 placeholder)
@@ -250,11 +250,20 @@ mcp:
       base_url: "http://192.168.22.28:8811"   # 운영 진단 MCP (LAN, 포트 placeholder)
       enabled: false
       trust: { read_only: true }
-    - name: "docutil"
+    - name: "docingest"
       transport: "http_sse"
-      base_url: "http://192.168.10.39:8812"   # DocUtil 문서 MCP (LAN, 포트 placeholder)
+      base_url: "http://192.168.22.28:8814"   # docingest 문서 MCP (LAN, 포트 placeholder)
       enabled: false
       trust: { read_only: true }
+      # docingest는 parse/search(read-only) + ingest(쓰기) 도구를 제공한다.
+      # trust.read_only=true이므로 자동 등록 대상이지만, 쓰기 도구(ingest)는
+      # allow_write를 명시하지 않는 한 등록에서 제외된다(fail-closed 기본 false).
+      # 따라서 기본 상태에서는 parse/search만 Worker에 자동 노출돼 안전하다.
+      # ingest까지 쓰려면 아래에 allow_write: true 를 추가해야 한다.
+      #   allow_write: true
+      # docingest는 자동 RAG(kowiki/KNOWLEDGE 모드)와 중복되지 않으므로
+      # expose_to_worker는 기본값 true(미지정)로 두어 Worker 도구 풀에 노출한다.
+      # 서버 실행: python -m mcp_servers.run docingest --port 8814
     - name: "kowiki"
       transport: "http_sse"
       base_url: "http://192.168.22.28:8813"   # kowiki RAG MCP (LAN, 포트 placeholder)
