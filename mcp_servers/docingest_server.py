@@ -12,6 +12,13 @@ core 재사용:
   PptxParser/PdfPlumberParser/HwpxParser + LocalModelProvider(embed) +
   KnowledgeStore 를 그대로 조립한다.
 
+PDF 파서 우선순위 (v7.3 단계 6 — 고품질=GPU, 경량=CPU 폴백):
+  .pdf 에는 두 파서가 후보다 — DoclingParser(레이아웃 인식, GPU 권장)와
+  PdfPlumberParser(경량, CPU). 이 서버가 도는 호스트에 GPU 가 있으면 Docling 을
+  더 높은 priority 로 등록해 우선시키고, GPU 가 없으면 Docling 을 등록하지 않아
+  자동으로 pdfplumber 경량 파서로 폴백되게 한다. requires_gpu=True 파서를 GPU
+  없는 호스트에 굳이 얹지 않는 것이 v7.3 티어 분기 의도에 맞는 가장 단순한 정책.
+
 read-only 구분 (fail-closed 정신):
   parse/search 는 부작용이 없고, ingest 만 DB 에 쓴다. 도구 설명에 명시해 호출
   측(권한 파이프라인)이 구분할 수 있게 한다.
@@ -38,6 +45,24 @@ _INGEST_SOURCE = "docingest"
 _QUERY_PREFIX = "query: "
 _DEFAULT_TOP_K = 5
 _MAX_TOP_K = 50
+
+
+def _gpu_available() -> bool:
+    """
+    이 호스트에 CUDA GPU 가 있는지 fail-soft 로 판정한다(레지스트리 구성용).
+
+    DoclingParser(requires_gpu=True)를 우선 등록할지 결정하는 데만 쓴다. torch 가
+    없거나(에어갭 일부 호스트) 감지 중 어떤 오류가 나도 "GPU 없음"으로 간주해
+    경량 파서(pdfplumber)로 자연스럽게 폴백한다 — 감지 실패가 인제스트 전체를
+    막아서는 안 된다. import 만 하며 설치 코드는 넣지 않는다(에어갭 규칙).
+    """
+    try:
+        import torch
+
+        return bool(torch.cuda.is_available())
+    except Exception as e:  # noqa: BLE001 — 감지 실패는 GPU 없음으로 흡수(폴백)
+        logger.debug("GPU 감지 실패 — GPU 없음으로 간주: %s", e)
+        return False
 
 
 class DocParseTool(McpServerTool):
@@ -193,12 +218,14 @@ async def build_app(api_key: str = "local-key") -> FastAPI:
 
     동작:
       1) core/config 로드.
-      2) ParserRegistry 에 PptxParser/PdfPlumberParser/HwpxParser 등록.
+      2) ParserRegistry 에 PptxParser/PdfPlumberParser/HwpxParser 등록 +
+         GPU 가용 시 DoclingParser(.pdf 고품질)를 더 높은 priority 로 등록.
       3) LocalModelProvider(embed) + KnowledgeStore(pg_pool) 구성.
       4) DocumentIngestPipeline 조립 → parse/ingest/search 도구 등록.
     """
     from core.config import load_and_validate_config
     from core.ingest.parser_base import ParserRegistry
+    from core.ingest.parsers.docling_layout import DoclingParser
     from core.ingest.parsers.hwpx import HwpxParser
     from core.ingest.parsers.pdf_plumber import PdfPlumberParser
     from core.ingest.parsers.pptx import PptxParser
@@ -209,12 +236,23 @@ async def build_app(api_key: str = "local-key") -> FastAPI:
     config = load_and_validate_config()
 
     # 파서 레지스트리 — 청정(MIT/OWPML) 기본 파서들을 등록(어댑터 슬롯 구조).
-    # 같은 확장자에 상용 고품질 파서를 더 높은 priority 로 끼우면 그것이 우선되고,
+    # 같은 확장자에 상용/고품질 파서를 더 높은 priority 로 끼우면 그것이 우선되고,
     # 미등록 시 자동으로 이 청정 기본 파서로 폴백된다(parser_base 우선순위 규칙).
     parser_registry = ParserRegistry()
     parser_registry.register(PptxParser(), priority=0)  # .pptx
-    parser_registry.register(PdfPlumberParser(), priority=0)  # .pdf (경량)
+    parser_registry.register(PdfPlumberParser(), priority=0)  # .pdf (경량, CPU)
     parser_registry.register(HwpxParser(), priority=0)  # .hwpx
+
+    # .pdf 고품질 어댑터 슬롯(v7.3 단계 6) — GPU 가용 호스트에서만 우선 등록한다.
+    # GPU 가 있으면 DoclingParser 를 priority=10 으로 등록해 pdfplumber(priority=0)
+    # 보다 우선시키고, get_for_path 의 can_parse 폴백 덕분에 Docling 이 처리 못 하는
+    # 파일은 자동으로 pdfplumber 로 넘어간다. GPU 가 없으면 아예 등록하지 않아
+    # 경량 파서만 남긴다(requires_gpu=True 파서를 CPU 호스트에 얹지 않음).
+    if _gpu_available():
+        parser_registry.register(DoclingParser(), priority=10)  # .pdf (고품질, GPU)
+        logger.info("docingest MCP 서버: GPU 감지 — DoclingParser(.pdf 고품질) 우선 등록")
+    else:
+        logger.info("docingest MCP 서버: GPU 미감지 — PdfPlumberParser(.pdf 경량)만 사용")
 
     # 임베딩 프로바이더(embed 전용).
     model_provider = LocalModelProvider(

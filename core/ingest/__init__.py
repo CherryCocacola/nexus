@@ -10,12 +10,13 @@ core.ingest — 문서 양식(레이아웃) 인식 임베딩 파이프라인 (v7
   parser_base.py         — DocumentParser(ABC), ParserRegistry
   parsers/pptx.py        — PptxParser (python-pptx, MIT)
   parsers/pdf_plumber.py — PdfPlumberParser (pdfplumber, MIT — PDF 경량)
+  parsers/docling_layout.py — DoclingParser (Docling — PDF 고품질, GPU 권장)
   parsers/hwpx.py        — HwpxParser (python-hwpx, OWPML — HWPX)
   chunker.py             — StructureAwareChunker (계층형 청킹)
   pipeline.py            — DocumentIngestPipeline (parse→chunk→embed→적재)
 
-향후(후속 단계 — v7.3 Part 9): 고품질 레이아웃(Docling)/스캔 OCR 파서를
-DocumentParser 인터페이스로 끼워 넣는다(어댑터 슬롯).
+향후(후속 단계 — v7.3 Part 9): 스캔 OCR 파서를 DocumentParser 인터페이스로
+끼워 넣는다(어댑터 슬롯).
 
 의존성 방향 (P2):
   core.ingest → core.rag(KnowledgeStore), core.model(ModelProvider). 역방향 없음.
@@ -25,6 +26,7 @@ from __future__ import annotations
 
 from core.ingest.chunker import StructureAwareChunker
 from core.ingest.parser_base import DocumentParser, ParserRegistry
+from core.ingest.parsers.docling_layout import DoclingParser
 from core.ingest.parsers.hwpx import HwpxParser
 from core.ingest.parsers.pdf_plumber import PdfPlumberParser
 from core.ingest.parsers.pptx import PptxParser
@@ -47,6 +49,7 @@ __all__ = [
     "ParserRegistry",
     "PptxParser",
     "PdfPlumberParser",
+    "DoclingParser",
     "HwpxParser",
     # chunker
     "StructureAwareChunker",
