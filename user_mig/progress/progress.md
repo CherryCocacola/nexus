@@ -2585,6 +2585,22 @@ v7.2까지는 클라이언트(`core/tools/mcp/*`)만 있고 서버는 placeholde
 - `PROJECT_NEXUS_SPEC_v7.3_DOC_INGEST.md`: PDF/HWPX·docingest·GPUTier.A100 를
   "신규 제안"→"구현 완료"로, 로드맵 단계 상태 컬럼 추가, Part 10 해소 항목 갱신.
 
+### web app full e2e — 실 vLLM 질의 (2026-06-02)
+
+mock 없이 실 인프라(실 PG/임베딩/vLLM/Redis)로만 검증:
+- `GET /v1/tools` → `mcp__db__query`, `mcp__kowiki__search` 노출.
+- `GET /metrics` → `mcp.connected: ['db','kowiki']`.
+- `POST /v1/chat` "tb_knowledge 행 수" → Worker(vLLM)가 **mcp__db__query 호출 →
+  1,067,978 정답**. kowiki 도구 호출·검색도 정상(니체 3건).
+- **버그 수정**: 웹 Worker는 cli_registry가 아닌 자체 풀을 써서 MCP 도구가
+  누락됐었다 → bootstrap `components["mcp_tools"]` + web 머지로 해소.
+
+**kowiki 8K overflow — 결정(2026-06-02, 사용자 확정)**: KNOWLEDGE 모드 자동 RAG
+주입 + kowiki MCP 도구 결과가 같은 검색을 이중으로 넣어 RTX 5090 8K(7778/8192)를
+초과 → 최종 답변 생성 불가. **MCP 결함이 아니라 자동 RAG와 도구의 중복 + 5090 8K
+제약.** 코드 변경 없이 **5090 한정 제약으로 인정**, 제품 검증 기준 **A100(80GB)/
+H200(141GB)의 32~128K 컨텍스트에서 자연 해소**. db/kowiki 둘 다 Worker 도구로 유지.
+
 ### 남은 단계 (미착수/후속)
 
 - 실 LAN 호스트 배포 e2e (현재는 인프로세스 + 루프백 TCP까지).
