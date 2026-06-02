@@ -2510,3 +2510,84 @@ GPU 의존 e2e로 무관).
 - v7.3 구현: PPTX 파서부터 단계적(`core/ingest/`). GPUTier.A100 추가 검토.
 - 실 LAN MCP 서버 4종(db/diag/docutil/kowiki) + 문서 인제스트 서버 구현 → e2e.
 - GlobalState mcp_servers/mcp_connected 가시성 필드(운영 /metrics 노출용).
+
+---
+
+## MCP 서버 구현 + v7.3 인제스트 파서 + 클라이언트↔서버 e2e (2026-06-02)
+
+브랜치: `feature/mcp-integration`. v7.2 다음 단계(미착수)였던 서버 측·e2e·가시성과
+v7.3 인제스트 파서(PDF/HWPX)를 구현 완료.
+
+### 1. MCP 서버 측 4종 구현 (`mcp_servers/` 신규)
+
+v7.2까지는 클라이언트(`core/tools/mcp/*`)만 있고 서버는 placeholder였다. 사내
+시스템을 LAN MCP 서버로 노출하는 서버 측을 신규 구현.
+
+| 파일 | 노출 도구 | 성격 | 기본 포트 |
+|---|---|---|---|
+| `framework.py` | (공통) `McpServerTool` ABC + `create_mcp_app` — JSON-RPC 2.0 디스패치/Bearer 인증/`/health`/lifespan | — | — |
+| `run.py` | `python -m mcp_servers.run <name>` uvicorn entrypoint | — | — |
+| `db_server.py` | `query` | read-only SELECT (검증 + READ ONLY 트랜잭션 이중 방어) | 8810 |
+| `diag_server.py` | `reachability`, `rag_latency` | read-only (웹/GPU/DB 점검, EXPLAIN ANALYZE) | 8811 |
+| `kowiki_server.py` | `search` | read-only (embed + pgvector 검색) | 8813 |
+| `docingest_server.py` | `parse`, `ingest`, `search` | parse/search read-only · **ingest 쓰기** | 8814 |
+
+- 의존성 방향 P2 준수: `mcp_servers → core` 만 허용(core는 mcp_servers 미import).
+- 에어갭: `0.0.0.0` LAN 바인드, 점검·접속 대상 전부 LAN. 외부 호출/런타임 install 없음.
+- 정정: v7.2 초판의 `docutil`(8812)은 미구현 — 실제 문서 MCP는 **docingest**(8814).
+
+### 2. 클라이언트↔서버 e2e 검증 (신규)
+
+`tests/integration/test_mcp_client_server_e2e.py` — 기존엔 AsyncMock 흉내뿐이었던
+구간을 실제 연결로 관통:
+- McpClient ↔ `create_mcp_app` 서버 (ASGITransport 인프로세스 + 임의 포트 uvicorn 실 TCP)
+- McpClient → McpToolAdapter 전구간(BaseTool/tool_use_error 래핑 포함)
+- 모든 연결 127.0.0.1 루프백(에어갭 준수).
+
+### 3. v7.3 인제스트 파서 (PDF/HWPX) + docingest
+
+- `core/ingest/parsers/pdf_plumber.py` — pdfplumber(MIT) PDF 경량(표·좌표·헤딩 휴리스틱, fail-soft).
+- `core/ingest/parsers/hwpx.py` — python-hwpx(OWPML) 1차 + zipfile/xml.etree 폴백.
+- `parsers/__init__.py` export: HwpxParser/PdfPlumberParser/PptxParser 3종.
+- docingest MCP 서버가 ParserRegistry(PPTX/PDF/HWPX) + DocumentIngestPipeline 조립.
+- Docling/OCR(Tesseract·PaddleOCR) 고품질 파서는 **어댑터 슬롯만 예약(미구현·후속)**.
+- 라이브러리: pdfplumber/python-hwpx/pytesseract + docling/paddleocr **개발 환경 설치 완료**.
+  에어갭은 배포물(wheel 번들)에만 적용 — 개발 중 설치는 정상.
+
+### 4. GPUTier.A100 추가
+
+- `core/model/gpu_detector.py:32` 에 `A100 = "a100"` 추가(5종).
+- 판정(`:161~169`): `vram_gb > 60` 구간에서 GPU 이름에 "a100" 포함 시 A100, 아니면 H100.
+- 프로파일(`:225~262`): BF16 NONE, max_model_len 8192, max_num_seqs 4, lora rank 64,
+  **FP8 미지원(Ampere)**. VRAM 80GB → 고품질 인제스트 스택 여유 충분(TIER_M급).
+
+### 5. GlobalState MCP 가시성 + top_k 견고성
+
+- `core/state.py:131` — `mcp_servers: dict` / `mcp_connected: set` 추가.
+- `core/bootstrap.py:391~395` — 등록 결과로 채움(빈 리스트는 connected 자연 제외).
+- `web/app.py:1206~` — `/metrics` 에 `mcp.connected_count`/`connected`/서버별 도구 노출.
+- top_k 견고성: kowiki/docingest/diag 의 `top_k=0/음수/bool` 거부, 미지정 시에만 기본값.
+
+### 테스트 / 회귀
+
+- 전체 회귀 **1091 passed, 1 skipped** (실측 2026-06-02).
+- 유일한 1 failed = `tests/e2e/test_gpu_e2e.py::test_simple_chat_completion`
+  (실 GPU 서버 의존 e2e — MCP/인제스트와 무관, 코드 회귀 아님).
+- 신규/갱신 테스트: `test_mcp_server_framework.py`, `test_mcp_db_server.py`,
+  `test_mcp_kowiki_docingest_server.py`, `test_mcp_client_server_e2e.py`,
+  `test_mcp_visibility.py`, `test_pdf_plumber_parser.py`, `test_hwpx_parser.py`.
+
+### 사양서 갱신 (이 작업에서 동시 반영)
+
+- `PROJECT_NEXUS_SPEC_v7.2_AMENDMENT.md`: 서버 측 placeholder→구현 완료(Part 6.0),
+  docutil→docingest 정정(6.4), Part 8 구현 현황/테스트, GlobalState 가시성 구현됨,
+  부록 A/B 코드 매트릭스에 mcp_servers/* 추가.
+- `PROJECT_NEXUS_SPEC_v7.3_DOC_INGEST.md`: PDF/HWPX·docingest·GPUTier.A100 를
+  "신규 제안"→"구현 완료"로, 로드맵 단계 상태 컬럼 추가, Part 10 해소 항목 갱신.
+
+### 남은 단계 (미착수/후속)
+
+- 실 LAN 호스트 배포 e2e (현재는 인프로세스 + 루프백 TCP까지).
+- PDF 고품질(Docling) + 스캔 OCR(Tesseract/PaddleOCR) 고품질 파서(어댑터 슬롯).
+- `.hwp`(LibreOffice 변환), `scripts/prepare_documents.py` 배치 스크립트.
+- yaml `mcp.servers` 를 실제 구현 서버(db/diag/kowiki/docingest)로 정렬(docutil 제거).

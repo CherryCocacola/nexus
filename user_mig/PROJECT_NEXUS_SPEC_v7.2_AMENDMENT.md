@@ -17,15 +17,14 @@ Nexus는 PoC가 아니라 **실제 제품화 대상**이다. 검증 기준 환�
 80GB**다. MCP는 모델·티어와 직교(orthogonal)하므로 GPU와 무관하게 동작하지만,
 제품 검증의 기준 GPU는 A100 80GB임을 명시한다.
 
-> **A100 티어 매핑 사실(실측, 추측 아님)**: 현재 `GPUTier` enum
-> (`core/model/gpu_detector.py:28~34`)에는 **A100 멤버가 없다.** 멤버는
-> `RTX_5090`(32GB) / `H100`(80GB) / `H200`(141GB) / `MULTI_GPU` 4종뿐이다.
-> 감지 로직(`gpu_detector.py:160~165`)은 단일 GPU 기준
-> `vram_gb > 120 → H200`, `vram_gb > 60 → H100`, 그 외 `RTX_5090`이다.
-> 따라서 A100 80GB는 H100(80GB)과 **동일 VRAM 구간(60 초과·120 이하)** 으로
-> 판정되어 **자동으로 H100 티어로 매핑**된다. 별도 A100 enum/프로파일 추가는
-> 불필요하다(검증 필요: A100 실제 장비에서 H100 프로파일의 BF16 풀 프리시전
-> 적재가 동일하게 동작하는지 현장 확인 권장).
+> **A100 티어 (구현 완료, 2026-06-02 — 초판 대비 변경)**: v7.2 초판은 "A100 enum
+> 이 없어 H100 으로 자동 매핑되며 별도 추가 불필요"로 기술했으나, 이후
+> **`GPUTier.A100`(`gpu_detector.py:32`)이 별도 enum 으로 추가**되었다. A100 80GB
+> 와 H100 80GB 는 VRAM 이 같아 용량만으로는 구분되지 않으므로, 감지 로직
+> (`gpu_detector.py:161~169`)이 `vram_gb > 60` 구간에서 **GPU 이름에 "a100"이
+> 포함되면 `GPUTier.A100`**, 아니면 `H100` 으로 판정한다. A100 프로파일은
+> H100 과 거의 동일하되 **Ampere 라 FP8 미지원**(`notes`에 명시)이라는 차이를
+> 반영한다. 상세는 v7.3 Part 4.4 참조. (MCP 동작에는 무관 — GPU 와 직교.)
 
 ### 왜 v7.2인가
 
@@ -622,10 +621,18 @@ mcp:
       trust: { read_only: true }
 ```
 
-> **포트 번호 8810~8813은 placeholder**이며 운영 확정 전 임시값이다 (Part 8
-> 미확정 항목). 코드 기본값은 `enabled: false` — yaml에서 명시 활성해야만
-> 연결을 시도한다. 4종 모두 `trust.read_only: true`이므로 read-only-only 등록
-> 정책(Part 4.5)에 의해 별도 `allow_write` 없이 등록된다.
+> **포트 확정(서버 구현 완료, 2026-06-02)**: 서버 측 구현(`mcp_servers/`)이
+> 완료되며 각 서버의 **기본 포트가 확정**되었다 — `db 8810 / diag 8811 /
+> kowiki 8813 / docingest 8814`(`mcp_servers/run.py::_SERVERS`). 즉 db/diag/
+> kowiki 의 placeholder 포트는 그대로 확정값이 되었고, **`docutil`(8812)은
+> 서버 미구현**이며 실제 구현된 문서 MCP 는 **`docingest`(8814)** 다(Part 6.4
+> 참조). 코드 기본값은 `enabled: false` — yaml에서 명시 활성해야만 연결을
+> 시도한다. 모두 `trust.read_only: true`(docingest 의 `ingest` 쓰기 도구만 예외 —
+> Part 6.4)이므로 read-only-only 등록 정책(Part 4.5)에 의해 등록된다.
+>
+> **주의(설정-구현 불일치)**: 위 yaml 의 `docutil`(8812) 항목은 서버가 구현되지
+> 않았으므로 활성화해도 연결되지 않는다. 운영 전 yaml 을 실제 구현 서버
+> (db/diag/kowiki/docingest)로 정렬해야 한다.
 
 ### 5.3 부트스트랩 초기화 위치 (구현 완료 — cli_registry 배선)
 
@@ -674,22 +681,59 @@ else:
 
 ---
 
-## Part 6: 초기 검증 대상 4종 상세
+## Part 6: 초기 검증 대상 4종 상세 (서버 측 구현 완료)
 
 각 대상은 "사내 시스템을 LAN MCP 서버로 떼어내 재사용"의 구체 사례다.
 read-only 여부는 `McpToolAdapter`의 `is_read_only` 명시적 완화 대상이며,
 권한 카테고리는 전부 `ToolCategory.MCP`(이름이 `mcp__`로 시작하므로 자동).
-4종 모두 `trust.read_only=true`라 read-only-only 등록 정책(Part 4.5)으로
-자동 등록된다.
+
+### 6.0 MCP 서버 측 구현 (`mcp_servers/` — 구현 완료, 2026-06-02)
+
+v7.2 초판은 서버 측(사내 시스템을 감싸 MCP 도구로 노출하는 LAN 호스트)을
+"미확정/placeholder"로 두고 클라이언트 측(`core/tools/mcp/*`)만 구현 완료로
+기술했다. 이제 **서버 측도 `mcp_servers/` 패키지로 구현 완료**되었으며,
+클라이언트와 JSON-RPC 2.0 와이어 프로토콜 수준에서 **e2e 정합**이 검증되었다.
+
+**구성 (`mcp_servers/`)**:
+
+| 파일 | 역할 |
+|---|---|
+| `framework.py` | `McpServerTool(ABC)` + `create_mcp_app()` — JSON-RPC 2.0 단일 POST `/` 디스패치(tools/list·tools/call), Bearer 인증(fail-closed), `/health`, lifespan shutdown 훅 |
+| `run.py` | `python -m mcp_servers.run <name>` uvicorn entrypoint. `_SERVERS` 포트 매핑: db 8810 / diag 8811 / kowiki 8813 / docingest 8814 |
+| `db_server.py` | `query` — read-only SELECT. `_validate_read_only`(주석 제거·다중문 금지·SELECT/WITH 만 허용·DDL/DML 키워드 차단) + asyncpg `transaction(readonly=True)` 이중 방어. 최대 1000행 |
+| `diag_server.py` | `reachability`(웹 HTTP/GPU SSH/DB TCP, `asyncio.to_thread` 병렬), `rag_latency`(임베딩 지연 + tb_knowledge EXPLAIN ANALYZE; pg 없으면 임베딩만 — fail-soft) |
+| `kowiki_server.py` | `search` — `LocalModelProvider.embed("query: …")` → `KnowledgeStore.search_by_vector(top_k)`. pg 실패 시 인메모리 폴백 |
+| `docingest_server.py` | `parse`(dry_run, read-only) / `ingest`(쓰기) / `search`(source='docingest' 필터, read-only). `DocumentIngestPipeline` + ParserRegistry(PPTX/PDF/HWPX) 조립 |
+
+**의존성 방향 (P2 준수)**: `mcp_servers/ → core/`(코어 재사용)만 허용. `core/`는
+`mcp_servers/`를 절대 import 하지 않는다(서버는 오케스트레이터가 아니라 사내
+시스템을 감싸는 독립 서비스). 각 서버 모듈은 `async def build_app(api_key) ->
+FastAPI`를 노출하며 db 풀 등 비동기 자원을 lifespan 에서 정리한다.
+
+**에어갭**: 기본 host `0.0.0.0`(LAN 바인드), 모든 점검·접속 대상은 LAN
+주소(192.168.x/localhost). 외부 도메인 호출·런타임 install 코드 없음.
+
+**클라이언트↔서버 e2e 검증 (구현 완료)**: 기존 client/adapter 테스트는
+`AsyncMock` 으로 서버를 흉내냈을 뿐이었다. 신규 `tests/integration/
+test_mcp_client_server_e2e.py`가 **우리 `McpClient` ↔ `create_mcp_app` 서버**를
+실제 연결해 전 구간을 관통 검증한다:
+- 방식 a: `httpx.ASGITransport(app=app)` — 인프로세스 결정론적 연결(McpClient
+  의 `_rpc`/`_parse_response`/에러 정규화가 진짜 서버 응답에 동작).
+- 방식 b: 임의 포트 uvicorn 실 TCP 소켓(127.0.0.1 루프백) — 진짜 소켓 경로도 입증.
+- `McpClient → McpToolAdapter` 전구간(BaseTool 래핑·tool_use_error 래핑 포함) 검증.
 
 ### 6.1 초기 검증 대상 4종 요약표
 
-| # | 서버 | 노출 도구 이름 | read-only | 트러스트 경계 | 대상 LAN 위치 |
+| # | 서버 | 노출 도구 이름 | read-only | 기본 포트 | 대상 LAN 위치 |
 |---|---|---|---|---|---|
-| 1 | DB 조회 | `mcp__db__query` | ✓ | SELECT 전용, DDL/DML 금지 | PG 192.168.10.39 |
-| 2 | 진단/모니터링 | `mcp__diag__reachability`, `mcp__diag__rag_latency` | ✓ | 읽기 점검만, 변경 없음 | 웹/GPU 22.28/DB 10.39 |
-| 3 | DocUtil 문서 | `mcp__docutil__search`, `mcp__docutil__get` | ✓ | 사내 문서 조회 전용 | DocUtil 192.168.10.39 |
-| 4 | kowiki RAG | `mcp__kowiki__search` | ✓ | 지식 검색 전용 | tb_knowledge + 임베딩 22.28:8002 |
+| 1 | DB 조회 (`db_server.py`) | `mcp__db__query` | ✓ | 8810 | PG 192.168.10.39 |
+| 2 | 진단/모니터링 (`diag_server.py`) | `mcp__diag__reachability`, `mcp__diag__rag_latency` | ✓ | 8811 | 웹/GPU 22.28/DB 10.39 |
+| 3 | 문서 인제스트 (`docingest_server.py`) | `mcp__docingest__parse`, `mcp__docingest__ingest`(쓰기), `mcp__docingest__search` | parse/search ✓ · ingest ✗ | 8814 | tb_knowledge + 임베딩 22.28:8002 |
+| 4 | kowiki RAG (`kowiki_server.py`) | `mcp__kowiki__search` | ✓ | 8813 | tb_knowledge + 임베딩 22.28:8002 |
+
+> **대상 3 변경**: v7.2 초판의 "DocUtil 문서 MCP(`mcp__docutil__*`, 8812)"는
+> 서버가 구현되지 않았다. 실제 구현된 문서 MCP 는 **docingest**(8814)이며,
+> parse/search 는 read-only, **ingest 만 쓰기 도구**다(상세 6.4).
 
 ### 6.2 대상 1 — DB 조회 MCP (`mcp__db__query`)
 
@@ -720,18 +764,32 @@ read-only 여부는 `McpToolAdapter`의 `is_read_only` 명시적 완화 대상�
   - (b) NVML mismatch(v7.1 Part 4.3) 상황에서도 추론 도달성은 정상 보고
   - (c) 진단 MCP 서버 다운 시 fail-closed — 해당 도구만 미등록, 본류 무영향
 
-### 6.4 대상 3 — DocUtil 문서 시스템 MCP (`mcp__docutil__*`)
+### 6.4 대상 3 — 문서 인제스트 MCP (`mcp__docingest__*`) — 구현 완료
 
-- **무엇**: 사내 DocUtil 문서/지식 시스템의 검색·조회를 MCP로 노출.
-- **read-only**: ✓ — 문서 검색·본문 조회 전용.
-- **노출 도구**: `mcp__docutil__search`(질의→문서 목록),
-  `mcp__docutil__get`(문서 ID→본문).
-- **트러스트 경계**: DocUtil MCP = 신뢰 경계 3.
+> v7.2 초판의 "DocUtil 문서 MCP(`mcp__docutil__*`)"를 대체한다. 실제 구현은
+> 문서 파일(PPTX/PDF/HWPX)을 파싱·청킹·임베딩하여 tb_knowledge 에 적재/검색하는
+> **docingest** 서버다(`mcp_servers/docingest_server.py`, 기본 포트 8814).
+
+- **무엇**: 로컬 문서 파일을 v7.3 인제스트 파이프라인(`core/ingest/*`)으로
+  파싱→청킹→임베딩→`tb_knowledge`(source='docingest') 적재·검색하는 MCP.
+- **노출 도구 3개**:
+  - `mcp__docingest__parse` (**read-only**) — 파싱·청킹만 하고 적재하지 않음
+    (dry_run). 제목/포맷/청크 수/구조 경고 요약 반환(적재 전 점검).
+  - `mcp__docingest__ingest` (**쓰기**) — 파일을 실제 적재. 동일 파일 재적재는
+    멱등(UPSERT). 적재 행수·오류 목록 반환.
+  - `mcp__docingest__search` (**read-only**) — source='docingest' 청크만 필터해
+    의미 기반 검색(다른 소스 누설 방지).
+- **read-only 구분**: parse/search 는 부작용 없음, ingest 만 DB 에 쓴다. 도구
+  설명에 `[read-only]`/`[쓰기]`를 명시해 권한 파이프라인이 구분하게 한다. 쓰기
+  도구(ingest)는 read-only-only 등록 정책상 `allow_write=True` 명시가 필요하다
+  (Part 4.5).
+- **트러스트 경계**: docingest MCP = 신뢰 경계 3.
 - **검증 포인트**:
-  - (a) `mcp__docutil__search` 질의 → 관련 문서 N건 반환
-  - (b) 대용량 본문은 어댑터가 `max_result_size`(BaseTool 기본 100,000자)로
+  - (a) `mcp__docingest__parse(path)` → 청크 수/경고 요약 반환(적재 없음)
+  - (b) `mcp__docingest__ingest(path)` → tb_knowledge 적재 행수 반환, 재적재 멱등
+  - (c) 대용량 본문은 어댑터가 `max_result_size`(BaseTool 기본 100,000자)로
     제한 — Worker 8K 컨텍스트 폭주 방지
-  - (c) Worker가 자발적으로 docutil 도구를 선택하는지(description 적정성)
+  - (d) ingest 쓰기 도구가 `allow_write` 없이는 미등록(read-only-only 정책)임을 확인
 
 ### 6.5 대상 4 — kowiki 지식 RAG MCP (`mcp__kowiki__search`) — 대표 사례
 
@@ -770,7 +828,7 @@ MCP 도입은 도구 풀에 원격 도구를 추가하는 것뿐이며, 다음 �
 | Training | **영향 없음** | 학습 대상 모델 불변 |
 | Air-gap | **강화됨** | LAN 경계 이중 강제(config `@model_validator` + `McpClient.__init__`) + `network_guard.is_lan_hostname` 일원화 + deny 비상 스위치 (Part 3) |
 | prompt cache 안정성 (P5) | **영향 없음** | registry 이름순 정렬이 MCP 도구도 포함해 보장 (bootstrap에서 cli_tools 재취득) |
-| 모델·티어(A100→H100 매핑) | **영향 없음** | MCP는 GPU와 직교. A100 80GB는 H100 티어로 자동 매핑(개정 개요) |
+| 모델·티어 | **영향 없음** | MCP는 GPU와 직교. (참고: `GPUTier.A100`이 별도 enum으로 추가됨 — v7.3 Part 4.4. MCP 동작에는 무관) |
 
 ---
 
@@ -785,31 +843,41 @@ MCP 도입은 도구 풀에 원격 도구를 추가하는 것뿐이며, 다음 �
 | 3 | `McpToolAdapter(BaseTool)` (+`validate_input`) | **구현 완료** | name 규칙, input_schema 매핑, tool_use_error 래핑 (`test_mcp_adapter.py`) |
 | 4 | `McpConnectionManager`(read-only-only) + bootstrap ⑨-d 배선 | **구현 완료** | 1개 서버 연결 실패 시 격리. cli_registry 등록 + cli_tools 재취득 |
 | 5 | 권한 통합 검증 | **구현 완료** | `mcp__db__query`가 DEFAULT=ASK / PLAN=DENY / BYPASS=ALLOW (`test_mcp_pipeline.py`) |
-| 6 | 검증 대상 1(DB) e2e | **검증 필요** | 6.2 검증 포인트 (a)~(d) — 실 LAN MCP 서버 필요 |
-| 7 | 검증 대상 2~4 순차 | **검증 필요** | 각 6.x 검증 포인트 — 실 LAN MCP 서버 필요 |
+| 6 | **MCP 서버 측 4종**(`mcp_servers/` db/diag/kowiki/docingest) + 공통 프레임워크 | **구현 완료** | `test_mcp_server_framework.py`, `test_mcp_db_server.py`, `test_mcp_kowiki_docingest_server.py` |
+| 7 | **클라이언트↔서버 e2e**(McpClient↔create_mcp_app, ASGITransport + 실 TCP, McpClient→McpToolAdapter 전구간) | **구현 완료** | `tests/integration/test_mcp_client_server_e2e.py` |
+| 8 | GlobalState `mcp_servers`/`mcp_connected` 가시성 + `/metrics` 노출 | **구현 완료** | `core/state.py:131`, `core/bootstrap.py:391~395`, `web/app.py:1206~`, `test_mcp_visibility.py` |
+| 9 | 검증 대상 e2e — **실 LAN 서버 배포 후** 6.x 시나리오 | **미착수(후속)** | 6.x 검증 포인트 — 실 LAN MCP 서버를 별도 호스트에 배포해 수행 |
 
 ### 8.2 테스트 전략 (testing.md 준수) — 구현 완료
 
-- MCP 서버는 mock(`httpx.AsyncClient` mock + JSON-RPC fixture) — 실 서버 없이 검증
+- 클라이언트 측: mock(`httpx.AsyncClient` mock + JSON-RPC fixture)로 tools/list·
+  tools/call 파싱 검증
+- 서버 측(신규): `create_mcp_app` 을 `httpx.ASGITransport` 로 인프로세스 호출해
+  JSON-RPC 디스패치/Bearer 인증(fail-closed)/도구 실행/에러 코드 매핑 검증
+- 클라이언트↔서버 e2e(신규): 실 McpClient ↔ 실 서버(ASGITransport + 임의 포트
+  uvicorn 실 TCP), McpClient→McpToolAdapter 전구간(127.0.0.1 루프백 — 에어갭 준수)
 - 권한: Layer 1 deny(`mcp__*`)/Layer 3 MODE_BEHAVIOR_MAP/Layer 5 PLAN 보정 시나리오
 - fail-closed: 연결 실패·비-LAN URL·timeout 3종이 모두 본류 무영향임을 검증
-- read-only-only 등록 정책: 쓰기 서버가 `allow_write` 없이는 미등록됨을 검증
-- 파일(구현됨): `tests/unit/test_mcp_config.py`, `tests/unit/test_mcp_adapter.py`,
-  `tests/integration/test_mcp_pipeline.py`
-- **테스트 결과(실측, 2026-06-01)**: MCP 단위/통합 **81 passed**.
-  전체 회귀 **916 passed, 1 skipped**(유일한 1 failed는
-  `tests/e2e/test_gpu_e2e.py::test_simple_chat_completion` — 실 GPU 서버
-  의존 e2e로 MCP와 무관. 코드 회귀 아님).
+- read-only-only 등록 정책: 쓰기 서버(docingest ingest)가 `allow_write` 없이는 미등록됨을 검증
+- top_k 견고성: kowiki/docingest/diag search 의 `top_k=0/음수/bool` 거부, 미지정 시에만 기본값 적용
+- 파일(구현됨): 클라이언트 — `test_mcp_config.py`, `test_mcp_adapter.py`,
+  `test_mcp_pipeline.py`; 서버 — `test_mcp_server_framework.py`,
+  `test_mcp_db_server.py`, `test_mcp_kowiki_docingest_server.py`; e2e —
+  `test_mcp_client_server_e2e.py`; 가시성 — `test_mcp_visibility.py`
+- **테스트 결과(실측, 2026-06-02)**: 전체 회귀 **1091 passed, 1 skipped**.
+  유일한 1 failed 는 `tests/e2e/test_gpu_e2e.py::test_simple_chat_completion`
+  — 실 GPU 서버 의존 e2e 로 MCP/인제스트와 무관(코드 회귀 아님).
 
 ### 8.3 향후 정식 운영 시 확장 경로
 
 | 확장 | 내용 |
 |---|---|
-| GlobalState 가시성 (권장) | `mcp_servers: dict`, `mcp_connected: set` 운영 가시성 필드는 **현재 `core/state.py`에 미존재**. 제품 정식 운영 가시성(`/metrics` 노출)을 위해 **추가 권장**. `mcp_manager`는 부트스트랩 components에는 보관되나 GlobalState/`/metrics`로는 노출되지 않음 |
-| MCP 서버 측 표준화 | 사내 시스템이 MCP 서버로 안정화되면 외부 MCP 호환 클라이언트(예: 타 사내 AI 도구)도 재사용 가능 |
+| GlobalState 가시성 | **구현 완료** — `mcp_servers: dict`/`mcp_connected: set` 가 `core/state.py:131`에 추가됨. bootstrap ⑨-d(`core/bootstrap.py:391~395`)가 등록 결과로 채우고, `web/app.py:1206~`의 `/metrics`에 `mcp.connected_count`/`connected`/서버별 도구 목록으로 노출된다 |
+| MCP 서버 측 표준화 | **구현 완료** — `mcp_servers/`(framework + db/diag/kowiki/docingest)로 사내 시스템을 LAN MCP 서버로 노출. 외부 MCP 호환 클라이언트도 동일 JSON-RPC 2.0 프로토콜로 재사용 가능 |
+| 실 LAN 서버 배포 e2e | **후속(미착수)** — 현재 e2e 는 인프로세스(ASGITransport) + 루프백 TCP 검증까지다. 별도 호스트에 서버를 배포해 Part 6.x 운영 시나리오를 수행하는 것은 다음 단계 |
 | 쓰기 가능 MCP | 초기 제품 정책은 read-only 4종 한정. 쓰기 MCP는 `allow_write=True` 명시 등록 + 표준 5계층 권한(DEFAULT=ASK/PLAN=DENY) 적용 |
 | 동시성 | 현재 MCP 어댑터는 `is_concurrency_safe=False`(기본). read-only 검증 후 병렬 완화 가능 (P12 concurrency partitioning) |
-| TIER/GPU 무관성 | MCP는 모델·티어와 직교 — TIER_S/M/L, A100(→H100 매핑) 어디서나 동일 동작. Scout/라우팅과 달리 티어별 비활성화 불필요 |
+| TIER/GPU 무관성 | MCP는 모델·티어와 직교 — TIER_S/M/L, A100/H100/H200 어디서나 동일 동작. Scout/라우팅과 달리 티어별 비활성화 불필요 |
 
 ---
 
@@ -830,16 +898,20 @@ MCP 도입은 도구 풀에 원격 도구를 추가하는 것뿐이며, 다음 �
 | 11 | LAN 판정 `network_guard.is_lan_hostname` 이전 | **구현됨** (`_is_lan_hostname` 별칭 유지) | Part 3.2 | 구현됨 |
 | 12 | LAN URL 이중 강제 | **구현됨** (config validator + McpClient) | Part 3.2 | 구현됨 |
 | 13 | bootstrap cli_registry 배선 | **구현됨** (배선 버그 정정) | Part 5.3 | 구현됨 |
-| 14 | A100 → H100 티어 자동 매핑 | 실측 명문화(별도 enum 불필요) | 개정 개요 | 확인됨 |
-| 15 | GlobalState `mcp_servers`/`mcp_connected` | **미존재** — 가시성 위해 추가 권장 | Part 8.3 | 미존재 |
+| 14 | GPU 티어 A100 | v7.2 초판은 "A100→H100 매핑(별도 enum 불필요)"였으나, **v7.3에서 `GPUTier.A100` 별도 enum 추가**(이름 기반 판정). MCP 동작과는 무관 | v7.3 Part 4.4 | 구현됨 |
+| 15 | GlobalState `mcp_servers`/`mcp_connected` | **구현됨** — `/metrics` 노출 포함 | Part 8.3 | 구현됨 |
+| 16 | MCP 서버 측(`mcp_servers/` db/diag/kowiki/docingest) | **구현됨** — 클라이언트↔서버 e2e 검증 | Part 6.0 | 구현됨 |
+| 17 | 검증 대상 3: `docutil` → `docingest` | **정정** — docutil 미구현, docingest(parse/ingest/search) 구현 | Part 6.4 | 구현됨 |
 
-> **GlobalState 가시성 주의(실측)**: `mcp_servers: dict`/`mcp_connected: set`는
-> `core/state.py`에 **여전히 존재하지 않는다.** `mcp_manager`는 부트스트랩의
-> `components` dict에는 보관되지만 GlobalState/`/metrics`로는 노출되지 않는다.
-> 제품 정식 운영 가시성을 위해 GlobalState 필드 추가를 권장한다(Part 8.3).
-> 이미 존재하던 MCP 인프라는 `ToolCategory.MCP`(types.py)와 `mcp__`
-> 식별(pipeline.py) 두 가지였고, v7.2에서 어댑터·설정·연결 관리자가 신규로
-> 구현되었다.
+> **GlobalState 가시성(구현 완료, 2026-06-02)**: `mcp_servers: dict`/
+> `mcp_connected: set`가 `core/state.py:131`에 추가되었다. bootstrap ⑨-d
+> (`core/bootstrap.py:391~395`)가 `connect_and_register` 결과로 채우며(빈
+> 리스트는 connected 에서 자연 제외 — fail-closed 요약), `web/app.py`의
+> `/metrics`(`:1206~`)가 `mcp.connected_count`/`connected`/서버별 도구 목록을
+> 노출한다. v7.2 초판 시점에 이미 존재하던 인프라는 `ToolCategory.MCP`(types.py)
+> 와 `mcp__` 식별(pipeline.py)이었고, v7.2에서 클라이언트(어댑터·설정·연결
+> 관리자)가, 2026-06-02 갱신에서 **서버 측(`mcp_servers/`)·e2e·GlobalState
+> 가시성**이 추가 구현되었다.
 
 ---
 
@@ -871,16 +943,28 @@ MCP 도입은 도구 풀에 원격 도구를 추가하는 것뿐이며, 다음 �
 | bootstrap MCP 연결 배선 (cli_registry) | `core/bootstrap.py:367~405` (블록 ⑨-d) | **구현됨** |
 | MCP 단위 테스트 (config/adapter) | `tests/unit/test_mcp_config.py`, `test_mcp_adapter.py` | **구현됨** |
 | MCP 통합 테스트 (5계층 파이프라인) | `tests/integration/test_mcp_pipeline.py` | **구현됨** |
-| GlobalState `mcp_servers`/`mcp_connected` | `core/state.py` | **미존재 — 가시성 위해 추가 권장** |
+| **MCP 서버 공통 프레임워크** | `mcp_servers/framework.py` (`McpServerTool`/`create_mcp_app`) | **구현됨** |
+| **MCP 서버 entrypoint** | `mcp_servers/run.py` (`python -m mcp_servers.run <name>`) | **구현됨** |
+| **db MCP 서버** (read-only SELECT) | `mcp_servers/db_server.py` (포트 8810) | **구현됨** |
+| **diag MCP 서버** (reachability/rag_latency) | `mcp_servers/diag_server.py` (포트 8811) | **구현됨** |
+| **kowiki MCP 서버** (embed+pgvector search) | `mcp_servers/kowiki_server.py` (포트 8813) | **구현됨** |
+| **docingest MCP 서버** (parse/ingest/search) | `mcp_servers/docingest_server.py` (포트 8814) | **구현됨** |
+| **MCP 서버 단위 테스트** | `tests/unit/test_mcp_server_framework.py`, `test_mcp_db_server.py`, `test_mcp_kowiki_docingest_server.py` | **구현됨** |
+| **클라이언트↔서버 e2e 테스트** | `tests/integration/test_mcp_client_server_e2e.py` | **구현됨** |
+| GlobalState `mcp_servers`/`mcp_connected` | `core/state.py:131` | **구현됨** |
+| MCP 가시성 bootstrap 배선 + `/metrics` | `core/bootstrap.py:391~395`, `web/app.py:1206~` | **구현됨** |
+| MCP 가시성 테스트 | `tests/unit/test_mcp_visibility.py` | **구현됨** |
 
 ---
 
-*작성일: 2026-06-01*
+*작성일: 2026-06-01 (서버 측·e2e·가시성 갱신: 2026-06-02)*
 *기준 운영 점검: tb_knowledge 1,067,978행 (DB MCP 검증값)*
-*테스트 실측(2026-06-01): MCP 단위/통합 81 passed, 전체 회귀 916 passed·1 skipped*
-*(1 failed = test_gpu_e2e 실 GPU 의존 e2e, MCP 무관)*
-*코드 확인 기준: core/tools/mcp/{client,adapter,connection_manager,__init__}.py,*
-*core/config.py, core/security/network_guard.py, core/bootstrap.py,*
-*core/model/gpu_detector.py, core/permission/{types,pipeline}.py,*
-*config/nexus_config.yaml, tests/unit/test_mcp_{config,adapter}.py,*
-*tests/integration/test_mcp_pipeline.py (2026-06-01 실측)*
+*테스트 실측(2026-06-02): 전체 회귀 1091 passed·1 skipped*
+*(1 failed = test_gpu_e2e 실 GPU 의존 e2e, MCP/인제스트 무관)*
+*코드 확인 기준(2026-06-02): mcp_servers/{framework,run,db_server,diag_server,*
+*kowiki_server,docingest_server}.py, core/tools/mcp/*, core/config.py,*
+*core/security/network_guard.py, core/bootstrap.py(블록 ⑨-d), core/state.py,*
+*core/model/gpu_detector.py, core/permission/{types,pipeline}.py, web/app.py(/metrics),*
+*config/nexus_config.yaml, tests/unit/test_mcp_{config,adapter,server_framework,*
+*db_server,kowiki_docingest_server,visibility}.py,*
+*tests/integration/test_mcp_{pipeline,client_server_e2e}.py*

@@ -47,10 +47,12 @@ MCP 서버")로 떼어내** v7.2의 `McpToolAdapter`로 호출하거나, `prepar
 - **라이선스 정책**: 청정(MIT/Apache) 기본 구현 + 상용 라이선스 구매 시
   교체 가능한 **어댑터 슬롯**. AGPL/GPL은 기본 스택 배제.
 
-> **코드 확인 주의**: 현재 `core/model/gpu_detector.py::GPUTier`는
-> `RTX_5090 / H100 / H200 / MULTI_GPU` 4종이며 **A100 티어는 존재하지 않는다**
-> (2026-06-01 실측). 제품 배포 타겟 A100(80GB)을 티어로 추가하는 것은
-> **신규 제안**이다 (Part 4.4, Part 9).
+> **코드 확인 주의 (구현 완료, 2026-06-02)**: `core/model/gpu_detector.py::GPUTier`
+> 에 **`A100 = "a100"`이 추가되었다**(`:32`). 멤버는 이제
+> `RTX_5090 / A100 / H100 / H200 / MULTI_GPU` 5종이다. A100/H100 은 VRAM 이 같아
+> 감지 로직(`:161~169`)이 `vram_gb > 60` 구간에서 GPU 이름에 "a100"이 포함되면
+> A100, 아니면 H100 으로 판정한다. A100 프로파일(`:225~262`)은 BF16 풀 프리시전
+> (Ampere — **FP8 미지원**)으로 정의되어 있다. 상세는 Part 4.4 참조.
 
 ---
 
@@ -164,23 +166,28 @@ v7.3 인제스트 파이프라인은 **"문서를 구조 보존 청킹해 tb_kno
 
 ### 2.2 의존성 방향 (P2 준수)
 
-신규 모듈 위치 제안: `core/ingest/`
+신규 모듈 위치: `core/ingest/` (★ = 구현 완료, ○ = 후속/어댑터 슬롯)
 
 ```
-core/ingest/                        ← 신규 디렉토리 (제안)
-  types.py            — DocumentTree, DocumentNode, DocumentChunk (Pydantic v2/frozen)
-  parser_base.py      — DocumentParser (ABC), ParserRegistry
+core/ingest/                        ← 신규 디렉토리 (구현됨)
+  types.py            ★ DocumentTree, DocumentNode, DocumentChunk (Pydantic v2/frozen)
+  parser_base.py      ★ DocumentParser (ABC), ParserRegistry (priority 기반 선택/폴백)
   parsers/            — 포맷별 구현체
-    pdf_plumber.py    — PdfPlumberParser (MIT)
-    pptx.py           — PptxParser (python-pptx, MIT)
-    hwpx.py           — HwpxParser (zipfile+xml.etree 또는 python-hwpx)
-    docling_layout.py — DoclingParser (Docling, MIT — GPU 권장)
-    ocr_paddle.py     — PaddleOcrParser (PaddleOCR/PP-Structure, Apache — GPU)
-    ocr_tesseract.py  — TesseractParser (Tesseract5, Apache — CPU)
-    hwp_libreoffice.py— HwpViaLibreOffice (.hwp→.docx subprocess 변환)
-  chunker.py          — StructureAwareChunker (계층형 청킹)
-  pipeline.py         — DocumentIngestPipeline (parse→chunk→embed→적재 오케스트레이션)
+    pdf_plumber.py    ★ PdfPlumberParser (pdfplumber, MIT — PDF 경량)
+    pptx.py           ★ PptxParser (python-pptx, MIT)
+    hwpx.py           ★ HwpxParser (python-hwpx 1차 + zipfile/xml.etree 폴백, OWPML)
+    docling_layout.py ○ DoclingParser (Docling, GPU 권장) — 미구현(어댑터 슬롯)
+    ocr_paddle.py     ○ PaddleOcrParser (PaddleOCR/PP-Structure, GPU) — 미구현(슬롯)
+    ocr_tesseract.py  ○ TesseractParser (Tesseract5, CPU) — 미구현(슬롯)
+    hwp_libreoffice.py○ HwpViaLibreOffice (.hwp→.docx subprocess) — 미구현(후속)
+  chunker.py          ★ StructureAwareChunker (계층형 청킹)
+  pipeline.py         ★ DocumentIngestPipeline (parse→chunk→embed→적재 오케스트레이션)
 ```
+
+> `parsers/__init__.py`가 현재 export 하는 것은 `HwpxParser`/`PdfPlumberParser`/
+> `PptxParser` 3종이다. docling/ocr/hwp 파서는 ParserRegistry 의 priority 슬롯에
+> 더 높은 우선순위로 끼우면 동일 확장자에서 자동 우선되고, 미등록 시 청정 기본
+> 파서로 폴백된다(과설계 없이 후속 확장 가능한 구조).
 
 의존성 방향 (단방향만):
 ```
@@ -426,11 +433,23 @@ RTX_5090/H100/H200/MULTI_GPU). 단, **인제스트는 주로 MCP 서버/배치 �
 | **A100 (80GB, 고객 타겟)** | **Docling** | **PaddleOCR PP-Structure** | **제품 검증 기준선** |
 | H200 (141GB, 자체) | Docling | PaddleOCR PP-Structure | 배치 대량 처리 여유 |
 
-### 4.4 A100 티어 추가 (신규 제안)
+### 4.4 A100 티어 추가 (구현 완료)
 
-`GPUTier` enum에 A100(80GB)이 없으므로(실측), 제품 검증 기준선을 명시하려면
-`A100 = "a100"` 추가가 필요하다. 이는 v7.3가 식별한 **신규 제안**이며, 추가
-시 ModelSpec/EmbeddingSpec 테이블에 A100 행을 함께 정의해야 한다(별도 작업).
+`GPUTier.A100 = "a100"`이 추가되었다(`core/model/gpu_detector.py:32`).
+
+- **판정**: A100 80GB 와 H100 80GB 는 VRAM 이 동일해 용량만으로 구분 불가하므로,
+  감지 로직(`:161~169`)이 `vram_gb > 60` 구간에서 **GPU 이름에 "a100"이 포함되면
+  A100**, 아니면 H100 으로 판정한다(이름 기반 분기).
+- **프로파일**(`get_tier_config`, `:225~262`): primary `qwen3.5-27b` /
+  auxiliary `exaone-32b` 모두 **BF16 풀 프리시전(QuantizationMethod.NONE)**,
+  `max_model_len=8192`, `max_num_seqs=4`. training 은 `lora`(rank 64).
+- **H100 과의 차이**: A100 은 Hopper 가 아니라 **Ampere 라 FP8/Transformer
+  Engine 미지원** — 양자화 없이 BF16 으로만 서빙. HBM2e 대역폭이 낮아
+  `max_num_seqs` 를 보수적으로 둔다. `notes="A100 80GB(Ampere). 58+32>80GB이므로
+  hot-swap 필요. FP8 미지원."`
+- **VRAM 80GB → TIER_M 매핑**: 본 인제스트의 PDF 고품질 분기(Part 4.2)는
+  `vram_free_gb >= docling_min_vram_gb(8.0)` 기준으로 Docling 을 선택하므로,
+  A100(80GB)은 고품질 스택을 쓸 여유가 충분하다(제품 검증 기준선 — Part 4.3).
 
 ---
 
@@ -592,18 +611,18 @@ SHA-256 매니페스트로 변조 탐지.
 
 development-workflow.md 준수. 하위 단계 완성 전 상위 단계 미착수.
 
-| 단계 | 작업 | 검증 기준 (제품 품질) |
-|---|---|---|
-| 1 | `core/ingest/types.py` + `parser_base.py` (DocumentTree/DocumentParser ABC, Pydantic v2/frozen) | 단위 테스트: 트리 직렬화·heading_path 전파 |
-| 2 | **PPTX 파서** (python-pptx, 좌표 읽기순서 복원) | 실제 .pptx 5종에서 슬라이드/표/텍스트박스 충돌 0 |
-| 3 | `StructureAwareChunker` (계층형, 소제목 경계 분할) | 인접 소제목 본문이 한 청크에 섞이지 않음 검증 |
-| 4 | `DocumentIngestPipeline` + tb_knowledge 적재 (metadata jsonb) | embed→add→search 왕복, metadata에 heading_path/page 보존 |
-| 5 | **PDF 경량** (pdfplumber, 표·좌표) | 텍스트 PDF에서 표 행/열 보존, 본문 분리 |
-| 6 | **PDF 고품질** (Docling, A100) + 티어 분기 | A100에서 Docling, 5090에서 pdfplumber 자동 선택 |
-| 7 | **HWPX** (zipfile+xml.etree 직접 파싱) | OWPML XML에서 헤딩/문단/표 구조 추출 |
-| 8 | **스캔 OCR** — Tesseract(경량) → PaddleOCR PP-Structure(고품질) | 스캔 PDF 한국어 OCR + 표 인식, v4 사용 확인 |
-| 9 | **.hwp 변환** (LibreOffice subprocess → .docx) | .hwp→.docx→트리, 변환 실패 fail-soft |
-| 10 | **MCP 서버화** (`mcp__docingest__*`) + 배치 스크립트 | v7.2 권한(ingest=ASK) 정합, 대량 배치 멱등 |
+| 단계 | 작업 | 검증 기준 (제품 품질) | 상태 (2026-06-02) |
+|---|---|---|---|
+| 1 | `core/ingest/types.py` + `parser_base.py` (DocumentTree/DocumentParser ABC, Pydantic v2/frozen) | 단위 테스트: 트리 직렬화·heading_path 전파 | **구현 완료** |
+| 2 | **PPTX 파서** (python-pptx, 좌표 읽기순서 복원) | 실제 .pptx 5종에서 슬라이드/표/텍스트박스 충돌 0 | **구현 완료** (`parsers/pptx.py`) |
+| 3 | `StructureAwareChunker` (계층형, 소제목 경계 분할) | 인접 소제목 본문이 한 청크에 섞이지 않음 검증 | **구현 완료** |
+| 4 | `DocumentIngestPipeline` + tb_knowledge 적재 (metadata jsonb) | embed→add→search 왕복, metadata에 heading_path/page 보존 | **구현 완료** |
+| 5 | **PDF 경량** (pdfplumber, 표·좌표) | 텍스트 PDF에서 표 행/열 보존, 본문 분리 | **구현 완료** (`parsers/pdf_plumber.py`) |
+| 6 | **PDF 고품질** (Docling, A100) + 티어 분기 | A100에서 Docling, 5090에서 pdfplumber 자동 선택 | **미착수(후속)** — 어댑터 슬롯만 예약 |
+| 7 | **HWPX** (python-hwpx, zipfile+xml.etree 폴백) | OWPML XML에서 헤딩/문단/표 구조 추출 | **구현 완료** (`parsers/hwpx.py`) |
+| 8 | **스캔 OCR** — Tesseract(경량) → PaddleOCR PP-Structure(고품질) | 스캔 PDF 한국어 OCR + 표 인식, v4 사용 확인 | **미착수(후속)** — 어댑터 슬롯만 예약 |
+| 9 | **.hwp 변환** (LibreOffice subprocess → .docx) | .hwp→.docx→트리, 변환 실패 fail-soft | **미착수(후속)** |
+| 10 | **MCP 서버화** (`mcp__docingest__*`) + 배치 스크립트 | v7.2 권한(ingest=ASK) 정합, 대량 배치 멱등 | **구현 완료** (MCP 서버) — 배치 스크립트는 후속 |
 
 우선순위 근거: **PPTX(네이티브 구조, 가장 쉬움) → PDF → HWPX → 스캔 → .hwp**.
 PoC가 아니라 각 단계가 제품 품질(충돌 0, 멱등, 에어갭, 라이선스 청정)을
@@ -614,16 +633,30 @@ PoC가 아니라 각 단계가 제품 품질(충돌 0, 멱등, 에어갭, 라이
 > 것을 권장한다. .hwp 변환은 기술 난이도가 아니라 고객 데이터 분포가 우선순위를
 > 결정한다(LibreOffice 필수 번들 — Part 7.2).
 
-### 9.1 신규 제안 사항 (구현 전 결정 필요)
+### 9.1 구현 현황 (초판 "신규 제안" → 구현 반영, 2026-06-02)
 
 | # | 항목 | 상태 |
 |---|---|---|
-| 1 | `core/ingest/` 신규 디렉토리 | 신규 제안 |
-| 2 | `GPUTier.A100` 추가 + A100 ModelSpec/EmbeddingSpec | 신규 제안 (현재 미존재) |
-| 3 | tb_knowledge source="docingest" 운영 정책 | 신규 제안 (스키마 변경 없음) |
-| 4 | `mcp__docingest__*` MCP 서버 (v7.2 PoC 5번째) | 신규 제안 |
-| 5 | `scripts/prepare_documents.py` 배치 | 신규 제안 |
+| 1 | `core/ingest/` 신규 디렉토리 (types/parser_base/pipeline/chunker/parsers) | **구현 완료** |
+| 2 | `GPUTier.A100` 추가 + A100 ModelSpec/EmbeddingSpec | **구현 완료** (`gpu_detector.py:32, 225~262`, 이름 기반 판정) |
+| 3 | tb_knowledge source="docingest" 운영 정책 | **구현 완료** (스키마 변경 없음, source 필터 검색) |
+| 4 | `mcp__docingest__*` MCP 서버 | **구현 완료** (`mcp_servers/docingest_server.py`, parse/ingest/search) |
+| 5 | `scripts/prepare_documents.py` 배치 | **미착수(후속)** |
 | 6 | tb_knowledge 1M행 초과 시 hnsw 전환 | 미확정 (v7.1 Part 1.3 정책 대상) |
+| 7 | PDF 고품질(Docling) / 스캔 OCR(Tesseract·PaddleOCR) 고품질 파서 | **미착수(후속)** — 어댑터 슬롯만 예약(ParserRegistry priority 로 끼움) |
+
+> **HWPX 파서 실제 구현(정정)**: 로드맵 초안은 HWPX 1차를 "zipfile+xml.etree 직접
+> 파싱"으로 적었으나, 실제 구현(`parsers/hwpx.py`)은 **python-hwpx(OWPML, 2.9.0
+> 기준)를 1차 파서로 사용**하고, 열기 실패 시 **zipfile+xml.etree 로 폴백**한다.
+> 표는 `table.iter_grid()`가 일부 표에서 예외를 던질 수 있어
+> `row_count/column_count + cell(r,c)` 직접 순회로 견고하게 처리한다.
+
+> **라이브러리 설치 현황(개발 환경)**: pdfplumber / python-hwpx / pytesseract 와
+> docling / paddleocr 가 **개발 환경에 설치되어 있다**. 단, 현재 구현이 실제로
+> 사용하는 것은 **pdfplumber(PDF 경량)·python-hwpx(HWPX)·python-pptx(PPTX)** 뿐이며,
+> docling/paddleocr/tesseract 고품질 파서는 **아직 구현되지 않은 어댑터 슬롯**이다.
+> 에어갭 원칙은 **배포물(wheel 번들)에만** 적용된다 — 개발 중 라이브러리 설치는
+> 정상이며, 배포 시 오프라인 wheel 로 번들한다(Part 7).
 
 ---
 
@@ -631,14 +664,14 @@ PoC가 아니라 각 단계가 제품 품질(충돌 0, 멱등, 에어갭, 라이
 
 | # | 항목 | 현 입장 / 필요 검증 |
 |---|---|---|
-| 1 | **python-hwpx 라이선스** | research 미확인 → 1차는 zipfile+xml.etree 직접 파싱(무위험) |
+| 1 | **python-hwpx 라이선스** | **사용 채택** — HWPX 1차 파서로 python-hwpx(2.9.0, OWPML) 채택, zipfile+xml.etree 폴백 유지(`parsers/hwpx.py`). 배포 wheel 번들 시 라이선스 최종 확인 필요 |
 | 2 | **Docling 한국어 정확도** | research 미확인 → A100 PoC에서 한국어 PDF 벤치 필수 |
 | 3 | **Docling 모델 가중치 라이선스** | 코드 MIT와 별개 → 별도 검증 |
 | 4 | **.hwp / .hwpx 고객 비율** | **구포맷 .hwp 비중 높음(확정)** → LibreOffice **필수** 번들, 로드맵 우선순위 상향(단계 9→HWPX 직후 검토) |
 | 5 | **OCR 엔진 한국어 벤치마크** | Tesseract vs PaddleOCR PP-OCRv4 한국어 정확도 비교 미수행 |
 | 6 | **PP-OCRv5 한국어 누락** | research 보고 → **v4 고정**으로 회피 |
-| 7 | **MCP 포트 8814** | placeholder, 운영 확정 전 미정 |
-| 8 | **A100 ModelSpec 값** | GPUTier 추가 시 정의 필요 (양자화·배치·컨텍스트) |
+| 7 | **MCP 포트 8814** | **확정** — `mcp_servers/run.py::_SERVERS` 에서 docingest 기본 포트 8814 로 확정(db 8810/diag 8811/kowiki 8813) |
+| 8 | **A100 ModelSpec 값** | **정의 완료** — `gpu_detector.py:225~262` (BF16 NONE, max_model_len 8192, max_num_seqs 4, lora rank 64, FP8 미지원) |
 | 9 | **계층형 청크 크기(128~256/512~1536)** | 한국어 e5-large 기준 튜닝 필요 |
 
 ---
@@ -669,18 +702,24 @@ PoC가 아니라 각 단계가 제품 품질(충돌 0, 멱등, 에어갭, 라이
 | KnowledgeEntry / KnowledgeStore.add (UPSERT) | `core/rag/knowledge_store.py:84, 124` | **이미 존재** |
 | split_into_chunks (단순 청킹) | `core/rag/knowledge_store.py:348` | **이미 존재** (인제스트는 별도 청커) |
 | 임베딩 `/v1/embed` 호출 | `core/model/inference.py::embed` (v7.1 Part 2) | **이미 존재** |
-| GPUTier (RTX_5090/H100/H200/MULTI_GPU) | `core/model/gpu_detector.py:28` | **이미 존재** (A100 없음) |
+| GPUTier (RTX_5090/A100/H100/H200/MULTI_GPU) | `core/model/gpu_detector.py:28` | **이미 존재** (A100 추가됨) |
 | DocumentProcessTool (읽기용, 평면 텍스트) | `core/tools/implementations/document_tool.py` | **이미 존재** (한계 Part 1.2) |
 | 배치 인제스트 패턴 (prepare_kowiki) | `scripts/prepare_kowiki.py` | **이미 존재** (참조 패턴) |
-| McpToolAdapter / McpConnectionManager | `core/tools/mcp/*` | **v7.2 신규 제안** (미존재) |
-| `core/ingest/` (DocumentParser/트리/청커/파이프라인) | `core/ingest/*` | **v7.3 신규 제안** |
-| `GPUTier.A100` + A100 ModelSpec | `core/model/gpu_detector.py` | **v7.3 신규 제안** |
-| `mcp__docingest__*` MCP 서버 | (LAN MCP 서버 호스트) | **v7.3 신규 제안** |
-| `scripts/prepare_documents.py` | `scripts/` | **v7.3 신규 제안** |
+| McpToolAdapter / McpConnectionManager | `core/tools/mcp/*` | **구현됨** (v7.2) |
+| `core/ingest/` (DocumentParser/트리/청커/파이프라인) | `core/ingest/{types,parser_base,chunker,pipeline}.py` | **구현됨** |
+| PPTX/PDF/HWPX 파서 | `core/ingest/parsers/{pptx,pdf_plumber,hwpx}.py` | **구현됨** |
+| Docling/OCR(Paddle·Tesseract)/.hwp 파서 | `core/ingest/parsers/` | **미구현(후속·어댑터 슬롯)** |
+| `GPUTier.A100` + A100 ModelSpec | `core/model/gpu_detector.py:32, 225~262` | **구현됨** (이름 기반 판정) |
+| `mcp__docingest__*` MCP 서버 (parse/ingest/search) | `mcp_servers/docingest_server.py` (포트 8814) | **구현됨** |
+| 인제스트 테스트 | `tests/unit/test_{pptx,pdf_plumber,hwpx}_parser.py`, `test_ingest_*`, `tests/integration/test_ingest_pipeline.py` | **구현됨** |
+| `scripts/prepare_documents.py` (배치) | `scripts/` | **미착수(후속)** |
 
 ---
 
-*작성일: 2026-06-01*
-*코드 확인 기준: core/tools/implementations/document_tool.py, core/rag/knowledge_store.py,*
-*scripts/prepare_kowiki.py, core/model/gpu_detector.py, v7.1/v7.2 AMENDMENT (2026-06-01 실측)*
+*작성일: 2026-06-01 (구현 반영 갱신: 2026-06-02)*
+*코드 확인 기준(2026-06-02): core/ingest/{types,parser_base,chunker,pipeline}.py,*
+*core/ingest/parsers/{pptx,pdf_plumber,hwpx,__init__}.py, mcp_servers/docingest_server.py,*
+*core/model/gpu_detector.py(GPUTier.A100), core/rag/knowledge_store.py,*
+*tests/unit/test_{pptx,pdf_plumber,hwpx}_parser.py, tests/integration/test_ingest_pipeline.py*
+*테스트 실측(2026-06-02): 전체 회귀 1091 passed·1 skipped (1 failed=test_gpu_e2e, 무관)*
 *조사 근거: research-assistant 보고 (라이선스·라이브러리 레이아웃 인식 수준)*
