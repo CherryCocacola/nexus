@@ -80,6 +80,32 @@ def _gpu_available() -> bool:
         return False
 
 
+def _paddleocr_available() -> bool:
+    """
+    이 호스트에서 PaddleOCR(고품질 OCR)을 import 할 수 있는지 fail-soft 로 판정한다.
+
+    PaddleOcrParser(requires_gpu=True)를 레지스트리에 등록할지 결정하는 데만 쓴다.
+    paddleocr/paddle 미설치 호스트(에어갭 일부 노드 등)에서는 import 가 실패하므로
+    아예 등록하지 않고 Tesseract 경량 OCR 로 폴백한다 — 감지 실패가 인제스트
+    전체를 막아서는 안 된다. import 가능 여부만 확인하며 인스턴스는 만들지 않는다
+    (모델 적재 비용 회피 — 실제 적재는 첫 parse() 때 지연 생성된다). 설치 코드는
+    넣지 않는다(에어갭 규칙, anti-pattern #10).
+
+    주의(KMP/OpenMP): Windows 개발 환경에서 paddle + torch 가 같은 프로세스에
+    올라가면 OpenMP DLL 중복 적재로 import 가 죽을 수 있다. 그 경우 실행 측에서
+    KMP_DUPLICATE_LIB_OK=TRUE 환경변수를 주입해야 한다(파서/서버 코드에서 강제
+    설정하지 않음 — Linux 배포 불필요 + torch 부작용 우려). env 미설정으로
+    import 가 죽으면 여기서 False 로 흡수돼 Tesseract 폴백이 된다.
+    """
+    try:
+        import importlib.util
+
+        return importlib.util.find_spec("paddleocr") is not None
+    except Exception as e:  # noqa: BLE001 — 감지 실패는 미가용으로 흡수(폴백)
+        logger.debug("PaddleOCR 감지 실패 — 미가용으로 간주: %s", e)
+        return False
+
+
 class DocParseTool(McpServerTool):
     """파일을 파싱·청킹만 하고 적재하지 않는 read-only 도구(dry_run)."""
 
@@ -272,6 +298,23 @@ async def build_app(api_key: str = "local-key") -> FastAPI:
     #    (docling/pdfplumber)가 항상 우선하고, OCR 은 명시 호출/폴백용으로만 둔다.
     #    (상세 정책은 모듈 docstring "OCR 등록 정책" 참조.)
     parser_registry.register(TesseractParser(), priority=-10)
+
+    # v7.3 단계 8 — PaddleOCR 고품질 OCR(어댑터 슬롯, requires_gpu=True).
+    #  · GPU 가용 + paddleocr import 가능 호스트에서만 등록한다(둘 중 하나라도
+    #    없으면 미등록 → 자동으로 Tesseract 경량 OCR 로 폴백).
+    #  · priority=-5 로 Tesseract(-10)보다 높게 둔다 →
+    #      - 이미지(.png/.jpg/.tiff): PaddleOCR 이 1차(고품질), Tesseract 폴백.
+    #      - .pdf: 여전히 디지털 텍스트 파서(docling=10 / pdfplumber=0)가 먼저
+    #        선택되고, OCR 끼리는 PaddleOCR 이 Tesseract 보다 앞선다. 즉 OCR 은
+    #        .pdf 의 자동 대상이 아니라 명시 호출/폴백용으로만 남는다(Tesseract
+    #        등록 정책과 동일 — 모듈 docstring "OCR 등록 정책" 참조).
+    if _gpu_available() and _paddleocr_available():
+        from core.ingest.parsers.ocr_paddle import PaddleOcrParser
+
+        parser_registry.register(PaddleOcrParser(), priority=-5)  # 이미지/.pdf 고품질 OCR
+        logger.info("docingest MCP 서버: GPU+paddleocr 감지 — PaddleOcrParser(고품질 OCR) 등록")
+    else:
+        logger.info("docingest MCP 서버: GPU/paddleocr 미가용 — TesseractParser(경량 OCR)만 사용")
 
     # .pdf 고품질 어댑터 슬롯(v7.3 단계 6) — GPU 가용 호스트에서만 우선 등록한다.
     # GPU 가 있으면 DoclingParser 를 priority=10 으로 등록해 pdfplumber(priority=0)

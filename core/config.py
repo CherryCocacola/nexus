@@ -574,6 +574,31 @@ class OcrConfig(BaseModel):
     lang: str = "kor+eng"  # 한국어+영어 혼용 인식
     dpi: int = 250  # 스캔 PDF 렌더 해상도(품질/속도 절충)
 
+    # ── PaddleOCR 고품질 OCR 파서 설정 (v7.3 단계 8 — 한국어 표/레이아웃 OCR, GPU) ──
+    #
+    # 왜 같은 OcrConfig 안에 두는가 (anti-pattern #4 — 하드코딩 금지):
+    #   Tesseract(경량 CPU)와 PaddleOCR(고품질 GPU)는 "스캔 PDF/이미지 OCR" 라는
+    #   같은 역할(v7.3 단계 8)을 품질 티어만 달리해 수행한다. 설정 묶음을 하나로
+    #   두면 배포 시 yaml/환경변수(NEXUS_OCR__PADDLE_*)로 함께 관리하기 쉽다.
+    #   tesseract_*/paddle_* 는 접두사로 구분되어 서로 충돌하지 않고 공존한다.
+    #
+    # 필드 설명:
+    #   - paddle_lang: PaddleOCR 인식 언어 코드. PaddleOCR 의 언어 코드 체계는
+    #     tesseract 와 달라 한국어는 "korean" 이다(tesseract 의 "kor" 이 아님).
+    #     그래서 lang(tesseract용)과 별도 필드로 둔다.
+    #   - paddle_use_gpu: GPU(CUDA) 사용 여부. 기본 True(고품질=GPU 권장).
+    #     GPU 가 없는 호스트에서는 레지스트리 단계에서 이 파서를 아예 등록하지
+    #     않으므로(아래 docingest_server 등록 정책 참조) 보통 이 값이 쓰이지
+    #     않지만, 명시 호출/CPU 강제 실행 시 False 로 내려 CPU 로 동작시킨다.
+    #   - paddle_enable_mkldnn: oneDNN(MKL-DNN) CPU 가속 사용 여부. 기본 False.
+    #     Windows 개발 환경의 paddle 3.3.1 CPU 빌드에서 oneDNN 경로가
+    #     "ConvertPirAttribute2RuntimeAttribute not support" 런타임 오류를 내는
+    #     것을 실측으로 확인했다(이 옵션을 False 로 두면 정상 동작). Linux 배포
+    #     GPU 환경에서는 영향이 없으므로 안전한 기본값으로 False 를 쓴다.
+    paddle_lang: str = "korean"  # PaddleOCR 한국어 코드(tesseract "kor" 과 다름)
+    paddle_use_gpu: bool = True  # 고품질=GPU 권장(미가용 시 레지스트리에서 미등록)
+    paddle_enable_mkldnn: bool = False  # Windows CPU oneDNN PIR 버그 회피(실측)
+
 
 # ─────────────────────────────────────────────
 # .hwp(구포맷) 파서 설정 — v7.3 로드맵 단계 9
