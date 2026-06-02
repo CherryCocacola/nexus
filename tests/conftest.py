@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncGenerator as AsyncGeneratorType
-from collections.abc import Callable, Generator
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -34,16 +34,21 @@ from core.message import (
 from core.model.inference import ModelConfig, ModelProvider
 from core.tools.base import BaseTool, ToolUseContext
 
-
 # ─────────────────────────────────────────────
 # 이벤트 루프 설정
 # ─────────────────────────────────────────────
-@pytest.fixture(scope="session")
-def event_loop() -> Generator[asyncio.AbstractEventLoop, None, None]:
-    """세션 전체에서 하나의 이벤트 루프를 공유한다."""
-    loop = asyncio.new_event_loop()
-    yield loop
-    loop.close()
+#
+# 과거에는 여기서 session 스코프 event_loop fixture 를 재정의해
+# 모든 async 테스트가 하나의 루프를 공유하게 했었다. 그러나:
+#   1) pytest-asyncio 0.21+ 부터 event_loop fixture 재정의는 deprecated 이고,
+#   2) 동기 테스트가 main() 안에서 asyncio.run() 을 부르면 그 함수가 종료 시
+#      set_event_loop(None) 을 호출해 "공유 세션 루프" 를 끊어버린다. 그러면
+#      이후 모든 async 테스트가 "no current event loop" 로 연쇄 실패했다(149개).
+#
+# 그래서 fixture 재정의를 제거하고, pytest-asyncio 0.24+ 의 권장 설정
+# (pyproject.toml: asyncio_default_fixture_loop_scope = "function") 을 사용한다.
+# 각 async 테스트/fixture 가 자기 전용 function 스코프 루프를 받으므로
+# 다른 테스트의 asyncio.run() 호출에 영향을 받지 않는다(연쇄 실패 차단).
 
 
 # ─────────────────────────────────────────────

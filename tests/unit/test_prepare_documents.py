@@ -202,34 +202,6 @@ def test_main_invalid_stack_value_rejected(
         pd.main()
 
 
-def _run_coro_without_touching_session_loop(coro: Any) -> Any:
-    """
-    asyncio.run 대역 — main() 이 부르는 asyncio.run 을 가로채 코루틴을 실행하되
-    프로세스 전역 이벤트 루프를 건드리지 않는다.
-
-    Why: 실제 asyncio.run() 은 종료 시 set_event_loop(None) 을 호출해 전역 루프를
-    제거한다. conftest 가 세션 스코프 event_loop fixture(파이테스트-asyncio 가
-    deprecated 라고 경고)를 공유하므로, main() 테스트가 진짜 asyncio.run 을 부르면
-    그 세션 루프가 끊겨 이후 async 테스트가 "no current event loop" 로 줄줄이 깨진다.
-    여기서는 새 루프를 만들어 코루틴만 돌리고, 끝나면 원래 전역 루프를 복원한다.
-    """
-    import asyncio
-
-    prev_loop = None
-    try:
-        prev_loop = asyncio.get_event_loop_policy().get_event_loop()
-    except Exception:  # noqa: BLE001 — 전역 루프가 없으면 복원할 것도 없음
-        prev_loop = None
-
-    new_loop = asyncio.new_event_loop()
-    try:
-        return new_loop.run_until_complete(coro)
-    finally:
-        new_loop.close()
-        # 세션 공유 루프를 원상 복구 — 이후 async 테스트가 정상 동작하도록.
-        asyncio.set_event_loop(prev_loop)
-
-
 def test_main_flags_mapped_to_run_ingest(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -241,8 +213,8 @@ def test_main_flags_mapped_to_run_ingest(
         return 0
 
     monkeypatch.setattr(pd, "run_ingest", _fake_run_ingest)
-    # main() 의 asyncio.run 을 세션 루프 보존 shim 으로 교체(전역 루프 파괴 방지).
-    monkeypatch.setattr(pd.asyncio, "run", _run_coro_without_touching_session_loop)
+    # main() 은 실제 asyncio.run 을 그대로 사용한다. async fixture 루프 스코프가
+    # function 이므로(pyproject.toml) 이 호출이 다른 테스트의 루프를 깨지 않는다.
     monkeypatch.setattr(
         "sys.argv",
         ["prepare_documents.py", "--input", "/docs", "--dry-run", "--limit", "5"],
@@ -268,7 +240,7 @@ def test_main_build_index_routes_to_run_build_index(
         return 0
 
     monkeypatch.setattr(pd, "run_build_index", _fake_run_build_index)
-    monkeypatch.setattr(pd.asyncio, "run", _run_coro_without_touching_session_loop)
+    # 실제 asyncio.run 사용 — function 스코프 루프라 전역 루프 파괴 위험 없음.
     monkeypatch.setattr("sys.argv", ["prepare_documents.py", "--build-index"])
     rc = pd.main()
     assert rc == 0
