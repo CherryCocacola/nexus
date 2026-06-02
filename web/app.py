@@ -208,6 +208,15 @@ def _build_web_query_engine(components: dict, state: Any) -> Any:
 
     web_registry = _create_web_tool_registry()
     web_tools = web_registry.get_all_tools()
+    # v7.2 MCP — 부트스트랩이 LAN MCP 서버에서 등록한 도구(mcp__db__query 등)를
+    # 웹 Worker 풀에도 흡수한다. 웹은 cli_registry가 아니라 _create_web_tool_registry
+    # 로 자체 풀을 만들기 때문에, 이 머지가 없으면 모델이 MCP 도구를 볼 수 없다
+    # (실측: Worker가 mcp__db__query를 못 보고 npx 셸 명령을 환각 호출하던 버그).
+    # _combine_scout_pool과 동일한 name 중복 제거 규칙으로 합친다(P5 이름순 정렬은
+    # registry/get_all_tools가 이미 보장 → prompt cache 안정).
+    mcp_tools = components.get("mcp_tools") or []
+    if mcp_tools:
+        web_tools = _combine_scout_pool(web_tools, mcp_tools)
     scout_tools = components.get("scout_tools") or []
     combined_pool = _combine_scout_pool(web_tools, scout_tools)
 
@@ -249,7 +258,10 @@ def _build_web_query_engine(components: dict, state: Any) -> Any:
         max_turns=200,
         routing_config=state.config.routing,
     )
-    return engine, web_dispatcher, web_registry
+    # web_tools(= MCP 머지 후 실제 Worker 도구 풀)를 반환한다. 이전엔 bare
+    # web_registry를 반환했는데, 그것은 MCP 머지 전 5개만 담고 있어 /v1/tools가
+    # 모델이 실제로 보는 도구와 어긋났다(MCP 도구 누락). 이제 실제 풀을 노출한다.
+    return engine, web_dispatcher, web_tools
 
 
 # ─────────────────────────────────────────────
@@ -389,14 +401,18 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # RTX 5090 (8192 ctx)에서 도구 24개(~6,102토큰)는 컨텍스트 초과.
         # 핵심 도구 8개(~1,851토큰)만 사용하여 입력+출력 공간 확보.
         # (2026-04-21 리팩토링 3: 인라인 조립 로직을 _build_web_query_engine으로 분리)
-        web_engine, web_dispatcher, web_registry = _build_web_query_engine(
+        web_engine, web_dispatcher, web_tools = _build_web_query_engine(
             components, state
         )
         _app_state["model_dispatcher"] = web_dispatcher
         _app_state["query_engine"] = web_engine
+        # /v1/tools가 모델이 실제로 보는 웹 Worker 도구 풀(MCP 포함)을 노출하도록 저장.
+        # 기존 _app_state["tool_registry"]는 부트스트랩의 23개 base 레지스트리라
+        # 웹 Worker 실풀과 다르다(MCP 누락) — 웹 엔드포인트는 web_tools를 우선한다.
+        _app_state["web_tools"] = web_tools
         logger.info(
             "웹 서버 부트스트랩 완료 (Phase 1 + 2, 웹 도구 %d개)",
-            len(web_registry.get_all_tools()),
+            len(web_tools),
         )
     except Exception as e:
         logger.warning(f"부트스트랩 실패, 기본 설정으로 시작: {e}")
@@ -1041,12 +1057,16 @@ async def list_tools() -> dict[str, Any]:
 
     ToolRegistry에서 등록된 모든 도구의 이름, 설명, 그룹을 반환한다.
     """
-    registry = _app_state.get("tool_registry")
-    if registry is None:
-        return {"tools": [], "total": 0}
+    # 웹 Worker가 실제로 보는 도구 풀을 우선 노출한다(MCP 도구 포함).
+    # _app_state["web_tools"]는 _build_web_query_engine이 MCP 머지 후 저장한 실풀.
+    # 부재 시(부트스트랩 실패 등) base tool_registry로 폴백.
+    tools = _app_state.get("web_tools")
+    if not tools:
+        registry = _app_state.get("tool_registry")
+        if registry is None:
+            return {"tools": [], "total": 0}
+        tools = registry.get_all_tools()
 
-    # ToolRegistry에서 등록된 모든 도구의 정보를 반환한다
-    tools = registry.get_all_tools()
     tool_list = [
         ToolInfo(
             name=t.name,

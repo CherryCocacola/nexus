@@ -372,6 +372,10 @@ async def init_phase2(state: GlobalState) -> dict:
     # (tools)에 실제로 전달되는 도구 풀은 ⑧에서 만든 cli_tools다(line 240).
     # 따라서 MCP 도구가 모델에 노출되려면 cli_registry에 등록한 뒤 cli_tools를
     # 다시 취득해야 한다(:132의 registry에 넣으면 QueryEngine까지 전달되지 않음).
+    #
+    # mcp_tools 기본값: MCP 비활성/실패 시에도 웹 도구 구성(_build_web_query_engine)이
+    # 안전하게 .get("mcp_tools", [])로 참조하도록 빈 리스트를 미리 둔다(fail-closed).
+    components["mcp_tools"] = []
     if config.mcp.enabled:
         try:
             # lazy import — Phase 2 모듈 패턴(필요 시점 import)을 따른다
@@ -383,6 +387,13 @@ async def init_phase2(state: GlobalState) -> dict:
             # 등록된 MCP 도구가 worker/QueryEngine 도구 풀에 포함되도록 재취득
             # (get_all_tools는 이름순 정렬을 보장 → prompt cache 안정성 P5 유지)
             cli_tools = cli_registry.get_all_tools()
+            # 웹 진입점(web/app.py)은 cli_registry가 아니라 _create_web_tool_registry로
+            # 자체 도구 풀을 만든다. 그 경로도 MCP 도구를 흡수할 수 있도록 등록된
+            # MCP 어댑터(이름 prefix "mcp__")만 따로 추려 components로 노출한다.
+            # (cli_registry 전체가 아니라 MCP 어댑터만 넘겨 웹 도구 구성의 독립성 유지)
+            components["mcp_tools"] = [
+                t for t in cli_tools if t.name.startswith("mcp__")
+            ]
             # GlobalState 에 MCP 가시성 정보를 채운다(메트릭/진단 노출용).
             #   mcp_servers: 서버명 → {등록 도구 목록, 개수} 상세.
             #   mcp_connected: 도구가 1개 이상 등록되어 "살아 있는" 서버명 집합.
