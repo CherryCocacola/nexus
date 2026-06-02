@@ -540,6 +540,76 @@ class TenantRegistry(BaseModel):
         return None
 
 
+# ─────────────────────────────────────────────
+# OCR(스캔 PDF/이미지) 설정 — v7.3 로드맵 단계 8
+# ─────────────────────────────────────────────
+class OcrConfig(BaseModel):
+    """
+    Tesseract OCR 파서(core/ingest/parsers/ocr_tesseract.py) 설정.
+
+    왜 설정으로 빼는가 (anti-pattern #4 — 하드코딩 금지):
+      개발 환경과 배포(에어갭) 환경에서 tesseract 실행 파일 경로와 한국어
+      학습 데이터(tessdata) 위치가 다르다. 코드에 박지 않고 여기서 받아
+      yaml/환경변수(NEXUS_OCR__*)로 배포 시 덮어쓸 수 있게 한다.
+
+    필드 설명:
+      - tesseract_cmd: tesseract 실행 파일 경로. 개발 기본값은 Windows 설치
+        경로. 배포 시 리눅스(예: "/usr/bin/tesseract") 등으로 오버라이드한다.
+      - tessdata_dir: 언어 데이터(*.traineddata)가 든 폴더. 개발 환경에서는
+        Program Files 쓰기 권한 문제로 사용자 LOCALAPPDATA 하위에 둔다.
+        빈 문자열이면 tesseract 기본 위치(TESSDATA_PREFIX 등)를 따른다.
+      - lang: OCR 언어 코드. "kor+eng" 는 한국어+영어 혼용 문서를 함께 인식한다
+        (tessdata_dir 에 kor/eng traineddata 가 있어야 한다).
+      - dpi: 스캔 PDF 페이지를 이미지로 렌더할 해상도. 200~300 이 OCR 품질과
+        속도의 절충점이다(너무 낮으면 인식률↓, 너무 높으면 느리고 메모리↑).
+
+    에어갭: 실행 파일/언어 데이터는 사전 배치 전제(런타임 설치 코드 없음).
+    """
+
+    # 개발 기본값 — 배포 시 yaml/환경변수(NEXUS_OCR__TESSERACT_CMD 등)로 오버라이드.
+    tesseract_cmd: str = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+    # 개발 기본값 — 사용자 LOCALAPPDATA 하위의 nexus_tessdata 폴더.
+    # (Program Files 에 쓰기 권한이 없어 학습 데이터를 사용자 폴더로 분리했다.)
+    tessdata_dir: str = os.path.join(os.environ.get("LOCALAPPDATA", ""), "nexus_tessdata")
+    lang: str = "kor+eng"  # 한국어+영어 혼용 인식
+    dpi: int = 250  # 스캔 PDF 렌더 해상도(품질/속도 절충)
+
+
+# ─────────────────────────────────────────────
+# .hwp(구포맷) 파서 설정 — v7.3 로드맵 단계 9
+# ─────────────────────────────────────────────
+class HwpConfig(BaseModel):
+    """
+    구포맷 .hwp 파서(core/ingest/parsers/hwp_libreoffice.py) 설정.
+
+    왜 LibreOffice 경유인가:
+      구포맷 .hwp(한글 v5, OLE 복합문서)는 개방형 OWPML(HWPX)과 달리 폐쇄
+      바이너리 포맷이다. 이를 직접 파싱하는 청정 라이선스 파이썬 라이브러리가
+      마땅치 않고(pyhwp 는 AGPL 이라 라이선스 정책상 배제), 사용자 문서에서
+      구포맷 .hwp 비중이 높다. 따라서 LibreOffice 의 한글 import 필터로 .hwp 를
+      .docx 로 변환한 뒤, 기존 python-docx 경로로 구조를 보존해 파싱한다.
+
+    왜 설정으로 빼는가 (anti-pattern #4 — 하드코딩 금지):
+      soffice 실행 파일 경로가 개발(Windows)과 배포(에어갭 Linux)에서 다르다.
+      코드에 박지 않고 여기서 받아 yaml/환경변수(NEXUS_HWP__*)로 오버라이드한다.
+
+    필드 설명:
+      - soffice_cmd: LibreOffice headless 실행 파일 경로. 개발 기본값은 Windows
+        설치 경로. 배포(Linux)에서는 "/usr/bin/soffice"(또는 libreoffice 런처)
+        등으로 yaml/환경변수로 오버라이드한다. 빈 문자열이면 파서가 환경변수
+        (NEXUS_SOFFICE_CMD) → 개발 기본값 순으로 폴백한다.
+      - convert_timeout_sec: soffice 변환 1건의 최대 대기(초). 한글 대용량 문서가
+        변환에 오래 걸릴 수 있어 넉넉히 둔다. 초과하면 TimeoutExpired → fail-soft.
+
+    에어갭: soffice 실행 파일은 사전 설치 전제(런타임 설치 코드 없음 — anti #10).
+    """
+
+    # 개발 기본값 — 배포 시 yaml/환경변수(NEXUS_HWP__SOFFICE_CMD)로 오버라이드.
+    soffice_cmd: str = r"C:\Program Files\LibreOffice\program\soffice.exe"
+    # 변환 타임아웃(초) — 대용량 .hwp 도 수용하되 무한 대기는 막는다.
+    convert_timeout_sec: float = 120.0
+
+
 class SecurityConfig(BaseModel):
     """보안 및 샌드박스 설정."""
 
@@ -654,6 +724,12 @@ class NexusConfig(BaseSettings):
 
     # v7.0 Scout (CPU 4B 모델)
     scout: ScoutConfig = Field(default_factory=ScoutConfig)
+
+    # v7.3 OCR (스캔 PDF/이미지 — Tesseract, CPU 경량)
+    ocr: OcrConfig = Field(default_factory=OcrConfig)
+
+    # v7.3 단계 9 — 구포맷 .hwp (LibreOffice headless 변환 경유)
+    hwp: HwpConfig = Field(default_factory=HwpConfig)
 
     # v7.0 Part 2.5 쿼리 라우팅 — 지식/도구 질의 분기 (2026-04-21 추가)
     routing: RoutingConfig = Field(default_factory=RoutingConfig)

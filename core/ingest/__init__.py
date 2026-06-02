@@ -12,6 +12,7 @@ core.ingest — 문서 양식(레이아웃) 인식 임베딩 파이프라인 (v7
   parsers/pdf_plumber.py — PdfPlumberParser (pdfplumber, MIT — PDF 경량)
   parsers/docling_layout.py — DoclingParser (Docling — PDF 고품질, GPU 권장)
   parsers/hwpx.py        — HwpxParser (python-hwpx, OWPML — HWPX)
+  parsers/hwp_libreoffice.py — HwpViaLibreOfficeParser (LibreOffice 변환 — 구포맷 .hwp)
   chunker.py             — StructureAwareChunker (계층형 청킹)
   pipeline.py            — DocumentIngestPipeline (parse→chunk→embed→적재)
 
@@ -27,6 +28,7 @@ from __future__ import annotations
 from core.ingest.chunker import StructureAwareChunker
 from core.ingest.parser_base import DocumentParser, ParserRegistry
 from core.ingest.parsers.docling_layout import DoclingParser
+from core.ingest.parsers.hwp_libreoffice import HwpViaLibreOfficeParser
 from core.ingest.parsers.hwpx import HwpxParser
 from core.ingest.parsers.pdf_plumber import PdfPlumberParser
 from core.ingest.parsers.pptx import PptxParser
@@ -51,6 +53,7 @@ __all__ = [
     "PdfPlumberParser",
     "DoclingParser",
     "HwpxParser",
+    "HwpViaLibreOfficeParser",
     # chunker
     "StructureAwareChunker",
     # pipeline

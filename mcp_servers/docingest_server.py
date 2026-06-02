@@ -19,6 +19,21 @@ PDF 파서 우선순위 (v7.3 단계 6 — 고품질=GPU, 경량=CPU 폴백):
   자동으로 pdfplumber 경량 파서로 폴백되게 한다. requires_gpu=True 파서를 GPU
   없는 호스트에 굳이 얹지 않는 것이 v7.3 티어 분기 의도에 맞는 가장 단순한 정책.
 
+OCR 등록 정책 (v7.3 단계 8 — 스캔 PDF/이미지 OCR, 경량 CPU):
+  TesseractParser(requires_gpu=False)는 두 역할을 한다.
+    (1) 이미지 파일(.png/.jpg/.jpeg/.tiff): 이 파서가 유일한 후보 — 그대로 1차.
+    (2) 스캔 PDF(.pdf): .pdf 의 1차는 항상 디지털 텍스트 파서(docling/pdfplumber)다.
+        OCR 은 "텍스트가 거의 없는 스캔 PDF"에만 필요한 경량 폴백이므로,
+        TesseractParser 를 .pdf 에 대해 가장 낮은 priority(=-10)로 등록한다.
+  왜 priority 폴백만으로 충분한가(과설계 금지):
+    ParserRegistry.get_for_path 는 priority 높은 순으로 can_parse() 가 True 인
+    첫 파서를 고른다. pdfplumber(priority 0)는 모든 %PDF 에 can_parse=True 이므로
+    디지털/스캔을 가리지 않고 항상 OCR(priority -10)보다 먼저 선택된다. 즉 단일
+    파일 라우팅에서는 OCR 이 .pdf 의 자동 대상이 되지 않는다. "디지털 파서 결과가
+    비면 OCR 로 폴백"하는 노드-기반 분기는 파이프라인 레벨 정책으로, 본 단계의
+    범위(파서 추가 + 등록)를 넘어선다 — v7.3 의도(스캔 OCR=경량 폴백)에 맞춰
+    여기서는 파서를 "명시 호출용 + 이미지 1차 + .pdf 최저 폴백"으로만 둔다.
+
 read-only 구분 (fail-closed 정신):
   parse/search 는 부작용이 없고, ingest 만 DB 에 쓴다. 도구 설명에 명시해 호출
   측(권한 파이프라인)이 구분할 수 있게 한다.
@@ -218,15 +233,18 @@ async def build_app(api_key: str = "local-key") -> FastAPI:
 
     동작:
       1) core/config 로드.
-      2) ParserRegistry 에 PptxParser/PdfPlumberParser/HwpxParser 등록 +
-         GPU 가용 시 DoclingParser(.pdf 고품질)를 더 높은 priority 로 등록.
+      2) ParserRegistry 에 PptxParser/PdfPlumberParser/HwpxParser/
+         HwpViaLibreOfficeParser/TesseractParser 등록 + GPU 가용 시
+         DoclingParser(.pdf 고품질)를 더 높은 priority 로 등록.
       3) LocalModelProvider(embed) + KnowledgeStore(pg_pool) 구성.
       4) DocumentIngestPipeline 조립 → parse/ingest/search 도구 등록.
     """
     from core.config import load_and_validate_config
     from core.ingest.parser_base import ParserRegistry
     from core.ingest.parsers.docling_layout import DoclingParser
+    from core.ingest.parsers.hwp_libreoffice import HwpViaLibreOfficeParser
     from core.ingest.parsers.hwpx import HwpxParser
+    from core.ingest.parsers.ocr_tesseract import TesseractParser
     from core.ingest.parsers.pdf_plumber import PdfPlumberParser
     from core.ingest.parsers.pptx import PptxParser
     from core.ingest.pipeline import DocumentIngestPipeline
@@ -242,6 +260,18 @@ async def build_app(api_key: str = "local-key") -> FastAPI:
     parser_registry.register(PptxParser(), priority=0)  # .pptx
     parser_registry.register(PdfPlumberParser(), priority=0)  # .pdf (경량, CPU)
     parser_registry.register(HwpxParser(), priority=0)  # .hwpx
+
+    # v7.3 단계 9 — 구포맷 .hwp(LibreOffice headless 변환 경유, CPU).
+    #  · .hwp 의 유일한 후보 파서다(HwpxParser 는 .hwpx 만 처리).
+    #  · LibreOffice 가 .hwp → .docx 로 변환 후 python-docx 로 구조 보존 파싱.
+    parser_registry.register(HwpViaLibreOfficeParser(), priority=0)  # .hwp
+
+    # v7.3 단계 8 — Tesseract OCR(경량 CPU).
+    #  · 이미지(.png/.jpg/.jpeg/.tiff): 유일한 후보이므로 1차 파서.
+    #  · .pdf: 가장 낮은 priority(-10)로 등록 → 디지털 텍스트 파서
+    #    (docling/pdfplumber)가 항상 우선하고, OCR 은 명시 호출/폴백용으로만 둔다.
+    #    (상세 정책은 모듈 docstring "OCR 등록 정책" 참조.)
+    parser_registry.register(TesseractParser(), priority=-10)
 
     # .pdf 고품질 어댑터 슬롯(v7.3 단계 6) — GPU 가용 호스트에서만 우선 등록한다.
     # GPU 가 있으면 DoclingParser 를 priority=10 으로 등록해 pdfplumber(priority=0)
