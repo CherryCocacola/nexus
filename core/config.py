@@ -21,7 +21,14 @@ from urllib.parse import urlparse
 from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings
 
+# LAN/에어갭 판정 헬퍼 — 보안 관심사이므로 core/security로 이동했다(P2: config → security 허용).
+from core.security.network_guard import is_lan_hostname
+
 logger = logging.getLogger("nexus.config")
+
+# 하위호환 별칭 — 기존 import 경로(from core.config import _is_lan_hostname) 유지용.
+# 신규 코드는 public 이름 is_lan_hostname을 직접 쓴다.
+_is_lan_hostname = is_lan_hostname
 
 
 # ─────────────────────────────────────────────
@@ -134,6 +141,92 @@ class ScoutConfig(BaseModel):
 
 
 # ─────────────────────────────────────────────
+# v7.2 MCP(Model Context Protocol) 통합 설정
+# ─────────────────────────────────────────────
+# 배경: 사내 시스템(PostgreSQL/임베딩 서버/DocUtil 등)을 LAN 내부 MCP 서버로
+# 노출하고, 그 도구들을 Nexus 도구 풀에 흡수한다. 외부 SaaS MCP는 여전히 금지.
+# 에어갭 원칙은 불변 — base_url은 LAN 대역(192.168/10/172.16~31/localhost)만 허용.
+# fail-closed: 모든 enabled 기본값은 False. 운영자가 yaml에서 명시 활성해야만 동작.
+# ─────────────────────────────────────────────
+class McpServerConfig(BaseModel):
+    """
+    LAN MCP 서버 1개의 연결 설정.
+
+    name은 도구 이름 규칙 mcp__{name}__{tool}의 {name}으로 쓰인다.
+    trust는 신뢰 메타데이터로, {"read_only": true}처럼 어댑터의 동작 플래그를
+    명시적으로 완화하는 데 사용한다(fail-closed: 명시하지 않으면 쓰기 도구로 간주).
+    """
+
+    name: str  # mcp__{name}__{tool}의 {name} (예: "db", "diag")
+    transport: str = "http_sse"  # LAN HTTP/SSE만 채택 (stdio 비채택)
+    base_url: str  # 반드시 LAN 대역 — 외부 도메인이면 강등됨
+    api_key: str = "local-key"  # LAN 내부 인증 키 (기본 placeholder)
+    enabled: bool = False  # fail-closed: 명시 활성만
+    trust: dict = Field(default_factory=dict)  # {"read_only": true} 등 신뢰 메타
+    # 쓰기 가능 MCP 서버를 의도적으로 등록 허용하는 운영자 명시 플래그.
+    # 초기 제품 정책: read-only(trust.read_only=True) 서버만 자동 등록한다.
+    # trust.read_only가 False(쓰기 가능)인 서버는 기본적으로 등록을 건너뛰며,
+    # 운영자가 이 값을 True로 명시했을 때에만 예외적으로 등록한다(fail-closed 기본 False).
+    # 등록된 쓰기 도구의 최종 권한 판단은 표준 5계층 파이프라인에 일임한다.
+    allow_write: bool = False
+    # 이 MCP 서버의 도구를 Nexus Worker(에이전트) 도구 풀에 노출할지 여부.
+    # 기본 True(노출). False로 두면 서버 자체는 (외부 사내 앱 재사용 등을 위해)
+    # 설정에는 남지만, 그 도구들은 Worker(ModelDispatcher/QueryEngine) 도구 풀에는
+    # 등록하지 않는다.
+    #
+    # 왜 필요한가: 일부 MCP 서버는 Nexus 내부 경로와 기능이 중복된다.
+    # 예) kowiki 검색 MCP는 KNOWLEDGE 모드의 "자동 RAG 주입"이 이미 담당한다.
+    # 이 둘이 동시에 컨텍스트에 들어가면(자동 RAG 결과 + 동일 검색 도구 스키마)
+    # RTX 5090의 8K 컨텍스트를 초과(overflow)한다. 그래서 자동 RAG가 책임지는
+    # 서버는 Worker 도구로 중복 노출하지 않도록 expose_to_worker=False로 제외한다.
+    expose_to_worker: bool = True
+
+
+class McpConfig(BaseModel):
+    """
+    v7.2 MCP 통합 설정.
+
+    enabled가 전역 마스터 스위치(기본 OFF)다. servers의 각 항목도 개별
+    enabled를 가지며, 전역+개별이 모두 True여야 실제 연결을 시도한다.
+
+    LAN URL 이중 검증의 1단계(설정 로드 단계)를 여기서 수행한다:
+    base_url의 hostname이 LAN 대역이 아니면 그 서버를 강제로 enabled=False로
+    강등하고 경고를 남긴다. 이렇게 하면 외부 도메인이 활성 상태로 남는 일이
+    구조적으로 불가능하다(fail-closed). 2단계 검증은 McpClient 생성 시 재수행.
+    """
+
+    enabled: bool = False  # 전역 마스터 스위치 (기본 OFF — 에어갭 fail-closed)
+    servers: list[McpServerConfig] = Field(default_factory=list)
+    connect_timeout_sec: float = 5.0  # 연결 타임아웃 (실패 시 fail-closed)
+
+    @model_validator(mode="after")
+    def validate_lan_urls(self) -> McpConfig:
+        """
+        각 서버의 base_url이 LAN 대역인지 검증한다.
+
+        왜 강등(enabled=False)인가: 외부 도메인을 단순히 거부(예외)하면
+        설정 파일 전체 로드가 실패해 본류까지 멈춘다. 대신 해당 서버만
+        비활성으로 강등하면 다른 LAN 서버는 정상 동작하면서 외부 연결만
+        구조적으로 차단된다(fail-closed + 본류 무영향).
+        """
+        import warnings
+
+        for server in self.servers:
+            if not is_lan_hostname(urlparse(server.base_url).hostname or ""):
+                if server.enabled:
+                    # 외부 도메인인데 활성으로 설정돼 있으면 강제 강등
+                    server.enabled = False
+                    msg = (
+                        f"MCP 서버 '{server.name}'의 base_url "
+                        f"'{server.base_url}'이(가) LAN 대역이 아니므로 "
+                        f"비활성으로 강등합니다 (에어갭 fail-closed)."
+                    )
+                    warnings.warn(msg, UserWarning, stacklevel=2)
+                    logger.warning(msg)
+        return self
+
+
+# ─────────────────────────────────────────────
 # 쿼리 라우팅 설정 (v7.0 Part 2.5, 2026-04-21)
 # ─────────────────────────────────────────────
 # 배경: Phase 3 LoRA가 도구 호출을 강화하는 대신 베이스 Qwen의 일반 지식
@@ -150,24 +243,64 @@ class ScoutConfig(BaseModel):
 # 동일 리스트를 모듈 상수로 유지한다. 추가/변경은 양쪽 모두에 반영해야 한다.
 _DEFAULT_TOOL_KEYWORDS: list[str] = [
     # 한국어 — 파일/프로젝트/도구 명시 힌트
-    "파일", "첨부", "업로드", "이 프로젝트", "코드베이스",
-    "디렉토리", "폴더", "리포지토리", "리포지터리",
-    "읽어줘", "읽어 줘", "편집해", "수정해",
-    "모듈 구조", "디렉토리 구조", "프로젝트 구조",
+    "파일",
+    "첨부",
+    "업로드",
+    "이 프로젝트",
+    "코드베이스",
+    "디렉토리",
+    "폴더",
+    "리포지토리",
+    "리포지터리",
+    "읽어줘",
+    "읽어 줘",
+    "편집해",
+    "수정해",
+    "모듈 구조",
+    "디렉토리 구조",
+    "프로젝트 구조",
     # 영어
-    "file", "attached", "upload", "this project", "codebase",
-    "repository", "directory", "folder",
+    "file",
+    "attached",
+    "upload",
+    "this project",
+    "codebase",
+    "repository",
+    "directory",
+    "folder",
     # 도구 이름 — 괄호 포함(함수 호출 스타일)
-    "Read(", "Write(", "Edit(", "Bash(", "Glob(", "Grep(",
-    "Agent(", "DocumentProcess",
+    "Read(",
+    "Write(",
+    "Edit(",
+    "Bash(",
+    "Glob(",
+    "Grep(",
+    "Agent(",
+    "DocumentProcess",
     # 단독 대문자 도구명 + 공백 — "Read 도구", "Edit the file" 등
-    "Read ", "Write ", "Edit ", "Bash ", "Glob ", "Grep ",
-    "Agent ", " LS ",
+    "Read ",
+    "Write ",
+    "Edit ",
+    "Bash ",
+    "Glob ",
+    "Grep ",
+    "Agent ",
+    " LS ",
     # 확장자 힌트 (공백 뒤 경로 패턴)
-    ".py ", ".md ", ".yaml ", ".json ",
+    ".py ",
+    ".md ",
+    ".yaml ",
+    ".json ",
     # 프로젝트 내부 디렉토리 prefix — core/orchestrator, web/app.py 등
-    "core/", "web/", "tests/", "training/", "deployment/",
-    "cli/", "config/", "scripts/", "tools/",
+    "core/",
+    "web/",
+    "tests/",
+    "training/",
+    "deployment/",
+    "cli/",
+    "config/",
+    "scripts/",
+    "tools/",
 ]
 
 
@@ -181,16 +314,46 @@ _DEFAULT_TOOL_KEYWORDS: list[str] = [
 # 길이 임계와 AND 조건으로만 트리거 — 긴 입력이면 인사어가 들어 있어도 CHAT 아님.
 _DEFAULT_CHAT_KEYWORDS: list[str] = [
     # 한국어 인사·잡담
-    "안녕", "안뇽", "좋은 아침", "좋은 저녁", "좋은 밤", "굿모닝", "굿나잇",
-    "잘 자", "잘자", "반가워", "반갑습니다", "반갑네",
-    "고마워", "고맙습니다", "감사", "땡큐",
-    "잘 가", "잘가", "다음에 봐", "다음에 보자",
-    "별거 없", "ㅋㅋ", "ㅎㅎ",
+    "안녕",
+    "안뇽",
+    "좋은 아침",
+    "좋은 저녁",
+    "좋은 밤",
+    "굿모닝",
+    "굿나잇",
+    "잘 자",
+    "잘자",
+    "반가워",
+    "반갑습니다",
+    "반갑네",
+    "고마워",
+    "고맙습니다",
+    "감사",
+    "땡큐",
+    "잘 가",
+    "잘가",
+    "다음에 봐",
+    "다음에 보자",
+    "별거 없",
+    "ㅋㅋ",
+    "ㅎㅎ",
     # 영어 인사·잡담
-    "hi", "hello", "hey", "yo", "sup",
-    "good morning", "good evening", "good night",
-    "thanks", "thank you", "thx", "ty",
-    "bye", "goodbye", "see you", "cya",
+    "hi",
+    "hello",
+    "hey",
+    "yo",
+    "sup",
+    "good morning",
+    "good evening",
+    "good night",
+    "thanks",
+    "thank you",
+    "thx",
+    "ty",
+    "bye",
+    "goodbye",
+    "see you",
+    "cya",
 ]
 
 
@@ -245,9 +408,7 @@ class RoutingConfig(BaseModel):
     # 입력이 짧고(chat_max_length 이하) 인사 어휘가 포함되면 CHAT으로 본다.
     # 너무 길게 잡으면 일반 지식 질의가 잡담으로 오분류될 수 있어 보수적으로 30자.
     chat_max_length: int = 30
-    chat_keywords: list[str] = Field(
-        default_factory=lambda: list(_DEFAULT_CHAT_KEYWORDS)
-    )
+    chat_keywords: list[str] = Field(default_factory=lambda: list(_DEFAULT_CHAT_KEYWORDS))
     knowledge_mode: RoutingProfile = Field(
         default_factory=lambda: RoutingProfile(
             model="qwen3.5-27b",
@@ -379,6 +540,101 @@ class TenantRegistry(BaseModel):
         return None
 
 
+# ─────────────────────────────────────────────
+# OCR(스캔 PDF/이미지) 설정 — v7.3 로드맵 단계 8
+# ─────────────────────────────────────────────
+class OcrConfig(BaseModel):
+    """
+    Tesseract OCR 파서(core/ingest/parsers/ocr_tesseract.py) 설정.
+
+    왜 설정으로 빼는가 (anti-pattern #4 — 하드코딩 금지):
+      개발 환경과 배포(에어갭) 환경에서 tesseract 실행 파일 경로와 한국어
+      학습 데이터(tessdata) 위치가 다르다. 코드에 박지 않고 여기서 받아
+      yaml/환경변수(NEXUS_OCR__*)로 배포 시 덮어쓸 수 있게 한다.
+
+    필드 설명:
+      - tesseract_cmd: tesseract 실행 파일 경로. 개발 기본값은 Windows 설치
+        경로. 배포 시 리눅스(예: "/usr/bin/tesseract") 등으로 오버라이드한다.
+      - tessdata_dir: 언어 데이터(*.traineddata)가 든 폴더. 개발 환경에서는
+        Program Files 쓰기 권한 문제로 사용자 LOCALAPPDATA 하위에 둔다.
+        빈 문자열이면 tesseract 기본 위치(TESSDATA_PREFIX 등)를 따른다.
+      - lang: OCR 언어 코드. "kor+eng" 는 한국어+영어 혼용 문서를 함께 인식한다
+        (tessdata_dir 에 kor/eng traineddata 가 있어야 한다).
+      - dpi: 스캔 PDF 페이지를 이미지로 렌더할 해상도. 200~300 이 OCR 품질과
+        속도의 절충점이다(너무 낮으면 인식률↓, 너무 높으면 느리고 메모리↑).
+
+    에어갭: 실행 파일/언어 데이터는 사전 배치 전제(런타임 설치 코드 없음).
+    """
+
+    # 개발 기본값 — 배포 시 yaml/환경변수(NEXUS_OCR__TESSERACT_CMD 등)로 오버라이드.
+    tesseract_cmd: str = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+    # 개발 기본값 — 사용자 LOCALAPPDATA 하위의 nexus_tessdata 폴더.
+    # (Program Files 에 쓰기 권한이 없어 학습 데이터를 사용자 폴더로 분리했다.)
+    tessdata_dir: str = os.path.join(os.environ.get("LOCALAPPDATA", ""), "nexus_tessdata")
+    lang: str = "kor+eng"  # 한국어+영어 혼용 인식
+    dpi: int = 250  # 스캔 PDF 렌더 해상도(품질/속도 절충)
+
+    # ── PaddleOCR 고품질 OCR 파서 설정 (v7.3 단계 8 — 한국어 표/레이아웃 OCR, GPU) ──
+    #
+    # 왜 같은 OcrConfig 안에 두는가 (anti-pattern #4 — 하드코딩 금지):
+    #   Tesseract(경량 CPU)와 PaddleOCR(고품질 GPU)는 "스캔 PDF/이미지 OCR" 라는
+    #   같은 역할(v7.3 단계 8)을 품질 티어만 달리해 수행한다. 설정 묶음을 하나로
+    #   두면 배포 시 yaml/환경변수(NEXUS_OCR__PADDLE_*)로 함께 관리하기 쉽다.
+    #   tesseract_*/paddle_* 는 접두사로 구분되어 서로 충돌하지 않고 공존한다.
+    #
+    # 필드 설명:
+    #   - paddle_lang: PaddleOCR 인식 언어 코드. PaddleOCR 의 언어 코드 체계는
+    #     tesseract 와 달라 한국어는 "korean" 이다(tesseract 의 "kor" 이 아님).
+    #     그래서 lang(tesseract용)과 별도 필드로 둔다.
+    #   - paddle_use_gpu: GPU(CUDA) 사용 여부. 기본 True(고품질=GPU 권장).
+    #     GPU 가 없는 호스트에서는 레지스트리 단계에서 이 파서를 아예 등록하지
+    #     않으므로(아래 docingest_server 등록 정책 참조) 보통 이 값이 쓰이지
+    #     않지만, 명시 호출/CPU 강제 실행 시 False 로 내려 CPU 로 동작시킨다.
+    #   - paddle_enable_mkldnn: oneDNN(MKL-DNN) CPU 가속 사용 여부. 기본 False.
+    #     Windows 개발 환경의 paddle 3.3.1 CPU 빌드에서 oneDNN 경로가
+    #     "ConvertPirAttribute2RuntimeAttribute not support" 런타임 오류를 내는
+    #     것을 실측으로 확인했다(이 옵션을 False 로 두면 정상 동작). Linux 배포
+    #     GPU 환경에서는 영향이 없으므로 안전한 기본값으로 False 를 쓴다.
+    paddle_lang: str = "korean"  # PaddleOCR 한국어 코드(tesseract "kor" 과 다름)
+    paddle_use_gpu: bool = True  # 고품질=GPU 권장(미가용 시 레지스트리에서 미등록)
+    paddle_enable_mkldnn: bool = False  # Windows CPU oneDNN PIR 버그 회피(실측)
+
+
+# ─────────────────────────────────────────────
+# .hwp(구포맷) 파서 설정 — v7.3 로드맵 단계 9
+# ─────────────────────────────────────────────
+class HwpConfig(BaseModel):
+    """
+    구포맷 .hwp 파서(core/ingest/parsers/hwp_libreoffice.py) 설정.
+
+    왜 LibreOffice 경유인가:
+      구포맷 .hwp(한글 v5, OLE 복합문서)는 개방형 OWPML(HWPX)과 달리 폐쇄
+      바이너리 포맷이다. 이를 직접 파싱하는 청정 라이선스 파이썬 라이브러리가
+      마땅치 않고(pyhwp 는 AGPL 이라 라이선스 정책상 배제), 사용자 문서에서
+      구포맷 .hwp 비중이 높다. 따라서 LibreOffice 의 한글 import 필터로 .hwp 를
+      .docx 로 변환한 뒤, 기존 python-docx 경로로 구조를 보존해 파싱한다.
+
+    왜 설정으로 빼는가 (anti-pattern #4 — 하드코딩 금지):
+      soffice 실행 파일 경로가 개발(Windows)과 배포(에어갭 Linux)에서 다르다.
+      코드에 박지 않고 여기서 받아 yaml/환경변수(NEXUS_HWP__*)로 오버라이드한다.
+
+    필드 설명:
+      - soffice_cmd: LibreOffice headless 실행 파일 경로. 개발 기본값은 Windows
+        설치 경로. 배포(Linux)에서는 "/usr/bin/soffice"(또는 libreoffice 런처)
+        등으로 yaml/환경변수로 오버라이드한다. 빈 문자열이면 파서가 환경변수
+        (NEXUS_SOFFICE_CMD) → 개발 기본값 순으로 폴백한다.
+      - convert_timeout_sec: soffice 변환 1건의 최대 대기(초). 한글 대용량 문서가
+        변환에 오래 걸릴 수 있어 넉넉히 둔다. 초과하면 TimeoutExpired → fail-soft.
+
+    에어갭: soffice 실행 파일은 사전 설치 전제(런타임 설치 코드 없음 — anti #10).
+    """
+
+    # 개발 기본값 — 배포 시 yaml/환경변수(NEXUS_HWP__SOFFICE_CMD)로 오버라이드.
+    soffice_cmd: str = r"C:\Program Files\LibreOffice\program\soffice.exe"
+    # 변환 타임아웃(초) — 대용량 .hwp 도 수용하되 무한 대기는 막는다.
+    convert_timeout_sec: float = 120.0
+
+
 class SecurityConfig(BaseModel):
     """보안 및 샌드박스 설정."""
 
@@ -397,9 +653,23 @@ class SecurityConfig(BaseModel):
     max_file_size_bytes: int = 10 * 1024 * 1024  # 10MB
     allowed_file_extensions: list[str] = Field(
         default_factory=lambda: [
-            ".py", ".js", ".ts", ".json", ".yaml", ".yml", ".toml",
-            ".md", ".txt", ".csv", ".html", ".css", ".sql",
-            ".sh", ".bash", ".dockerfile", ".env.example",
+            ".py",
+            ".js",
+            ".ts",
+            ".json",
+            ".yaml",
+            ".yml",
+            ".toml",
+            ".md",
+            ".txt",
+            ".csv",
+            ".html",
+            ".css",
+            ".sql",
+            ".sh",
+            ".bash",
+            ".dockerfile",
+            ".env.example",
         ]
     )
 
@@ -480,11 +750,20 @@ class NexusConfig(BaseSettings):
     # v7.0 Scout (CPU 4B 모델)
     scout: ScoutConfig = Field(default_factory=ScoutConfig)
 
+    # v7.3 OCR (스캔 PDF/이미지 — Tesseract, CPU 경량)
+    ocr: OcrConfig = Field(default_factory=OcrConfig)
+
+    # v7.3 단계 9 — 구포맷 .hwp (LibreOffice headless 변환 경유)
+    hwp: HwpConfig = Field(default_factory=HwpConfig)
+
     # v7.0 Part 2.5 쿼리 라우팅 — 지식/도구 질의 분기 (2026-04-21 추가)
     routing: RoutingConfig = Field(default_factory=RoutingConfig)
 
     # 멀티테넌시 (Part 5 Ch 15, 2026-04-21)
     tenants: TenantRegistry = Field(default_factory=TenantRegistry)
+
+    # v7.2 MCP 통합 — LAN 내부 MCP 서버 연결 (기본 비활성, 에어갭 fail-closed)
+    mcp: McpConfig = Field(default_factory=McpConfig)
 
     # 하드웨어 티어 (auto: GPU VRAM 기반 자동 감지)
     hardware_tier: str = "auto"
@@ -584,7 +863,8 @@ def load_and_validate_config(
                 config = config.model_copy(update={"tenants": TenantRegistry(**t_data)})
                 logger.info(
                     "테넌트 설정 로드 완료: %s (%d 테넌트)",
-                    tenants_path, len(config.tenants.tenants),
+                    tenants_path,
+                    len(config.tenants.tenants),
                 )
         except Exception as e:
             logger.warning("테넌트 설정 로드 실패 (기본값 사용): %s", e)

@@ -122,6 +122,15 @@ class GlobalState:
     scout_enabled: bool = False              # Scout(CPU 4B) 활성 여부
     orchestration_mode: str = "multi_model"  # "multi_model" | "single_model"
 
+    # === MCP 서버 가시성 (Phase 2 부트스트랩에서 채움) ===
+    # mcp_servers: 서버명 → 등록 결과(등록된 도구 목록/개수 등)를 담는 dict.
+    #   예: {"kowiki": {"tools": ["search"], "tool_count": 1}, ...}
+    # mcp_connected: 도구가 1개 이상 등록되어 "연결 성공"으로 간주된 서버명 집합.
+    # 왜 분리하는가: mcp_servers 는 상세 진단/표시용이고, mcp_connected 는
+    #   "몇 개 서버가 실제로 살아 있는가" 를 빠르게 판단하기 위한 요약이다.
+    mcp_servers: dict = field(default_factory=dict)
+    mcp_connected: set = field(default_factory=set)
+
     # === 캐시 래치 (한번 설정되면 세션 내에서 변경되지 않는 값) ===
     fast_mode_latched: bool = False
     thinking_enabled_latched: bool | None = None

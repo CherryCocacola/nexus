@@ -297,8 +297,8 @@ def main() -> int:
                         default="http://192.168.22.28:8002",
                         help="임베딩 서버 base URL")
     parser.add_argument("--pg", type=str,
-                        default="postgresql://nexus:idino%40%4012@192.168.10.39:5440/nexus",
-                        help="PostgreSQL 연결 문자열 (asyncpg)")
+                        default="postgresql://nexus:idino%4012@192.168.10.39:5440/nexus",
+                        help="PostgreSQL 연결 문자열 (asyncpg) — config/nexus_config.yaml의 postgresql 섹션과 동일 자격 사용")
     parser.add_argument("--dry-run", action="store_true",
                         help="파싱/청크까지만 수행 (DB·임베딩 호출 생략)")
     parser.add_argument("--build-index", action="store_true",

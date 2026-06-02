@@ -6,15 +6,271 @@
 
 ## 현재 상태
 
-- **현재 Phase**: v0.14.8 — 임베딩 워밍업/keep-warm + CLI 단계별 status spinner
-- **마지막 업데이트**: 2026-04-27
+- **현재 Phase**: v0.14.8 (코드) / 인프라 복구 06-01
+- **마지막 업데이트**: 2026-06-01
 - **브랜치**: main
 - **총 테스트**: 811 passed / 1 skipped (단위 + 통합, e2e 제외)
 - **전체 파일**: ~170개 Python/HTML 모듈
 
 ---
 
-## v0.14.8 — 임베딩 cold start 제거 + CLI 진행 표시 (2026-04-27 야간)
+## 인프라 복구 — pgvector 라이브러리 누락 해소 (2026-06-01)
+
+### 배경 — 발견 경위
+
+사양서 잔여 작업(kowiki `--build-index` 메모리 잔류) 확인 차 DB 점검 중,
+`192.168.10.39:5440` docutil-postgres에서 모든 vector 연산이
+`could not access file "$libdir/vector": No such file or directory`로 실패.
+`pg_extension`에 `vector v0.8.0` 등록은 되어 있으나 동적 라이브러리(.so) 파일이
+사라진 상태. 영향 범위:
+
+- `tb_knowledge` (kowiki, ~1.07M행) — KNOWLEDGE 라우팅 벡터 검색 실패 (ILIKE 폴백만)
+- `tb_memories` (장기 메모리, ~20.4만행) — 의미검색/승격 정지
+- `tb_symbols` (Phase 10 심볼) — SymbolSearch 정지
+
+원인: docutil-postgres가 5일 전부터 `postgres:17-alpine` (pgvector 미포함) 이미지로
+교체 운영 중. 컨테이너 재빌드 시점에 누군가 순정 alpine 이미지로 바꿔치기.
+
+### 조치 — 옵션 A (이미지 교체)
+
+- `alpine` repo에 `postgresql17-pgvector` 패키지 없음 확인 → 옵션 B(apk add) 폐기
+- 외부 docker hub 접근 가능 확인 → 공식 `pgvector/pgvector:pg17`로 교체
+
+```
+1. docker pull pgvector/pgvector:pg17                          (157MB, 2026-05-15 빌드)
+2. /home/idino/docutil/docker-compose.yml 백업 (.bak_20260601_pgvector)
+3. 252라인 단 한 줄 수정:
+   image: postgres:17-alpine  →  image: pgvector/pgvector:pg17
+4. docker compose config 유효성 확인
+5. docker compose up -d postgres  (recreate)
+6. healthy 확인 — 즉시 통과 (start_period 15s 이내)
+```
+
+다른 시도 없음. command/healthcheck/볼륨/포트/환경변수 모두 그대로 유지.
+
+### 검증 — `scripts/_verify_pgvector.py` 신규
+
+읽기 전용 진단 스크립트. 기본 vector 연산(type cast/cosine/L2) + 3개 테이블의
+실제 COUNT(*) + 인덱스 메타데이터까지 한 번에 점검.
+
+**복구 후 결과**:
+- ✓ vector 기본 연산 3종 전부 OK
+- ✓ tb_knowledge exact COUNT(*) = **1,067,978** (04-24 적재 종료 기록과 정확 일치 → 데이터 무결성 100%)
+- ✓ tb_memories exact COUNT(*) = 203,991
+- ✓ tb_symbols exact COUNT(*) = 2,118
+- ✓ idx_knowledge_embed (ivfflat), idx_memories_embedding (hnsw) 모두 존속
+
+**부수 변화** (안전):
+- PG 17.9 → 17.10 마이너 업그레이드 (이미지 베이스 차이, 데이터 호환)
+- 컨테이너 OS Alpine → Debian (pgvector 공식 이미지 베이스)
+
+### 부수 발견 (별도 작업 후보)
+
+| 항목 | 상태 |
+|---|---|
+| `tb_memories` 인덱스 `hnsw` | 코드의 `DDL_IVFFLAT` 클래스 상수와 불일치 — 어느 시점에 수동/스크립트로 hnsw로 만든 것 추정. 정합성 점검 필요 |
+| `tb_symbols` 벡터 인덱스 부재 | 행수 2,118로 작아 시급도 낮지만 SymbolSearch 향후 확장 시 필요 |
+| ~~임베딩 서버 404~~ | **오진 정정**: 서버 정상, 커스텀 `POST /v1/embed`({"texts":[...]}) 계약. verify 스크립트만 수정 후 KNOWLEDGE e2e (sim≥0.86×5건) 통과 |
+| `prepare_kowiki.py` DSN 오타 | `idino%40%4012`(=idino@@12) → `idino%4012`(=idino@12) 수정 완료 |
+
+### 신규/수정 파일
+
+```
+신규:
+  scripts/_verify_pgvector.py        (읽기 전용 진단 스크립트)
+
+수정:
+  scripts/prepare_kowiki.py          (DSN 기본값 오타 수정)
+  user_mig/progress/progress.md      (이 항목)
+
+원격 (192.168.10.39):
+  /home/idino/docutil/docker-compose.yml (252라인 1줄 수정)
+  /home/idino/docutil/docker-compose.yml.bak_20260601_pgvector (백업)
+```
+
+### 사양서 정합성
+
+이번 변경은 운영 인프라 복구로 v6.1/v7.0 어느 챕터도 변경하지 않음. 단,
+`tb_memories`의 hnsw 인덱스 불일치는 사양서 Ch 12(Memory) 명시와 충돌
+가능성 있어 별도 점검 후보로 기록.
+
+---
+
+## v7.1 AMENDMENT 작성 + 운영 DB tb_symbols 인덱스 적용 (2026-06-01)
+
+### 운영 DB 즉시 적용
+
+- `docutil-postgres`에 `idx_symbols_embed` (ivfflat, lists=100) 신규 생성
+- 실행: `CREATE INDEX IF NOT EXISTS ... USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)`
+- 소요: 1.52초, 인덱스 크기 17MB
+- verify: `_verify_pgvector.py` → 3개 테이블 모두 `vector_idx=O`
+
+### v7.1 AMENDMENT 신규 작성
+
+신규 파일: `user_mig/PROJECT_NEXUS_SPEC_v7.1_AMENDMENT.md`
+
+목적: v7.0 이후 6주 운영에서 발견된 **사양서 ↔ 코드/운영 분기점** 정리.
+신기능 도입 아님. 10가지 정정 사항을 Part 1~6 + 부록 A/B로 정리:
+
+| Part | 내용 |
+|---|---|
+| 1 | Ch 12 Memory — 4테이블 분리 → 단일 `tb_memories`, hnsw 정책, `ensure_schema` 책임 |
+| 2 | Ch 4.5 Embedding Server — 커스텀 `/v1/embed` 계약 명문화 (OpenAI 호환 아님) |
+| 3 | Scout 모델 — gemma-4-4b-it → Qwen3.5-4B-Q4_K_M, yaml scout 섹션 정책 |
+| 4 | 인프라 운영 가이드 — docutil-postgres 이미지 정책, NVML, 진단 스크립트 목록 |
+| 5 | 운영성 절차 — 임베딩 워밍업/keep-warm (v0.14.8) 절차화 |
+| 6 | 설계 일관성 — 4-Tier 체인·권한·Hook 등 영향 없음 재확인 |
+| 부록 A | 10가지 정정 사항 표 |
+| 부록 B | 사양서 ↔ 코드 위치 매트릭스 |
+
+### 사양서 정합성
+
+v7.1은 **운영 데이터 정의·인프라 정책**만 갱신하며 4-Tier 체인·도구·권한·
+Hook·Thinking·Memory 호출 인터페이스 어떤 무결성도 깨지 않음.
+
+### 신규/수정 파일
+
+```
+신규:
+  user_mig/PROJECT_NEXUS_SPEC_v7.1_AMENDMENT.md
+
+수정:
+  user_mig/progress/progress.md (이 항목)
+
+원격 (192.168.10.39 docutil-postgres):
+  tb_symbols.idx_symbols_embed 인덱스 신규 생성
+```
+
+---
+
+## tb_symbols ivfflat 인덱스 조건부 자동 빌드 (2026-06-01)
+
+### 배경 — 사양서/코드/운영 일관성 점검
+
+pgvector 복구 점검 중 발견:
+- 코드(`core/rag/symbol_store.py`)는 `_DDL_IVFFLAT`을 정의 → `PgVectorStore.build_vector_index()`로 호출 가능
+- 그러나 어디서도 호출 안 함 (`bootstrap`에서 `ensure_schema()`만 호출)
+- 결과: 운영 DB `tb_symbols`(2,118행)에 **벡터 인덱스 부재**
+- KnowledgeStore는 `prepare_kowiki.py --build-index` 수동 실행으로 인덱스
+  보유 — 같은 패턴이 SymbolStore에는 없었던 것
+
+### 구현
+
+**`core/rag/symbol_indexer.py::background_index`** 확장:
+- 초기 인덱싱 완료 후 행수 ≥ 1000일 때만 `store.build_vector_index()` 호출
+- 임계치 근거: 사양서 Ch 12 "ivfflat is recommended when 1000+ records"
+- 적은 데이터에서 빌드하면 lists=100 통계 부족으로 검색 품질 저하
+- `IF NOT EXISTS`로 멱등 — 인덱스 이미 있으면 no-op
+- 빌드 실패는 본류 응답에 무영향(WARNING만)
+
+### 테스트 (`tests/unit/test_symbol_indexer.py` 신규 3건)
+
+- `test_background_index_skips_vector_index_below_threshold` — 5건 << 1000 → 미호출
+- `test_background_index_builds_vector_index_above_threshold` — count mock 2000 → 호출
+- `test_background_index_swallows_indexing_errors` — index_project 실패 시도 무중단
+
+회귀: 단위 19/19 (test_symbol_indexer) → 전체 **733 passed** (+3 신규).
+
+### 운영 영향
+
+- 다음 nexus 부트스트랩 시 자동으로 ivfflat 인덱스 생성됨 (현재 2,118행 > 1000 임계치)
+- 즉시 적용하려면 운영 DB에서 1줄 DDL 수동 실행 가능:
+  ```sql
+  CREATE INDEX IF NOT EXISTS idx_symbols_embed
+    ON tb_symbols USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
+  ```
+
+### 신규/수정 파일
+
+```
+수정:
+  core/rag/symbol_indexer.py          (background_index에 조건부 빌드)
+  tests/unit/test_symbol_indexer.py   (신규 3건 + background_index import)
+  user_mig/progress/progress.md       (이 항목)
+```
+
+### 사양서 영향 없음
+
+코드 기준 정의가 그대로 보존됨. v6.1 Ch 12 "1000+ records" 권고 그대로 적용.
+
+---
+
+## tb_memories 스키마/인덱스 정합화 — `LongTermMemory.ensure_schema()` 추가 (2026-06-01)
+
+### 배경 — 3중 불일치 발견
+
+pgvector 복구(위 항목) 후 후속 점검에서 다음 사실 확인:
+
+| 위치 | tb_memories 정의 | 인덱스 |
+|---|---|---|
+| v6.1 사양서 (Ch 12) | episodic/semantic/procedural/feedback 4개 분리 | ivfflat |
+| nexus 코드 (`long_term.py`) | 단일 tb_memories 가정 (INSERT/SELECT만, **DDL 없음**) | **인덱스 생성 코드 없음** |
+| 실제 운영 DB | 단일 tb_memories (203,991행) | **hnsw** (수동/외부 생성) |
+
+핵심 문제: nexus 코드에 `CREATE TABLE tb_memories`도 인덱스 생성도 없어, 새 PG
+인스턴스(예: 컨테이너 교체, 재해 복구)에서 부트스트랩 시 즉시 깨짐. 운영
+DB가 멀쩡한 건 누군가 수동으로 만들어놓은 덕분.
+
+### 결정 — 옵션 A (운영을 정으로)
+
+- 운영 hnsw가 200K+ 행 규모에서 ivfflat보다 정확/지연 모두 우수
+- 사양서 4개 분리는 v6.1 작성 시점 설계, 이미 단일로 진화 → 되돌리기 위험 큼
+- 새 환경 셋업 자동화·재해 복구 가능성이 최대 이득
+
+### 구현
+
+**1) `core/memory/long_term.py`**
+- 모듈 상단에 `_DDL_TB_MEMORIES` + `_DDL_TB_MEMORIES_INDEXES` 상수 (운영 정의 1:1)
+  - `id varchar(12) PRIMARY KEY` (ImportanceAssessor의 sha 12자리 호환)
+  - `importance` CHECK (0.0 ≤ x ≤ 1.0) 제약 동일 적용
+  - `embedding vector(1024)` — e5-large 차원
+  - 인덱스 5종: type/tags GIN/created_at DESC/importance DESC/embedding hnsw
+- `LongTermMemory.ensure_schema()` 추가 — pg_pool=None이면 no-op, 있으면
+  `CREATE EXTENSION vector` → 테이블 → 인덱스 5종을 순차 IF NOT EXISTS 실행
+
+**2) `core/bootstrap.py`** (Phase 2 ③ MemoryManager 초기화)
+- `ltm = LongTermMemory(pg_pool=pg_pool)` 직후 `await ltm.ensure_schema()` 호출
+- 실패 시 WARNING만 — 인메모리 폴백으로 본류 응답 가능
+
+**3) `tests/unit/test_memory.py`** (`TestLongTermMemoryEnsureSchema` 신규)
+- `test_ensure_schema_inmemory_noop` — pg_pool=None일 때 no-op 확인
+- `test_ensure_schema_executes_ddl_with_pool` — mock asyncpg 풀로 SQL 7건
+  실행 검증 (확장 + 테이블 + 인덱스 5종), 핵심 키워드(`USING hnsw`,
+  `vector_cosine_ops`, `tb_memories_importance_check`) 단언
+
+### 테스트 결과
+
+- `tests/unit/test_memory.py`: 64 passed (이전 62 + 신규 2)
+- 전체 단위 테스트: **730 passed, 0 failed** (회귀 없음)
+- ruff 신규 위반 0 (사전 존재한 long line 1건은 별건)
+
+### 사양서 영향
+
+`PROJECT_NEXUS_SPEC_v7.0_AMENDMENT.md`에 후속 절(예: Part 5 Ch 12 보강)을
+추가하여 다음을 명시할 필요:
+- v6.1 Ch 12의 4개 테이블 분리(episodic/semantic/procedural/feedback)는
+  단일 tb_memories로 통합됨
+- 인덱스 정책: 1000행 이하 ivfflat, 그 이상 hnsw (운영 정책)
+- 스키마 책임: `LongTermMemory.ensure_schema()` (코드 기준 단일 정의)
+
+본 항목은 코드 변경 후 별도 사양서 갱신 묶음 커밋 시 함께 정리 예정.
+
+### 신규/수정 파일
+
+```
+신규:
+  (tests/unit/test_memory.py 내 TestLongTermMemoryEnsureSchema 클래스)
+
+수정:
+  core/memory/long_term.py     (_DDL_TB_MEMORIES, _DDL_TB_MEMORIES_INDEXES, ensure_schema)
+  core/bootstrap.py            (Phase 2 ③에서 ltm.ensure_schema() 호출)
+  tests/unit/test_memory.py    (신규 테스트 2건)
+  user_mig/progress/progress.md (이 항목)
+```
+
+---
+
+## 인프라 복구 — pgvector 라이브러리 누락 해소 (2026-06-01)
 
 ### 배경 — 진단
 
@@ -2182,3 +2438,172 @@ CPU 5.7%/RSS 158MB로 안정적. ELAPSED 1d21h58m 시점 기준 여전히 run �
 ### 설계 기준 (사양서 이탈 없음)
 - Part 2.5.8 지식 RAG 파이프라인 — kowiki 적재 스크립트와 ivfflat 인덱스는 이미 명세
 - 적재 규모 확장은 "한계와 향후 과제" 섹션에서 예고된 작업
+
+---
+
+## MCP 도입 PoC — v7.2 사양서 amendment 작성 (2026-06-01)
+
+### 배경
+
+사내 시스템 한두 개를 LAN MCP 서버로 떼어내고 Nexus에 MCP 클라이언트 어댑터를
+추가하는 PoC를 시작. 첫 단계로 기술 사양서 v7.2 개정안을 작성.
+
+### 산출물
+
+`user_mig/PROJECT_NEXUS_SPEC_v7.2_AMENDMENT.md` (약 580라인, enterprise-architect
+위임 작성 → 핵심 인용 실측 검증 완료).
+
+### 핵심 정합화 논점
+
+- v6.1은 MCP를 "외부 SaaS 의존 → 에어갭 불가, Phase 2 연기"로 보류(Removed/Disabled).
+- v7.2 정정: **외부 SaaS MCP는 여전히 금지, 사내 LAN MCP 서버는 허용**.
+  근거 — v6.1 라인 402가 "Machine A↔B (LAN, HTTP/SSE)"를 ALLOWED로 명시(자기모순 해소).
+- 권한 인프라는 **이미 코드에 존재**: `ToolCategory.MCP`(types.py:117),
+  `mcp__` 식별(pipeline.py:191), MODE_BEHAVIOR_MAP MCP 열, Layer5 PLAN 보정(:368).
+  → v7.2 신규 추가는 **MCP 클라이언트 어댑터 + 연결 관리자**(`core/tools/mcp/`)와
+  `McpConfig` 뿐. 4-Tier·권한·Hook 불변.
+
+### PoC 대상 4종 (전부 read-only, LAN HTTP/SSE)
+
+| 서버 | 도구 | LAN 위치 |
+|---|---|---|
+| DB 조회 | `mcp__db__query` | PG 192.168.10.39 (SELECT 전용) |
+| 진단/모니터링 | `mcp__diag__reachability`, `mcp__diag__rag_latency` | 웹/GPU 22.28/DB 10.39 |
+| DocUtil 문서 | `mcp__docutil__search`, `mcp__docutil__get` | DocUtil 192.168.10.39 |
+| kowiki RAG | `mcp__kowiki__search` | tb_knowledge + 임베딩 22.28:8002 |
+
+### 미확정 (사용자 확인 필요)
+
+1. GlobalState `mcp_servers`/`mcp_connected` 필드는 **실제 코드엔 미존재**
+   (초기 grep은 v6.1 문서 내 코드였음) — 정식 도입 시 신규 추가 대상으로 표기.
+2. MCP 서버 포트 8810~8813은 placeholder — 운영 배치 확정 필요.
+3. kowiki MCP(명시 호출) vs 기존 자동 RAG 주입(v7.0 Part 2.5.8) 통합 여부 — PoC 후 결정.
+
+### 구현 완료 (2026-06-01, 제품화 기준 전환)
+
+**코드 구현**: `core/tools/mcp/`(client/adapter/connection_manager) + `core/config.py`
+McpConfig/McpServerConfig + `core/security/network_guard.py`(is_lan_hostname, config에서
+이전) + `core/bootstrap.py` Phase 2 ⑨-d 배선 + `config/nexus_config.yaml` mcp 섹션.
+
+**부트스트랩 배선 버그 수정**: MCP 도구를 메인 registry(:132)가 아니라 **cli_registry**에
+등록 + cli_tools 재취득해야 ModelDispatcher/QueryEngine에 전달됨(QA 발견).
+
+**제품 보안 강화 (PoC→제품)**: read-only MCP만 자동 등록(쓰기는 `allow_write=True`
+명시 필요), `check_permissions` 항상 ALLOW로 일원화(5계층 위임 → PLAN=DENY/BYPASS=ALLOW
+정상화), `validate_input` 스키마 검증, 예외 범위 축소(버그 은폐 방지).
+
+**테스트**: MCP 단위/통합 **81 passed**, 전체 회귀 **916 passed/1 skipped**(1 failed는
+GPU 의존 e2e로 무관).
+
+**사양서**: v7.2를 PoC→**제품 사양**으로 개정. v7.3(문서 양식 인식 임베딩 설계) 신규
+작성 — HWP/PDF/PPT 레이아웃 인식 + 구조 보존 청킹 + 임베딩 적재, 청정(MIT/Apache)
+라이선스 기본 + 상용 어댑터 슬롯, 티어별(5090/A100/H200) 스택.
+
+### 결정 사항 (2026-06-01)
+
+- 쓰기 MCP 정책: read-only만 허용(PLAN 안전성)
+- 라이선스: 추상 인터페이스 + 청정 기본(AGPL/GPL 배제)
+- HWP: **구포맷 .hwp 비중 높음** → LibreOffice 필수 번들, .hwp 처리 우선순위 상향
+
+### 다음 단계 (미착수)
+
+- v7.3 구현: PPTX 파서부터 단계적(`core/ingest/`). GPUTier.A100 추가 검토.
+- 실 LAN MCP 서버 4종(db/diag/docutil/kowiki) + 문서 인제스트 서버 구현 → e2e.
+- GlobalState mcp_servers/mcp_connected 가시성 필드(운영 /metrics 노출용).
+
+---
+
+## MCP 서버 구현 + v7.3 인제스트 파서 + 클라이언트↔서버 e2e (2026-06-02)
+
+브랜치: `feature/mcp-integration`. v7.2 다음 단계(미착수)였던 서버 측·e2e·가시성과
+v7.3 인제스트 파서(PDF/HWPX)를 구현 완료.
+
+### 1. MCP 서버 측 4종 구현 (`mcp_servers/` 신규)
+
+v7.2까지는 클라이언트(`core/tools/mcp/*`)만 있고 서버는 placeholder였다. 사내
+시스템을 LAN MCP 서버로 노출하는 서버 측을 신규 구현.
+
+| 파일 | 노출 도구 | 성격 | 기본 포트 |
+|---|---|---|---|
+| `framework.py` | (공통) `McpServerTool` ABC + `create_mcp_app` — JSON-RPC 2.0 디스패치/Bearer 인증/`/health`/lifespan | — | — |
+| `run.py` | `python -m mcp_servers.run <name>` uvicorn entrypoint | — | — |
+| `db_server.py` | `query` | read-only SELECT (검증 + READ ONLY 트랜잭션 이중 방어) | 8810 |
+| `diag_server.py` | `reachability`, `rag_latency` | read-only (웹/GPU/DB 점검, EXPLAIN ANALYZE) | 8811 |
+| `kowiki_server.py` | `search` | read-only (embed + pgvector 검색) | 8813 |
+| `docingest_server.py` | `parse`, `ingest`, `search` | parse/search read-only · **ingest 쓰기** | 8814 |
+
+- 의존성 방향 P2 준수: `mcp_servers → core` 만 허용(core는 mcp_servers 미import).
+- 에어갭: `0.0.0.0` LAN 바인드, 점검·접속 대상 전부 LAN. 외부 호출/런타임 install 없음.
+- 정정: v7.2 초판의 `docutil`(8812)은 미구현 — 실제 문서 MCP는 **docingest**(8814).
+
+### 2. 클라이언트↔서버 e2e 검증 (신규)
+
+`tests/integration/test_mcp_client_server_e2e.py` — 기존엔 AsyncMock 흉내뿐이었던
+구간을 실제 연결로 관통:
+- McpClient ↔ `create_mcp_app` 서버 (ASGITransport 인프로세스 + 임의 포트 uvicorn 실 TCP)
+- McpClient → McpToolAdapter 전구간(BaseTool/tool_use_error 래핑 포함)
+- 모든 연결 127.0.0.1 루프백(에어갭 준수).
+
+### 3. v7.3 인제스트 파서 (PDF/HWPX) + docingest
+
+- `core/ingest/parsers/pdf_plumber.py` — pdfplumber(MIT) PDF 경량(표·좌표·헤딩 휴리스틱, fail-soft).
+- `core/ingest/parsers/hwpx.py` — python-hwpx(OWPML) 1차 + zipfile/xml.etree 폴백.
+- `parsers/__init__.py` export: HwpxParser/PdfPlumberParser/PptxParser 3종.
+- docingest MCP 서버가 ParserRegistry(PPTX/PDF/HWPX) + DocumentIngestPipeline 조립.
+- Docling/OCR(Tesseract·PaddleOCR) 고품질 파서는 **어댑터 슬롯만 예약(미구현·후속)**.
+- 라이브러리: pdfplumber/python-hwpx/pytesseract + docling/paddleocr **개발 환경 설치 완료**.
+  에어갭은 배포물(wheel 번들)에만 적용 — 개발 중 설치는 정상.
+
+### 4. GPUTier.A100 추가
+
+- `core/model/gpu_detector.py:32` 에 `A100 = "a100"` 추가(5종).
+- 판정(`:161~169`): `vram_gb > 60` 구간에서 GPU 이름에 "a100" 포함 시 A100, 아니면 H100.
+- 프로파일(`:225~262`): BF16 NONE, max_model_len 8192, max_num_seqs 4, lora rank 64,
+  **FP8 미지원(Ampere)**. VRAM 80GB → 고품질 인제스트 스택 여유 충분(TIER_M급).
+
+### 5. GlobalState MCP 가시성 + top_k 견고성
+
+- `core/state.py:131` — `mcp_servers: dict` / `mcp_connected: set` 추가.
+- `core/bootstrap.py:391~395` — 등록 결과로 채움(빈 리스트는 connected 자연 제외).
+- `web/app.py:1206~` — `/metrics` 에 `mcp.connected_count`/`connected`/서버별 도구 노출.
+- top_k 견고성: kowiki/docingest/diag 의 `top_k=0/음수/bool` 거부, 미지정 시에만 기본값.
+
+### 테스트 / 회귀
+
+- 전체 회귀 **1091 passed, 1 skipped** (실측 2026-06-02).
+- 유일한 1 failed = `tests/e2e/test_gpu_e2e.py::test_simple_chat_completion`
+  (실 GPU 서버 의존 e2e — MCP/인제스트와 무관, 코드 회귀 아님).
+- 신규/갱신 테스트: `test_mcp_server_framework.py`, `test_mcp_db_server.py`,
+  `test_mcp_kowiki_docingest_server.py`, `test_mcp_client_server_e2e.py`,
+  `test_mcp_visibility.py`, `test_pdf_plumber_parser.py`, `test_hwpx_parser.py`.
+
+### 사양서 갱신 (이 작업에서 동시 반영)
+
+- `PROJECT_NEXUS_SPEC_v7.2_AMENDMENT.md`: 서버 측 placeholder→구현 완료(Part 6.0),
+  docutil→docingest 정정(6.4), Part 8 구현 현황/테스트, GlobalState 가시성 구현됨,
+  부록 A/B 코드 매트릭스에 mcp_servers/* 추가.
+- `PROJECT_NEXUS_SPEC_v7.3_DOC_INGEST.md`: PDF/HWPX·docingest·GPUTier.A100 를
+  "신규 제안"→"구현 완료"로, 로드맵 단계 상태 컬럼 추가, Part 10 해소 항목 갱신.
+
+### web app full e2e — 실 vLLM 질의 (2026-06-02)
+
+mock 없이 실 인프라(실 PG/임베딩/vLLM/Redis)로만 검증:
+- `GET /v1/tools` → `mcp__db__query`, `mcp__kowiki__search` 노출.
+- `GET /metrics` → `mcp.connected: ['db','kowiki']`.
+- `POST /v1/chat` "tb_knowledge 행 수" → Worker(vLLM)가 **mcp__db__query 호출 →
+  1,067,978 정답**. kowiki 도구 호출·검색도 정상(니체 3건).
+- **버그 수정**: 웹 Worker는 cli_registry가 아닌 자체 풀을 써서 MCP 도구가
+  누락됐었다 → bootstrap `components["mcp_tools"]` + web 머지로 해소.
+
+**kowiki 8K overflow — 결정(2026-06-02, 사용자 확정)**: KNOWLEDGE 모드 자동 RAG
+주입 + kowiki MCP 도구 결과가 같은 검색을 이중으로 넣어 RTX 5090 8K(7778/8192)를
+초과 → 최종 답변 생성 불가. **MCP 결함이 아니라 자동 RAG와 도구의 중복 + 5090 8K
+제약.** 코드 변경 없이 **5090 한정 제약으로 인정**, 제품 검증 기준 **A100(80GB)/
+H200(141GB)의 32~128K 컨텍스트에서 자연 해소**. db/kowiki 둘 다 Worker 도구로 유지.
+
+### 남은 단계 (미착수/후속)
+
+- 실 LAN 호스트 배포 e2e (현재는 인프로세스 + 루프백 TCP까지).
+- PDF 고품질(Docling) + 스캔 OCR(Tesseract/PaddleOCR) 고품질 파서(어댑터 슬롯).
+- `.hwp`(LibreOffice 변환), `scripts/prepare_documents.py` 배치 스크립트.
+- yaml `mcp.servers` 를 실제 구현 서버(db/diag/kowiki/docingest)로 정렬(docutil 제거).

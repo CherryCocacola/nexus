@@ -105,6 +105,11 @@ known-first-party = ["core", "training", "deployment", "cli", "web"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# pytest-asyncio 0.24+ 권장 설정. async fixture 의 기본 이벤트 루프 스코프를
+# function 으로 명시한다. conftest 의 session 스코프 event_loop fixture 재정의
+# (deprecated)를 제거했으므로, 각 async 테스트/fixture 는 자기 전용 루프를 받는다.
+# 이로써 동기 테스트의 asyncio.run() 이 다른 테스트의 루프를 파괴하던 연쇄 실패를 막는다.
+asyncio_default_fixture_loop_scope = "function"
 markers = [
     "unit: 단위 테스트",
     "integration: 통합 테스트",

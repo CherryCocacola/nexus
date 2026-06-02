@@ -69,6 +69,7 @@ def _sanitize_history_inplace(history: list) -> None:
                     Message.assistant(cleaned) if role == "assistant" else Message.user(cleaned)
                 )
 
+
 from fastapi import FastAPI, Header, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
@@ -126,6 +127,7 @@ def _build_transcript(session_id: str) -> Any:
     """
     try:
         from core.memory.transcript import SessionTranscript as _Trans
+
         cfg = _app_state.get("config")
         sessions_dir = cfg.session.sessions_dir if cfg else ".nexus/sessions"
         transcript_enabled = cfg.session.transcript_enabled if cfg else True
@@ -174,18 +176,15 @@ def _load_worker_system_prompt(agent_registry: Any | None) -> str:
 
     if agent_registry is not None and len(agent_registry) > 0:
         agent_lines = [
-            f"  - {name}: {desc}"
-            for name, desc in agent_registry.list_descriptions().items()
+            f"  - {name}: {desc}" for name, desc in agent_registry.list_descriptions().items()
         ]
         base += (
             "\n\n## Sub-agents (Agent tool)\n"
             "Delegate specialized tasks to sub-agents via the Agent tool.\n"
-            "Available sub-agents:\n"
-            + "\n".join(agent_lines)
-            + "\n\nWhen to use sub-agents:\n"
+            "Available sub-agents:\n" + "\n".join(agent_lines) + "\n\nWhen to use sub-agents:\n"
             "  - Simple questions or greetings → answer directly, NO tools\n"
             "  - Single file task → use Read/Edit/Write directly\n"
-            "  - Broad project exploration → Agent(subagent_type=\"scout\")\n"
+            '  - Broad project exploration → Agent(subagent_type="scout")\n'
             "NEVER invoke scout for trivial tasks — it is slow (~30s on CPU)."
         )
     return base
@@ -208,6 +207,15 @@ def _build_web_query_engine(components: dict, state: Any) -> Any:
 
     web_registry = _create_web_tool_registry()
     web_tools = web_registry.get_all_tools()
+    # v7.2 MCP — 부트스트랩이 LAN MCP 서버에서 등록한 도구(mcp__db__query 등)를
+    # 웹 Worker 풀에도 흡수한다. 웹은 cli_registry가 아니라 _create_web_tool_registry
+    # 로 자체 풀을 만들기 때문에, 이 머지가 없으면 모델이 MCP 도구를 볼 수 없다
+    # (실측: Worker가 mcp__db__query를 못 보고 npx 셸 명령을 환각 호출하던 버그).
+    # _combine_scout_pool과 동일한 name 중복 제거 규칙으로 합친다(P5 이름순 정렬은
+    # registry/get_all_tools가 이미 보장 → prompt cache 안정).
+    mcp_tools = components.get("mcp_tools") or []
+    if mcp_tools:
+        web_tools = _combine_scout_pool(web_tools, mcp_tools)
     scout_tools = components.get("scout_tools") or []
     combined_pool = _combine_scout_pool(web_tools, scout_tools)
 
@@ -249,7 +257,10 @@ def _build_web_query_engine(components: dict, state: Any) -> Any:
         max_turns=200,
         routing_config=state.config.routing,
     )
-    return engine, web_dispatcher, web_registry
+    # web_tools(= MCP 머지 후 실제 Worker 도구 풀)를 반환한다. 이전엔 bare
+    # web_registry를 반환했는데, 그것은 MCP 머지 전 5개만 담고 있어 /v1/tools가
+    # 모델이 실제로 보는 도구와 어긋났다(MCP 도구 누락). 이제 실제 풀을 노출한다.
+    return engine, web_dispatcher, web_tools
 
 
 # ─────────────────────────────────────────────
@@ -381,22 +392,22 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         _app_state["memory_manager"] = components.get("memory_manager")  # Ch 16
         _app_state["tenant_registry"] = state.config.tenants  # M2 — 헤더 해석용
         # v0.14.8: 임베딩 keepalive task — 종료 시 cancel하기 위해 보관
-        _app_state["embedding_keepalive_task"] = components.get(
-            "embedding_keepalive_task"
-        )
+        _app_state["embedding_keepalive_task"] = components.get("embedding_keepalive_task")
 
         # 웹 전용 QueryEngine — 도구 8개로 축소 (토큰 예산 관리)
         # RTX 5090 (8192 ctx)에서 도구 24개(~6,102토큰)는 컨텍스트 초과.
         # 핵심 도구 8개(~1,851토큰)만 사용하여 입력+출력 공간 확보.
         # (2026-04-21 리팩토링 3: 인라인 조립 로직을 _build_web_query_engine으로 분리)
-        web_engine, web_dispatcher, web_registry = _build_web_query_engine(
-            components, state
-        )
+        web_engine, web_dispatcher, web_tools = _build_web_query_engine(components, state)
         _app_state["model_dispatcher"] = web_dispatcher
         _app_state["query_engine"] = web_engine
+        # /v1/tools가 모델이 실제로 보는 웹 Worker 도구 풀(MCP 포함)을 노출하도록 저장.
+        # 기존 _app_state["tool_registry"]는 부트스트랩의 23개 base 레지스트리라
+        # 웹 Worker 실풀과 다르다(MCP 누락) — 웹 엔드포인트는 web_tools를 우선한다.
+        _app_state["web_tools"] = web_tools
         logger.info(
             "웹 서버 부트스트랩 완료 (Phase 1 + 2, 웹 도구 %d개)",
-            len(web_registry.get_all_tools()),
+            len(web_tools),
         )
     except Exception as e:
         logger.warning(f"부트스트랩 실패, 기본 설정으로 시작: {e}")
@@ -478,8 +489,7 @@ async def chat(
         transcript=transcript,
     )
     if tenant is not None:
-        logger.info("tenant 해석: %s (sources=%s)", tenant.id,
-                    tenant.allowed_knowledge_sources)
+        logger.info("tenant 해석: %s (sources=%s)", tenant.id, tenant.allowed_knowledge_sources)
 
     # Ch 16: Redis에서 해당 세션의 이전 히스토리 복원
     memory_manager = _app_state.get("memory_manager")
@@ -489,6 +499,7 @@ async def chat(
             saved = await memory_manager.short_term.get_conversation_context(session_id)
             if saved:
                 from core.message import Message as _Msg
+
                 for item in saved:
                     role = item.get("role")
                     content = item.get("content", "")
@@ -505,19 +516,69 @@ async def chat(
     from core.message import StreamEvent, StreamEventType
 
     response_text_parts: list[str] = []
-    tool_calls_info: list[ToolCallInfo] = []
     usage = UsageInfo()
 
+    # ─── 도구 호출 수집 (tool_calls 응답 필드 보강) ─────────────────
+    # 스트리밍 경로는 SSE 프레임으로 이벤트를 실시간 전달하지만, 비스트리밍
+    # 경로는 최종 ChatResponse 한 번만 돌려준다. 기존 구현은 TEXT_DELTA/USAGE만
+    # 보고 tool_use 이벤트를 무시했기 때문에, 도구가 실제로 실행돼도(로그·결과
+    # 정상) 응답의 tool_calls가 항상 비어 있었다.
+    #
+    # 4-Tier 체인을 우회하지 않고 submit_message가 yield하는 StreamEvent만
+    # 소비하여 누적한다(이벤트 소비 = 정당한 상위 Tier 동작).
+    #   - TOOL_USE_STOP: 도구 호출 확정(이름/입력/tool_use_id). 증분(DELTA)이 아닌
+    #     STOP에서 input이 완성되므로 STOP을 기준으로 한 건씩 등록한다.
+    #   - TOOL_RESULT : 같은 tool_use_id로 결과 요약/에러 여부를 매칭해 채운다.
+    # tool_use_id로 매칭하여 한 호출당 ToolCallInfo 하나를 유지한다.
+    tool_calls_by_id: dict[str, ToolCallInfo] = {}
+    # id가 없는(혹은 누락된) 경우를 위해 등장 순서도 함께 보존한다.
+    tool_calls_order: list[str] = []
+
+    # 결과 본문이 과도하게 길면 응답이 비대해지므로 요약 길이를 제한한다(과설계 금지).
+    result_summary_max = 500
+
     async for event in engine.submit_message(request.message):
-        if isinstance(event, StreamEvent):
-            if event.type == StreamEventType.TEXT_DELTA and event.text:
-                response_text_parts.append(event.text)
-            elif event.type == StreamEventType.USAGE_UPDATE and event.usage:
-                usage = UsageInfo(
-                    input_tokens=event.usage.input_tokens,
-                    output_tokens=event.usage.output_tokens,
-                    total_tokens=event.usage.total_tokens,
+        if not isinstance(event, StreamEvent):
+            continue
+
+        if event.type == StreamEventType.TEXT_DELTA and event.text:
+            response_text_parts.append(event.text)
+
+        elif event.type == StreamEventType.USAGE_UPDATE and event.usage:
+            usage = UsageInfo(
+                input_tokens=event.usage.input_tokens,
+                output_tokens=event.usage.output_tokens,
+                total_tokens=event.usage.total_tokens,
+            )
+
+        elif event.type == StreamEventType.TOOL_USE_STOP and event.tool_use:
+            # 도구 호출 확정 — 이름/입력/tool_use_id를 등록한다.
+            tu = event.tool_use
+            tu_id = tu.id
+            if tu_id not in tool_calls_by_id:
+                tool_calls_by_id[tu_id] = ToolCallInfo(
+                    name=tu.name,
+                    input=tu.input,
                 )
+                tool_calls_order.append(tu_id)
+
+        elif event.type == StreamEventType.TOOL_RESULT and event.tool_result:
+            # 도구 결과 — 같은 tool_use_id의 호출 정보에 요약/에러 여부를 채운다.
+            tr = event.tool_result
+            info = tool_calls_by_id.get(tr.tool_use_id)
+            if info is None:
+                # STOP 이벤트를 못 본 경우(방어적): 결과만으로 항목을 만든다.
+                info = ToolCallInfo(name="", input={})
+                tool_calls_by_id[tr.tool_use_id] = info
+                tool_calls_order.append(tr.tool_use_id)
+            summary = tr.content or ""
+            if len(summary) > result_summary_max:
+                summary = summary[:result_summary_max] + "…(truncated)"
+            info.result = summary
+            info.is_error = tr.is_error
+
+    # 등장 순서대로 ToolCallInfo 목록을 만든다.
+    tool_calls_info: list[ToolCallInfo] = [tool_calls_by_id[tid] for tid in tool_calls_order]
 
     return ChatResponse(
         session_id=engine.session_id,
@@ -576,9 +637,7 @@ async def chat_stream(
             histories[session_id] = []
             if memory_manager is not None:
                 try:
-                    saved = await memory_manager.short_term.get_conversation_context(
-                        session_id
-                    )
+                    saved = await memory_manager.short_term.get_conversation_context(session_id)
                     if saved:
                         from core.message import Message as _Msg
 
@@ -593,7 +652,8 @@ async def chat_stream(
                                 histories[session_id].append(_Msg.assistant(content))
                         logger.info(
                             "세션 %s Redis 복원: %d개 메시지",
-                            session_id, len(histories[session_id]),
+                            session_id,
+                            len(histories[session_id]),
                         )
                 except Exception as e:
                     logger.warning("세션 Redis 복원 실패 (%s): %s", session_id, e)
@@ -605,6 +665,7 @@ async def chat_stream(
         # Ch 16: 세션별 JSONL 트랜스크립트 주입 (웹은 QueryEngine 싱글톤이라 동적 세팅)
         try:
             from core.memory.transcript import SessionTranscript as _Trans
+
             cfg = _app_state.get("config")
             sessions_dir = cfg.session.sessions_dir if cfg else ".nexus/sessions"
             transcript_enabled = cfg.session.transcript_enabled if cfg else True
@@ -626,8 +687,7 @@ async def chat_stream(
             transcript=transcript,
         )
         if tenant is not None:
-            logger.info("tenant 해석: %s (sources=%s)", tenant.id,
-                        tenant.allowed_knowledge_sources)
+            logger.info("tenant 해석: %s (sources=%s)", tenant.id, tenant.allowed_knowledge_sources)
 
         # QueryEngine의 messages를 해당 세션의 히스토리로 교체
         # 도구 호출/결과 메시지는 토큰을 많이 차지하므로 제외하고,
@@ -662,17 +722,16 @@ async def chat_stream(
 
         # ─── 요청 단위 타이밍/관측 로그 ───────────────────
         # 첨부 파일 경로가 메시지에 포함되면 업로드 케이스로 표시
-        has_attach = (
-            "서버 경로:" in request.message
-            or "[첨부파일:" in request.message
-        )
+        has_attach = "서버 경로:" in request.message or "[첨부파일:" in request.message
         req_start_mono = time.monotonic()
         event_count = 0
         stream_abort_error: BaseException | None = None
 
         logger.info(
             "SSE 시작: session=%s, message_len=%d, has_attach=%s",
-            session_id, len(request.message), has_attach,
+            session_id,
+            len(request.message),
+            has_attach,
         )
 
         # ─── Heartbeat/Producer 분리 구조 ──────────────────
@@ -720,14 +779,9 @@ async def chat_stream(
                         "type": "error",
                         "session_id": session_id,
                         "error_code": "stream_aborted",
-                        "message": (
-                            f"{type(payload).__name__}: {payload}"
-                        ),
+                        "message": (f"{type(payload).__name__}: {payload}"),
                     }
-                    yield (
-                        "data: " + json.dumps(err_frame, ensure_ascii=False)
-                        + "\n\n"
-                    )
+                    yield ("data: " + json.dumps(err_frame, ensure_ascii=False) + "\n\n")
                     break
 
                 event = payload
@@ -767,13 +821,17 @@ async def chat_stream(
             if stream_abort_error is not None:
                 logger.warning(
                     "SSE 중단: session=%s, elapsed=%.1fs, events=%d, error=%s",
-                    session_id, elapsed_total, event_count,
+                    session_id,
+                    elapsed_total,
+                    event_count,
                     type(stream_abort_error).__name__,
                 )
             else:
                 logger.info(
                     "SSE 완료: session=%s, elapsed=%.1fs, events=%d",
-                    session_id, elapsed_total, event_count,
+                    session_id,
+                    elapsed_total,
+                    event_count,
                 )
 
         # 이번 턴의 user/assistant 텍스트 메시지만 히스토리에 저장
@@ -791,7 +849,12 @@ async def chat_stream(
                         # 얕은 복사본을 만들어 히스토리에 넣는다. 원본 Message는
                         # Pydantic frozen이므로 text를 바꿀 수 없다 → 새 Message 생성.
                         from core.message import Message
-                        new_msg = Message.assistant(content_clean) if role == "assistant" else Message.user(content_clean)
+
+                        new_msg = (
+                            Message.assistant(content_clean)
+                            if role == "assistant"
+                            else Message.user(content_clean)
+                        )
                         histories[session_id].append(new_msg)
                     elif content_clean:
                         histories[session_id].append(msg)
@@ -910,9 +973,7 @@ async def get_session_messages(session_id: str) -> dict[str, Any]:
     memory_manager = _app_state.get("memory_manager")
     if memory_manager is not None:
         try:
-            redis_msgs = await memory_manager.short_term.get_conversation_context(
-                session_id
-            )
+            redis_msgs = await memory_manager.short_term.get_conversation_context(session_id)
             if redis_msgs:
                 normalized: list[dict[str, Any]] = []
                 for m in redis_msgs:
@@ -996,9 +1057,7 @@ async def delete_session(session_id: str) -> dict[str, Any]:
     memory_manager = _app_state.get("memory_manager")
     if memory_manager is not None:
         try:
-            existing = await memory_manager.short_term.get_conversation_context(
-                session_id
-            )
+            existing = await memory_manager.short_term.get_conversation_context(session_id)
             if existing:
                 await memory_manager.short_term.clear_session(session_id)
                 deleted_redis = True
@@ -1022,7 +1081,9 @@ async def delete_session(session_id: str) -> dict[str, Any]:
 
     logger.info(
         "세션 삭제: session=%s, redis=%s, disk=%s",
-        session_id, deleted_redis, deleted_disk,
+        session_id,
+        deleted_redis,
+        deleted_disk,
     )
     return {
         "session_id": session_id,
@@ -1041,12 +1102,16 @@ async def list_tools() -> dict[str, Any]:
 
     ToolRegistry에서 등록된 모든 도구의 이름, 설명, 그룹을 반환한다.
     """
-    registry = _app_state.get("tool_registry")
-    if registry is None:
-        return {"tools": [], "total": 0}
+    # 웹 Worker가 실제로 보는 도구 풀을 우선 노출한다(MCP 도구 포함).
+    # _app_state["web_tools"]는 _build_web_query_engine이 MCP 머지 후 저장한 실풀.
+    # 부재 시(부트스트랩 실패 등) base tool_registry로 폴백.
+    tools = _app_state.get("web_tools")
+    if not tools:
+        registry = _app_state.get("tool_registry")
+        if registry is None:
+            return {"tools": [], "total": 0}
+        tools = registry.get_all_tools()
 
-    # ToolRegistry에서 등록된 모든 도구의 정보를 반환한다
-    tools = registry.get_all_tools()
     tool_list = [
         ToolInfo(
             name=t.name,
@@ -1200,6 +1265,17 @@ async def metrics() -> dict[str, Any]:
     if state:
         result["session"] = state.get_session_summary()
 
+        # MCP 가시성 — Phase 2 부트스트랩이 GlobalState 에 채운 등록 결과를
+        # 간단히 노출한다(연결 서버 수 + 서버별 도구 개수). 과설계 없이
+        # "몇 개 서버가 살아 있고 각자 도구가 몇 개인가" 만 보여준다.
+        mcp_servers = getattr(state, "mcp_servers", {}) or {}
+        mcp_connected = getattr(state, "mcp_connected", set()) or set()
+        result["mcp"] = {
+            "connected_count": len(mcp_connected),
+            "connected": sorted(mcp_connected),
+            "tool_counts": {name: info.get("tool_count", 0) for name, info in mcp_servers.items()},
+        }
+
     # 서브에이전트 메트릭스 — Ch 17 (v7.0 Phase 9 재설계)
     # AgentTool.get_stats()가 subagent_type별 호출 통계를 집계한다.
     # 예: {"scout": {"calls": 3, "total_latency_ms": 99000, "avg_latency_ms": 33000}}
@@ -1216,9 +1292,7 @@ async def metrics() -> dict[str, Any]:
     scout_agent_stats = result["agents"].get("scout", {})
     result["scout"] = {
         "tier": dispatcher.tier.value if dispatcher is not None else "unknown",
-        "scout_enabled": (
-            dispatcher.scout_enabled if dispatcher is not None else False
-        ),
+        "scout_enabled": (dispatcher.scout_enabled if dispatcher is not None else False),
         "scout_calls": scout_agent_stats.get("calls", 0),
         "scout_avg_latency_ms": scout_agent_stats.get("avg_latency_ms", 0.0),
         "scout_fallback_count": 0,  # fallback 개념은 AgentTool 이관 후 의미 없음

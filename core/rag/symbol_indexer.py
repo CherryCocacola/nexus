@@ -303,9 +303,38 @@ class SymbolProjectIndexer:
 # ─────────────────────────────────────────────
 # 편의 — bootstrap에서 fire-and-forget 호출
 # ─────────────────────────────────────────────
+# ivfflat 인덱스 빌드 임계치 — 사양서 Ch 12 권장(1000+ rows)을 따른다.
+# 너무 적은 데이터에서 빌드하면 lists=100 대비 통계가 부족해 검색 품질이
+# 오히려 저하될 수 있다. 인덱스가 이미 있으면 IF NOT EXISTS로 no-op.
+_SYMBOL_VECTOR_INDEX_MIN_ROWS = 1000
+
+
 async def background_index(indexer: SymbolProjectIndexer, root: str | Path) -> None:
-    """예외 삼킴 래퍼 — bootstrap의 `asyncio.create_task()`와 함께 쓴다."""
+    """예외 삼킴 래퍼 — bootstrap의 `asyncio.create_task()`와 함께 쓴다.
+
+    초기 인덱싱 후 행수가 임계치를 넘으면 ivfflat 벡터 인덱스도 빌드한다.
+    이렇게 늦게 빌드해야 데이터 분포가 잡혀 검색 품질이 좋아진다.
+    """
     try:
         await indexer.index_project(root)
     except Exception as e:
         logger.warning("심볼 백그라운드 인덱싱 실패 (무시): %s", e)
+        return
+
+    # 인덱싱 완료 후 벡터 인덱스 빌드 — 행수 조건 충족 시에만
+    try:
+        store = indexer._store  # noqa: SLF001 — 같은 모듈 내부 협력
+        row_count = await store.count()
+        if row_count >= _SYMBOL_VECTOR_INDEX_MIN_ROWS:
+            await store.build_vector_index()
+            logger.info(
+                "tb_symbols ivfflat 인덱스 빌드 완료 (rows=%d)", row_count,
+            )
+        else:
+            logger.debug(
+                "tb_symbols 행수 %d < %d — ivfflat 빌드 보류",
+                row_count, _SYMBOL_VECTOR_INDEX_MIN_ROWS,
+            )
+    except Exception as e:
+        # 인덱스 빌드 실패는 검색 품질 저하일 뿐 본류 응답 가능 — WARNING만.
+        logger.warning("tb_symbols 벡터 인덱스 빌드 실패 (무시): %s", e)

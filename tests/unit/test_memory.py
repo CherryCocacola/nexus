@@ -378,6 +378,69 @@ class TestLongTermMemory:
 
 
 # ─────────────────────────────────────────────
+# ensure_schema 테스트 — 운영 정의(2026-06-01)를 멱등 보장
+# ─────────────────────────────────────────────
+class TestLongTermMemoryEnsureSchema:
+    """ensure_schema()가 pg_pool 유무에 따라 올바르게 동작하는지 확인한다."""
+
+    @pytest.mark.asyncio
+    async def test_ensure_schema_inmemory_noop(self):
+        """pg_pool=None이면 ensure_schema는 아무 작업도 하지 않는다."""
+        # 인메모리 폴백 모드 — DDL 실행할 수 없으므로 조용히 no-op
+        ltm = LongTermMemory(pg_pool=None)
+        # 예외 없이 통과하면 성공 (no-op 검증)
+        await ltm.ensure_schema()
+
+    @pytest.mark.asyncio
+    async def test_ensure_schema_executes_ddl_with_pool(self):
+        """pg_pool이 있으면 vector 확장 + tb_memories 테이블 + 인덱스 5종 DDL을
+        모두 실행한다. asyncpg 호출을 mock해서 실행 SQL을 검증한다."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        # asyncpg 풀/커넥션 mock — async with self._pg.acquire() as conn 패턴 모사
+        executed: list[str] = []
+
+        conn = MagicMock()
+
+        async def fake_execute(sql: str) -> None:
+            # 실행된 SQL 본문을 기록해서 어떤 DDL이 흘러갔는지 검증한다.
+            executed.append(sql)
+
+        conn.execute = fake_execute
+
+        acquire_cm = MagicMock()
+        acquire_cm.__aenter__ = AsyncMock(return_value=conn)
+        acquire_cm.__aexit__ = AsyncMock(return_value=False)
+
+        pool = MagicMock()
+        pool.acquire = MagicMock(return_value=acquire_cm)
+
+        ltm = LongTermMemory(pg_pool=pool)
+        await ltm.ensure_schema()
+
+        # 최소한 다음 DDL이 실행되어야 한다 (순서·갯수까지 검증):
+        #   1) CREATE EXTENSION vector
+        #   2) CREATE TABLE tb_memories
+        #   3) 인덱스 5종 (type/tags/created_at/importance/embedding hnsw)
+        assert len(executed) == 7, f"실행된 SQL 수 불일치: {len(executed)} (기대 7)"
+        assert "CREATE EXTENSION" in executed[0]
+        assert "tb_memories" in executed[1]
+        assert "varchar(12) PRIMARY KEY" in executed[1]
+        assert "vector(1024)" in executed[1]
+        assert "tb_memories_importance_check" in executed[1]
+        # 인덱스 — 순서는 보장하나 핵심 키워드 매칭으로 검증
+        idx_sqls = "\n".join(executed[2:])
+        assert "idx_memories_type" in idx_sqls
+        assert "idx_memories_tags" in idx_sqls and "USING gin" in idx_sqls
+        assert "idx_memories_created_at" in idx_sqls and "DESC" in idx_sqls
+        assert "idx_memories_importance" in idx_sqls
+        # hnsw 선택 검증 — 운영 DB와 동일한 인덱스 종류
+        assert "idx_memories_embedding" in idx_sqls
+        assert "USING hnsw" in idx_sqls
+        assert "vector_cosine_ops" in idx_sqls
+
+
+# ─────────────────────────────────────────────
 # ImportanceAssessor 테스트
 # ─────────────────────────────────────────────
 class TestImportanceAssessor:
