@@ -45,6 +45,10 @@ class McpConnectionManager:
         self._config = mcp_config
         # 등록에 성공한 서버의 McpClient들 — 종료 시 정리 대상
         self._clients: list[McpClient] = []
+        # Worker 풀 노출에서 정책적으로 제외된 서버 → 사유 매핑(가시성).
+        # 예) {"kowiki": "expose_to_worker=false"}. 연결 실패와 구분하기 위해
+        # 별도로 보관해, bootstrap이 state.mcp_servers 요약에 사유를 드러낼 수 있게 한다.
+        self.excluded_from_worker: dict[str, str] = {}
 
     async def connect_and_register(self, registry: ToolRegistry) -> dict[str, list[str]]:
         """
@@ -59,10 +63,44 @@ class McpConnectionManager:
         격리해, 일부만 살아 있어도 그만큼은 도구 풀에 흡수되게 한다.
         """
         registered: dict[str, list[str]] = {}
+        # 재호출 대비 — 정책 제외 기록을 초기화한 뒤 다시 채운다(멱등).
+        self.excluded_from_worker = {}
 
         for server in self._config.servers:
             # 개별 enabled가 꺼진 서버는 건너뛴다 (config 검증에서 비-LAN도 이미 강등됨)
             if not server.enabled:
+                continue
+
+            # ───────────────────────────────────────────────────────────
+            # Worker 도구 풀 노출 제어(expose_to_worker):
+            #   enabled=True여도 expose_to_worker=False면, 이 서버의 도구는
+            #   Nexus Worker(에이전트) 도구 풀에 등록하지 않는다.
+            #
+            #   왜 제외하는가: 이 서버는 Nexus 내부 경로와 기능이 중복된다.
+            #   예) kowiki 검색 MCP는 KNOWLEDGE 모드의 "자동 RAG 주입"이 이미
+            #   담당한다. 둘을 동시에 컨텍스트에 넣으면(자동 RAG 결과 + 동일
+            #   검색 도구 스키마) RTX 5090의 8K 컨텍스트를 초과한다. 그래서
+            #   자동 RAG가 책임지는 서버는 Worker 도구로 중복 노출하지 않는다.
+            #
+            #   왜 "연결 자체"를 스킵하는가: 어차피 도구를 등록하지 않으므로
+            #   tools/list를 위한 LAN 연결도 불필요하다. 연결을 건너뛰면 불필요한
+            #   LAN 왕복과 클라이언트 보유(정리 부담)를 함께 줄일 수 있어 깔끔하다.
+            #   (서버 설정 자체는 외부 사내 앱 재사용 등을 위해 그대로 유지된다.)
+            #
+            #   가시성: 반환 dict에는 빈 리스트로 기록하되, state.mcp_servers 요약에
+            #   드러나도록 별도 표기를 함께 남긴다(아래 registered 기록 참조).
+            #   에러가 아니라 정상적인 정책 스킵이므로 INFO 로그만 남긴다.
+            # ───────────────────────────────────────────────────────────
+            if not server.expose_to_worker:
+                logger.info(
+                    "MCP 서버 '%s' Worker 풀 노출 제외(expose_to_worker=false) — "
+                    "내부 경로(자동 RAG 등)와 중복",
+                    server.name,
+                )
+                # 빈 도구 리스트 + 제외 사유를 함께 기록(가시성).
+                # bootstrap의 state.mcp_servers 요약이 이 표기를 그대로 노출한다.
+                registered[server.name] = []
+                self.excluded_from_worker[server.name] = "expose_to_worker=false"
                 continue
 
             # ───────────────────────────────────────────────────────────

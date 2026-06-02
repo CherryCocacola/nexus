@@ -260,6 +260,10 @@ mcp:
       base_url: "http://192.168.22.28:8813"   # kowiki RAG MCP (LAN, 포트 placeholder)
       enabled: false
       trust: { read_only: true }
+      # kowiki 검색은 KNOWLEDGE 모드 자동 RAG 주입이 담당하므로 Worker 도구로는
+      # 중복 노출하지 않음(5090 8K overflow 방지). MCP 서버 자체는 외부 사내 앱
+      # 재사용용으로 유지한다(설정에는 남기되 Worker 도구 풀에서만 제외).
+      expose_to_worker: false
 
 # 운영 설정
 log_level: "INFO"

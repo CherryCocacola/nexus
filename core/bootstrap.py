@@ -391,16 +391,23 @@ async def init_phase2(state: GlobalState) -> dict:
             # 자체 도구 풀을 만든다. 그 경로도 MCP 도구를 흡수할 수 있도록 등록된
             # MCP 어댑터(이름 prefix "mcp__")만 따로 추려 components로 노출한다.
             # (cli_registry 전체가 아니라 MCP 어댑터만 넘겨 웹 도구 구성의 독립성 유지)
-            components["mcp_tools"] = [
-                t for t in cli_tools if t.name.startswith("mcp__")
-            ]
+            components["mcp_tools"] = [t for t in cli_tools if t.name.startswith("mcp__")]
             # GlobalState 에 MCP 가시성 정보를 채운다(메트릭/진단 노출용).
             #   mcp_servers: 서버명 → {등록 도구 목록, 개수} 상세.
             #   mcp_connected: 도구가 1개 이상 등록되어 "살아 있는" 서버명 집합.
             # connect_and_register 가 실패 서버를 빈 리스트로 돌려주므로,
             # 빈 리스트는 connected 에서 자연히 제외된다(fail-closed 요약).
+            # 정책적으로 Worker 풀에서 제외된 서버(expose_to_worker=false)는
+            # 도구 0개이지만 "연결 실패"가 아니라 "의도된 제외"임을 가시화한다.
+            # excluded_from_worker = {서버명: 사유}. 빈 도구라도 사유를 덧붙여 노출.
+            excluded = getattr(mcp_manager, "excluded_from_worker", {})
             state.mcp_servers = {
-                name: {"tools": list(tools), "tool_count": len(tools)}
+                name: {
+                    "tools": list(tools),
+                    "tool_count": len(tools),
+                    # 제외된 서버에만 사유 표기를 덧붙인다(과설계 없이 간단히).
+                    **({"excluded": excluded[name]} if name in excluded else {}),
+                }
                 for name, tools in registered.items()
             }
             state.mcp_connected = {name for name, tools in registered.items() if len(tools) >= 1}

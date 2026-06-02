@@ -169,6 +169,17 @@ class McpServerConfig(BaseModel):
     # 운영자가 이 값을 True로 명시했을 때에만 예외적으로 등록한다(fail-closed 기본 False).
     # 등록된 쓰기 도구의 최종 권한 판단은 표준 5계층 파이프라인에 일임한다.
     allow_write: bool = False
+    # 이 MCP 서버의 도구를 Nexus Worker(에이전트) 도구 풀에 노출할지 여부.
+    # 기본 True(노출). False로 두면 서버 자체는 (외부 사내 앱 재사용 등을 위해)
+    # 설정에는 남지만, 그 도구들은 Worker(ModelDispatcher/QueryEngine) 도구 풀에는
+    # 등록하지 않는다.
+    #
+    # 왜 필요한가: 일부 MCP 서버는 Nexus 내부 경로와 기능이 중복된다.
+    # 예) kowiki 검색 MCP는 KNOWLEDGE 모드의 "자동 RAG 주입"이 이미 담당한다.
+    # 이 둘이 동시에 컨텍스트에 들어가면(자동 RAG 결과 + 동일 검색 도구 스키마)
+    # RTX 5090의 8K 컨텍스트를 초과(overflow)한다. 그래서 자동 RAG가 책임지는
+    # 서버는 Worker 도구로 중복 노출하지 않도록 expose_to_worker=False로 제외한다.
+    expose_to_worker: bool = True
 
 
 class McpConfig(BaseModel):
