@@ -340,6 +340,277 @@ class TestMcpConnectionManagerRegister:
 
 
 # ─────────────────────────────────────────────
+# McpConnectionManager — expose_to_worker (Worker 풀 노출 제어, v7.3)
+# ─────────────────────────────────────────────
+class TestMcpConnectionManagerExposeToWorker:
+    """connect_and_register의 expose_to_worker 정책 스킵을 검증한다.
+
+    회귀 배경: kowiki MCP 도구가 KNOWLEDGE 모드 자동 RAG와 중복되어 RTX 5090의
+    8K 컨텍스트를 초과(overflow)했다. 그래서 expose_to_worker=False 서버는
+    Worker 도구 풀에서 제외하되, 연결(McpClient/list_tools) 자체를 스킵한다.
+
+    핵심 계약(read_only 필터와의 차이):
+      - read_only 필터: McpClient는 만들지 않지만, expose 체크가 먼저 통과해야 도달.
+      - expose_to_worker=False: 'enabled 통과 직후' 가장 먼저 스킵 → McpClient 미호출.
+      - 가시성: registered[name]==[], excluded_from_worker[name]=="expose_to_worker=false".
+      - enabled=False가 우선(expose 값과 무관하게 완전 스킵, excluded 기록도 없음).
+    """
+
+    @pytest.mark.asyncio
+    async def test_expose_to_worker_false_skips_registration_and_connection(self):
+        """expose_to_worker=False 서버 → 미등록 + McpClient 미호출 + 제외 사유 기록.
+
+        registered[name]==[]이고 registry.tool_count==0이며, McpClient 생성(=연결)
+        자체가 일어나지 않아야 한다(assert_not_called). manager.excluded_from_worker에
+        "expose_to_worker=false" 사유가 남아야 한다(가시성).
+        """
+        config = McpConfig(
+            enabled=True,
+            servers=[
+                McpServerConfig(
+                    name="kowiki",
+                    base_url="http://192.168.10.39:9001",
+                    enabled=True,
+                    # read-only 신뢰 도구이지만 expose_to_worker=False가 우선해 스킵돼야 한다.
+                    trust={"read_only": True},
+                    expose_to_worker=False,
+                ),
+            ],
+        )
+        # list_tools가 호출되면 등록될 도구 — 하지만 호출 자체가 없어야 한다.
+        fake_tools = [{"name": "search", "description": "검색", "inputSchema": {"type": "object"}}]
+        factory = _make_fake_client_factory({"http://192.168.10.39:9001": fake_tools})
+
+        registry = ToolRegistry()
+        manager = McpConnectionManager(config)
+        with patch("core.tools.mcp.connection_manager.McpClient", side_effect=factory) as mock_cls:
+            registered = await manager.connect_and_register(registry)
+
+        # 빈 리스트로 기록(가시성) + registry 미등록.
+        assert registered["kowiki"] == []
+        assert registry.tool_count == 0
+        # 연결(McpClient 생성) 자체가 일어나지 않아야 한다 → list_tools도 당연히 미호출.
+        mock_cls.assert_not_called()
+        # 제외 사유가 인스턴스 속성에 기록되어야 한다(bootstrap이 state.mcp_servers에 노출).
+        assert manager.excluded_from_worker["kowiki"] == "expose_to_worker=false"
+
+    @pytest.mark.asyncio
+    async def test_expose_to_worker_true_registers_normally(self):
+        """expose_to_worker=True(명시) 서버는 기존대로 정상 등록되어야 한다."""
+        config = McpConfig(
+            enabled=True,
+            servers=[
+                McpServerConfig(
+                    name="db",
+                    base_url="http://192.168.10.39:9000",
+                    enabled=True,
+                    trust={"read_only": True},
+                    expose_to_worker=True,
+                ),
+            ],
+        )
+        fake_tools = [{"name": "query", "description": "조회", "inputSchema": {"type": "object"}}]
+        factory = _make_fake_client_factory({"http://192.168.10.39:9000": fake_tools})
+
+        registry = ToolRegistry()
+        manager = McpConnectionManager(config)
+        with patch("core.tools.mcp.connection_manager.McpClient", side_effect=factory):
+            registered = await manager.connect_and_register(registry)
+
+        assert registered["db"] == ["mcp__db__query"]
+        assert registry.find_tool("mcp__db__query") is not None
+        # 노출 서버는 제외 기록에 없어야 한다.
+        assert "db" not in manager.excluded_from_worker
+
+    @pytest.mark.asyncio
+    async def test_expose_to_worker_unspecified_defaults_to_registered(self):
+        """expose_to_worker 미지정(기본 True) 서버도 정상 등록되어야 한다.
+
+        McpServerConfig.expose_to_worker 기본값이 True이므로, 명시하지 않은 서버는
+        노출(등록) 동작이 기본이다.
+        """
+        config = McpConfig(
+            enabled=True,
+            servers=[
+                McpServerConfig(
+                    name="db",
+                    base_url="http://192.168.10.39:9000",
+                    enabled=True,
+                    trust={"read_only": True},
+                    # expose_to_worker 미지정 → 기본 True.
+                ),
+            ],
+        )
+        fake_tools = [{"name": "query", "description": "조회", "inputSchema": {"type": "object"}}]
+        factory = _make_fake_client_factory({"http://192.168.10.39:9000": fake_tools})
+
+        registry = ToolRegistry()
+        manager = McpConnectionManager(config)
+        with patch("core.tools.mcp.connection_manager.McpClient", side_effect=factory):
+            registered = await manager.connect_and_register(registry)
+
+        assert registered["db"] == ["mcp__db__query"]
+        assert "db" not in manager.excluded_from_worker
+
+    @pytest.mark.asyncio
+    async def test_expose_to_worker_isolation_kowiki_excluded_others_registered(self):
+        """kowiki만 expose_to_worker=False + db/diag는 True → kowiki만 제외, 나머지 등록.
+
+        서버별 격리: 한 서버의 정책 제외가 다른 서버 등록에 영향을 주면 안 된다.
+        kowiki는 연결조차 안 하고(excluded 기록), db/diag는 정상 등록되어야 한다.
+        """
+        config = McpConfig(
+            enabled=True,
+            servers=[
+                McpServerConfig(
+                    name="kowiki",
+                    base_url="http://192.168.10.39:9001",
+                    enabled=True,
+                    trust={"read_only": True},
+                    expose_to_worker=False,  # 제외 대상
+                ),
+                McpServerConfig(
+                    name="db",
+                    base_url="http://192.168.10.39:9000",
+                    enabled=True,
+                    trust={"read_only": True},
+                    expose_to_worker=True,
+                ),
+                McpServerConfig(
+                    name="diag",
+                    base_url="http://192.168.10.39:9002",
+                    enabled=True,
+                    trust={"read_only": True},
+                    # 미지정 → 기본 True.
+                ),
+            ],
+        )
+        # kowiki의 URL은 호출되면 안 되므로 매핑에 두지 않는다(호출 시 KeyError로 결함 노출).
+        factory = _make_fake_client_factory(
+            {
+                "http://192.168.10.39:9000": [
+                    {"name": "query", "description": "조회", "inputSchema": {"type": "object"}}
+                ],
+                "http://192.168.10.39:9002": [
+                    {"name": "latency", "description": "진단", "inputSchema": {"type": "object"}}
+                ],
+            }
+        )
+
+        registry = ToolRegistry()
+        manager = McpConnectionManager(config)
+        with patch("core.tools.mcp.connection_manager.McpClient", side_effect=factory):
+            registered = await manager.connect_and_register(registry)
+
+        # kowiki는 제외(빈 리스트 + 사유), db/diag는 정상 등록.
+        assert registered["kowiki"] == []
+        assert registered["db"] == ["mcp__db__query"]
+        assert registered["diag"] == ["mcp__diag__latency"]
+        assert manager.excluded_from_worker == {"kowiki": "expose_to_worker=false"}
+        # registry에는 db/diag 도구만, kowiki 도구는 없어야 한다.
+        all_names = [t.name for t in registry.get_all_tools()]
+        assert all_names == ["mcp__db__query", "mcp__diag__latency"]
+
+    @pytest.mark.asyncio
+    async def test_disabled_takes_priority_over_expose_to_worker(self):
+        """enabled=False가 expose_to_worker보다 우선 — 완전 스킵, excluded 기록도 없음.
+
+        enabled 체크가 expose_to_worker 체크보다 먼저 오므로, enabled=False 서버는
+        expose 값과 무관하게 registered dict에 키조차 남지 않고(continue),
+        '정책 제외(excluded_from_worker)'로도 기록되지 않아야 한다(둘은 다른 사유).
+        """
+        config = McpConfig(
+            enabled=True,
+            servers=[
+                # enabled=False지만 expose_to_worker=True인 서버.
+                McpServerConfig(
+                    name="off_exposed",
+                    base_url="http://192.168.10.39:9003",
+                    enabled=False,
+                    trust={"read_only": True},
+                    expose_to_worker=True,
+                ),
+                # enabled=False면서 expose_to_worker=False인 서버.
+                McpServerConfig(
+                    name="off_excluded",
+                    base_url="http://192.168.10.39:9004",
+                    enabled=False,
+                    trust={"read_only": True},
+                    expose_to_worker=False,
+                ),
+            ],
+        )
+        registry = ToolRegistry()
+        manager = McpConnectionManager(config)
+        # 비활성 서버는 어느 분기로도 McpClient를 만들면 안 된다(방어적 patch).
+        with patch(
+            "core.tools.mcp.connection_manager.McpClient", side_effect=AssertionError
+        ) as mock_cls:
+            registered = await manager.connect_and_register(registry)
+
+        # 두 서버 모두 enabled=False → registered dict에 키 없음(완전 스킵).
+        assert "off_exposed" not in registered
+        assert "off_excluded" not in registered
+        # enabled=False는 '정책 제외'가 아니므로 excluded_from_worker에도 없어야 한다.
+        assert manager.excluded_from_worker == {}
+        assert registry.tool_count == 0
+        mock_cls.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_excluded_from_worker_reset_between_calls(self):
+        """connect_and_register 재호출 시 excluded_from_worker가 초기화되어야 한다(멱등).
+
+        두 번째 호출에서 제외 서버가 사라지면(설정 변경 가정) 이전 사유가 잔존하면
+        안 된다. 매 호출 시작에서 self.excluded_from_worker={}로 리셋되는지 확인.
+        """
+        registry = ToolRegistry()
+
+        # 1차: kowiki를 제외 대상으로 등록.
+        config1 = McpConfig(
+            enabled=True,
+            servers=[
+                McpServerConfig(
+                    name="kowiki",
+                    base_url="http://192.168.10.39:9001",
+                    enabled=True,
+                    trust={"read_only": True},
+                    expose_to_worker=False,
+                ),
+            ],
+        )
+        manager = McpConnectionManager(config1)
+        with patch("core.tools.mcp.connection_manager.McpClient", side_effect=AssertionError):
+            await manager.connect_and_register(registry)
+        assert manager.excluded_from_worker == {"kowiki": "expose_to_worker=false"}
+
+        # 2차: 동일 manager로 제외 서버가 없는 설정을 재적용(설정 핫스왑 가정).
+        manager._config = McpConfig(
+            enabled=True,
+            servers=[
+                McpServerConfig(
+                    name="db",
+                    base_url="http://192.168.10.39:9000",
+                    enabled=True,
+                    trust={"read_only": True},
+                    expose_to_worker=True,
+                ),
+            ],
+        )
+        factory = _make_fake_client_factory(
+            {
+                "http://192.168.10.39:9000": [
+                    {"name": "query", "description": "조회", "inputSchema": {"type": "object"}}
+                ]
+            }
+        )
+        with patch("core.tools.mcp.connection_manager.McpClient", side_effect=factory):
+            await manager.connect_and_register(ToolRegistry())
+
+        # 이전 kowiki 제외 사유가 잔존하면 안 된다(초기화 확인).
+        assert manager.excluded_from_worker == {}
+
+
+# ─────────────────────────────────────────────
 # 5계층 PermissionPipeline 통합 — ToolCategory.MCP
 # ─────────────────────────────────────────────
 # 실제 호출하는 pipeline API:

@@ -155,6 +155,30 @@ class TestMcpConfigDefaults:
         server = McpServerConfig(name="db", base_url="http://192.168.1.10:9000", allow_write=True)
         assert server.allow_write is True
 
+    def test_mcp_server_config_default_expose_to_worker_is_true(self):
+        """expose_to_worker는 기본 True여야 한다 (기본 노출 — 명시적 제외만 차단).
+
+        v7.3 회귀: expose_to_worker는 fail-closed가 아니라 "기본 노출(True)"이다.
+        대부분의 MCP 서버는 Worker 도구 풀에 노출되어야 정상이고, kowiki처럼
+        자동 RAG와 기능이 중복되는 특수 서버만 명시적으로 False로 제외한다.
+        따라서 미지정 시에는 노출(True)이 안전한 기본값이다.
+        """
+        server = McpServerConfig(name="db", base_url="http://192.168.1.10:9000")
+        assert server.expose_to_worker is True
+
+    def test_mcp_server_config_expose_to_worker_can_be_disabled(self):
+        """운영자가 expose_to_worker=False로 명시하면 그대로 반영되어야 한다.
+
+        예) kowiki MCP는 KNOWLEDGE 모드 자동 RAG와 중복되어 8K overflow를
+        유발하므로 Worker 풀에서 제외(False)한다.
+        """
+        server = McpServerConfig(
+            name="kowiki",
+            base_url="http://192.168.10.39:9001",
+            expose_to_worker=False,
+        )
+        assert server.expose_to_worker is False
+
 
 # ─────────────────────────────────────────────
 # validate_lan_urls — 외부 도메인 강등 (model_validator)

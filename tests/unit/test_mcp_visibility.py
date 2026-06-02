@@ -30,17 +30,37 @@ from core.state import GlobalState
 # ─────────────────────────────────────────────
 # 부트스트랩 MCP 반영 로직
 # ─────────────────────────────────────────────
-def _apply_mcp_visibility(state: GlobalState, registered: dict[str, list[str]]) -> None:
+def _apply_mcp_visibility(
+    state: GlobalState,
+    registered: dict[str, list[str]],
+    excluded: dict[str, str] | None = None,
+) -> None:
     """
     bootstrap.init_phase2 의 MCP 가시성 반영 블록과 동일한 변환을 수행한다.
 
-    bootstrap.py(:391~395)와 1:1 대응:
-      state.mcp_servers = {name: {"tools": [...], "tool_count": len(...)} ...}
+    bootstrap.py(:403~413)와 1:1 대응:
+      excluded = mcp_manager.excluded_from_worker  # {서버명: 사유}
+      state.mcp_servers = {
+          name: {"tools": [...], "tool_count": len(...),
+                 **({"excluded": excluded[name]} if name in excluded else {})}
+          ...
+      }
       state.mcp_connected = {도구 1개 이상 등록된 서버명}
+
     이 헬퍼는 그 로직을 그대로 옮겨 단위 검증한다(무거운 init_phase2 우회).
+
+    excluded: expose_to_worker=False 등으로 Worker 풀에서 정책 제외된 서버 → 사유.
+      제외 서버에만 상세에 "excluded" 키를 덧붙인다(노출 서버엔 키 부재).
     """
+    excluded = excluded or {}
     state.mcp_servers = {
-        name: {"tools": list(tools), "tool_count": len(tools)} for name, tools in registered.items()
+        name: {
+            "tools": list(tools),
+            "tool_count": len(tools),
+            # 제외된 서버에만 사유 표기를 덧붙인다(bootstrap과 동일).
+            **({"excluded": excluded[name]} if name in excluded else {}),
+        }
+        for name, tools in registered.items()
     }
     state.mcp_connected = {name for name, tools in registered.items() if len(tools) >= 1}
 
@@ -95,6 +115,85 @@ class TestBootstrapMcpVisibility:
         _apply_mcp_visibility(state, {})
         assert state.mcp_servers == {}
         assert state.mcp_connected == set()
+
+
+class TestBootstrapMcpExcludedVisibility:
+    """expose_to_worker=False 정책 제외 서버의 가시성(state.mcp_servers.excluded)을 검증한다.
+
+    v7.3 회귀: kowiki MCP는 자동 RAG와 중복되어 Worker 풀에서 제외된다. 제외 서버는
+    도구 0개이지만 '연결 실패'가 아니라 '의도된 제외'이므로, bootstrap이
+    state.mcp_servers[name]["excluded"]에 사유를 남겨 진단/메트릭에서 구분 가능하게 한다.
+
+    핵심 계약:
+      - 제외 서버(빈 리스트 + excluded 사유): mcp_servers에 excluded 키 존재, mcp_connected 미포함.
+      - 노출 서버(정상 등록): excluded 키 부재.
+      - 연결 실패 서버(빈 리스트 + 사유 없음): excluded 키 부재(제외와 실패는 다른 사유).
+    """
+
+    async def test_excluded_server_has_excluded_key(self):
+        """expose_to_worker=False 제외 서버는 mcp_servers에 excluded 키를 가져야 한다."""
+        # connect_and_register 결과: kowiki는 빈 리스트(제외), db는 정상 등록.
+        registered = {"kowiki": [], "db": ["mcp__db__query"]}
+        # excluded_from_worker: kowiki만 정책 제외 사유.
+        excluded = {"kowiki": "expose_to_worker=false"}
+
+        state = GlobalState()
+        _apply_mcp_visibility(state, registered, excluded)
+
+        # 제외 서버 kowiki: excluded 키 존재 + 도구 0개.
+        assert state.mcp_servers["kowiki"]["excluded"] == "expose_to_worker=false"
+        assert state.mcp_servers["kowiki"]["tool_count"] == 0
+        # 제외 서버는 mcp_connected 에 포함되지 않아야 한다.
+        assert "kowiki" not in state.mcp_connected
+
+    async def test_exposed_server_has_no_excluded_key(self):
+        """노출(정상 등록) 서버에는 excluded 키가 없어야 한다."""
+        registered = {"kowiki": [], "db": ["mcp__db__query"]}
+        excluded = {"kowiki": "expose_to_worker=false"}
+
+        state = GlobalState()
+        _apply_mcp_visibility(state, registered, excluded)
+
+        # db는 정상 등록 → excluded 키 부재, mcp_connected 포함.
+        assert "excluded" not in state.mcp_servers["db"]
+        assert state.mcp_servers["db"]["tool_count"] == 1
+        assert "db" in state.mcp_connected
+
+    async def test_failed_server_has_no_excluded_key(self):
+        """연결 실패 서버(빈 리스트지만 제외 사유 없음)에는 excluded 키가 없어야 한다.
+
+        '정책 제외(expose_to_worker=false)'와 '연결 실패'는 구분된다. 둘 다 빈
+        리스트지만, 제외만 excluded 사유를 가진다. 실패 서버는 excluded 키가 없다.
+        """
+        # kowiki=정책 제외, failed=연결 실패(둘 다 빈 리스트).
+        registered = {"kowiki": [], "failed": []}
+        excluded = {"kowiki": "expose_to_worker=false"}
+
+        state = GlobalState()
+        _apply_mcp_visibility(state, registered, excluded)
+
+        # 제외 서버는 excluded 키 보유.
+        assert state.mcp_servers["kowiki"]["excluded"] == "expose_to_worker=false"
+        # 연결 실패 서버는 excluded 키 부재(제외가 아니라 실패).
+        assert "excluded" not in state.mcp_servers["failed"]
+        # 둘 다 도구 0개라 mcp_connected 에는 없어야 한다.
+        assert state.mcp_connected == set()
+
+    async def test_excluded_server_not_in_mcp_connected(self):
+        """제외 서버는 mcp_connected 에 포함되지 않고, 노출 서버만 연결로 집계된다."""
+        registered = {
+            "kowiki": [],  # 정책 제외
+            "db": ["mcp__db__query"],
+            "diag": ["mcp__diag__latency"],
+        }
+        excluded = {"kowiki": "expose_to_worker=false"}
+
+        state = GlobalState()
+        _apply_mcp_visibility(state, registered, excluded)
+
+        # kowiki는 제외이므로 연결 집계에서 빠지고, db/diag만 연결로 본다.
+        assert state.mcp_connected == {"db", "diag"}
+        assert "kowiki" not in state.mcp_connected
 
 
 # ─────────────────────────────────────────────
