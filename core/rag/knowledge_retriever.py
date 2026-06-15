@@ -64,6 +64,19 @@ class KnowledgeRetriever:
         # 1) 벡터 검색 — 임베딩 서버가 살아있을 때만
         # allowed_sources는 DB-level 필터로 넘겨 cross-tenant 누설을 구조적으로 막는다
         results: list[dict] = []
+        # 벡터 검색을 "실제로 끝까지 수행했는지" 추적하는 플래그.
+        # 왜 필요한가:
+        #   - 아래 폴백(search_by_text)은 content/title을 ILIKE로 1M행 전체
+        #     풀스캔(Parallel Seq Scan)하므로 콜드 시 100초 이상 걸리는 시한폭탄이다.
+        #   - 폴백의 본래 의도는 "임베딩 서버가 불능이라 벡터 검색을 못 했을 때"의
+        #     최후 수단이다(아래 search_by_text 주석 참조).
+        #   - 그런데 단순히 `if not results`로 분기하면, 임베딩이 멀쩡하고 벡터
+        #     검색도 정상 수행됐지만 "관련 지식이 없어서 0건"인 경우까지 폴백에
+        #     빠진다. 이 경우는 지식이 없는 것이므로 폴백할 이유가 없다.
+        #   - 따라서 벡터 검색을 정상 수행했다면(True) 결과가 0건이어도 폴백을
+        #     건너뛰고 빈 문자열을 반환한다. 임베딩 서버가 실제로 불능일 때만
+        #     (False) ILIKE 폴백을 최후 수단으로 허용한다.
+        vector_search_done = False
         if self._embedding is not None:
             try:
                 vecs = await self._embedding.embed([query])
@@ -74,15 +87,21 @@ class KnowledgeRetriever:
                         min_similarity=self._min_similarity,
                         allowed_sources=allowed_sources,
                     )
+                    # 임베딩 생성 + 벡터 검색을 끝까지 마쳤다 → 0건이어도 폴백 불필요
+                    vector_search_done = True
             except Exception as e:
                 logger.warning("KnowledgeRetriever 벡터 검색 실패: %s", e)
 
-        # 2) 텍스트 검색 폴백 (DB search_by_text는 단일 source만 받으므로 클라이언트
-        #    측 필터로 보정 — 텍스트 검색은 주 경로 아님)
-        if not results:
+        # 2) 텍스트 검색 폴백 — 벡터 검색을 아예 수행하지 못했을 때만 진입한다.
+        #    (임베딩 서버 다운 / 빈 임베딩 / 임베딩 예외 등)
+        #    벡터 검색이 정상 수행됐는데 0건이면 "관련 지식 없음"이므로 여기로 오지
+        #    않고 아래에서 빈 문자열을 반환한다 — ILIKE 풀스캔 병목을 회피한다.
+        #    (DB search_by_text는 단일 source만 받으므로 클라이언트 측 필터로 보정)
+        if not results and not vector_search_done:
             try:
                 results = await self._store.search_by_text(
-                    query=query, top_k=self._top_k,
+                    query=query,
+                    top_k=self._top_k,
                 )
                 if allowed_sources is not None:
                     allowed_set = set(allowed_sources)
@@ -123,6 +142,8 @@ class KnowledgeRetriever:
 
         logger.debug(
             "KnowledgeRetriever: '%s...' → %d개 청크 주입 (~%d자)",
-            query[:30], len(lines), used,
+            query[:30],
+            len(lines),
+            used,
         )
         return "\n\n".join(lines)
