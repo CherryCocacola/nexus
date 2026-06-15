@@ -22,6 +22,7 @@ from typing import Any
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import InMemoryHistory
+from rich.box import ROUNDED
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -35,15 +36,21 @@ logger = logging.getLogger("nexus.cli.repl")
 # ─── 버전 정보 ───
 __version__ = "0.1.0"
 
-# ─── 배너 텍스트 ───
-_BANNER = r"""
- _   _
-| \ | | _____  ___   _ ___
-|  \| |/ _ \ \/ / | | / __|
-| |\  |  __/>  <| |_| \__ \
-|_| \_|\___/_/\_\\__,_|___/
-
-Project Nexus v{version} — 에어갭 로컬 LLM 오케스트레이션
+# ─── IDINO 회사 마크 (블록 ASCII 아트) ───
+# 배너 좌측에 배치되는 IDINO 로고. 사용자 제공 원본 디자인을 정확히 유지한다.
+# 블록(████)은 4칸씩, 블록 사이 공백도 4칸 — 가로 폭 20칸의 정사각 비율.
+# 이 비율을 어기면 'i'/'d' 글자 형태가 깨지므로 변형 금지.
+_IDINO_MARK = """\
+████    ████
+████    ████
+        ████
+        ████
+████████████████████
+████████████████████
+████    ████    ████
+████    ████    ████
+████████████    ████
+████████████    ████\
 """
 
 
@@ -60,6 +67,7 @@ class NexusREPL:
         permission_mode: str = "default",
         model: str = "primary",
         resume_session_id: str | None = None,
+        log_level: str = "WARNING",
     ):
         """
         REPL을 초기화한다.
@@ -68,12 +76,17 @@ class NexusREPL:
             permission_mode: 권한 모드 (default, auto, plan, trust, bypass)
             model: 사용할 모델 (primary, auxiliary)
             resume_session_id: 이어서 할 세션 ID (None이면 새 세션)
+            log_level: 채팅 화면에 표시할 nexus.* 로그 레벨 (v0.14.12).
+                기본 WARNING — 채팅 흐름에 운영 INFO가 끼어들지 않게 한다.
+                bootstrap이 _configure_logging으로 INFO로 reset하지만,
+                부트스트랩 직후 _apply_log_level()이 다시 적용한다.
         """
         self.console = Console()
         self._formatter = OutputFormatter(show_thinking=False)
         self._permission_mode = permission_mode
         self._model = model
         self._resume_session_id = resume_session_id
+        self._log_level = log_level
         self._running = False
 
         # prompt-toolkit 세션 (히스토리 + 멀티라인 지원)
@@ -175,29 +188,132 @@ class NexusREPL:
             # 부트스트랩 실패 시에도 기본 REPL은 동작하도록 한다
             logger.warning(f"부트스트랩 실패, 기본 모드로 시작: {e}")
             self._state = None
+        finally:
+            # v0.14.12 — bootstrap의 _configure_logging이 nexus.* 레벨을 INFO로
+            # 재설정하므로 사용자 지정 log_level을 부트스트랩 직후 다시 적용.
+            self._apply_log_level()
+
+    def _apply_log_level(self) -> None:
+        """nexus.* 로거 레벨을 self._log_level로 설정한다.
+
+        대화 화면에 운영 INFO 로그가 흐르지 않도록 채팅 시작 직전 호출.
+        """
+        try:
+            level = getattr(logging, self._log_level.upper(), logging.WARNING)
+            logging.getLogger("nexus").setLevel(level)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("로그 레벨 적용 실패: %s", e)
 
     # ─── 배너 표시 ───
 
     def _display_banner(self) -> None:
-        """시작 배너와 도움말 힌트를 표시한다."""
-        banner_text = _BANNER.format(version=__version__)
+        """시작 배너 + 도움말 힌트를 표시한다 (v0.14.10 IDINO 코퍼레이트).
+
+        IDINO 픽셀 마크(images.png 기반)를 좌측, 우측에 회사 카드·라우팅
+        모델·인프라·슬래시 커맨드를 묶어 Claude Code 스타일 패널로 출력한다.
+        라우팅이 활성이면 KNOWLEDGE/TOOL/CHAT 각 분기에 실제 사용 모델명
+        (예: qwen3.5-27b, nexus-phase3)을 노출하여 alias("primary") 모호성을
+        제거한다.
+        """
+        # ───── 좌측: IDINO 픽셀 마크 ─────
+        # IDINO 코퍼레이트 컬러 rgb(0,71,157) — 배지/홈페이지/이미지와 일치
+        mark = Text(_IDINO_MARK, style="bold rgb(0,71,157)")
+
+        # ───── 우측: 회사 카드 + 시스템 정보 ─────
+        info = Text()
+        info.append("Project Nexus", style="bold rgb(0,71,157)")
+        info.append(f"  v{__version__}\n", style="dim white")
+        info.append("에어갭 로컬 LLM 오케스트레이션 플랫폼\n", style="white")
+        info.append("Powered by ", style="dim white")
+        info.append("IDINO Corp.", style="bold rgb(0,71,157)")
+        info.append("  ·  Air-gapped AI for Enterprise\n", style="dim white")
+
+        # 구분선
+        info.append("─" * 44 + "\n", style="dim rgb(0,71,157)")
+
+        # 라우팅 활성 여부에 따른 모델 표시 — alias 대신 실제 served-model-name
+        routing = getattr(getattr(self._state, "config", None), "routing", None)
+        if routing is not None and getattr(routing, "enabled", False):
+            chat_model = getattr(
+                getattr(routing, "chat_mode", None), "model", "?"
+            )
+            know_model = getattr(
+                getattr(routing, "knowledge_mode", None), "model", "?"
+            )
+            tool_model = getattr(
+                getattr(routing, "tool_mode", None), "model", "?"
+            )
+            info.append("모델 라우팅 (질의별 자동 분기)\n", style="bold white")
+            info.append(f"  CHAT       {chat_model}\n", style="cyan")
+            info.append(f"  KNOWLEDGE  {know_model}\n", style="green")
+            info.append(f"  TOOL       {tool_model}\n", style="yellow")
+        else:
+            # 라우팅 비활성 — primary/auxiliary 모델 표시
+            model_cfg = getattr(
+                getattr(self._state, "config", None), "model", None
+            )
+            primary = getattr(model_cfg, "primary_model", self._model)
+            aux = getattr(model_cfg, "auxiliary_model", "-")
+            info.append("모델\n", style="bold white")
+            info.append(f"  Primary    {primary}\n", style="cyan")
+            info.append(f"  Auxiliary  {aux}\n", style="dim")
+
+        # 인프라 한 줄
+        gpu_url = getattr(
+            getattr(self._state, "config", None), "gpu_server_url", "(?)"
+        )
+        scout_cfg = getattr(
+            getattr(self._state, "config", None), "scout", None
+        )
+        scout_url = getattr(scout_cfg, "base_url", "-") if scout_cfg else "-"
+        info.append("인프라\n", style="bold white")
+        info.append(f"  Worker     {gpu_url}\n", style="dim")
+        info.append(f"  Scout      {scout_url}\n", style="dim")
+
+        # 세션 컨텍스트
+        info.append("세션\n", style="bold white")
+        info.append(f"  권한 모드   {self._permission_mode}\n", style="dim")
+        if self._resume_session_id:
+            info.append(f"  복원 세션   {self._resume_session_id}\n", style="dim")
+        else:
+            info.append("  복원 세션   (신규)\n", style="dim")
+
+        # ───── 좌·우 grid 합치기 ─────
+        layout = Table.grid(padding=(0, 4))
+        layout.add_column(justify="left", vertical="top")
+        layout.add_column(justify="left", vertical="top")
+        layout.add_row(mark, info)
+
+        # Claude Code 스타일 — 둥근 모서리 + 좌측 정렬 타이틀
         self.console.print(
             Panel(
-                Text(banner_text, style="bold blue"),
-                border_style="blue",
+                layout,
+                title="[bold]✻ Welcome to Nexus[/bold]",
+                title_align="left",
+                subtitle="[dim]IDINO Corp. · 2026[/dim]",
+                subtitle_align="right",
+                border_style="rgb(0,71,157)",
+                box=ROUNDED,
+                padding=(1, 2),
                 expand=False,
             )
         )
+        # 슬래시 커맨드 단축키 한 줄
         self.console.print(
-            "[dim]/help로 명령어를 확인하세요. "
-            "Ctrl+C로 요청을 취소하고, Ctrl+D로 종료합니다.[/dim]\n"
+            "[dim]✻ 슬래시 커맨드: [/dim]"
+            "[cyan]/help[/cyan][dim] · [/dim]"
+            "[cyan]/model[/cyan][dim] · [/dim]"
+            "[cyan]/config[/cyan][dim] · [/dim]"
+            "[cyan]/session[/cyan][dim] · [/dim]"
+            "[cyan]/clear[/cyan][dim] · [/dim]"
+            "[cyan]/exit[/cyan]"
         )
-
-        # 모델 정보 표시
-        model_info = f"모델: {self._model} | 권한: {self._permission_mode}"
-        if self._resume_session_id:
-            model_info += f" | 세션: {self._resume_session_id}"
-        self.console.print(f"[dim]{model_info}[/dim]\n")
+        self.console.print(
+            "[dim]   단축키:    [/dim]"
+            "[white]Enter[/white][dim] 전송 · [/dim]"
+            "[white]Ctrl+C[/white][dim] 요청 취소 · [/dim]"
+            "[white]Ctrl+D[/white][dim] 종료[/dim]\n"
+        )
 
     # ─── 메시지 처리 ───
 
@@ -240,13 +356,13 @@ class NexusREPL:
                         status_ctx.__exit__(None, None, None)
                         status_active = False
                 elif next_label == "_TOOL_DONE_":
-                    # 도구가 끝나고 다음 LLM 응답 대기 — spinner 재가동
-                    if not status_active:
-                        status_ctx = self.console.status(
-                            "[cyan]응답 생성 중...[/cyan]", spinner="dots"
-                        )
-                        status_ctx.__enter__()
-                        status_active = True
+                    # 도구 완료 — Tool Panel을 곧 출력해야 하므로 spinner 닫기.
+                    # spinner와 Panel이 동시에 활성이면 Panel이 깨져 보인다.
+                    # 후속 이벤트(next LLM 응답·다음 도구 호출)에서 spinner는
+                    # 아래 `elif next_label is not None` 분기가 자동 재개.
+                    if status_active:
+                        status_ctx.__exit__(None, None, None)
+                        status_active = False
                 elif next_label is not None:
                     # 단계 텍스트 갱신 (TURN_START/TOOL_USE_START 등)
                     if status_active:

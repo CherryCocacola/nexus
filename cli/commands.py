@@ -45,14 +45,34 @@ def cli():
     default=None,
     help="이어서 할 세션 ID",
 )
-def chat(model: str, permission_mode: str, resume: str | None) -> None:
+@click.option(
+    "--log-level",
+    default="WARNING",
+    type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"]),
+    help=(
+        "로그 표시 레벨 — 채팅 화면에 보이는 nexus.* 로그 임계. "
+        "기본 WARNING(채팅에 안 보임). 디버깅 시 INFO/DEBUG로 올려서 본다."
+    ),
+)
+def chat(
+    model: str,
+    permission_mode: str,
+    resume: str | None,
+    log_level: str,
+) -> None:
     """대화형 채팅 세션을 시작한다."""
+    # v0.14.12 — 채팅 중 nexus.* INFO 로그(라우팅/RAG 주입 등)가 출력에 섞여
+    # 거슬리는 문제 해결. 기본 WARNING으로 낮춰 채팅 화면을 깨끗이 유지하고,
+    # 디버깅이 필요할 때만 --log-level INFO/DEBUG로 끌어올린다.
+    # 실제 적용은 NexusREPL._apply_log_level()이 부트스트랩 직후 한 번 더 강제
+    # (bootstrap._configure_logging이 INFO로 reset하기 때문).
     from cli.repl import NexusREPL
 
     repl = NexusREPL(
         permission_mode=permission_mode,
         model=model,
         resume_session_id=resume,
+        log_level=log_level,
     )
     asyncio.run(repl.run())
 

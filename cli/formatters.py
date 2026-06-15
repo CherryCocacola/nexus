@@ -227,8 +227,11 @@ class OutputFormatter:
         if event_type == StreamEventType.TEXT_DELTA and event.text:
             return self.format_text_delta(event.text)
 
-        # 도구 사용 시작 — 도구 이름과 입력 표시
-        if event_type == StreamEventType.TOOL_USE_START and event.tool_use:
+        # 도구 사용 — TOOL_USE_STOP 시점에 완성된 input으로 표시 (v0.14.11).
+        # TOOL_USE_START는 도구 이름이 도착한 시점에 input={}로 yield되며
+        # 인자(arguments)는 TOOL_USE_DELTA로 점진적으로 누적된 뒤 STOP에서 합쳐진다.
+        # START에서 표시하면 항상 빈 {}가 보이는 문제 → STOP에서 한 번만 표시.
+        if event_type == StreamEventType.TOOL_USE_STOP and event.tool_use:
             return self.format_tool_use(
                 tool_name=event.tool_use.name,
                 input_data=event.tool_use.input,
