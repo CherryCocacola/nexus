@@ -818,3 +818,61 @@ class TestMemoryManager:
         h1 = MemoryManager._hash_input({"a": 1})
         h2 = MemoryManager._hash_input({"a": 2})
         assert h1 != h2
+
+
+# ─────────────────────────────────────────────
+# _serialize_message 직렬화 계약 회귀 테스트
+# ─────────────────────────────────────────────
+# 배경(버그):
+#   웹 비스트리밍 /v1/chat 멀티턴에서 1턴 assistant 응답이 Redis 대화 이력에서
+#   유실됐다. 근본 원인은 저장 직렬화가 model_dump(mode="json")을 그대로 써서
+#   user content는 평문 str, assistant content는 ContentBlock 리스트로 "비대칭"
+#   저장됐기 때문이다. 복원 측이 Message.assistant(리스트)에 리스트를 넘겨
+#   ValidationError가 났고, 그 예외가 복원 루프 전체를 중단시켜 이력이 유실됐다.
+#
+# 수정:
+#   _serialize_message가 content를 항상 평문(text_content)으로 통일해 저장한다.
+#   아래 테스트는 user/assistant 모두 content가 "평문 str"로 직렬화되는지를
+#   못박아(회귀 방지) 검증한다. 특히 assistant content가 리스트가 아님이 핵심.
+class TestSerializeMessageContract:
+    """MemoryManager._serialize_message의 저장 직렬화 계약을 검증한다."""
+
+    def test_serialize_message_user_content_is_plain_string(self):
+        """user 메시지 직렬화 시 content가 평문 str로 보존되는지 확인한다."""
+        # Message.user는 content를 평문 str로 보관한다.
+        msg = Message.user("안녕")
+        # staticmethod라 인스턴스 없이 호출한다.
+        data = MemoryManager._serialize_message(msg)
+
+        assert isinstance(data["content"], str)
+        assert data["content"] == "안녕"
+
+    def test_serialize_message_assistant_content_is_plain_string_not_list(self):
+        """assistant 메시지 직렬화 시 content가 (리스트가 아닌) 평문 str인지 확인한다.
+
+        이것이 버그 회귀 방지의 핵심이다.
+        Message.assistant("...")는 내부적으로 content를 list[ContentBlock]으로
+        정규화하지만, 저장 단계에서는 평문 str로 통일되어야 한다.
+        """
+        msg = Message.assistant("네, 반갑습니다")
+        # 사전 조건: 메모리 상의 content는 실제로 리스트(ContentBlock)다.
+        assert isinstance(msg.content, list)
+
+        data = MemoryManager._serialize_message(msg)
+
+        # 저장 직렬화 결과의 content는 반드시 평문 str여야 한다(리스트가 아님).
+        assert isinstance(data["content"], str), (
+            f"assistant content가 평문이어야 하는데 {type(data['content'])} 이다 — "
+            "버그 회귀: model_dump의 리스트가 그대로 저장됨"
+        )
+        assert not isinstance(data["content"], list)
+        assert data["content"] == "네, 반갑습니다"
+
+    def test_serialize_message_preserves_role_field(self):
+        """직렬화 결과에 role 필드(user/assistant)가 보존되는지 확인한다."""
+        user_data = MemoryManager._serialize_message(Message.user("질문"))
+        asst_data = MemoryManager._serialize_message(Message.assistant("답변"))
+
+        # role은 문자열로 직렬화된다(use_enum_values=True). 값만 비교한다.
+        assert str(user_data["role"]) == "user"
+        assert str(asst_data["role"]) == "assistant"

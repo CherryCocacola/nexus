@@ -388,9 +388,22 @@ class MemoryManager:
 
     @staticmethod
     def _serialize_message(message: Message) -> dict:
-        """Message를 직렬화 가능한 dict로 변환한다."""
+        """Message를 직렬화 가능한 dict로 변환한다.
+
+        왜 content를 평문(text_content)으로 통일하는가:
+          model_dump(mode="json")은 user의 content는 평문 str로, assistant의
+          content는 ContentBlock 리스트로 직렬화한다. 이 "형식 비대칭" 때문에
+          복원 측(web/app.py)에서 Message.assistant(content)에 리스트가 들어가
+          ValidationError가 발생했고, 그 예외가 복원 루프를 중단시켜 대화 이력
+          일부(assistant 응답)가 유실됐다.
+          단기 대화 이력 복원에는 텍스트만 필요하므로, 저장 단계에서 user/assistant
+          모두 평문으로 맞춰 저장↔복원 계약을 일치시킨다.
+        """
         try:
-            return message.model_dump(mode="json")
+            # role 등 다른 메타데이터는 보존하고 content만 평문으로 덮어쓴다.
+            data = message.model_dump(mode="json")
+            data["content"] = message.text_content
+            return data
         except Exception:
             # 최소한의 폴백 직렬화
             return {

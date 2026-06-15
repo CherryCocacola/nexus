@@ -455,6 +455,46 @@ if _static_dir.exists():
 # ─────────────────────────────────────────────
 # 채팅 엔드포인트
 # ─────────────────────────────────────────────
+def _restore_messages_from_saved(saved: list[dict] | None, session_id: str) -> list:
+    """Redis에서 가져온 직렬화 메시지(dict 목록)를 Message 객체 리스트로 복원한다.
+
+    비스트리밍/스트리밍 두 핸들러가 동일하게 쓰던 복원 로직을 한 곳으로 모은다.
+
+    왜 항목 단위로 예외를 격리하는가:
+      과거 버전이 assistant content를 ContentBlock 리스트 형식으로 저장한
+      "오염 데이터"가 Redis에 남아 있을 수 있다. 예전 코드는 복원 루프 전체를
+      하나의 try/except로 감싸서, 한 항목(리스트 content)이 깨지면 그 뒤 항목까지
+      전부 복원이 중단됐다(이력 유실의 직접 원인).
+      따라서 항목마다 예외를 격리하고, content가 리스트면 텍스트만 추출해
+      평문으로 되돌려 견고하게 복원한다.
+    """
+    from core.message import Message as _Msg
+
+    restored: list[_Msg] = []
+    for item in saved or []:
+        try:
+            role = item.get("role")
+            content = item.get("content", "")
+            # 과거 오염 데이터 호환: content가 ContentBlock 리스트면 텍스트만 추출한다.
+            if isinstance(content, list):
+                content = "".join(
+                    block.get("text", "")
+                    for block in content
+                    if isinstance(block, dict) and block.get("type") == "text"
+                )
+            if not content:
+                continue
+            if role == "user":
+                restored.append(_Msg.user(content))
+            elif role == "assistant":
+                restored.append(_Msg.assistant(content))
+        except Exception as e:
+            # 한 항목이 깨져도 나머지는 복원되도록 건너뛴다(부분 복원 보장).
+            logger.warning("세션 복원 항목 건너뜀 (%s): %s", session_id, e)
+            continue
+    return restored
+
+
 @app.post("/v1/chat", response_model=ChatResponse)
 async def chat(
     request: ChatRequest,
@@ -497,18 +537,7 @@ async def chat(
         try:
             engine.clear_messages()
             saved = await memory_manager.short_term.get_conversation_context(session_id)
-            if saved:
-                from core.message import Message as _Msg
-
-                for item in saved:
-                    role = item.get("role")
-                    content = item.get("content", "")
-                    if not content:
-                        continue
-                    if role == "user":
-                        engine._messages.append(_Msg.user(content))
-                    elif role == "assistant":
-                        engine._messages.append(_Msg.assistant(content))
+            engine._messages.extend(_restore_messages_from_saved(saved, session_id))
         except Exception as e:
             logger.warning("비스트리밍 세션 복원 실패 (%s): %s", session_id, e)
 
@@ -638,22 +667,13 @@ async def chat_stream(
             if memory_manager is not None:
                 try:
                     saved = await memory_manager.short_term.get_conversation_context(session_id)
-                    if saved:
-                        from core.message import Message as _Msg
-
-                        for item in saved:
-                            role = item.get("role")
-                            content = item.get("content", "")
-                            if not content:
-                                continue
-                            if role == "user":
-                                histories[session_id].append(_Msg.user(content))
-                            elif role == "assistant":
-                                histories[session_id].append(_Msg.assistant(content))
+                    restored = _restore_messages_from_saved(saved, session_id)
+                    histories[session_id].extend(restored)
+                    if restored:
                         logger.info(
                             "세션 %s Redis 복원: %d개 메시지",
                             session_id,
-                            len(histories[session_id]),
+                            len(restored),
                         )
                 except Exception as e:
                     logger.warning("세션 Redis 복원 실패 (%s): %s", session_id, e)
