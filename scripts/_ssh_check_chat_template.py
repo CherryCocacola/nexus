@@ -14,7 +14,7 @@ def run(ssh, cmd, timeout=15):
 def main() -> None:
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    ssh.connect("192.168.22.28", username="idino", password="dkdlelsh@12", timeout=10)
+    ssh.connect("192.168.21.112", username="idino", password="dkdlelsh@12", timeout=10)
 
     # Phase 2 체크포인트의 chat_template.jinja 검사
     print("=== Phase 2 LoRA의 chat_template.jinja에서 thinking 관련 토큰 ===")

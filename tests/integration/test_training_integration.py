@@ -262,7 +262,7 @@ class TestCheckpointManager:
             mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
             mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
 
-            await mgr.activate("ckpt-001", gpu_server_url="http://192.168.22.28:8000")
+            await mgr.activate("ckpt-001", gpu_server_url="http://192.168.21.112:8000")
 
         # 활성 체크포인트가 업데이트되었는지 확인
         assert mgr.active_checkpoint == "ckpt-001"
@@ -287,7 +287,7 @@ class TestCheckpointManager:
             mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
             mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
 
-            await mgr.rollback(gpu_server_url="http://192.168.22.28:8000")
+            await mgr.rollback(gpu_server_url="http://192.168.21.112:8000")
 
         # 활성 체크포인트가 초기화되었는지 확인
         assert mgr.active_checkpoint is None

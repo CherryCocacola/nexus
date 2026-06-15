@@ -133,7 +133,7 @@ class ScoutConfig(BaseModel):
     model_config = {"protected_namespaces": ()}  # model_ 접두사 경고 방지
 
     enabled: bool = True  # TIER_S에서만 자동 활성화
-    base_url: str = "http://192.168.22.28:8003"
+    base_url: str = "http://192.168.21.112:8003"
     api_key: str = "local-key"
     model_id: str = "qwen3.5-4b"
     max_context_tokens: int = 4096

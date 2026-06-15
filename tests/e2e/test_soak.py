@@ -17,8 +17,8 @@ import time
 import httpx
 import pytest
 
-GPU_SERVER_URL = "http://192.168.22.28:8001"
-EMBEDDING_SERVER_URL = "http://192.168.22.28:8002"
+GPU_SERVER_URL = "http://192.168.21.112:8001"
+EMBEDDING_SERVER_URL = "http://192.168.21.112:8002"
 MODEL_ID = "qwen3.5-27b"
 
 
@@ -29,7 +29,7 @@ def _gpu_server_available() -> bool:
 
         s = socket.socket()
         s.settimeout(3)
-        result = s.connect_ex(("192.168.22.28", 8001)) == 0
+        result = s.connect_ex(("192.168.21.112", 8001)) == 0
         s.close()
         return result
     except Exception:
@@ -41,7 +41,7 @@ pytestmark = [
     pytest.mark.soak,
     pytest.mark.skipif(
         not _gpu_server_available(),
-        reason="GPU 서버(192.168.22.28:8001)에 연결할 수 없습니다",
+        reason="GPU 서버(192.168.21.112:8001)에 연결할 수 없습니다",
     ),
 ]
 

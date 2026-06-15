@@ -363,7 +363,7 @@ class TestDiagReachabilityTool:
 
         fake_web = {"reachable": True, "status": 200}
         fake_db = {"host": "192.168.10.39", "ports": {"PostgreSQL": {"reachable": True}}}
-        fake_gpu = {"reachable": True, "host": "192.168.22.28"}
+        fake_gpu = {"reachable": True, "host": "192.168.21.112"}
 
         # 블로킹 점검 함수(실 네트워크)를 전부 가짜로 교체한다.
         with (

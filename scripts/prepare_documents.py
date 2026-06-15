@@ -24,7 +24,7 @@ PostgreSQL(:5440)은 모두 LAN 주소이므로 에어갭을 준수한다.
   1. 디렉토리 적재(자동 스택 선택 — GPU 감지):
        python scripts/prepare_documents.py \\
          --input /opt/nexus-gpu/corpora/docs \\
-         --embed-url http://192.168.22.28:8002 \\
+         --embed-url http://192.168.21.112:8002 \\
          --pg "postgresql://nexus:idino%4012@192.168.10.39:5440/nexus"
 
   2. 스모크(첫 5개 파일, 적재 없이 파싱·청킹만):

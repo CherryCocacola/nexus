@@ -41,7 +41,7 @@ logger = logging.getLogger("nexus.mcp_servers.diag")
 # ─────────────────────────────────────────────
 # 서버 상수 (scripts/_diag_*.py 와 동일 — LAN 전용 자격)
 # ─────────────────────────────────────────────
-GPU_HOST = "192.168.22.28"
+GPU_HOST = "192.168.21.112"
 GPU_USER = "idino"
 GPU_PASS = "dkdlelsh@12"  # noqa: S105 — LAN 내부 진단용 고정 자격(에어갭)
 
@@ -49,7 +49,7 @@ DB_HOST = "192.168.10.39"
 DB_PORTS = {"PostgreSQL": 5440, "Redis": 6340}
 
 WEB_URL = "https://localhost:8443/metrics"
-EMBED_URL = "http://192.168.22.28:8002"
+EMBED_URL = "http://192.168.21.112:8002"
 
 # RAG 지연 측정에 쓰는 DB 컨테이너 자격(scripts/_diag_rag_latency 와 동일).
 PG_CONTAINER = "docutil-postgres"

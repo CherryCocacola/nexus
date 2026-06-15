@@ -8,7 +8,7 @@ import paramiko
 
 sys.stdout.reconfigure(encoding="utf-8")
 
-HOST = "192.168.22.28"
+HOST = "192.168.21.112"
 USER = "idino"
 PASSWORD = "dkdlelsh@12"
 

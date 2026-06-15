@@ -16,8 +16,8 @@ web app full e2e로 증명한다. mock 금지 — 실 PG/임베딩/vLLM/Redis로
 
 실 인프라:
   - 실 PostgreSQL (192.168.10.39:5440) — db MCP 서버 + 장기 메모리 + 자동 RAG
-  - 실 임베딩 (192.168.22.28:8002) — 자동 RAG 주입 / kowiki MCP 서버
-  - 실 vLLM (192.168.22.28:8001) — web QueryEngine Worker
+  - 실 임베딩 (192.168.21.112:8002) — 자동 RAG 주입 / kowiki MCP 서버
+  - 실 vLLM (192.168.21.112:8001) — web QueryEngine Worker
   - 실 Redis (192.168.10.39:6340) — 세션 단기 메모리
 
 운영 무영향: 운영 config 원본은 읽기만 하고, 임시 yaml 복사본으로만 부트스트랩한다.

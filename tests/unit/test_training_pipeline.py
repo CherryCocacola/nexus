@@ -299,10 +299,10 @@ class TestLoRATrainer:
     def test_accepts_lan_url(self):
         """LAN 주소는 허용되는지."""
         trainer = LoRATrainer(
-            gpu_server_url="http://192.168.22.28:8000",
+            gpu_server_url="http://192.168.21.112:8000",
             config=TrainingConfig(),
         )
-        assert trainer.gpu_server_url == "http://192.168.22.28:8000"
+        assert trainer.gpu_server_url == "http://192.168.21.112:8000"
 
     def test_accepts_localhost(self):
         """localhost는 허용되는지."""

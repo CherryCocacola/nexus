@@ -19,8 +19,8 @@ Nexus 의 LAN MCP 서버(`db` / `diag` / `kowiki` / `docingest`)를 **DB 서버
 |---|---|---|---|
 | `db` | 8810 | PostgreSQL `localhost`(.39 컨테이너) | read-only SELECT 전용 |
 | `diag` | 8811 | GPU(.28) SSH / DB(.39) socket / 임베딩(.28:8002) | 인프라 도달성·지연 점검 |
-| `kowiki` | 8813 | 임베딩 192.168.22.28:8002 + pgvector(localhost) | tb_knowledge 검색(read-only) |
-| `docingest` | 8814 | 임베딩 192.168.22.28:8002 + PostgreSQL(localhost) | parse/search(읽기) + ingest(쓰기) |
+| `kowiki` | 8813 | 임베딩 192.168.21.112:8002 + pgvector(localhost) | tb_knowledge 검색(read-only) |
+| `docingest` | 8814 | 임베딩 192.168.21.112:8002 + PostgreSQL(localhost) | parse/search(읽기) + ingest(쓰기) |
 
 - `db` MCP 는 **PostgreSQL 을 localhost 로** 접속한다. .39 에서 도는 `docutil-postgres`
   컨테이너가 호스트 포트(예: 5440)로 노출돼 있으므로, `config/nexus_config.yaml`

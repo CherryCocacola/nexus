@@ -154,7 +154,7 @@ v7.3 인제스트 파이프라인은 **"문서를 구조 보존 청킹해 tb_kno
 ┌──────────────────────────────────────────────┐
 │  임베딩 (v7.1 Part 2 계약 그대로)               │
 │   POST /v1/embed {"texts":["passage: ..."]}    │
-│   → 192.168.22.28:8002 (e5-large, 1024차원)     │
+│   → 192.168.21.112:8002 (e5-large, 1024차원)     │
 └──────────────────────────────────────────────┘
         │
         ▼
@@ -476,7 +476,7 @@ mcp:
   servers:
     - name: "docingest"
       transport: "http_sse"
-      base_url: "http://192.168.22.28:8814"   # GPU 호스트 (LAN) — placeholder 포트
+      base_url: "http://192.168.21.112:8814"   # GPU 호스트 (LAN) — placeholder 포트
       enabled: false                            # fail-closed
       trust: { read_only: false }               # 적재(쓰기) 가능 → 보수적
 ```
@@ -510,7 +510,7 @@ python scripts/prepare_documents.py \
   --input /opt/nexus-gpu/corpora/docs/ \
   --formats "pptx,pdf,hwpx" \
   --stack high          # high=Docling+Paddle, light=pdfplumber+Tesseract
-  --embed-url http://192.168.22.28:8002 \
+  --embed-url http://192.168.21.112:8002 \
   --pg "postgresql://nexus:idino%4012@192.168.10.39:5440/nexus"
 ```
 

@@ -46,7 +46,7 @@ class ScoutModelProvider(LocalModelProvider):
 
     def __init__(
         self,
-        base_url: str = "http://192.168.22.28:8003",
+        base_url: str = "http://192.168.21.112:8003",
         api_key: str = "local-key",
         model_id: str = "qwen3.5-4b",
         max_context_tokens: int = 4096,
@@ -123,7 +123,7 @@ class ScoutModelProvider(LocalModelProvider):
 
 
 async def create_scout_provider_if_available(
-    base_url: str = "http://192.168.22.28:8003",
+    base_url: str = "http://192.168.21.112:8003",
     api_key: str = "local-key",
 ) -> ScoutModelProvider | None:
     """

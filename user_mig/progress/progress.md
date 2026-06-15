@@ -1074,7 +1074,7 @@ Enable-NetAdapter -Name "이더넷"
   - gpu_server.url: 8001, embedding_url: 8002
   - max_context_tokens: 8192, default_max_tokens: 4096
   - gpu_server_url → property로 전환 (YAML gpu_server.url 자동 동기화)
-- **GPU 서버** (192.168.22.28):
+- **GPU 서버** (192.168.21.112):
   - vLLM: --max-model-len 8192, --gpu-memory-utilization 0.90
   - 도구 호출 활성화: --enable-auto-tool-choice --tool-call-parser gemma4
 
@@ -2147,9 +2147,9 @@ v7.0 Phase 9 코드(HardwareTier/TurnState/ModelDispatcher/Scout)는 모듈
 3. **웹 서버 실행**: `python -m uvicorn web.app:app --host 0.0.0.0 --port 8443 --ssl-keyfile config/ssl/key.pem --ssl-certfile config/ssl/cert.pem`
 4. **CLI 실행**: `python -m cli.commands chat`
 5. **서버 정보**:
-   - GPU Worker: 192.168.22.28:8001 (Qwen 3.5 27B AWQ + LoRA, qwen3_xml parser)
-   - GPU Scout: 192.168.22.28:8003 (Gemma 4 E4B, llama.cpp CPU)
-   - Embedding: 192.168.22.28:8002 (e5-large)
+   - GPU Worker: 192.168.21.112:8001 (Qwen 3.5 27B AWQ + LoRA, qwen3_xml parser)
+   - GPU Scout: 192.168.21.112:8003 (Gemma 4 E4B, llama.cpp CPU)
+   - Embedding: 192.168.21.112:8002 (e5-large)
    - DB: 192.168.10.39:5440 (PostgreSQL nexus), :6340 (Redis db=6)
    - 웹: https://192.168.22.223:8443
 6. **GPU 서버 모델 목록**:
@@ -2184,7 +2184,7 @@ v7.0 Phase 9 코드(HardwareTier/TurnState/ModelDispatcher/Scout)는 모듈
    - Scout(Gemma 4 E4B)는 Qwen 계열이 아님 (향후 교체 고려)
 10. 532개 테스트 전부 통과
 6. **서버 정보**:
-   - GPU: 192.168.22.28 (Worker :8001, Embedding :8002, Scout :8003), max-model-len=8192
+   - GPU: 192.168.21.112 (Worker :8001, Embedding :8002, Scout :8003), max-model-len=8192
    - Scout: Gemma 4 E4B (Q4_K_M) on llama.cpp CPU, ~16 TPS
    - DB: 192.168.10.39 (PostgreSQL + Redis, 현재 미연결)
    - 웹: https://192.168.22.223:8443 (자체 서명 SSL)
@@ -2313,7 +2313,7 @@ v0.14.0 "다음 세션 후보" 3·4번 일괄 소화. 동시에 kowiki 전체 �
 적재 현황을 점검했다.
 
 ### kowiki 적재 현황 (2026-04-22 04:02 KST)
-`scripts/_ssh_kowiki_status.py`로 GPU 서버(192.168.22.28) 상태 조회:
+`scripts/_ssh_kowiki_status.py`로 GPU 서버(192.168.21.112) 상태 조회:
 - tmux `kowiki_ingest` 세션이 19시간 42분 경과 상태로 진행 중 (PID 206672)
 - `--limit 0 --categories ""` (전체 kowiki) 모드 — 500건 제한 해제 후 재시작된 버전
 - 진행: **처리=182,005 / 적재=93,300 / 청크=291,073**
@@ -2398,7 +2398,7 @@ v0.14.0 "다음 세션 후보" 3·4번 일괄 소화. 동시에 kowiki 전체 �
 ## kowiki 전체 덤프 적재 경과 기록 (2026-04-22)
 
 C2-γ 확장 적재. 500건(2026-04-21 야간)과 별개로 카테고리/limit 제한 없이 전체
-kowiki 덤프를 돌리는 장기 작업이 GPU 서버(192.168.22.28) tmux `kowiki_ingest`
+kowiki 덤프를 돌리는 장기 작업이 GPU 서버(192.168.21.112) tmux `kowiki_ingest`
 세션에서 진행 중.
 
 ### 실행 명령
@@ -2406,7 +2406,7 @@ kowiki 덤프를 돌리는 장기 작업이 GPU 서버(192.168.22.28) tmux `kowi
 /opt/nexus-gpu/.venv/bin/python3.12 scripts/prepare_kowiki.py \
   --dump /opt/nexus-gpu/corpora/kowiki/kowiki-latest-pages-articles.xml.bz2 \
   --categories "" --limit 0 \
-  --embed-url http://192.168.22.28:8002 \
+  --embed-url http://192.168.21.112:8002 \
   --pg postgresql://nexus:idino%4012@192.168.10.39:5440/nexus
 ```
 

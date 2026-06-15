@@ -163,7 +163,7 @@ v6.1 Ch 4.5는 e5-large 임베딩 서버를 always-on으로 명시했지만, Ope
 
 **파일**: `/opt/nexus-gpu/embedding_server.py` (FastAPI, sentence-transformers)
 **프로세스**: PID 1087 (2026-06-01 기준 46일+ 무중단)
-**위치**: 192.168.22.28:8002
+**위치**: 192.168.21.112:8002
 **디바이스**: CPU (`device="cpu"` — GPU VRAM 절약)
 
 ### 2.2 API 계약 (확정)
@@ -225,7 +225,7 @@ async def embed(self, texts: list[str]) -> list[list[float]]:
 v7.0 Part 4는 Scout 모델로 `gemma-4-4b-it`를 명시했다. 실 운영은 **`Qwen3.5-4B`** (Q4_K_M GGUF)를 사용한다.
 
 ```bash
-# 현 운영 (192.168.22.28, PID 26253)
+# 현 운영 (192.168.21.112, PID 26253)
 /opt/nexus-gpu/llama.cpp/llama-b8808/llama-server \
   --model /opt/nexus-gpu/models/qwen3.5-4b-gguf/Qwen3.5-4B-Q4_K_M.gguf \
   --host 0.0.0.0 --port 8003 \
@@ -258,7 +258,7 @@ override가 필요할 때만 yaml에 섹션 추가한다.
 # config/nexus_config.yaml (선택)
 scout:
   enabled: true
-  base_url: "http://192.168.22.28:8003"
+  base_url: "http://192.168.21.112:8003"
   model_id: "qwen3.5-4b"
   max_context_tokens: 4096
   max_output_tokens: 512
@@ -295,7 +295,7 @@ vector 연산이 `$libdir/vector: No such file or directory`로 실패. RAG/장�
 
 ### 4.3 NVML driver/library mismatch (GPU 서버)
 
-**현 상태 (2026-06-01)**: `192.168.22.28`에서 `nvidia-smi` 실행 시
+**현 상태 (2026-06-01)**: `192.168.21.112`에서 `nvidia-smi` 실행 시
 `Failed to initialize NVML: Driver/library version mismatch` (NVML library v580.159).
 
 **영향**:

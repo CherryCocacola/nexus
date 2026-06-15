@@ -9,7 +9,7 @@ sys.stdout.reconfigure(encoding="utf-8")
 def main() -> None:
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    ssh.connect("192.168.22.28", username="idino", password="dkdlelsh@12", timeout=10)
+    ssh.connect("192.168.21.112", username="idino", password="dkdlelsh@12", timeout=10)
 
     stdin, stdout, stderr = ssh.exec_command(
         "curl -s http://localhost:8001/v1/models | "

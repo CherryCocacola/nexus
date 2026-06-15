@@ -14,7 +14,7 @@ def run(ssh, cmd, timeout=15):
 def main() -> None:
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    ssh.connect("192.168.22.28", username="idino", password="dkdlelsh@12", timeout=10)
+    ssh.connect("192.168.21.112", username="idino", password="dkdlelsh@12", timeout=10)
 
     print("=== vLLM 로그에서 tool_call 관련 ===")
     print(run(ssh, "grep -Ei 'tool.call|qwen3|hermes|parser' /opt/nexus-gpu/vllm.log | tail -30"))

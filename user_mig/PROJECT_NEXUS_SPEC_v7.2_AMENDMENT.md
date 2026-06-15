@@ -377,7 +377,7 @@ MCP 표준은 stdio와 HTTP/SSE 두 transport를 정의한다. v7.2는 **HTTP/SS
 | 에어갭 검증 용이성 | 프로세스 권한·샌드박스 추가 필요 | URL이 LAN인지만 검사하면 됨 (단순) |
 
 **stdio 비채택 이유**: 사내 MCP 대상(PostgreSQL 192.168.10.39, 임베딩 서버
-192.168.22.28, DocUtil 등)은 이미 **원격 LAN 서비스**다. stdio는 이들을
+192.168.21.112, DocUtil 등)은 이미 **원격 LAN 서비스**다. stdio는 이들을
 Machine A 로컬 프로세스로 끌어와야 하므로 2-Machine 토폴로지(P4)와 어긋나고
 샌드박스 부담만 늘린다. HTTP/SSE는 v6.1이 이미 허용한 통신 형태를 그대로 쓴다.
 
@@ -385,7 +385,7 @@ Machine A 로컬 프로세스로 끌어와야 하므로 2-Machine 토폴로지(P
 
 | 구분 | 판정 | 예시 |
 |---|---|---|
-| **허용** | LAN MCP 서버 | `http://192.168.10.39:*`, `http://192.168.22.28:*`, `http://10.x.x.x:*`, `http://localhost:*` |
+| **허용** | LAN MCP 서버 | `http://192.168.10.39:*`, `http://192.168.21.112:*`, `http://10.x.x.x:*`, `http://localhost:*` |
 | **금지** | 외부 SaaS MCP | 공인 도메인, 인터넷 IP, TLS to public CA |
 
 URL 검증은 **이중 강제**한다(구현 확인됨). 두 단계 모두 보안 모듈의 공용
@@ -606,7 +606,7 @@ mcp:
       trust: { read_only: true }
     - name: "diag"
       transport: "http_sse"
-      base_url: "http://192.168.22.28:8811"   # 운영 진단 MCP (LAN, 포트 placeholder)
+      base_url: "http://192.168.21.112:8811"   # 운영 진단 MCP (LAN, 포트 placeholder)
       enabled: false
       trust: { read_only: true }
     - name: "docutil"
@@ -616,7 +616,7 @@ mcp:
       trust: { read_only: true }
     - name: "kowiki"
       transport: "http_sse"
-      base_url: "http://192.168.22.28:8813"   # kowiki RAG MCP (LAN, 포트 placeholder)
+      base_url: "http://192.168.21.112:8813"   # kowiki RAG MCP (LAN, 포트 placeholder)
       enabled: false
       trust: { read_only: true }
 ```
@@ -794,7 +794,7 @@ test_mcp_client_server_e2e.py`가 **우리 `McpClient` ↔ `create_mcp_app` 서�
 ### 6.5 대상 4 — kowiki 지식 RAG MCP (`mcp__kowiki__search`) — 대표 사례
 
 - **무엇**: v7.0 Part 2.5.8 지식 RAG(tb_knowledge ~105만행 + 임베딩 서버
-  192.168.22.28:8002의 커스텀 `/v1/embed` 계약, v7.1 Part 2 참조)를 **표준 MCP
+  192.168.21.112:8002의 커스텀 `/v1/embed` 계약, v7.1 Part 2 참조)를 **표준 MCP
   도구로 노출**. "사내 시스템을 MCP로 떼어내 재사용"의 가장 명확한 사례.
 - **read-only**: ✓ — 벡터 검색 조회 전용.
 - **노출 도구**: `mcp__kowiki__search`(질의→유사 청크 top-k).

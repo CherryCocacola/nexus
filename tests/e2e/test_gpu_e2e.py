@@ -1,13 +1,13 @@
 """
-E2E 테스트 — 실 GPU 서버(192.168.22.28) 연결 검증.
+E2E 테스트 — 실 GPU 서버(192.168.21.112) 연결 검증.
 
 이 테스트는 실제 vLLM 서버가 가동 중일 때만 실행 가능하다.
 pytest -m e2e 로 분리 실행하거나,
 GPU 서버가 없으면 자동 스킵된다.
 
 서버 구성:
-  - Gemma 4 31B (AWQ INT4): 192.168.22.28:8001
-  - e5-large embedding: 192.168.22.28:8002
+  - Gemma 4 31B (AWQ INT4): 192.168.21.112:8001
+  - e5-large embedding: 192.168.21.112:8002
 """
 
 from __future__ import annotations
@@ -18,8 +18,8 @@ import httpx
 import pytest
 
 # GPU 서버 주소 (config와 동일)
-GPU_SERVER_URL = "http://192.168.22.28:8001"
-EMBEDDING_SERVER_URL = "http://192.168.22.28:8002"
+GPU_SERVER_URL = "http://192.168.21.112:8001"
+EMBEDDING_SERVER_URL = "http://192.168.21.112:8002"
 MODEL_ID = "qwen3.5-27b"
 EMBEDDING_MODEL_ID = "multilingual-e5-large"
 
@@ -31,7 +31,7 @@ def _gpu_server_available() -> bool:
 
         s = socket.socket()
         s.settimeout(3)
-        result = s.connect_ex(("192.168.22.28", 8001)) == 0
+        result = s.connect_ex(("192.168.21.112", 8001)) == 0
         s.close()
         return result
     except Exception:
@@ -43,7 +43,7 @@ pytestmark = [
     pytest.mark.e2e,
     pytest.mark.skipif(
         not _gpu_server_available(),
-        reason="GPU 서버(192.168.22.28:8001)에 연결할 수 없습니다",
+        reason="GPU 서버(192.168.21.112:8001)에 연결할 수 없습니다",
     ),
 ]
 

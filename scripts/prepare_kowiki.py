@@ -14,7 +14,7 @@ Nexus 런타임이 외부 네트워크를 호출하지 않지만, 최초 코퍼�
          --dump /opt/nexus-gpu/corpora/kowiki/kowiki-latest-pages-articles.xml.bz2 \\
          --categories "철학,문학,역사,인물" \\
          --limit 500 \\
-         --embed-url http://192.168.22.28:8002 \\
+         --embed-url http://192.168.21.112:8002 \\
          --pg "postgresql://nexus:idino@12@192.168.10.39:5440/nexus"
 
   3. 벡터 인덱스 빌드 (대량 적재 후 1회):
@@ -294,7 +294,7 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=0,
                         help="상위 N개 문서만 처리 (0 = 무제한)")
     parser.add_argument("--embed-url", type=str,
-                        default="http://192.168.22.28:8002",
+                        default="http://192.168.21.112:8002",
                         help="임베딩 서버 base URL")
     parser.add_argument("--pg", type=str,
                         default="postgresql://nexus:idino%4012@192.168.10.39:5440/nexus",

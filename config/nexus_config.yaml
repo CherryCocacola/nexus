@@ -5,19 +5,32 @@
 
 # GPU 서버 (Machine B) 연결 설정
 gpu_server:
-  url: "http://192.168.22.28:8001"
-  embedding_url: "http://192.168.22.28:8002"
+  url: "http://192.168.21.112:8001"
+  embedding_url: "http://192.168.21.112:8002"
   timeout_seconds: 120.0
   max_retries: 10
   retry_base_delay: 0.5
   health_check_interval: 30.0
 
+# 하드웨어 티어 — 오케스트레이션 모드(Scout 분리/컨텍스트 한계)를 결정한다.
+#   왜 "auto"가 아니라 명시하는가:
+#   자동 감지(_detect_gpu_vram_gb)는 Machine A 로컬에서 GPU를 조회한다.
+#   하지만 2-Machine 토폴로지에서 GPU는 Machine B에만 있어 Machine A에서는
+#   항상 조회 실패 → 보수적 TIER_S로 fallback하며 경고 로그를 남긴다.
+#   GPU 서버가 RTX 5090(32GB)이므로 결과 자체는 small이 맞다. 경고를 없애고
+#   의도를 분명히 하기 위해 명시한다.
+#   값: small(RTX 5090 32GB) / medium(H100 80GB) / large(H200·A100 128GB+).
+#   → H200/A100 서버로 이전하면 이 값을 medium 또는 large로 변경한다.
+hardware_tier: "small"
+
 # Redis (단기 메모리 / 세션 캐시) — docutil-redis 컨테이너 공유
+# 비번 주의: docutil-redis 컨테이너의 requirepass가 06-15에 변경됨.
+#   (구 docutil_redis_2024 → WRONGPASS 발생). 실제 컨테이너 CMD의 --requirepass 값과 일치시킴.
 redis:
   host: "192.168.10.39"
   port: 6340
   db: 6
-  password: "docutil_redis_2024"
+  password: "2a4a59309d85062c35989796bf4570a37806ff88cb823f1e3d2fa35dc95d25bf"
   socket_timeout: 5.0
 
 # PostgreSQL + pgvector (장기 메모리) — docutil-postgres 컨테이너, nexus DB
@@ -247,12 +260,12 @@ mcp:
       trust: { read_only: true }
     - name: "diag"
       transport: "http_sse"
-      base_url: "http://192.168.22.28:8811"   # 운영 진단 MCP (LAN, 포트 placeholder)
+      base_url: "http://192.168.21.112:8811"   # 운영 진단 MCP (LAN, 포트 placeholder)
       enabled: false
       trust: { read_only: true }
     - name: "docingest"
       transport: "http_sse"
-      base_url: "http://192.168.22.28:8814"   # docingest 문서 MCP (LAN, 포트 placeholder)
+      base_url: "http://192.168.21.112:8814"   # docingest 문서 MCP (LAN, 포트 placeholder)
       enabled: false
       trust: { read_only: true }
       # docingest는 parse/search(read-only) + ingest(쓰기) 도구를 제공한다.
@@ -266,7 +279,7 @@ mcp:
       # 서버 실행: python -m mcp_servers.run docingest --port 8814
     - name: "kowiki"
       transport: "http_sse"
-      base_url: "http://192.168.22.28:8813"   # kowiki RAG MCP (LAN, 포트 placeholder)
+      base_url: "http://192.168.21.112:8813"   # kowiki RAG MCP (LAN, 포트 placeholder)
       enabled: false
       trust: { read_only: true }
       # kowiki 검색은 KNOWLEDGE 모드 자동 RAG 주입이 담당하므로 Worker 도구로는

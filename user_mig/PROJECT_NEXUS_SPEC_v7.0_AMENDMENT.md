@@ -735,7 +735,7 @@ python scripts/prepare_kowiki.py \
   --dump /opt/nexus-gpu/corpora/kowiki/kowiki-latest-pages-articles.xml.bz2 \
   --categories "철학,문학,역사,인물" \
   --limit 500 \
-  --embed-url http://192.168.22.28:8002 \
+  --embed-url http://192.168.21.112:8002 \
   --pg "postgresql://nexus:idino@12@192.168.10.39:5440/nexus"
 
 # 3) 벡터 인덱스 빌드 (1회)
@@ -918,7 +918,7 @@ TIER_L (128K):
 v6.1의 2-Machine 토폴로지(Ch 2, P4)에 CPU 모델 서빙을 추가한다.
 
 ```
-Machine B (GPU 서버, 192.168.22.28):
+Machine B (GPU 서버, 192.168.21.112):
   CPU: Intel Core Ultra 9 285K (24코어) + 64GB DDR5
   GPU: RTX 5090 (32GB VRAM)
 
@@ -989,7 +989,7 @@ hardware:
 
 scout:
   enabled: true           # TIER_S에서만 자동 활성화
-  base_url: "http://192.168.22.28:8003"
+  base_url: "http://192.168.21.112:8003"
   model_id: "gemma-4-4b-it"
   max_context_tokens: 4096
   max_output_tokens: 512

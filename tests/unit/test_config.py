@@ -28,8 +28,8 @@ class TestGPUServerConfig:
 
     def test_local_url_passes_validation(self):
         """LAN 주소가 검증을 통과하는지 확인한다."""
-        config = GPUServerConfig(url="http://192.168.22.28:8000")
-        assert config.url == "http://192.168.22.28:8000"
+        config = GPUServerConfig(url="http://192.168.21.112:8000")
+        assert config.url == "http://192.168.21.112:8000"
 
     def test_external_url_warns(self):
         """외부 주소가 경고를 발생시키는지 확인한다."""

@@ -118,7 +118,7 @@ async def check_tables(conn: asyncpg.Connection, vector_ok: bool) -> None:
 async def check_knowledge_search(conn: asyncpg.Connection, query: str) -> None:
     """KNOWLEDGE 라우팅을 모사한 실 검색 — 임베딩 서버 → 벡터 검색.
 
-    임베딩 서버(192.168.22.28:8002)가 살아있고 pgvector도 정상이어야 통과.
+    임베딩 서버(192.168.21.112:8002)가 살아있고 pgvector도 정상이어야 통과.
     """
     section(f"실 KNOWLEDGE 검색 — '{query}'")
     try:
@@ -132,7 +132,7 @@ async def check_knowledge_search(conn: asyncpg.Connection, query: str) -> None:
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
-                "http://192.168.22.28:8002/v1/embed",
+                "http://192.168.21.112:8002/v1/embed",
                 json={"texts": [f"query: {query}"]},
             )
             resp.raise_for_status()

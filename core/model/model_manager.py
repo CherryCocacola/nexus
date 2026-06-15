@@ -40,7 +40,7 @@ class ModelManager:
     GPU 서버(Machine B)의 모델 상태를 원격으로 관리한다.
 
     사용 예:
-        manager = ModelManager(gpu_server_url="http://192.168.22.28:8000")
+        manager = ModelManager(gpu_server_url="http://192.168.21.112:8000")
         await manager.initialize()
         health = await manager.health_check()
         await manager.swap_model(ActiveModel.AUXILIARY)

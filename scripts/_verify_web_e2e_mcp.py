@@ -2,8 +2,8 @@
 
 이 스크립트는 mock 없이 실 인프라로만 동작한다:
   - 실 PostgreSQL (192.168.10.39:5440) — db MCP 서버가 사용
-  - 실 임베딩 서버 (192.168.22.28:8002) — kowiki MCP 서버가 사용
-  - 실 vLLM (192.168.22.28:8001) — web app QueryEngine의 Worker
+  - 실 임베딩 서버 (192.168.21.112:8002) — kowiki MCP 서버가 사용
+  - 실 vLLM (192.168.21.112:8001) — web app QueryEngine의 Worker
   - 실 Redis (192.168.10.39:6340) — 세션 단기 메모리
 
 수행 흐름:
