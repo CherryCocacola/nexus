@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -52,18 +53,37 @@ class PromptAssembler:
         """시스템 프롬프트를 최종 조립해 반환한다.
 
         호출 지점은 `QueryEngine.submit_message()` — 매 턴 한 번만 호출.
+
+        조립 timing 로그 — 각 step(turn_state/project_rag/knowledge_rag)의
+        소요 시간을 ms 단위로 기록한다. 운영 모니터링 및 RAG 병목 진단에 쓴다
+        ([ASSEMBLE_TIMING] 키로 grep).
         """
         prompt = base_prompt
+        t_start = time.perf_counter()
 
         # ① TurnState — 이전 턴 요약
+        t0 = time.perf_counter()
         prompt = self._attach_turn_state(prompt, session_id)
+        ms_turn_state = (time.perf_counter() - t0) * 1000
 
         # ② 프로젝트 RAG — 관련 파일 청크 (질의 타입 무관)
+        t0 = time.perf_counter()
         prompt = await self._attach_project_rag(prompt, user_input)
+        ms_project_rag = (time.perf_counter() - t0) * 1000
 
         # ③ Knowledge RAG — KNOWLEDGE 질의에만 (tenant 필터 적용)
+        t0 = time.perf_counter()
         prompt = await self._attach_knowledge_base(prompt, user_input, decision)
+        ms_kb = (time.perf_counter() - t0) * 1000
 
+        ms_total = (time.perf_counter() - t_start) * 1000
+        # 한 줄로 모아 찍어 grep이 쉽게 — class는 라우팅 결과를 그대로 노출
+        logger.info(
+            "[ASSEMBLE_TIMING] class=%s total=%.0fms "
+            "turn_state=%.0fms project_rag=%.0fms knowledge_rag=%.0fms",
+            decision.query_class, ms_total,
+            ms_turn_state, ms_project_rag, ms_kb,
+        )
         return prompt
 
     # ─── 내부 스텝 ───────────────────────────────────
@@ -122,19 +142,39 @@ class PromptAssembler:
             logger.debug("지식 RAG 주입 실패 (무시): %s", e)
             return prompt
         if not kb_ctx:
-            return prompt
+            # ★2 게이팅 — KNOWLEDGE 질의인데 관련 자료를 못 찾은 경우.
+            # 예전엔 그냥 prompt를 반환해 KB 블록 없이 모델이 자유 생성했고,
+            # 이것이 "KB에 없는 사실(예: BWV 544)을 자신 있게 지어내는"
+            # 할루시네이션의 직접 원인이었다. 빈 결과여도 침묵하지 말고
+            # "관련 자료 없음"을 명시 주입해, worker_system.md의 grounding
+            # 지침과 결합되어 모델이 추측 대신 "자료에 없어 확실치 않다"고 답하게 한다.
+            logger.info("지식 RAG: 관련 자료 없음 — '자료 없음' 마커 주입")
+            return (
+                prompt
+                + "\n\n--- Knowledge base ---\n"
+                + "(질의와 직접 관련된 자료를 지식베이스에서 찾지 못했습니다.)\n"
+                + "--- End of knowledge base ---\n"
+                + "No relevant material was found above. For verifiable facts "
+                "(catalog numbers, names, dates, figures), do NOT invent an answer. "
+                "If you are not confident from well-established common knowledge, "
+                "say honestly in the user's language that the material is not "
+                "available and you cannot verify it (예: '제공된 자료에는 없고 "
+                "정확히 확인하기 어렵습니다')."
+            )
         logger.info("지식 RAG 주입: ~%d자", len(kb_ctx))
-        # D 보조 — 검색 결과가 질의와 무관할 때 모델이 무리하게 활용하지 않도록 명시.
+        # 검색 결과가 질의와 무관할 때 모델이 무리하게 활용하지 않도록 명시.
         # kowiki 100만 청크 환경에서 어떤 질의든 코사인 유사도로 무언가가 잡히지만
-        # 의미적으로 관련이 없을 수 있다. 이때 "주어진 컨텍스트 = 정답 재료"로 오인
-        # 하지 말 것을 시스템 프롬프트에 명시.
+        # 의미적으로 관련이 없을 수 있다. "주어진 컨텍스트 = 정답 재료"로 오인하지
+        # 말 것 + 검증 가능한 사실은 근거 없으면 단정 금지(★1 grounding)를 명시.
         return (
             prompt
             + "\n\n--- Knowledge base ---\n"
             + kb_ctx
             + "\n--- End of knowledge base ---\n"
             + "Use the information above ONLY when it is clearly relevant to the "
-            "user's question. If the snippets above are off-topic, irrelevant, or "
-            "contradict common-sense knowledge, IGNORE them and answer from your "
-            "own general knowledge. Never force-fit the snippets into the answer."
+            "user's question. If the snippets are off-topic or irrelevant, do not "
+            "force-fit them. For verifiable facts (catalog numbers, names, dates, "
+            "figures), state them as certain ONLY if supported above or by "
+            "well-established common knowledge; otherwise say you are not sure "
+            "rather than guessing."
         )

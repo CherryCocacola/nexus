@@ -67,7 +67,7 @@ async def test_assemble_skips_kb_for_tool_decision() -> None:
 
 @pytest.mark.asyncio
 async def test_assemble_injects_kb_for_knowledge_decision() -> None:
-    """KNOWLEDGE 분류일 때만 KB 주입 + 'IGNORE off-topic' 지시 포함."""
+    """KNOWLEDGE 분류일 때만 KB 주입 + grounding(불확실 시 추측 금지) 지시 포함."""
     kr = MagicMock()
     kr.get_context = AsyncMock(return_value="kowiki 청크 본문")
 
@@ -80,8 +80,33 @@ async def test_assemble_injects_kb_for_knowledge_decision() -> None:
     )
 
     assert "kowiki 청크 본문" in out
-    # D 보조 지시가 KB 블록 뒤에 함께 들어간다
-    assert "IGNORE" in out
+    # ★1 grounding 보조 지시가 KB 블록 뒤에 함께 들어간다
+    # (검증 가능한 사실은 근거 없으면 단정 말고 'not sure'라고 답하라)
+    assert "not sure rather than guessing" in out
+    kr.get_context.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_assemble_injects_no_material_marker_when_kb_empty() -> None:
+    """★2 게이팅 — KNOWLEDGE 질의인데 KB 결과가 비면 '관련 자료 없음'을 명시 주입.
+
+    빈 결과여도 침묵하지 않고 '자료 없음 + 추측 금지'를 주입해, 모델이 KB에
+    없는 사실(예: BWV 544)을 지어내는 할루시네이션을 막는다.
+    """
+    kr = MagicMock()
+    kr.get_context = AsyncMock(return_value="")  # 관련 자료 0건
+
+    assembler = PromptAssembler(knowledge_retriever=kr)
+    out = await assembler.assemble(
+        base_prompt="BASE",
+        session_id="s1",
+        user_input="바흐 BWV 544 작품 알려줘",
+        decision=_make_decision("KNOWLEDGE"),
+    )
+
+    # '관련 자료 없음' 마커 + 추측 금지 지시가 주입된다
+    assert "찾지 못했습니다" in out
+    assert "do NOT invent" in out
     kr.get_context.assert_awaited_once()
 
 

@@ -76,6 +76,54 @@ _SAMPLE_CHUNK = {
 
 
 # ─────────────────────────────────────────────
+# 엔티티(식별자) 매칭 게이팅 (옵션 A) — 부분 관련 함정 차단
+# ─────────────────────────────────────────────
+@pytest.mark.asyncio
+async def test_entity_gating_drops_chunk_missing_identifier() -> None:
+    """질의에 식별자(다자리 숫자)가 있는데 청크에 없으면 드롭 → 빈 반환.
+
+    'BWV 543' 질의에 '바흐 일반' 청크(543 미포함)가 잡혀도, 식별자 543이
+    없으므로 드롭되어 ""를 반환한다(→ 호출자가 '관련 자료 없음' 주입).
+    """
+    chunk = {
+        "source": "kowiki", "title": "바흐", "section": "", "similarity": 0.6,
+        "content": "요한 제바스티안 바흐는 독일의 작곡가이자 오르가니스트다.",
+    }
+    store = _make_mock_store(vector_results=[chunk])
+    emb = _make_mock_embedding(return_value=[[0.1] * 4])
+    kr = KnowledgeRetriever(store=store, embedding_provider=emb)
+
+    out = await kr.get_context("바흐 작품 BWV 543 알려줘")
+    assert out == ""
+
+
+@pytest.mark.asyncio
+async def test_entity_gating_keeps_chunk_with_identifier() -> None:
+    """식별자(543)가 청크에 실제로 등장하면 정상 주입한다."""
+    chunk = {
+        "source": "kowiki", "title": "BWV 543", "section": "", "similarity": 0.8,
+        "content": "전주곡과 푸가 BWV 543은 바흐의 오르간 작품이다.",
+    }
+    store = _make_mock_store(vector_results=[chunk])
+    emb = _make_mock_embedding(return_value=[[0.1] * 4])
+    kr = KnowledgeRetriever(store=store, embedding_provider=emb)
+
+    out = await kr.get_context("BWV 543 알려줘")
+    assert "BWV 543" in out
+
+
+@pytest.mark.asyncio
+async def test_entity_gating_skipped_for_conceptual_query() -> None:
+    """다자리 숫자 식별자가 없는 개념 질의는 게이팅을 적용하지 않는다(회귀 방지)."""
+    store = _make_mock_store(vector_results=[_SAMPLE_CHUNK])
+    emb = _make_mock_embedding(return_value=[[0.1] * 4])
+    kr = KnowledgeRetriever(store=store, embedding_provider=emb)
+
+    out = await kr.get_context("광합성 원리를 설명해줘")
+    assert "니체" in out
+
+
+# ─────────────────────────────────────────────
 # 시나리오 1 (핵심) — 임베딩 성공 + 벡터검색 0건 → 폴백 차단
 # ─────────────────────────────────────────────
 @pytest.mark.asyncio

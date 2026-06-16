@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -34,7 +35,12 @@ class KnowledgeRetriever:
         store: KnowledgeStore,
         embedding_provider: ModelProvider | None,
         top_k: int = 5,
-        min_similarity: float = 0.3,
+        # 0.3→0.5 상향(★2 게이팅): kowiki 100만 청크에서는 어떤 질의든 약한
+        # 유사도로 무언가가 잡힌다. 임계가 낮으면 무관한 청크(노이즈)가 주입돼
+        # 오히려 "그럴듯한 오답"의 재료가 된다. 임계를 올려 의미적으로 관련된
+        # 청크만 통과시키고, KB에 정답이 없는 질의는 0건 → "관련 자료 없음"으로
+        # 흘러가 모델이 추측 대신 "모른다"고 답하도록 유도한다(할루시네이션 방지).
+        min_similarity: float = 0.5,
         chars_per_token: int = 3,
     ) -> None:
         self._store = store
@@ -109,6 +115,27 @@ class KnowledgeRetriever:
             except Exception as e:
                 logger.debug("KnowledgeRetriever 텍스트 검색 실패: %s", e)
                 return ""
+
+        # ★ 엔티티(식별자) 매칭 게이팅 (옵션 A) — 부분 관련 함정 차단.
+        #   왜 필요한가:
+        #     "BWV 543"처럼 KB에 없는 특정 대상을 물으면, "바흐 일반" 청크가
+        #     표면 유사도(min_similarity)만으로 잡혀 주입되고, 모델이 그 무관한
+        #     청크를 근거로 그럴듯한 오답을 지어낸다(주제는 맞지만 그 작품은 아님).
+        #   처리:
+        #     질의에 구체 식별자(2~5자리 숫자: 카탈로그 번호·모델명·연도 등)가
+        #     있으면, 그 숫자를 실제로 포함한 청크만 남긴다. 식별자가 어느 청크에도
+        #     없으면 "특정 대상을 다루는 자료가 없다"는 뜻이므로 전부 드롭한다.
+        #     → 0건이 되면 아래에서 빈 문자열을 반환하고, 호출자(prompt_assembler)가
+        #       "관련 자료 없음"을 명시 주입해 모델이 추측 대신 "모른다"고 답하게 된다.
+        #   순수 개념 질의(예: "광합성 원리")는 다자리 숫자가 없어 게이팅이
+        #   적용되지 않으므로 정상 동작에 영향이 없다.
+        identifiers = re.findall(r"\d{2,5}", query)
+        if identifiers and results:
+            results = [
+                r
+                for r in results
+                if any(idn in (r.get("content") or "") for idn in identifiers)
+            ]
 
         if not results:
             return ""
