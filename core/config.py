@@ -35,21 +35,49 @@ _is_lan_hostname = is_lan_hostname
 # GPU 서버 설정
 # ─────────────────────────────────────────────
 class GPUServerConfig(BaseModel):
-    """GPU 서버 (Machine B) 연결 설정."""
+    """
+    GPU 서버 (Machine B) 연결 설정.
 
+    2-Machine 토폴로지에서 추론을 담당하는 vLLM 서버(OpenAI 호환 API)의 접속
+    정보를 담는다. Machine A(오케스트레이터)의 ModelClient/추론 클라이언트가
+    이 값을 읽어 LAN 너머의 GPU 서버로 요청을 보낸다.
+    """
+
+    # vLLM 메인 추론 서버 URL. 개발 기본값은 localhost지만 실제 운영에서는
+    # yaml/환경변수로 GPU 서버 LAN 주소(예: http://192.168.21.112:8000)를 넣는다.
     url: str = "http://localhost:8000"
-    embedding_url: str = "http://localhost:8002"  # 임베딩 서버 (별도 vLLM 인스턴스)
+    # 임베딩 전용 vLLM 인스턴스 — 메인 추론과 부하/모델을 분리하려고 포트를
+    # 따로 둔다(8002). e5-large 임베딩 호출이 여기로 간다.
+    embedding_url: str = "http://localhost:8002"
+    # HTTP 요청 1건의 최대 대기 시간(초). 27B 모델의 긴 생성도 끊기지 않도록
+    # 넉넉히 120초로 둔다(짧게 잡으면 정상 추론이 타임아웃으로 끊긴다).
     timeout_seconds: float = 120.0
+    # 일시적 네트워크/서버 오류 시 재시도 횟수. GPU 서버 재기동·잠깐의 과부하를
+    # 견디도록 10회로 둔다(Tier 4 with_retry에서 사용).
     max_retries: int = 10
+    # 재시도 사이 대기의 기준 시간(초). 보통 지수 백오프의 base로 쓰여
+    # 0.5 → 1.0 → 2.0초 식으로 점점 늘어난다.
     retry_base_delay: float = 0.5
+    # GPU 서버 헬스체크 주기(초). 30초마다 살아 있는지 확인한다.
     health_check_interval: float = 30.0
 
     @field_validator("url")
     @classmethod
     def validate_url_is_local(cls, v: str) -> str:
-        """에어갭 검증: GPU 서버 URL이 로컬/LAN 주소인지 확인한다."""
+        """
+        에어갭 검증: GPU 서버 URL이 로컬/LAN 주소인지 확인한다.
+
+        동작 단계:
+          1. URL을 파싱해 hostname만 뽑는다.
+          2. 허용 prefix(localhost/127.0.0.1/사설망 대역)로 시작하는지 본다.
+          3. 어디에도 안 맞으면(=외부 주소로 의심) 경고만 띄운다.
+        주의: 여기서는 예외를 던지지 않고 warning만 낸다 — 잘못된 설정으로
+        로드 자체가 실패해 본류가 멈추는 것을 피하려는 의도다(경고로 알리되
+        진행은 시킨다). 실제 차단은 에어갭 모드 검증/네트워크 계층에서 한다.
+        """
         parsed = urlparse(v)
         hostname = parsed.hostname or ""
+        # 사설망(RFC1918) + 로컬호스트 대역만 허용. 10./172./192.168.은 LAN 대역.
         allowed_prefixes = ("localhost", "127.0.0.1", "10.", "172.", "192.168.")
         if not any(hostname.startswith(p) for p in allowed_prefixes):
             import warnings
@@ -67,12 +95,20 @@ class GPUServerConfig(BaseModel):
 # Redis 설정 (단기 메모리 / 세션 캐시)
 # ─────────────────────────────────────────────
 class RedisConfig(BaseModel):
-    """Redis 연결 설정."""
+    """
+    Redis 연결 설정 (단기 메모리 / 세션 캐시).
 
-    host: str = "localhost"
-    port: int = 6379
+    core/memory/short_term이 세션·대화의 휘발성 상태를 여기에 저장한다.
+    장기 기억(PostgreSQL+pgvector)과 달리 빠른 읽기/쓰기와 TTL 만료가 목적이다.
+    """
+
+    host: str = "localhost"  # Redis 서버 주소. 운영 시 LAN 주소로 오버라이드.
+    port: int = 6379  # Redis 표준 포트.
+    # 논리 DB 번호(0~15). 같은 Redis 인스턴스를 변형(예: G2)과 나눠 쓸 때
+    # 번호로 격리한다(기본 0번 사용).
     db: int = 0
-    password: str | None = None
+    password: str | None = None  # 인증이 없으면 None. LAN 내부라 기본은 무인증.
+    # 소켓 연산 1건의 타임아웃(초). 단기 캐시는 빠르게 응답해야 하므로 5초로 짧게.
     socket_timeout: float = 5.0
 
 
@@ -80,14 +116,21 @@ class RedisConfig(BaseModel):
 # PostgreSQL 설정 (장기 메모리 + pgvector)
 # ─────────────────────────────────────────────
 class PostgreSQLConfig(BaseModel):
-    """PostgreSQL 연결 설정."""
+    """
+    PostgreSQL 연결 설정 (장기 메모리 + pgvector).
 
-    host: str = "localhost"
-    port: int = 5432
-    database: str = "nexus"
-    user: str = "nexus"
-    password: str = ""
+    core/memory/long_term이 쓰는 영속 저장소. pgvector 확장으로 임베딩 벡터를
+    저장/검색하며, 지식 베이스(tb_knowledge)·기억(tb_memories) 등이 여기 있다.
+    """
+
+    host: str = "localhost"  # PG 서버 주소. 운영 시 DB 서버 LAN 주소로 오버라이드.
+    port: int = 5432  # PostgreSQL 표준 포트.
+    database: str = "nexus"  # 접속할 데이터베이스 이름.
+    user: str = "nexus"  # 접속 계정.
+    password: str = ""  # 비밀번호. 빈 문자열이면 yaml/환경변수로 주입 전제.
+    # 커넥션 풀의 최소 유지 개수. 항상 2개는 열어두어 첫 요청 지연을 줄인다.
     min_connections: int = 2
+    # 커넥션 풀의 최대 개수. 동시 요청이 몰려도 이 수를 넘기지 않아 DB를 보호한다.
     max_connections: int = 10
 
 
@@ -95,13 +138,26 @@ class PostgreSQLConfig(BaseModel):
 # 모델 설정
 # ─────────────────────────────────────────────
 class ModelConfig(BaseModel):
-    """LLM 모델 설정."""
+    """
+    LLM 모델 설정.
 
+    추론에 쓰는 모델 이름과 기본 생성 파라미터를 담는다. 여기 이름들은 vLLM의
+    served-model-name과 일치해야 GPU 서버가 올바른 모델로 라우팅한다.
+    (질의 타입별 세부 분기는 RoutingConfig가 따로 담당한다.)
+    """
+
+    # 주 추론 모델 — 27B Qwen. 일반 대화/도구 호출의 기본.
     primary_model: str = "qwen3.5-27b"
+    # 보조 모델 — 한국어 특화 ExaOne. 한국어 품질이 중요한 경로에서 보조로 쓴다.
     auxiliary_model: str = "exaone-7.8b"
+    # 임베딩 모델 — 다국어 e5-large. RAG 벡터 검색용 임베딩 생성에 사용.
     embedding_model: str = "multilingual-e5-large"
+    # 컨텍스트 윈도우 상한(토큰). RTX 5090(32GB) 제약상 보수적으로 4096.
+    # (운영 라우팅에서는 프로필별로 별도 max_tokens를 두기도 한다.)
     max_context_tokens: int = 4096
+    # 기본 샘플링 온도. 라우팅 프로필이 없을 때의 폴백 값(0.7=다소 창의적).
     default_temperature: float = 0.7
+    # 응답 생성 토큰 상한의 기본값. 프로필이 지정되면 그 값이 우선한다.
     default_max_tokens: int = 4096
 
 
@@ -109,12 +165,24 @@ class ModelConfig(BaseModel):
 # 세션 설정
 # ─────────────────────────────────────────────
 class SessionConfig(BaseModel):
-    """세션 관리 설정."""
+    """
+    세션 관리 설정.
 
+    QueryEngine(Tier 1)이 한 세션의 수명·예산·기록을 통제하는 데 쓰는 값들이다.
+    무한 루프나 폭주를 막는 안전장치(턴 수·시간 예산)가 핵심이다.
+    """
+
+    # 세션/대화 기록을 저장할 디렉토리(상대경로 — 작업 디렉토리 기준).
     sessions_dir: str = ".nexus/sessions"
+    # 한 세션에서 허용하는 최대 에이전트 턴 수. query_loop의 while(True)가
+    # 도구 호출로 끝없이 돌지 않도록 50턴에서 강제 종료한다(폭주 방지 안전장치).
     max_turns: int = 50
+    # 한 세션의 누적 시간 예산(초). 5분을 넘기면 중단한다 — 응답이 한없이
+    # 길어지는 것을 막는 시간 기준 안전장치.
     max_budget_seconds: float = 300.0
+    # 세션 데이터의 유효 기간(시간). 24시간 지난 세션은 만료 대상으로 본다.
     session_ttl_hours: int = 24
+    # 대화 전체를 JSONL transcript로 남길지 여부. 기본 True(감사/재현용 기록).
     transcript_enabled: bool = True
 
 
@@ -130,13 +198,20 @@ class ScoutConfig(BaseModel):
       tool_call 문법 일관성을 확보한다.
     """
 
+    # Pydantic가 model_ 로 시작하는 필드를 예약어로 보고 경고하는데, 여기엔
+    # model_id 등이 있으므로 그 경고를 끈다(실제 동작에는 영향 없음).
     model_config = {"protected_namespaces": ()}  # model_ 접두사 경고 방지
 
+    # Scout 활성 여부. 단, 실제로는 하드웨어 티어가 TIER_S일 때만 자동 켜진다.
     enabled: bool = True  # TIER_S에서만 자동 활성화
+    # Scout 전용 vLLM 인스턴스 주소(메인 추론 8000과 다른 8003 포트).
     base_url: str = "http://192.168.21.112:8003"
-    api_key: str = "local-key"
+    api_key: str = "local-key"  # LAN 내부 인증 키(기본 placeholder).
+    # served-model-name — Worker(27B)와 같은 Qwen 패밀리의 4B 경량 모델.
     model_id: str = "qwen3.5-4b"
+    # Scout가 다룰 입력 컨텍스트 상한(토큰). 경량 보조 역할이라 4096이면 충분.
     max_context_tokens: int = 4096
+    # Scout 응답의 출력 토큰 상한. 빠른 사전판단 용도라 짧게 512로 제한한다.
     max_output_tokens: int = 512
 
 
@@ -358,15 +433,41 @@ _DEFAULT_CHAT_KEYWORDS: list[str] = [
 
 
 class RoutingProfile(BaseModel):
-    """개별 라우팅 프로필 — 질의 타입별 모델/파라미터 조합."""
+    """
+    개별 라우팅 프로필 — 질의 타입별 모델/파라미터 조합.
 
+    질의 분류(KNOWLEDGE/TOOL/CHAT) 결과에 따라 이 프로필 하나가 선택되어
+    vLLM 호출 페이로드(모델 이름 + 샘플링 파라미터)로 그대로 전달된다.
+    즉 "어떤 모델을, 어떤 온도/샘플링으로 부를지"를 한 묶음으로 정의한다.
+    """
+
+    # Pydantic의 model_ 예약어 경고를 끈다(아래 model 필드 때문). 동작엔 무영향.
     model_config = {"protected_namespaces": ()}  # model_ 접두사 경고 방지
 
-    model: str  # vLLM served-model-name (LoRA 어댑터 이름 또는 베이스)
+    # vLLM served-model-name. LoRA 어댑터 이름(예: nexus-phase3)이거나
+    # 베이스 모델 이름(qwen3.5-27b)이다. 이 값으로 GPU 서버가 모델을 고른다.
+    model: str
+    # 샘플링 온도. 낮을수록 결정적(사실 위주), 높을수록 다양/창의적.
     temperature: float = 0.3
+    # 이 프로필로 생성할 최대 출력 토큰 수.
     max_tokens: int = 4096
+    # Qwen3.5의 사고(thinking) 모드 on/off. chat_template_kwargs로 전달되며
+    # 기본 False(추가 사고 토큰을 안 써 속도/컨텍스트를 아낀다).
     enable_thinking: bool = False  # Qwen3.5 chat_template_kwargs 인자
+    # 사람용 설명 — 동작에는 영향 없고 운영자/테스트가 프로필을 식별하는 메모.
     description: str = ""  # 운영자/테스트용 설명
+    # ── 샘플링 파라미터 (degeneration/무한 반복 방지) ──────────────────
+    # 왜 추가하나: 이 4개가 누락되어 동일 문장이 무한 반복되는 결함이 있었다.
+    # 모든 기본값은 "비활성"(vLLM이 무시하는 값)으로 두어 하위 호환을 보장한다.
+    #   top_p=1.0            → nucleus 샘플링 비활성(전체 분포 사용)
+    #   repetition_penalty=1.0 → 반복 페널티 없음(1.0이 중립값)
+    #   frequency_penalty=0.0  → 빈도 페널티 없음
+    #   presence_penalty=0.0   → 등장 페널티 없음
+    # 실제 운영값은 config/nexus_config.yaml의 routing 프로필에서 주입한다.
+    top_p: float = 1.0
+    repetition_penalty: float = 1.0
+    frequency_penalty: float = 0.0
+    presence_penalty: float = 0.0
 
 
 class RoutingConfig(BaseModel):
@@ -385,6 +486,8 @@ class RoutingConfig(BaseModel):
     (하드웨어 업그레이드 또는 문제 발생 시 비상 스위치).
     """
 
+    # 라우팅 분류기 마스터 스위치. True면 질의 타입을 분류해 프로필을 고르고,
+    # False면 분류 없이 항상 tool_mode 프로필로 동작한다(위 docstring의 비상 스위치).
     enabled: bool = True
     long_input_threshold: int = 500  # 이 글자수 이상이면 TOOL_MODE
     # 분류기 종류 — 기본은 "heuristic" (HeuristicClassifier).
@@ -416,6 +519,13 @@ class RoutingConfig(BaseModel):
             max_tokens=2048,
             enable_thinking=False,
             description="일반 지식 QA — 베이스 Qwen + 낮은 temperature",
+            # 지식 QA는 사실 위주라 반복 페널티를 가장 강하게 건다.
+            # top_p=0.95로 꼬리 토큰을 약간 잘라 안정성 확보,
+            # repetition_penalty=1.15로 동일 문장 반복(degeneration) 억제.
+            top_p=0.95,
+            repetition_penalty=1.15,
+            frequency_penalty=0.3,
+            presence_penalty=0.0,
         )
     )
     tool_mode: RoutingProfile = Field(
@@ -425,6 +535,14 @@ class RoutingConfig(BaseModel):
             max_tokens=4096,
             enable_thinking=False,
             description="도구 호출 — Phase 3 LoRA + 중간 temperature",
+            # 도구 호출 모드는 repetition_penalty=1.0(비활성)이 핵심이다.
+            # 왜: tool_call JSON/XML은 같은 키("name","arguments" 등)와 괄호를
+            # 반복할 수밖에 없는데, 반복 페널티를 걸면 이 필수 토큰이 왜곡되어
+            # 파싱 실패를 유발한다. top_p만 0.95로 살짝 좁혀 안정성만 확보.
+            top_p=0.95,
+            repetition_penalty=1.0,
+            frequency_penalty=0.0,
+            presence_penalty=0.0,
         )
     )
     # CHAT_MODE 프로필 — 모델·온도는 KNOWLEDGE와 같지만 PromptAssembler가
@@ -437,6 +555,12 @@ class RoutingConfig(BaseModel):
             max_tokens=512,
             enable_thinking=False,
             description="인사·잡담 — 베이스 Qwen + RAG 미주입 + 짧은 응답",
+            # 잡담은 다양성이 중요하므로 top_p=0.9로 살짝 더 좁히되,
+            # 반복 페널티는 중간 강도(1.1)로 같은 인사말 반복을 막는다.
+            top_p=0.9,
+            repetition_penalty=1.1,
+            frequency_penalty=0.2,
+            presence_penalty=0.0,
         )
     )
 
@@ -455,11 +579,12 @@ class RoutingConfig(BaseModel):
 class TenantConfig(BaseModel):
     """단일 테넌트(학교·기업·기본) 설정."""
 
+    # model_override 등 model_ 접두사 필드 때문에 Pydantic 예약어 경고를 끈다.
     model_config = {"protected_namespaces": ()}  # model_ 접두사 경고 방지
 
-    id: str
-    name: str = ""
-    description: str = ""
+    id: str  # 테넌트 고유 식별자. X-Tenant-ID 헤더/조회 키로 쓰인다(필수).
+    name: str = ""  # 사람용 표시 이름(예: "한양대학교"). 없으면 빈 문자열.
+    description: str = ""  # 테넌트 설명 메모(운영용).
 
     # LoRA 라우팅 — tenant 전용 어댑터. None이면 라우팅/기본값 사용
     model_override: str | None = None
@@ -497,9 +622,17 @@ class TenantConfig(BaseModel):
 
 
 class TenantRegistry(BaseModel):
-    """테넌트 레지스트리."""
+    """
+    테넌트 레지스트리 — 등록된 모든 테넌트의 목록과 조회 헬퍼.
 
+    보통 config/tenants.yaml에서 통째로 로드되어 NexusConfig.tenants에 들어간다.
+    요청이 들어오면 X-Tenant-ID(또는 API 키)로 이 레지스트리에서 해당
+    TenantConfig를 찾아 LoRA/지식 소스 격리를 적용한다.
+    """
+
+    # 식별 실패 시 폴백할 기본 테넌트 id. resolve()가 이 값을 최후 보루로 쓴다.
     default_tenant: str = "default"
+    # 등록된 테넌트 목록. 기본으로 공개 지식만 보는 "default" 한 개를 둔다.
     tenants: list[TenantConfig] = Field(
         default_factory=lambda: [
             TenantConfig(
@@ -636,21 +769,37 @@ class HwpConfig(BaseModel):
 
 
 class SecurityConfig(BaseModel):
-    """보안 및 샌드박스 설정."""
+    """
+    보안 및 샌드박스 설정.
 
+    core/security(샌드박스/명령어 필터)와 권한 파이프라인 Layer 2가 참조한다.
+    Bash 명령어 화이트/블랙리스트, 파일 크기·확장자 제한 등 "무엇을 허용/차단할지"
+    의 경계값을 모아둔다. 기본값은 fail-closed 철학에 맞춰 보수적으로 잡혀 있다.
+    """
+
+    # 샌드박스 활성 여부. 기본 True — Bash 도구 실행을 격리 환경에서 돌린다.
     sandbox_enabled: bool = True
+    # 샌드박스 안에서 명령 1건의 최대 실행 시간(초). 무한 루프/멈춤을 30초에서 끊는다.
     sandbox_timeout_seconds: float = 30.0
+    # 명시적으로 허용할 Bash 패턴 화이트리스트. 비어 있으면 화이트리스트를
+    # 적용하지 않는다(차단은 아래 deny 패턴이 담당).
     bash_allow_patterns: list[str] = Field(default_factory=list)
+    # 무조건 차단할 위험 Bash 패턴(정규식). 시스템 파괴/포크 폭탄/디스크 덮어쓰기
+    # 같은 치명적 명령을 막는 최소 안전망이다.
     bash_deny_patterns: list[str] = Field(
         default_factory=lambda: [
-            r"rm\s+-rf\s+/",
-            r":(){ :\|:& };:",
-            r"dd\s+if=/dev/zero",
-            r"mkfs\.",
-            r">\s*/dev/sd",
+            r"rm\s+-rf\s+/",  # 루트부터 강제 삭제
+            r":(){ :\|:& };:",  # 포크 폭탄(fork bomb) — 프로세스 무한 증식
+            r"dd\s+if=/dev/zero",  # 디스크/파일을 0으로 덮어쓰기
+            r"mkfs\.",  # 파일시스템 포맷
+            r">\s*/dev/sd",  # 블록 디바이스에 직접 리다이렉트(디스크 손상)
         ]
     )
+    # 도구가 읽거나 쓸 수 있는 파일 1건의 최대 크기(바이트). 10MB를 넘는
+    # 거대 파일이 메모리를 잡아먹거나 컨텍스트를 폭주시키는 것을 막는다.
     max_file_size_bytes: int = 10 * 1024 * 1024  # 10MB
+    # 파일 도구가 다룰 수 있는 확장자 화이트리스트. 텍스트/코드/설정 계열만
+    # 허용해 바이너리나 위험 포맷 접근을 기본적으로 막는다.
     allowed_file_extensions: list[str] = Field(
         default_factory=lambda: [
             ".py",
@@ -672,6 +821,50 @@ class SecurityConfig(BaseModel):
             ".env.example",
         ]
     )
+
+
+# ─────────────────────────────────────────────
+# 지식 베이스 RAG 게이팅 설정 (2026-06-18)
+# ─────────────────────────────────────────────
+# 배경(실측으로 확정): e5-large 코사인 유사도는 "무관한 문서끼리"도 0.78~0.83
+# 구간에 몰린다. 즉 절대 유사도만으로는 관련/무관을 가르기 어렵다.
+#   - 메타질문 "rag에 이런 정보가 있었어?" → top1 sim=0.824 (무관: 비트토렌트류)
+#   - "요한 제바스티안 바흐"                → top1 sim=0.857 (관련)
+# 기존 KnowledgeRetriever.min_similarity=0.5(코드 기본값, config 미노출)는 너무
+# 낮아 모든 검색 결과가 무조건 주입됐고, 모델이 무관 청크를 근거로 그럴듯한
+# 오답을 만들어내는 할루시네이션의 원인이 됐다.
+#
+# 해법(2단 게이팅):
+#   1) abs_threshold(절대 임계): 최상위 결과조차 이 값보다 낮으면 "관련 자료
+#      없음"으로 보고 전부 드롭한다. 무관 분포 상한(~0.83)보다 살짝 위인 0.84로
+#      잡아, 관련 질의(바흐 0.857)는 통과시키고 무관 질의(0.824)는 차단한다.
+#   2) relevance_margin(상대 마진): 최상위 유사도(top_sim)에서 이 값만큼만
+#      떨어진 결과까지만 남긴다. top과 크게 벌어진 "끼어든 노이즈 청크"를 잘라
+#      가장 관련 높은 소수의 청크만 모델에 보여준다.
+class KnowledgeRagConfig(BaseModel):
+    """
+    지식 베이스(tb_knowledge) RAG 검색·게이팅 설정.
+
+    모든 임계값의 단일 소스는 config/nexus_config.yaml#knowledge_rag 이며,
+    이 클래스의 기본값은 yaml 누락 시(테스트/경량 실행) 폴백으로만 쓰인다.
+    """
+
+    # 검색해 올 상위 청크 개수. 너무 많으면 무관 청크가 섞이고 컨텍스트를
+    # 잡아먹으므로 5개로 보수적으로 둔다(RTX 5090 8K 컨텍스트 절약).
+    top_k: int = 5
+    # DB 벡터 검색 단계의 1차 컷오프(search_by_vector에 그대로 전달).
+    # 명백히 무관한 하위 청크를 DB 단계에서 미리 떨군다. 기존 코드 기본값
+    # 0.5는 e5 분포상 사실상 무필터였으므로 0.75로 현실화한다(아래 게이팅과
+    # 별개의 1차 필터 — 게이팅은 그 위에서 다시 한 번 정밀하게 거른다).
+    min_similarity: float = 0.75
+    # 절대 임계 게이팅: 최상위 결과의 유사도가 이 값보다 낮으면 전부 드롭한다.
+    # 실측 근거 — 무관 분포가 0.78~0.83에 몰리므로 그 상한 바로 위인 0.84로
+    # 둔다. 무관 메타질문(top1=0.824)은 차단, 관련 질의(바흐 0.857)는 통과.
+    abs_threshold: float = 0.84
+    # 상대 마진 게이팅: 최상위 유사도(top_sim)에서 이 값 이내로 떨어진 결과만
+    # 남긴다. e5는 관련 청크들끼리도 유사도가 촘촘해서 0.03(3%p)이면 진짜 핵심
+    # 청크 1~몇 개만 통과하고, top과 동떨어진 노이즈 청크는 잘린다.
+    relevance_margin: float = 0.03
 
 
 # ─────────────────────────────────────────────
@@ -702,6 +895,9 @@ class NexusConfig(BaseSettings):
     postgresql: PostgreSQLConfig = Field(default_factory=PostgreSQLConfig)
 
     # 편의 접근자 (flat config 호환)
+    # 아래 property들은 config.redis.host처럼 중첩 접근하지 않고 config.redis_host로
+    # 평평하게 읽을 수 있게 해주는 단순 위임자다. 과거 flat 설정을 쓰던 코드와의
+    # 호환을 위해 남겨두며, 값을 가공하지 않고 그대로 돌려준다.
     @property
     def redis_host(self) -> str:
         return self.redis.host
@@ -759,30 +955,46 @@ class NexusConfig(BaseSettings):
     # v7.0 Part 2.5 쿼리 라우팅 — 지식/도구 질의 분기 (2026-04-21 추가)
     routing: RoutingConfig = Field(default_factory=RoutingConfig)
 
+    # 지식 베이스 RAG 게이팅 — 무관 청크 주입 차단 (2026-06-18 추가)
+    # 임계값을 코드가 아닌 yaml에서 받아 운영 중 튜닝 가능하게 한다.
+    knowledge_rag: KnowledgeRagConfig = Field(default_factory=KnowledgeRagConfig)
+
     # 멀티테넌시 (Part 5 Ch 15, 2026-04-21)
     tenants: TenantRegistry = Field(default_factory=TenantRegistry)
 
     # v7.2 MCP 통합 — LAN 내부 MCP 서버 연결 (기본 비활성, 에어갭 fail-closed)
     mcp: McpConfig = Field(default_factory=McpConfig)
 
-    # 하드웨어 티어 (auto: GPU VRAM 기반 자동 감지)
+    # 하드웨어 티어 — Scout 활성화/컨텍스트 길이 등 동작을 좌우한다.
+    # "auto"면 GPU VRAM을 감지해 TIER_S/M/L 등을 자동 결정한다. 특정 티어를
+    # 강제하고 싶으면 그 값을 직접 넣는다(예: 테스트에서 티어 고정).
     hardware_tier: str = "auto"
 
     # 운영
-    log_level: str = "INFO"
-    log_file: str | None = None
+    log_level: str = "INFO"  # 로그 레벨(DEBUG/INFO/WARNING/...). 기본 INFO.
+    log_file: str | None = None  # 로그를 파일로도 남길 경로. None이면 콘솔만.
+    # 설정/소스 파일 변경 감시 후 자동 리로드 여부. 기본 False(운영 안정성 우선).
     watch_files: bool = False
-    debug: bool = False
+    debug: bool = False  # 디버그 모드 스위치. 켜면 추가 진단 동작/로그가 활성화된다.
 
-    # 에어갭 모드
+    # 에어갭 모드 — 기본 True. 켜져 있으면 아래 validator가 GPU URL이 LAN인지
+    # 한 번 더 확인한다(외부 주소면 경고). 폐쇄망 운영의 기본 전제.
     air_gap_mode: bool = True
 
     @model_validator(mode="after")
     def validate_air_gap(self) -> NexusConfig:
-        """에어갭 모드가 켜져 있으면 GPU 서버 URL이 로컬인지 확인한다."""
+        """
+        에어갭 모드가 켜져 있으면 GPU 서버 URL이 로컬인지 확인한다.
+
+        GPUServerConfig의 url validator와 비슷하지만, 이건 전체 설정이 조립된
+        뒤(after) 한 번 더 도는 최종 점검이다. air_gap_mode가 True인데 GPU URL이
+        외부 주소면 경고를 띄운다. 여기서도 예외가 아니라 warning만 내는 이유는
+        설정 로드 실패로 전체가 멈추는 것을 피하기 위함이다(알리되 진행).
+        """
         if self.air_gap_mode:
             parsed = urlparse(self.gpu_server_url)
             hostname = parsed.hostname or ""
+            # 로컬호스트 + 사설망(RFC1918) 대역만 "내부"로 인정한다.
             local_prefixes = ("localhost", "127.0.0.1", "10.", "172.", "192.168.")
             if not any(hostname.startswith(p) for p in local_prefixes):
                 import warnings
@@ -814,6 +1026,8 @@ def load_and_validate_config(
     환경변수가 파일 설정을 덮어쓸 수 있어야 배포 환경에서 유연하다.
     """
     # 설정 파일 경로 탐색
+    # config_path를 명시하지 않으면 정해진 후보들을 위에서부터 훑어 처음 존재하는
+    # 파일을 채택한다(프로젝트 로컬 → 사용자 홈 순). 운영에선 대개 첫 후보가 잡힌다.
     if config_path is None:
         candidates = [
             Path("config/nexus_config.yaml"),
@@ -827,26 +1041,33 @@ def load_and_validate_config(
                 break
 
     if config_path and Path(config_path).exists():
-        # YAML 파일에서 로드
+        # 찾은(또는 지정된) 설정 파일을 확장자에 따라 YAML/JSON으로 읽는다.
         path = Path(config_path)
         if path.suffix in (".yaml", ".yml"):
             try:
                 import yaml
 
+                # safe_load는 신뢰할 수 없는 태그 실행을 막아준다. 빈 파일이면
+                # None이 나오므로 `or {}`로 빈 dict로 정규화한다.
                 with open(path, encoding="utf-8") as f:
                     file_data = yaml.safe_load(f) or {}
             except ImportError:
+                # PyYAML 부재는 치명적이지 않게 처리 — 기본값으로라도 뜨게 한다.
                 logger.warning("PyYAML이 설치되지 않아 설정 파일을 로드할 수 없습니다.")
                 file_data = {}
         else:
+            # .yaml/.yml이 아니면 JSON으로 간주해 읽는다.
             import json
 
             with open(path, encoding="utf-8") as f:
                 file_data = json.load(f)
 
+        # 파일에서 읽은 dict를 펼쳐 Pydantic 모델에 주입한다. 이 시점에 환경변수
+        # (NEXUS_*)와 각종 validator가 함께 적용되어 최종 설정이 검증·확정된다.
         config = NexusConfig(**file_data)
         logger.info(f"설정 파일 로드 완료: {config_path}")
     else:
+        # 후보 파일이 하나도 없으면 전부 기본값으로 초기화한다(테스트/최초 실행).
         config = NexusConfig()
         logger.info("기본 설정으로 초기화 (설정 파일 없음)")
 
@@ -859,6 +1080,9 @@ def load_and_validate_config(
 
             with open(tenants_path, encoding="utf-8") as f:
                 t_data = yaml.safe_load(f) or {}
+            # tenants.yaml이 실제로 테넌트 키를 담고 있을 때만 덮어쓴다(빈/잘못된
+            # 파일이 멀쩡한 기본 레지스트리를 날리는 것을 막는 가드). model_copy로
+            # tenants 필드만 교체해 나머지 설정은 그대로 보존한다.
             if isinstance(t_data, dict) and ("tenants" in t_data or "default_tenant" in t_data):
                 config = config.model_copy(update={"tenants": TenantRegistry(**t_data)})
                 logger.info(

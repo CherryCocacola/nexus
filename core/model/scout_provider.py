@@ -23,6 +23,8 @@ import logging
 from collections.abc import AsyncGenerator
 from typing import Any
 
+# Scout는 별도 백엔드가 아니라 LocalModelProvider를 상속해 재사용한다.
+# (llama.cpp도 OpenAI 호환 API를 제공하므로 통신 로직이 동일하다)
 from core.message import Message, StreamEvent
 from core.model.inference import LocalModelProvider
 
@@ -99,6 +101,10 @@ class ScoutModelProvider(LocalModelProvider):
         stop_sequences: list[str] | None = None,
         model_override: str | None = None,
         enable_thinking: bool | None = False,
+        top_p: float = 1.0,
+        repetition_penalty: float = 1.0,
+        frequency_penalty: float = 0.0,
+        presence_penalty: float = 0.0,
     ) -> AsyncGenerator[StreamEvent, None]:
         """
         Scout 전용 stream — enable_thinking을 None으로 강제한다.
@@ -108,7 +114,9 @@ class ScoutModelProvider(LocalModelProvider):
         이렇게 하면 llama.cpp의 기본 Qwen3.5 chat template이 그대로 동작하여
         정상적인 길이의 응답(마크다운 4섹션 리포트)을 얻을 수 있다.
         """
-        # enable_thinking을 None으로 강제 — 4B가 False에서 깨지는 α 이슈 회피
+        # 부모 stream()을 그대로 호출하되 enable_thinking만 None으로 강제 주입한다.
+        # 부모가 만들어 yield하는 StreamEvent를 한 건씩 그대로 다시 흘려보내는
+        # passthrough 패턴 — 4-Tier 체인을 우회하지 않고 부모 제너레이터를 감싼다.
         async for ev in super().stream(
             messages=messages,
             system_prompt=system_prompt,
@@ -118,6 +126,11 @@ class ScoutModelProvider(LocalModelProvider):
             stop_sequences=stop_sequences,
             model_override=model_override,
             enable_thinking=None,
+            # 샘플링 파라미터를 그대로 상위로 전달(passthrough) — degeneration 방지.
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            frequency_penalty=frequency_penalty,
+            presence_penalty=presence_penalty,
         ):
             yield ev
 

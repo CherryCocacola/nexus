@@ -14,16 +14,20 @@ LocalModelProvider는 vLLM의 OpenAI 호환 API와 SSE 스트리밍으로 통신
 
 from __future__ import annotations
 
-import json
+# 표준 라이브러리
+import json  # SSE 청크(JSON 문자열) 파싱 및 tool_calls arguments 직렬화에 사용
 import logging
-import time
+import time  # latency 측정용 단조 시계(time.monotonic)
 from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 from typing import Any
 
+# 외부 라이브러리 — vLLM 서버와 HTTP/SSE로 통신하는 비동기 클라이언트
 import httpx
 
+# 내부 도메인 모델 — 4-Tier 체인 전체에서 공유하는 데이터 타입
+# (StreamEvent/StopReason 등은 frozen이므로 생성 후 수정하지 않는다)
 from core.message import (
     Message,
     StopReason,
@@ -34,6 +38,7 @@ from core.message import (
     ToolUseBlock,
 )
 
+# 모듈 전용 로거 — JSONL 로깅 규칙에 맞춰 "nexus.{module}" 네이밍을 따른다
 logger = logging.getLogger("nexus.model.inference")
 
 
@@ -48,13 +53,14 @@ class ModelConfig:
     """
 
     model_id: str  # vLLM에서 사용하는 모델 식별자
-    max_context_tokens: int = 8192
-    max_output_tokens: int = 4096
+    max_context_tokens: int = 8192  # 입력+출력 합산 상한 (모델 컨텍스트 윈도우)
+    max_output_tokens: int = 4096  # 한 번에 생성할 수 있는 응답 토큰 상한
     default_temperature: float = 0.7
     supports_tool_calling: bool = True  # vLLM 네이티브 tool calling 지원 여부
     supports_streaming: bool = True
-    stop_sequences: list[str] = field(default_factory=list)
+    stop_sequences: list[str] = field(default_factory=list)  # 생성 중단 토큰 목록
     fallback_model_id: str | None = None  # OOM 시 대체 모델
+    # 로컬 추론이라 토큰 과금이 없다. 사용량 추적 코드와의 호환을 위해 필드만 유지.
     cost_per_input_token: float = 0.0  # 로컬: 0 (전기 비용은 별도)
     cost_per_output_token: float = 0.0
 
@@ -85,6 +91,10 @@ class ModelProvider(ABC):
         stop_sequences: list[str] | None = None,
         model_override: str | None = None,
         enable_thinking: bool | None = False,
+        top_p: float = 1.0,
+        repetition_penalty: float = 1.0,
+        frequency_penalty: float = 0.0,
+        presence_penalty: float = 0.0,
     ) -> AsyncGenerator[StreamEvent, None]:
         """
         모델에 스트리밍 요청을 보낸다.
@@ -93,6 +103,11 @@ class ModelProvider(ABC):
             model_override: 호출 시점에 기본 model_id를 덮어쓴다.
                 v7.0 Part 2.5 쿼리 라우팅에서 LoRA ON/OFF를 런타임 전환하기 위해 사용.
                 None이면 프로바이더의 model_id를 그대로 쓴다.
+            top_p: nucleus 샘플링 임계. 1.0이면 비활성(전체 분포 사용).
+            repetition_penalty: 반복 토큰 페널티. 1.0이 중립(비활성).
+                동일 문장 무한 반복(degeneration)을 억제한다.
+            frequency_penalty: 빈도 페널티. 0.0이면 비활성.
+            presence_penalty: 등장 페널티. 0.0이면 비활성.
             enable_thinking: Qwen3.5 chat_template_kwargs.enable_thinking 인자.
                 - False(기본): 빈 <think></think> 블록 주입 — Worker(27B)에서 내부 독백이
                   답변을 잡아먹는 현상 회피 목적.
@@ -159,6 +174,19 @@ class LocalModelProvider(ModelProvider):
         connect_timeout: float = 10.0,
         read_timeout: float = 300.0,
     ):
+        """
+        vLLM 서버 연결 정보와 httpx 클라이언트를 준비한다.
+
+        Args:
+            base_url: vLLM 서버 주소 (에어갭이므로 LAN/localhost만 허용)
+            api_key: vLLM --api-key와 동일해야 인증을 통과한다
+            model_id: 기본으로 사용할 모델 식별자 (stream에서 override 가능)
+            embedding_base_url: 임베딩 전용 서버가 따로 있을 때 지정. None이면
+                채팅과 동일한 base_url을 재사용한다.
+            connect_timeout: 연결 수립 제한 시간(초)
+            read_timeout: 응답 본문 읽기 제한 시간(초). GPU 추론이 길 수 있어 넉넉히 둔다.
+        """
+        # 끝의 슬래시를 제거해 "{base_url}/v1/..." 조합 시 // 가 생기지 않게 한다
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.model_id = model_id
@@ -177,21 +205,23 @@ class LocalModelProvider(ModelProvider):
             supports_tool_calling=True,
         )
 
-        # httpx 비동기 클라이언트 — 커넥션 풀링 + 타임아웃 설정
+        # httpx 비동기 클라이언트 — 커넥션 풀링 + 단계별 타임아웃 설정.
+        # 클라이언트를 1개만 만들어 재사용하면 매 요청마다 TCP 핸드셰이크를
+        # 반복하지 않아도 되어 LAN 추론에서 지연이 줄어든다.
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(
-                connect=connect_timeout,
-                read=read_timeout,
-                write=30.0,
-                pool=10.0,
+                connect=connect_timeout,  # 연결 수립 단계 제한
+                read=read_timeout,  # 응답 읽기 단계 제한 (스트리밍 본문)
+                write=30.0,  # 요청 본문 전송 제한
+                pool=10.0,  # 풀에서 커넥션을 얻기까지의 대기 제한
             ),
             limits=httpx.Limits(
-                max_connections=20,
-                max_keepalive_connections=10,
+                max_connections=20,  # 동시에 열 수 있는 총 커넥션 수
+                max_keepalive_connections=10,  # 재사용 위해 유지할 idle 커넥션 수
             ),
         )
 
-        # 요청 통계
+        # 요청 통계 — stats 프로퍼티로 노출해 운영 중 latency/에러율 모니터링에 쓴다
         self._request_count: int = 0
         self._total_latency: float = 0.0
         self._error_count: int = 0
@@ -208,6 +238,10 @@ class LocalModelProvider(ModelProvider):
         stop_sequences: list[str] | None = None,
         model_override: str | None = None,
         enable_thinking: bool | None = False,
+        top_p: float = 1.0,
+        repetition_penalty: float = 1.0,
+        frequency_penalty: float = 0.0,
+        presence_penalty: float = 0.0,
     ) -> AsyncGenerator[StreamEvent, None]:
         """
         vLLM /v1/chat/completions SSE 스트리밍.
@@ -221,6 +255,7 @@ class LocalModelProvider(ModelProvider):
         enable_thinking=None이면 chat_template_kwargs 자체를 요청에서 빼서
         llama.cpp/vLLM 기본 동작을 따르도록 한다(Scout 전용 경로).
         """
+        # 통계용 카운터 증가 + 지연 측정 시작점 기록
         self._request_count += 1
         start_time = time.monotonic()
 
@@ -249,6 +284,20 @@ class LocalModelProvider(ModelProvider):
             "max_tokens": max_tokens,
             "stream": True,
             "stream_options": {"include_usage": True},  # vLLM 사용량 추적
+            # ── 샘플링 파라미터 (degeneration/무한 반복 방지) ──────────────
+            # 왜 항상 top-level에 넣는가:
+            #   이 코드는 openai SDK가 아니라 httpx raw POST(json=payload)로
+            #   /v1/chat/completions에 직접 보낸다. 따라서 vLLM 확장 파라미터인
+            #   repetition_penalty도 extra_body가 아니라 payload 최상위에 그대로
+            #   넣어야 vLLM이 인식한다(SDK라면 extra_body가 필요하지만 여기선 아님).
+            # 왜 조건부 주입 없이 항상 넣는가:
+            #   기본값(top_p=1.0/repetition_penalty=1.0/freq=0.0/presence=0.0)은
+            #   전부 "비활성"값이라 vLLM이 사실상 무시한다. 분기 없이 항상 보내면
+            #   코드가 단순해지고 누락(=이번 버그의 원인)을 원천 차단한다.
+            "top_p": top_p,
+            "repetition_penalty": repetition_penalty,
+            "frequency_penalty": frequency_penalty,
+            "presence_penalty": presence_penalty,
         }
         if enable_thinking is not None:
             # bool(True/False)일 때만 명시적으로 주입 — None이면 완전 생략
@@ -262,12 +311,14 @@ class LocalModelProvider(ModelProvider):
             payload["tools"] = [self._convert_tool_schema(t) for t in tools]
             payload["tool_choice"] = "auto"
 
+        # vLLM 인증 헤더 — api_key가 서버 --api-key와 일치해야 401을 피한다
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
         }
 
         # MESSAGE_START 이벤트 — 실제 호출된 model_id를 전달(라우팅 추적용)
+        # 상위 Tier(query_loop)는 이 이벤트로 "어떤 모델이 응답을 시작했는지" 안다
         yield StreamEvent(
             type=StreamEventType.MESSAGE_START,
             model_id=active_model_id,
@@ -279,13 +330,16 @@ class LocalModelProvider(ModelProvider):
         max_retries_for_context = 3
         current_max_tokens = payload["max_tokens"]
 
+        # 컨텍스트 초과(400) 시에만 max_tokens를 줄여 다시 도는 재시도 루프.
+        # 정상 흐름이면 첫 번째 attempt에서 [DONE]을 받고 return 하므로 1회만 돈다.
         for attempt in range(max_retries_for_context):
             payload["max_tokens"] = current_max_tokens
 
-            # SSE 스트리밍 처리
+            # ── 이번 attempt의 누적 상태 (attempt마다 새로 초기화) ──
+            # tool_calls는 SSE 청크에 쪼개져 오므로 index별로 모아 합친다
             accumulated_tool_calls: dict[int, dict[str, Any]] = {}
             total_usage = TokenUsage()
-            context_exceeded = False
+            context_exceeded = False  # 이번 attempt가 컨텍스트 초과로 끝났는지 표시
             # finish_reason 이후 usage 청크를 기다리기 위한 변수
             # vLLM은 finish_reason 청크 → usage 청크 → [DONE] 순으로 전송한다.
             pending_stop: StopReason | None = None
@@ -345,11 +399,14 @@ class LocalModelProvider(ModelProvider):
                         )
                         return
 
-                    # SSE 라인 파싱 (async with 블록 안에서 수행)
+                    # SSE 라인 파싱 (async with 블록 안에서 수행).
+                    # SSE 프로토콜은 "data: {json}\n\n" 형태로 청크를 흘려보낸다.
                     async for line in response.aiter_lines():
+                        # "data: " 접두사가 없는 줄(빈 줄, 주석 등)은 무시
                         if not line.startswith("data: "):
                             continue
 
+                        # "data: " (6글자) 이후가 실제 페이로드
                         data_str = line[6:].strip()
                         if data_str == "[DONE]":
                             # pending_stop이 없으면 (finish_reason 없이 [DONE] 도달)
@@ -370,6 +427,9 @@ class LocalModelProvider(ModelProvider):
                             logger.warning("잘못된 SSE JSON: %s", data_str[:200])
                             continue
 
+                        # usage 청크 — stream_options.include_usage 덕분에 마지막에
+                        # 별도 청크로 온다. OpenAI 키 이름(prompt/completion)을
+                        # Nexus TokenUsage 필드(input/output)로 매핑한다.
                         if "usage" in data and data["usage"]:
                             u = data["usage"]
                             total_usage = TokenUsage(
@@ -377,13 +437,16 @@ class LocalModelProvider(ModelProvider):
                                 output_tokens=u.get("completion_tokens", 0),
                             )
 
+                        # usage 전용 청크는 choices가 비어 있을 수 있으므로 건너뛴다
                         if not data.get("choices"):
                             continue
 
+                        # 스트리밍에서는 한 청크당 choice 1개. delta에 이번 조각이 담긴다.
                         choice = data["choices"][0]
                         delta = choice.get("delta", {})
                         finish_reason = choice.get("finish_reason")
 
+                        # 본문 텍스트 조각 → 그대로 TEXT_DELTA로 상위에 흘려보낸다
                         if delta.get("content"):
                             yield StreamEvent(
                                 type=StreamEventType.TEXT_DELTA,
@@ -409,6 +472,8 @@ class LocalModelProvider(ModelProvider):
                                 text=reasoning,
                             )
 
+                        # tool_calls 조각도 청크에 쪼개져 오므로 누적 헬퍼에 위임.
+                        # 헬퍼가 시작/델타 시점에 맞는 StreamEvent를 만들어 반환한다.
                         if "tool_calls" in delta:
                             for tc_delta in delta["tool_calls"]:
                                 for _evt in self._accumulate_tool_call(
@@ -416,6 +481,9 @@ class LocalModelProvider(ModelProvider):
                                 ):
                                     yield _evt
 
+                        # finish_reason이 오면 이번 응답이 끝났다는 뜻.
+                        # OpenAI finish_reason 문자열을 Nexus StopReason으로 매핑.
+                        # 알 수 없는 값은 안전하게 END_TURN으로 처리(fail-closed).
                         if finish_reason:
                             stop = {
                                 "stop": StopReason.END_TURN,
@@ -434,7 +502,12 @@ class LocalModelProvider(ModelProvider):
                             # [DONE] 또는 usage 청크에서 최종 yield + return 한다.
                             pending_stop = stop
 
+            # ── 예외 처리: 모든 통신 오류를 ERROR StreamEvent로 변환 ──
+            # 예외를 위로 던지지 않고 이벤트로 감싸는 이유: 상위 Tier(query_loop)는
+            # AsyncGenerator를 소비할 뿐 try/except로 감싸지 않으므로, 여기서 ERROR
+            # 이벤트로 내려보내야 사용자에게 안내 메시지가 깔끔하게 전달된다.
             except httpx.ConnectError as e:
+                # 서버 자체에 연결 불가 — GPU 서버 다운/네트워크/방화벽 문제
                 self._error_count += 1
                 yield StreamEvent(
                     type=StreamEventType.ERROR,
@@ -446,6 +519,7 @@ class LocalModelProvider(ModelProvider):
                     ),
                 )
             except httpx.ReadTimeout as e:
+                # 연결은 됐지만 read_timeout 내에 응답 본문이 안 옴 (추론 과부하 등)
                 self._error_count += 1
                 yield StreamEvent(
                     type=StreamEventType.ERROR,
@@ -453,6 +527,7 @@ class LocalModelProvider(ModelProvider):
                     message=f"GPU 서버 응답 타임아웃 ({self._client.timeout.read}s): {e}",
                 )
             except httpx.HTTPStatusError as e:
+                # raise_for_status 등에서 올라온 HTTP 상태 오류
                 self._error_count += 1
                 yield StreamEvent(
                     type=StreamEventType.ERROR,
@@ -460,6 +535,8 @@ class LocalModelProvider(ModelProvider):
                     message=f"vLLM HTTP 에러: {e.response.status_code} - {e.response.text[:500]}",
                 )
             except Exception as e:
+                # 예상 못한 모든 오류의 최종 안전망 — anti-pattern #8(bare except)을
+                # 피하되, 마지막 방어선으로 구체 타입을 남기고 traceback을 로깅한다.
                 self._error_count += 1
                 logger.exception("stream()에서 예상치 못한 에러: %s", e)
                 yield StreamEvent(
@@ -468,11 +545,13 @@ class LocalModelProvider(ModelProvider):
                     message=f"예상치 못한 에러: {type(e).__name__}: {e}",
                 )
 
-            # 컨텍스트 초과 재시도가 아니면 루프 탈출
+            # 컨텍스트 초과 재시도가 아니면(정상 종료 또는 다른 에러) 루프 탈출.
+            # context_exceeded=True일 때만 max_tokens를 줄여 다음 attempt로 넘어간다.
             if not context_exceeded:
                 break
         else:
-            # for 루프가 break 없이 끝남 = 재시도 모두 실패
+            # for...else: for가 break 없이 끝났을 때만 실행된다.
+            # 즉 모든 attempt가 컨텍스트 초과로 소진된 경우 = 재시도 모두 실패
             yield StreamEvent(
                 type=StreamEventType.ERROR,
                 error_code="CONTEXT_OVERFLOW",
@@ -482,6 +561,7 @@ class LocalModelProvider(ModelProvider):
                 ),
             )
 
+        # 성공/실패와 무관하게 이번 호출에 걸린 시간을 누적(평균 latency 산출용)
         self._total_latency += time.monotonic() - start_time
 
     # ─── embed() ───
@@ -523,7 +603,13 @@ class LocalModelProvider(ModelProvider):
     # ─── count_tokens() ───
 
     async def count_tokens(self, messages: list[Message]) -> int:
-        """메시지의 토큰 수를 휴리스틱으로 추정한다."""
+        """
+        메시지의 토큰 수를 휴리스틱으로 추정한다.
+
+        실제 vLLM의 BPE 토크나이저를 호출하지 않고 Message.estimated_tokens()의
+        근사치를 합산한다. 정확도가 필요한 컨텍스트 초과 판정은 stream() 내부에서
+        서버가 돌려준 실제 input_tokens로 재계산하므로, 여기선 빠른 추정으로 충분하다.
+        """
         return sum(m.estimated_tokens() for m in messages)
 
     # ─── get_config() ───
@@ -588,6 +674,8 @@ class LocalModelProvider(ModelProvider):
                                 },
                             })
 
+                    # 텍스트가 전혀 없으면 content를 None으로 둔다. OpenAI 규약상
+                    # tool_calls만 있는 assistant 메시지는 content가 null이어도 된다.
                     entry["content"] = " ".join(text_parts) if text_parts else None
                     if tool_calls:
                         entry["tool_calls"] = tool_calls
@@ -627,10 +715,16 @@ class LocalModelProvider(ModelProvider):
         """
         SSE chunk에서 온 tool_call 델타를 누적하고,
         필요한 StreamEvent를 반환한다.
+
+        왜 누적이 필요한가: vLLM은 하나의 tool_call도 여러 청크로 쪼개 보낸다.
+        보통 첫 청크에 id+function.name이 오고, 이후 청크들에 arguments(JSON 문자열)가
+        조금씩 이어진다. index를 키로 삼아 같은 도구 호출의 조각들을 한곳에 모은다.
         """
         events: list[StreamEvent] = []
+        # 같은 tool_call의 조각을 식별하는 키. 병렬 도구 호출이면 0,1,2... 로 구분된다.
         idx = tc_delta.get("index", 0)
 
+        # 이 index가 처음 등장하면 빈 누적 슬롯을 만든다
         if idx not in accumulated:
             accumulated[idx] = {
                 "id": tc_delta.get("id", ""),
@@ -638,13 +732,15 @@ class LocalModelProvider(ModelProvider):
             }
 
         tc = accumulated[idx]
+        # id는 나중 청크에서 채워질 수 있으므로 들어올 때마다 갱신
         if tc_delta.get("id"):
             tc["id"] = tc_delta["id"]
 
         func = tc_delta.get("function", {})
+        # name은 보통 한 번만 온다 → 이 시점을 "도구 호출 시작"으로 보고 알린다
         if func.get("name"):
             tc["function"]["name"] = func["name"]
-            # TOOL_USE_START 이벤트
+            # TOOL_USE_START 이벤트 (input은 아직 비어 있음 — 곧 델타로 채워진다)
             events.append(
                 StreamEvent(
                     type=StreamEventType.TOOL_USE_START,
@@ -655,6 +751,8 @@ class LocalModelProvider(ModelProvider):
                     ),
                 )
             )
+        # arguments는 JSON 문자열 조각으로 여러 번 나뉘어 온다 → 이어붙이며 누적.
+        # 동시에 각 조각을 TOOL_USE_DELTA로 흘려보내 UI가 실시간 표시할 수 있게 한다.
         if func.get("arguments"):
             tc["function"]["arguments"] += func["arguments"]
             events.append(
@@ -672,11 +770,20 @@ class LocalModelProvider(ModelProvider):
     def _finalize_tool_calls(
         accumulated: dict[int, dict[str, Any]],
     ) -> list[StreamEvent]:
-        """누적된 tool_calls를 최종 TOOL_USE_STOP 이벤트로 변환한다."""
+        """
+        누적된 tool_calls를 최종 TOOL_USE_STOP 이벤트로 변환한다.
+
+        finish_reason="tool_calls" 또는 [DONE] 시점에 호출된다. 그동안 조각으로
+        모아둔 arguments 문자열을 이제 완성된 JSON으로 파싱해 도구별로 닫아준다.
+        index 순서대로 처리해 병렬 도구 호출의 순서를 안정적으로 유지한다.
+        """
         events: list[StreamEvent] = []
         for idx in sorted(accumulated.keys()):
             tc = accumulated[idx]
+            # name이 없는 슬롯은 불완전한 호출이므로 건너뛴다
             if tc.get("function", {}).get("name"):
+                # 누적된 arguments 문자열을 dict로 파싱. 깨진 JSON이면 빈 dict로
+                # 폴백해 도구 실행 단계에서 스키마 검증이 처리하도록 넘긴다.
                 try:
                     args = json.loads(tc["function"].get("arguments", "{}"))
                 except json.JSONDecodeError:
@@ -697,7 +804,11 @@ class LocalModelProvider(ModelProvider):
 
     @property
     def stats(self) -> dict[str, Any]:
-        """요청 통계를 반환한다."""
+        """
+        요청 통계를 반환한다 (운영 모니터링/디버깅용).
+
+        request_count가 0일 때 0으로 나누지 않도록 avg 계산에서 max(...,1)을 쓴다.
+        """
         return {
             "request_count": self._request_count,
             "error_count": self._error_count,
@@ -708,5 +819,9 @@ class LocalModelProvider(ModelProvider):
         }
 
     async def close(self) -> None:
-        """HTTP 클라이언트를 정리한다."""
+        """
+        HTTP 클라이언트를 정리한다.
+
+        커넥션 풀의 열린 소켓을 닫는다. 앱 종료 시 호출해 리소스 누수를 막는다.
+        """
         await self._client.aclose()

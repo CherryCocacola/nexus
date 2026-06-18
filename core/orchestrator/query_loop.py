@@ -141,6 +141,10 @@ async def query_loop(
     temperature: float = 0.7,
     max_tokens_cap: int | None = None,
     enable_thinking: bool = False,
+    top_p: float = 1.0,
+    repetition_penalty: float = 1.0,
+    frequency_penalty: float = 0.0,
+    presence_penalty: float = 0.0,
 ) -> AsyncGenerator[StreamEvent | Message, None]:
     """
     핵심 에이전트 턴 루프.
@@ -171,15 +175,26 @@ async def query_loop(
             base_max_tokens로 사용되어, 가벼운 답변(예: KNOWLEDGE_MODE 2048)이
             필요할 때 과도한 토큰 소비를 막는다.
         enable_thinking: Qwen3.5 chat_template_kwargs 인자 (기본 False).
+        top_p: nucleus 샘플링 임계 (기본 1.0=비활성). 라우팅 프로필에서 결정한 값을
+            그대로 Tier 3(model_provider.stream)로 전달한다(passthrough).
+        repetition_penalty: 반복 토큰 페널티 (기본 1.0=비활성). 동일 문장 무한 반복
+            (degeneration)을 억제하기 위해 추가됨.
+        frequency_penalty: 빈도 페널티 (기본 0.0=비활성).
+        presence_penalty: 등장 페널티 (기본 0.0=비활성).
 
     Yields:
         StreamEvent: 스트리밍 이벤트 (UI 업데이트용)
         Message: assistant/tool_result 메시지 (대화 히스토리용)
     """
     # 루프 상태 초기화
+    # state: 턴 카운트·토큰 누적·각종 재시도 카운터를 한 객체에 모아 관리한다.
+    # stop_resolver: 매 턴 끝에서 "도구 호출이 남았는지"를 판정해 계속/종료를 결정한다.
     state = LoopState(messages=messages)
     stop_resolver = StopResolver()
 
+    # ── while(True) 에이전트 턴 루프 (Tier 2의 심장부) ──
+    # 모델이 도구 사용을 멈추거나(정상 종료), 7가지 Continue Transition 중 하나로
+    # 복구가 끝날 때까지 턴을 반복한다. max_turns는 무한 루프를 막는 안전장치다.
     while state.turn_count < max_turns:
         state.turn_count += 1
 
@@ -224,6 +239,8 @@ async def query_loop(
         model_cfg = model_provider.get_config()
         base_max_tokens = max_tokens_cap or model_cfg.max_output_tokens
 
+        # Transition 3/4(에스컬레이션·이어쓰기 복구)에서 override 값이 설정되면
+        # 동적 계산을 건너뛰고 그 값을 그대로 쓴다. 그 외에는 매 턴 새로 계산한다.
         if state.max_output_tokens_override:
             max_tokens = state.max_output_tokens_override
         else:
@@ -231,6 +248,8 @@ async def query_loop(
             # 토큰 추정은 문자수/3 (보수적) — 한글/특수문자가 많으면 토큰이 더 많다
             import json as _json
 
+            # ensure_ascii=False로 직렬화해 한글이 \uXXXX로 부풀려지지 않게 한다
+            # (그래야 실제 전송될 토큰 양에 가까운 문자수를 얻는다).
             tool_chars = sum(len(_json.dumps(s, ensure_ascii=False)) for s in tool_schemas)
             msg_chars = sum(len(str(m.content)) for m in api_messages)
             prompt_chars = len(system_prompt)
@@ -244,15 +263,20 @@ async def query_loop(
             input_limit = int(max_context * 0.85)
             if estimated_input > input_limit and len(api_messages) >= 1:
                 # 가장 최근 메시지의 내용을 자른다 (대화 맥락 유지)
+                # 왜 마지막 메시지인가: 보통 길이를 폭발시키는 건 방금 붙은
+                # 사용자 입력/도구 결과이고, 앞쪽 대화 맥락은 살려야 하기 때문이다.
                 last_msg = api_messages[-1]
                 content_str = str(last_msg.content)
-                # 초과분 계산 후 마지막 메시지에서 제거
+                # 토큰 추정이 /3이었으므로, 줄여야 할 토큰을 다시 ×3 해서
+                # 잘라낼 문자 수(excess_chars)로 환산한다.
                 excess_chars = (estimated_input - input_limit) * 3
+                # excess_chars + 200 보다 길 때만 자른다 — 안내 문구를 붙일
+                # 최소 여유(약 200자)를 남겨 내용이 통째로 사라지는 것을 막는다.
                 if len(content_str) > excess_chars + 200:
                     truncated = content_str[: len(content_str) - excess_chars]
                     truncated += "\n\n[내용이 길어서 일부가 잘렸습니다. 핵심 부분만 분석합니다.]"
                     last_msg.content = truncated
-                    # 재추정
+                    # 자른 뒤 입력 토큰을 다시 추정해 이후 max_tokens 계산에 반영한다
                     msg_chars = sum(len(str(m.content)) for m in api_messages)
                     total_chars = tool_chars + msg_chars + prompt_chars
                     estimated_input = total_chars // 3
@@ -266,7 +290,13 @@ async def query_loop(
                 )
 
             # 최대 컨텍스트에서 입력을 빼고 200 토큰 버퍼를 둔다
+            # (추정 오차를 흡수하는 안전 마진).
             dynamic_max = max_context - estimated_input - 200
+            # 최종 max_tokens는 세 값의 균형으로 정한다:
+            #   - 최소 512: 너무 작아 답이 끊기지 않도록 하한
+            #   - base_max_tokens: 모드/설정이 정한 상한(예: KNOWLEDGE_MODE 2048)
+            #   - dynamic_max: 컨텍스트에 실제로 남은 공간
+            # 즉 "남은 공간 안에서, 설정 상한을 넘지 않되, 최소 512은 보장"한다.
             max_tokens = max(512, min(base_max_tokens, dynamic_max))
 
         # ═══════════════════════════════════════
@@ -275,6 +305,7 @@ async def query_loop(
         # model_provider.stream()을 호출하고 이벤트를 수집/yield한다.
         # 동시에 StreamingToolExecutor로 도구를 미리 실행한다.
 
+        # 이번 턴 동안 스트림에서 수집할 정보들. 매 턴 새로 초기화한다.
         assistant_text_parts: list[str] = []  # TEXT_DELTA 누적
         tool_use_blocks: list[dict[str, Any]] = []  # 완성된 tool_use 블록
         turn_usage = TokenUsage()  # 이번 턴의 토큰 사용량
@@ -282,6 +313,8 @@ async def query_loop(
         model_error: str | None = None  # 모델 에러 메시지
 
         # StreamingToolExecutor 생성 — 스트리밍 중 도구를 병렬 실행
+        # 모델이 응답을 다 만들 때까지 기다리지 않고, tool_use가 완성되는 즉시
+        # 실행을 시작해 지연(latency)을 줄인다. 매 턴 새 인스턴스를 쓴다.
         streaming_executor = StreamingToolExecutor(
             tools=tools,
             context=context,
@@ -304,16 +337,23 @@ async def query_loop(
                 max_tokens=max_tokens,
                 model_override=model_override,
                 enable_thinking=enable_thinking,
+                # 샘플링 파라미터를 Tier 3로 전달 — 누락 시 degeneration(무한 반복)
+                # 결함이 발생하므로 항상 함께 흘려보낸다.
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                frequency_penalty=frequency_penalty,
+                presence_penalty=presence_penalty,
             )
             async for event in stream_with_watchdog(
                 _raw_stream,
                 idle_timeout=30.0,
                 total_timeout=300.0,
             ):
-                # 이벤트를 UI로 전파
+                # 이벤트를 UI로 전파 (먼저 상위 Tier로 흘려보낸 뒤 내부 처리)
                 yield event
 
                 # 이벤트 처리 — type이 enum이거나 문자열일 수 있음
+                # 프로바이더 구현에 따라 둘 중 무엇이 와도 동작하도록 .value로 정규화한다.
                 event_type = event.type if isinstance(event.type, str) else event.type.value
 
                 if event_type == StreamEventType.TEXT_DELTA.value:
@@ -358,9 +398,13 @@ async def query_loop(
                         return
 
                 # 스트리밍 중 완료된 도구 결과를 소비
+                # add_tool()로 미리 돌려둔 도구 중 끝난 것이 있으면 즉시 결과를
+                # 흘려보내, 모델 응답과 도구 실행을 겹쳐 전체 시간을 단축한다.
                 for completed in streaming_executor.get_completed():
                     yield completed
 
+        # ── 스트림 도중 발생한 예외를 종류별로 분기 처리 ──
+        # 일부는 복구(압축/재시도) 후 continue로 다음 턴을, 일부는 return으로 종료한다.
         except Exception as e:
             error_name = type(e).__name__
 
@@ -422,6 +466,8 @@ async def query_loop(
                     continue
 
             # GPU OOM → 컨텍스트 30% 감소 후 재시도
+            # 왜 0.7배: vLLM이 메모리를 다 못 잡으면 입력을 줄이는 것 외엔 방법이
+            # 없으므로, 다음 시도에서 컨텍스트 상한을 70%로 낮춰 메모리를 확보한다.
             if "out of memory" in str(e).lower():
                 state.model_error_count += 1
                 if state.model_error_count <= MAX_MODEL_ERROR_RETRY:
@@ -462,6 +508,9 @@ async def query_loop(
         )
 
         # 모델 에러 처리 (도구 호출 JSON 파싱 실패 등)
+        # 조건이 "에러 O + 도구 블록 X"인 이유: 도구가 하나라도 정상 파싱됐다면
+        # 그 도구를 실행해 진행할 수 있으므로 재시도 대상에서 제외한다. 도구를
+        # 전혀 못 건진 경우에만 같은 입력으로 모델을 다시 불러본다.
         if model_error and not tool_use_blocks:
             state.tool_parse_retry_count += 1
             if state.tool_parse_retry_count <= MAX_TOOL_PARSE_RETRY:
@@ -488,6 +537,9 @@ async def query_loop(
                 return
 
         # assistant 메시지 기록
+        # 스트림으로 조각조각 받은 텍스트를 하나로 합치고, 이번 턴에 모델이 요청한
+        # tool_use 블록을 함께 묶어 하나의 assistant 메시지로 만든다.
+        # 대화 히스토리(state.messages)에 추가해야 다음 턴에서 모델이 맥락을 본다.
         assistant_text = "".join(assistant_text_parts)
         assistant_msg = Message.assistant(
             text=assistant_text,
@@ -505,6 +557,8 @@ async def query_loop(
             from core.orchestrator.turn_state import extract_turn_state
 
             # 도구 결과 요약 수집
+            # 각 tool_result를 앞 100자만 잘라 요약 리스트로 모은다(상태 저장 비용 절감).
+            # role은 enum/문자열 양쪽 모두 올 수 있어 .value로 정규화해 비교한다.
             _tool_result_summaries: list[str] = []
             for msg in state.messages:
                 role = msg.role if isinstance(msg.role, str) else msg.role.value
@@ -513,6 +567,8 @@ async def query_loop(
                     _tool_result_summaries.append(content[:100])
 
             # 사용자 요청 추출 (messages에서 마지막 user 메시지)
+            # 뒤에서부터 훑어 가장 최근 user 발화를 찾는다 — 이번 턴이 응답하려는
+            # 실제 요청이 무엇인지 TurnState에 남기기 위함이다.
             _user_req = ""
             for msg in reversed(state.messages):
                 role = msg.role if isinstance(msg.role, str) else msg.role.value
@@ -534,6 +590,9 @@ async def query_loop(
 
         # ─── 종료 판단 ───
         # StopResolver로 도구 호출 유무를 확인
+        # should_continue가 True면(=실행할 도구가 남음) 아래 종료 블록을 건너뛰고
+        # 곧장 Phase 4(도구 실행) → 다음 턴으로 간다. False면 종료 후보로 보고,
+        # 그 전에 Transition 3~6(이어쓰기 복구·Hook 차단 등)을 차례로 검사한다.
         if not stop_resolver.should_continue(state, tool_use_blocks):
             # 도구 호출이 없음 → 종료 후보
 
@@ -545,15 +604,20 @@ async def query_loop(
                     state.max_output_recovery_count += 1
                     if state.max_output_recovery_count == 1:
                         # 첫 번째 시도: 토큰 한도 증가
+                        # 현재 max_tokens가 에스컬레이션 단계(4K/8K/16K) 중 하나면
+                        # 그 다음 단계로, 아니면 0번(4K)부터 시작한다.
                         current_idx = (
                             OUTPUT_TOKEN_ESCALATION.index(max_tokens)
                             if max_tokens in OUTPUT_TOKEN_ESCALATION
                             else 0
                         )
+                        # 마지막 단계(16K)를 넘지 않도록 min으로 상한을 건다.
                         next_idx = min(
                             current_idx + 1,
                             len(OUTPUT_TOKEN_ESCALATION) - 1,
                         )
+                        # override를 세팅하면 다음 턴 Phase 1에서 동적 계산 대신
+                        # 이 값을 그대로 max_tokens로 사용한다.
                         state.max_output_tokens_override = OUTPUT_TOKEN_ESCALATION[next_idx]
                         state.continue_reason = ContinueReason.MAX_OUTPUT_TOKENS_ESCALATE
                         logger.info(
@@ -625,6 +689,8 @@ async def query_loop(
         # StreamingToolExecutor의 drain_remaining()으로
         # 모든 도구 실행을 완료하고 결과를 yield/기록한다.
 
+        # 스트리밍 중 미처 끝나지 않은 도구를 모두 완료시키고 결과를 흘려보낸다.
+        # 도구 결과(tool_result Message)는 다음 턴에서 모델이 읽도록 히스토리에 넣는다.
         async for event in streaming_executor.drain_remaining():
             yield event
             # Message 이벤트(tool_result)는 대화 히스토리에 추가
@@ -633,6 +699,9 @@ async def query_loop(
 
         # ─── Transition 7: next_turn ───
         # 도구 실행 완료 → 정상적으로 다음 턴 진행
+        # 이번 턴이 정상적으로 한 바퀴를 마쳤으므로, 에러 상황에서만 의미 있는
+        # 복구/재시도 카운터를 0으로 되돌린다. 그래야 다음에 같은 에러가 나도
+        # 누적치가 아니라 처음부터 다시 재시도 한도를 쓸 수 있다.
         state.continue_reason = ContinueReason.NEXT_TURN
         state.max_output_recovery_count = 0  # 복구 카운터 리셋
         state.tool_parse_retry_count = 0  # 파싱 재시도 카운터 리셋

@@ -74,10 +74,13 @@ class ModelDispatcher:
             system_prompt: 기본 시스템 프롬프트
             max_turns: Worker 최대 턴 수
         """
+        # Worker 관련 의존성 — route()가 실제로 사용하는 값들이다.
         self._tier = tier
         self._worker_provider = worker_provider
         self._worker_tools = worker_tools
         self._context = context
+        # Scout 관련 — 현재는 보관만 한다(하위 호환). 실제 Scout 호출은 Worker가
+        # AgentTool을 통해 context.options에서 직접 꺼내 수행하므로 여기선 안 쓴다.
         self._scout_provider = scout_provider
         self._scout_tools = scout_tools or []
         self._system_prompt = system_prompt
@@ -103,6 +106,10 @@ class ModelDispatcher:
         temperature: float = 0.7,
         max_tokens_cap: int | None = None,
         enable_thinking: bool = False,
+        top_p: float = 1.0,
+        repetition_penalty: float = 1.0,
+        frequency_penalty: float = 0.0,
+        presence_penalty: float = 0.0,
     ) -> AsyncGenerator[StreamEvent | Message, None]:
         """
         Worker query_loop으로 직행한다 (passthrough).
@@ -127,6 +134,12 @@ class ModelDispatcher:
             temperature=temperature,
             max_tokens_cap=max_tokens_cap,
             enable_thinking=enable_thinking,
+            # 샘플링 파라미터 passthrough — Dispatcher는 값을 만들지 않고
+            # QueryEngine이 라우팅으로 결정한 값을 query_loop로 그대로 넘긴다.
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            frequency_penalty=frequency_penalty,
+            presence_penalty=presence_penalty,
         ):
             yield event
 

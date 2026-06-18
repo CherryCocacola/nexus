@@ -456,3 +456,74 @@ def test_resolver_chat_with_tenant_override_applies_lora() -> None:
     assert decision.model_override == "nexus-school-a"
     # CHAT에서도 KB는 안 주입
     assert decision.inject_knowledge_rag is False
+
+
+# ─────────────────────────────────────────────
+# 11) RoutingDecision 샘플링 파라미터 전파 (degeneration 버그 수정, 2026-06-18)
+# ─────────────────────────────────────────────
+# RoutingResolver.resolve()가 선택된 프로필의 top_p/repetition_penalty/
+# frequency_penalty/presence_penalty 4개를 RoutingDecision으로 그대로 실어
+# 보내는지 검증한다. 여기서부터 query_loop → dispatcher → inference로
+# passthrough되어 vLLM payload에 반영된다.
+def test_resolve_knowledge_query_propagates_sampling_params() -> None:
+    """KNOWLEDGE성 질의의 RoutingDecision에 KNOWLEDGE 프로필 샘플링 값이 실린다."""
+    from core.orchestrator.routing import RoutingResolver
+
+    cfg = RoutingConfig()
+    resolver = RoutingResolver(cfg)
+    decision = resolver.resolve("니체 철학 요약해줘")
+
+    assert decision.query_class == "KNOWLEDGE"
+    assert decision.top_p == pytest.approx(0.95)
+    assert decision.repetition_penalty == pytest.approx(1.15)
+    assert decision.frequency_penalty == pytest.approx(0.3)
+    assert decision.presence_penalty == pytest.approx(0.0)
+
+
+def test_resolve_chat_query_propagates_sampling_params() -> None:
+    """CHAT성 질의(인사)의 RoutingDecision에 CHAT 프로필 샘플링 값이 실린다."""
+    from core.orchestrator.routing import RoutingResolver
+
+    cfg = RoutingConfig()
+    resolver = RoutingResolver(cfg)
+    decision = resolver.resolve("안녕")
+
+    assert decision.query_class == "CHAT"
+    assert decision.top_p == pytest.approx(0.9)
+    assert decision.repetition_penalty == pytest.approx(1.1)
+    assert decision.frequency_penalty == pytest.approx(0.2)
+    assert decision.presence_penalty == pytest.approx(0.0)
+
+
+def test_resolve_tool_query_propagates_sampling_params() -> None:
+    """TOOL성 질의의 RoutingDecision에 TOOL 프로필 샘플링 값이 실린다(반복 페널티=1.0)."""
+    from core.orchestrator.routing import RoutingResolver
+
+    cfg = RoutingConfig()
+    resolver = RoutingResolver(cfg)
+    decision = resolver.resolve("이 파일 읽어줘")
+
+    assert decision.query_class == "TOOL"
+    assert decision.top_p == pytest.approx(0.95)
+    assert decision.repetition_penalty == pytest.approx(1.0)
+    assert decision.frequency_penalty == pytest.approx(0.0)
+    assert decision.presence_penalty == pytest.approx(0.0)
+
+
+def test_resolve_disabled_routing_falls_back_to_inactive_sampling() -> None:
+    """enabled=False 폴백 경로는 비활성 샘플링 기본값(1.0/1.0/0.0/0.0)을 쓴다.
+
+    이 경로는 프로필을 치환하지 않으므로 신규 4개 필드는 RoutingDecision의
+    dataclass 기본값(비활성)으로 남아야 한다(하위 호환).
+    """
+    from core.orchestrator.routing import RoutingResolver
+
+    cfg = RoutingConfig(enabled=False)
+    resolver = RoutingResolver(cfg)
+    decision = resolver.resolve("니체 철학 요약해줘")
+
+    assert decision.query_class == "TOOL"  # enabled=False는 항상 TOOL로 수렴
+    assert decision.top_p == pytest.approx(1.0)
+    assert decision.repetition_penalty == pytest.approx(1.0)
+    assert decision.frequency_penalty == pytest.approx(0.0)
+    assert decision.presence_penalty == pytest.approx(0.0)

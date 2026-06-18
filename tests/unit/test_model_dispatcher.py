@@ -42,7 +42,12 @@ def mock_scout_provider() -> EnhancedMockModelProvider:
 
 @pytest.fixture
 def mock_tools() -> list[MagicMock]:
-    """테스트용 mock 도구 리스트를 생성한다."""
+    """이름만 있는 가짜 도구 3개(Read/Write/Bash) 리스트.
+
+    Dispatcher는 도구를 query_loop에 그대로 넘기기만 하고 직접 실행하지 않으므로,
+    실제 구현 대신 spec=BaseTool인 MagicMock으로 충분하다(가볍고 격리됨).
+    worker_tools 전달이 잘 되는지 확인할 때 신원(identity) 비교용으로 쓰인다.
+    """
     tools = []
     for name in ["Read", "Write", "Bash"]:
         tool = MagicMock(spec=BaseTool)
@@ -74,7 +79,11 @@ class TestModelDispatcherInit:
         mock_tools: list[MagicMock],
         mock_context: ToolUseContext,
     ):
-        """TIER_S + scout_provider가 있으면 scout가 활성화된다."""
+        """TIER_S에 scout_provider까지 주면 scout_enabled 플래그가 켜지는지 검증한다.
+
+        scout_enabled는 'Scout 서버에 연결돼 있다'는 관측 지표일 뿐이다(아래
+        재설계 노트 참고). 여기서는 provider가 있으면 True가 됨을 확인한다.
+        """
         from core.orchestrator.model_dispatcher import ModelDispatcher
 
         dispatcher = ModelDispatcher(
@@ -93,7 +102,11 @@ class TestModelDispatcherInit:
         mock_tools: list[MagicMock],
         mock_context: ToolUseContext,
     ):
-        """TIER_S이지만 scout_provider가 None이면 scout는 비활성화된다."""
+        """같은 TIER_S라도 scout_provider가 없으면 scout_enabled가 False인지 검증한다.
+
+        위 테스트의 짝꿍(negative case)이다. TIER가 아니라 'provider 존재 여부'가
+        플래그를 결정한다는 점을 두 테스트로 확정한다.
+        """
         from core.orchestrator.model_dispatcher import ModelDispatcher
 
         dispatcher = ModelDispatcher(
@@ -145,7 +158,11 @@ class TestModelDispatcherInit:
 # ModelDispatcher 프로퍼티 테스트
 # ─────────────────────────────────────────────
 class TestModelDispatcherProperties:
-    """프로퍼티 반환값을 검증한다."""
+    """생성자에 넣은 값이 프로퍼티로 그대로 다시 나오는지(저장 무결성) 검증한다.
+
+    단순해 보여도, 생성자 인자를 엉뚱한 필드에 보관하면 라우팅 전체가 틀어진다.
+    각 프로퍼티가 초기화 입력을 변형 없이 반환하는지 확인하는 기초 가드다.
+    """
 
     def test_tier_property(
         self,
@@ -212,7 +229,11 @@ class TestModelDispatcherStatsFields:
         mock_tools: list[MagicMock],
         mock_context: ToolUseContext,
     ):
-        """stats가 Scout 관련 필수 키 5개를 모두 포함한다."""
+        """stats가 SessionMetrics가 기대하는 5개 키를 빠짐없이 노출하는지 검증한다.
+
+        대시보드(Ch 17 SessionMetrics)가 이 키들을 그대로 읽어가므로, 값이 아니라
+        '스키마(키 존재)'를 고정하는 계약 테스트다. 키 하나만 사라져도 대시보드가 깨진다.
+        """
         from core.orchestrator.model_dispatcher import ModelDispatcher
 
         dispatcher = ModelDispatcher(
@@ -291,7 +312,13 @@ class TestModelDispatcherRoute:
         mock_tools: list[MagicMock],
         mock_context: ToolUseContext,
     ):
-        """TIER_M에서 route()는 query_loop을 호출하고 StreamEvent를 yield한다."""
+        """route()가 query_loop을 호출하고 그 StreamEvent를 그대로 흘려보내는지 검증한다.
+
+        Dispatcher의 본질은 '얇은 패스스루'다. query_loop을 patch로 가짜로 바꿔
+        3개의 이벤트를 내보내게 하고, route()가 그 3개를 순서·내용 그대로
+        다시 yield하는지 확인한다. 진짜 query_loop은 별도 테스트에서 검증하므로
+        여기선 라우팅 배선만 격리해서 본다.
+        """
         from core.orchestrator.model_dispatcher import ModelDispatcher
 
         dispatcher = ModelDispatcher(
@@ -301,7 +328,7 @@ class TestModelDispatcherRoute:
             context=mock_context,
         )
 
-        # query_loop을 mock하여 StreamEvent를 yield하도록 한다
+        # query_loop을 가짜로 교체 — 고정된 3개 StreamEvent만 내보내는 AsyncGenerator
         async def fake_query_loop(**kwargs):
             yield StreamEvent(type=StreamEventType.MESSAGE_START)
             yield StreamEvent(type=StreamEventType.TEXT_DELTA, text="hello")
@@ -329,7 +356,13 @@ class TestModelDispatcherRoute:
         mock_tools: list[MagicMock],
         mock_context: ToolUseContext,
     ):
-        """route()가 query_loop에 올바른 인자를 전달하는지 확인한다."""
+        """route()가 query_loop에 인자를 빠짐없이·올바르게 넘기는지 검증한다.
+
+        가짜 query_loop이 받은 kwargs를 captured_kwargs에 통째로 베껴 두고,
+        messages/system_prompt/model_provider/tools/context/max_turns/콜백이
+        Dispatcher가 보관한 값과 동일(identity 또는 값 비교)한지 확인한다.
+        패스스루 도중 인자가 누락·뒤바뀌면 여기서 잡힌다.
+        """
         from core.orchestrator.model_dispatcher import ModelDispatcher
 
         dispatcher = ModelDispatcher(
@@ -340,6 +373,7 @@ class TestModelDispatcherRoute:
             max_turns=50,
         )
 
+        # 가짜 query_loop이 받은 kwargs를 그대로 베껴와 나중에 검증한다
         captured_kwargs = {}
 
         async def capture_query_loop(**kwargs):
@@ -449,7 +483,12 @@ class TestModelDispatcherRoute:
         mock_tools: list[MagicMock],
         mock_context: ToolUseContext,
     ):
-        """on_turn_complete 콜백이 query_loop에 올바르게 전달되는지 확인한다."""
+        """턴 종료 콜백(on_turn_complete)이 query_loop까지 그대로 전달되는지 검증한다.
+
+        이 콜백은 메모리 저장·사용량 집계 등 턴마다 일어나야 할 후처리의 훅이다.
+        Dispatcher가 중간에서 삼키면 그 후처리가 통째로 누락되므로, 가짜 query_loop이
+        받은 콜백이 우리가 넘긴 바로 그 함수(identity)인지 확인한다.
+        """
         from core.orchestrator.model_dispatcher import ModelDispatcher
 
         dispatcher = ModelDispatcher(
@@ -477,3 +516,87 @@ class TestModelDispatcherRoute:
                 pass
 
         assert received_callback is callback_fn
+
+    async def test_route_forwards_sampling_params_to_query_loop(
+        self,
+        mock_worker_provider: EnhancedMockModelProvider,
+        mock_tools: list[MagicMock],
+        mock_context: ToolUseContext,
+    ):
+        """route()가 4개 샘플링 파라미터를 query_loop에 그대로 전달한다.
+
+        degeneration 버그 수정(2026-06-18): top_p/repetition_penalty/
+        frequency_penalty/presence_penalty가 dispatcher에서 누락되면 vLLM까지
+        도달하지 못해 무한 반복이 재발한다. passthrough를 회귀 가드로 고정한다.
+        """
+        from core.orchestrator.model_dispatcher import ModelDispatcher
+
+        dispatcher = ModelDispatcher(
+            tier=HardwareTier.TIER_M,
+            worker_provider=mock_worker_provider,
+            worker_tools=mock_tools,
+            context=mock_context,
+        )
+
+        captured_kwargs: dict = {}
+
+        async def capture_query_loop(**kwargs):
+            captured_kwargs.update(kwargs)
+            yield StreamEvent(type=StreamEventType.MESSAGE_STOP)
+
+        messages = [Message.user("test")]
+
+        with patch(
+            "core.orchestrator.model_dispatcher.query_loop",
+            side_effect=capture_query_loop,
+        ):
+            async for _ in dispatcher.route(
+                messages,
+                "sys prompt",
+                top_p=0.95,
+                repetition_penalty=1.15,
+                frequency_penalty=0.3,
+                presence_penalty=0.0,
+            ):
+                pass
+
+        assert captured_kwargs["top_p"] == pytest.approx(0.95)
+        assert captured_kwargs["repetition_penalty"] == pytest.approx(1.15)
+        assert captured_kwargs["frequency_penalty"] == pytest.approx(0.3)
+        assert captured_kwargs["presence_penalty"] == pytest.approx(0.0)
+
+    async def test_route_sampling_params_default_inactive_when_omitted(
+        self,
+        mock_worker_provider: EnhancedMockModelProvider,
+        mock_tools: list[MagicMock],
+        mock_context: ToolUseContext,
+    ):
+        """route()를 샘플링 인자 없이 호출하면 비활성 기본값이 query_loop로 간다(하위 호환)."""
+        from core.orchestrator.model_dispatcher import ModelDispatcher
+
+        dispatcher = ModelDispatcher(
+            tier=HardwareTier.TIER_M,
+            worker_provider=mock_worker_provider,
+            worker_tools=mock_tools,
+            context=mock_context,
+        )
+
+        captured_kwargs: dict = {}
+
+        async def capture_query_loop(**kwargs):
+            captured_kwargs.update(kwargs)
+            yield StreamEvent(type=StreamEventType.MESSAGE_STOP)
+
+        messages = [Message.user("test")]
+
+        with patch(
+            "core.orchestrator.model_dispatcher.query_loop",
+            side_effect=capture_query_loop,
+        ):
+            async for _ in dispatcher.route(messages, "sys prompt"):
+                pass
+
+        assert captured_kwargs["top_p"] == pytest.approx(1.0)
+        assert captured_kwargs["repetition_penalty"] == pytest.approx(1.0)
+        assert captured_kwargs["frequency_penalty"] == pytest.approx(0.0)
+        assert captured_kwargs["presence_penalty"] == pytest.approx(0.0)

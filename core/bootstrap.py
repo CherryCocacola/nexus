@@ -298,9 +298,18 @@ async def init_phase2(state: GlobalState) -> dict:
         # pg_pool이 있으면 스키마 멱등 생성 — 실제 PostgreSQL에만 DDL 실행됨
         if pg_pool is not None:
             await knowledge_store.ensure_schema()
+        # 유사도 게이팅 임계값을 config(yaml 단일 소스)에서 주입한다.
+        # KnowledgeRetriever 생성자 기본값은 "게이팅 무효"라, 여기서 실제 값을
+        # 넘겨야 무관 청크 차단(abs_threshold)+노이즈 절단(relevance_margin)이
+        # 작동한다. 코드에 임계를 박지 않아 운영 중 yaml로 튜닝할 수 있다.
+        krag = config.knowledge_rag
         knowledge_retriever = KnowledgeRetriever(
             store=knowledge_store,
             embedding_provider=provider,  # e5-large 임베딩 서버 경유
+            top_k=krag.top_k,
+            min_similarity=krag.min_similarity,
+            abs_threshold=krag.abs_threshold,
+            relevance_margin=krag.relevance_margin,
         )
         components["knowledge_store"] = knowledge_store
         components["knowledge_retriever"] = knowledge_retriever
@@ -653,7 +662,13 @@ async def _create_pg_pool(config: Any) -> Any:
 
 
 def _create_tool_registry():  # noqa: ANN202 — ToolRegistry는 함수 내부에서 import
-    """24개 도구를 등록한 ToolRegistry를 생성한다."""
+    """24개 도구를 모두 등록한 "풀세트" ToolRegistry를 생성한다.
+
+    TIER_M/L(컨텍스트 여유) 및 Phase 2 ②의 메트릭용 레지스트리로 쓰인다.
+    TIER_S에서는 컨텍스트 절약을 위해 대신 _create_cli_tool_registry(6개)를 사용한다.
+    lazy import 이유: 도구 구현 모듈이 core 하위를 import하므로 함수 진입 시점에만 끌어와
+    Phase 1과의 의존성 분리(순환 import 방지)를 지킨다.
+    """
     from core.tools.implementations.bash_tool import BashTool
     from core.tools.implementations.docker_tools import DockerBuildTool, DockerRunTool
     from core.tools.implementations.edit_tool import EditTool
@@ -933,7 +948,11 @@ _cleanup_handlers: list = []
 
 
 def register_cleanup(handler) -> None:
-    """종료 시 실행할 클린업 함수를 등록한다."""
+    """종료 시 실행할 클린업 함수를 등록한다.
+
+    진입점(CLI/웹)이 Redis·PG 풀 close 등 자원 정리 콜백을 미리 걸어두는 용도다.
+    여기 등록된 핸들러는 SIGINT/SIGTERM 수신 시 _shutdown_handler에서 순서대로 실행된다.
+    """
     _cleanup_handlers.append(handler)
 
 

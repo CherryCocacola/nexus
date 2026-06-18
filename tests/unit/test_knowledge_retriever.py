@@ -260,3 +260,151 @@ async def test_get_context_vector_search_with_results_assembles_block() -> None:
     assert "의지와 표상" in ctx
     assert "sim=0.91" in ctx  # 헤더에 유사도가 소수점 2자리로 포맷된다
     assert "kowiki" in ctx
+
+
+# ─────────────────────────────────────────────
+# 유사도 2단 게이팅 (2026-06-18) — 무관 청크 주입 차단(할루시네이션 저감)
+#   1단계: 절대 임계(abs_threshold) — top1조차 미만이면 전체 드롭
+#   2단계: 상대 마진(relevance_margin) — top_sim - margin 미만 청크 절단
+# 운영 게이팅 값: abs_threshold=0.84, relevance_margin=0.03 (config 기본값)
+# ─────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_abs_threshold_top1_below_threshold_drops_all_returns_empty() -> None:
+    """top1 유사도가 abs_threshold 미만이면 전체 드롭되어 빈 문자열을 반환한다.
+
+    실측 사례: 메타질문 "rag에 이런 정보가 있었어?"의 top1=0.824는
+    abs_threshold=0.84 미만이므로 "관련 자료 없음"으로 보고 전부 드롭한다.
+    엔티티 게이팅과 섞이지 않도록 질의에 다자리 숫자를 넣지 않는다.
+    """
+    # top1=0.824 < 0.84 → 절대 임계에서 전체 드롭되어야 한다.
+    chunk = {
+        "source": "kowiki", "title": "RAG", "section": "", "similarity": 0.824,
+        "content": "검색 증강 생성에 관한 일반 설명 청크.",
+    }
+    store = _make_mock_store(vector_results=[chunk])
+    emb = _make_mock_embedding(return_value=[[0.1] * 4])
+    kr = KnowledgeRetriever(
+        store=store,
+        embedding_provider=emb,
+        abs_threshold=0.84,
+        relevance_margin=0.03,
+    )
+
+    out = await kr.get_context("rag에 이런 정보가 있었어")
+    assert out == ""
+
+
+@pytest.mark.asyncio
+async def test_relevance_margin_keeps_chunks_within_margin_drops_outliers() -> None:
+    """top1 >= abs_threshold일 때, top_sim - margin 미만 청크만 절단한다.
+
+    top1=0.857, margin=0.03이면 컷오프는 0.827이다.
+      - 0.857(top), 0.83(>= 0.827)  → 유지
+      - 0.80(< 0.827)               → 노이즈로 절단
+    엔티티 게이팅 회피를 위해 질의에 다자리 숫자를 넣지 않는다.
+    """
+    top = {
+        "source": "kowiki", "title": "바흐", "section": "", "similarity": 0.857,
+        "content": "요한 제바스티안 바흐는 독일의 작곡가다.",
+    }
+    near = {
+        "source": "kowiki", "title": "헨델", "section": "", "similarity": 0.83,
+        "content": "게오르크 프리드리히 헨델도 바로크 작곡가다.",
+    }
+    far = {
+        "source": "kowiki", "title": "잡음청크", "section": "", "similarity": 0.80,
+        "content": "마진 밖 노이즈 청크 본문 텍스트.",
+    }
+    store = _make_mock_store(vector_results=[top, near, far])
+    emb = _make_mock_embedding(return_value=[[0.1] * 4])
+    kr = KnowledgeRetriever(
+        store=store,
+        embedding_provider=emb,
+        abs_threshold=0.84,
+        relevance_margin=0.03,
+    )
+
+    out = await kr.get_context("바흐와 바로크 음악 알려줘")
+    # 컷오프(0.827) 이상인 top/near는 유지, 미만인 far는 절단되어야 한다.
+    assert "바흐" in out
+    assert "헨델" in out
+    assert "잡음청크" not in out
+
+
+@pytest.mark.asyncio
+async def test_gating_disabled_by_default_passes_all_results() -> None:
+    """게이팅 인자를 주지 않으면(기본 abs=0.0 / margin=1.0) 종전과 동일하게 통과.
+
+    하위 호환 검증: 낮은 유사도(0.55, 0.50)의 청크라도 기본값에서는
+    절대 임계(0.0)와 상대 마진(1.0) 어느 쪽에도 걸리지 않아 모두 주입된다.
+    """
+    low1 = {
+        "source": "kowiki", "title": "청크A", "section": "", "similarity": 0.55,
+        "content": "유사도가 낮은 첫 번째 청크.",
+    }
+    low2 = {
+        "source": "kowiki", "title": "청크B", "section": "", "similarity": 0.50,
+        "content": "유사도가 더 낮은 두 번째 청크.",
+    }
+    store = _make_mock_store(vector_results=[low1, low2])
+    emb = _make_mock_embedding(return_value=[[0.1] * 4])
+    # 게이팅 인자 미지정 → abs_threshold=0.0, relevance_margin=1.0 (비활성)
+    kr = KnowledgeRetriever(store=store, embedding_provider=emb)
+
+    out = await kr.get_context("두 청크 모두 보여줘")
+    assert "청크A" in out
+    assert "청크B" in out
+
+
+@pytest.mark.asyncio
+async def test_similarity_gating_then_entity_gating_cooperate_returns_empty() -> None:
+    """유사도 게이팅을 통과해도 엔티티(식별자)가 청크에 없으면 전부 드롭.
+
+    질의에 식별자 "543"이 있고 청크는 유사도(0.857)로 게이팅을 통과하지만,
+    content에 543이 없으므로 엔티티 게이팅이 전부 드롭 → 빈 문자열.
+    두 게이팅이 순서대로(유사도 → 엔티티) 협동함을 검증한다.
+    """
+    chunk = {
+        "source": "kowiki", "title": "바흐", "section": "", "similarity": 0.857,
+        "content": "요한 제바스티안 바흐는 독일의 작곡가이자 오르가니스트다.",
+    }
+    store = _make_mock_store(vector_results=[chunk])
+    emb = _make_mock_embedding(return_value=[[0.1] * 4])
+    kr = KnowledgeRetriever(
+        store=store,
+        embedding_provider=emb,
+        abs_threshold=0.84,
+        relevance_margin=0.03,
+    )
+
+    out = await kr.get_context("바흐 작품 BWV 543 알려줘")
+    # 유사도 게이팅은 통과(0.857 >= 0.84)했지만 식별자 543 부재로 전부 드롭.
+    assert out == ""
+
+
+@pytest.mark.asyncio
+async def test_abs_threshold_exact_boundary_passes_strict_less_than() -> None:
+    """경계값: top1 == abs_threshold(0.84 == 0.84)는 `<` 비교라 통과해야 한다.
+
+    절대 임계는 `top_sim < abs_threshold`로 비교하므로, 정확히 같은 값은
+    드롭되지 않고 통과한다(엄격한 미만 비교의 경계 동작 회귀 가드).
+    엔티티 게이팅 회피를 위해 질의에 다자리 숫자를 넣지 않는다.
+    """
+    chunk = {
+        "source": "kowiki", "title": "경계청크", "section": "", "similarity": 0.84,
+        "content": "정확히 임계값과 같은 유사도를 가진 청크.",
+    }
+    store = _make_mock_store(vector_results=[chunk])
+    emb = _make_mock_embedding(return_value=[[0.1] * 4])
+    kr = KnowledgeRetriever(
+        store=store,
+        embedding_provider=emb,
+        abs_threshold=0.84,
+        relevance_margin=0.03,
+    )
+
+    out = await kr.get_context("경계값 청크 알려줘")
+    # 0.84 == 0.84 → `<` 비교에서 False이므로 드롭되지 않고 통과한다.
+    assert "경계청크" in out

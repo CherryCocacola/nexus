@@ -41,12 +41,33 @@ class KnowledgeRetriever:
         # 청크만 통과시키고, KB에 정답이 없는 질의는 0건 → "관련 자료 없음"으로
         # 흘러가 모델이 추측 대신 "모른다"고 답하도록 유도한다(할루시네이션 방지).
         min_similarity: float = 0.5,
+        # ── 유사도 게이팅 파라미터 (2026-06-18) ──────────────────────────
+        # 왜 기본값이 "게이팅 무효"인가 (하위 호환):
+        #   abs_threshold=0.0  → 어떤 유사도든 0.0 이상이라 절대 임계가 작동하지
+        #                        않는다(= 전부 통과).
+        #   relevance_margin=1.0 → top_sim에서 1.0(코사인 유사도 최대폭) 이내면
+        #                          전부 남으므로 상대 마진도 작동하지 않는다.
+        #   따라서 인자를 주지 않고 생성하면 종전과 100% 동일하게 동작한다.
+        #   실제 게이팅 값(0.84/0.03)은 bootstrap이 config에서 주입한다.
+        abs_threshold: float = 0.0,
+        relevance_margin: float = 1.0,
         chars_per_token: int = 3,
     ) -> None:
+        """게이팅 임계와 검색 파라미터를 보관한다.
+
+        bootstrap이 config.knowledge_rag(yaml 단일 소스)에서 실제 값을 주입한다.
+        인자를 생략하면 게이팅이 무효(전부 통과)라 종전 동작과 100% 동일하다 —
+        위 abs_threshold/relevance_margin 주석의 "하위 호환" 설명 참조.
+        chars_per_token: 토큰 예산을 글자수로 환산할 때 쓰는 1토큰≈3자 근사값.
+        """
         self._store = store
         self._embedding = embedding_provider
         self._top_k = top_k
         self._min_similarity = min_similarity
+        # 절대 임계: 최상위 결과조차 이 값 미만이면 "관련 자료 없음"으로 전체 드롭.
+        self._abs_threshold = abs_threshold
+        # 상대 마진: top_sim에서 이 폭 이내 결과만 유지(노이즈 청크 절단).
+        self._relevance_margin = relevance_margin
         self._chars_per_token = chars_per_token
 
     async def get_context(
@@ -116,6 +137,35 @@ class KnowledgeRetriever:
                 logger.debug("KnowledgeRetriever 텍스트 검색 실패: %s", e)
                 return ""
 
+        # ★ 유사도 2단 게이팅 (2026-06-18) — 무관 청크 주입 차단.
+        #   왜 절대+상대 2단인가 (e5-large 분포 특성):
+        #     실측상 e5-large 코사인 유사도는 "무관한 문서끼리"도 0.78~0.83에
+        #     몰린다. 즉 절대 유사도 하나만으로는 관련/무관을 깔끔히 가를 수 없다.
+        #       - 메타질문 "rag에 이런 정보가 있었어?" → top1=0.824 (무관)
+        #       - "요한 제바스티안 바흐"                → top1=0.857 (관련)
+        #     그래서 두 단계로 거른다:
+        #       1) 절대 임계(abs_threshold): 최상위 결과조차 이 값보다 낮으면
+        #          KB에 관련 자료가 없다는 뜻이므로 전부 드롭한다. 무관 분포
+        #          상한(~0.83) 바로 위(0.84)에 두어 무관 질의는 통과하지 못한다.
+        #       2) 상대 마진(relevance_margin): 최상위 유사도(top_sim)에서 이 폭
+        #          이내로 떨어진 결과만 남긴다. top과 동떨어진 "끼어든 노이즈
+        #          청크"를 잘라, 진짜 관련 높은 소수 청크만 모델에 보여준다.
+        #   벡터 검색 결과는 distance ASC 정렬이라 results[0]이 최고 유사도다.
+        #   유사도 값은 각 결과 dict의 "similarity" 키에 들어 있다.
+        #   (기본값 abs_threshold=0.0 / relevance_margin=1.0이면 이 블록은
+        #    아무것도 거르지 않으므로 하위 호환이 보장된다.)
+        if results:
+            top_sim = results[0].get("similarity", 0.0)
+            if top_sim < self._abs_threshold:
+                # 최상위조차 무관 → 전체 드롭 (아래에서 빈 문자열 반환)
+                results = []
+            else:
+                results = [
+                    r
+                    for r in results
+                    if r.get("similarity", 0.0) >= top_sim - self._relevance_margin
+                ]
+
         # ★ 엔티티(식별자) 매칭 게이팅 (옵션 A) — 부분 관련 함정 차단.
         #   왜 필요한가:
         #     "BWV 543"처럼 KB에 없는 특정 대상을 물으면, "바흐 일반" 청크가
@@ -140,10 +190,15 @@ class KnowledgeRetriever:
         if not results:
             return ""
 
-        # 3) 토큰 예산 내에서 블록을 조립
+        # 3) 토큰 예산 내에서 주입 블록을 조립한다.
+        #    게이팅을 통과한 청크를 유사도 높은 순(results는 distance ASC)으로
+        #    하나씩 쌓되, max_tokens를 글자수로 환산한 예산(budget_chars)을 넘으면
+        #    멈춘다. 왜 토큰이 아니라 글자수로 자르나: 여기서 토크나이저를 돌리면
+        #    비용·지연이 커서, 1토큰≈3자 근사로 가볍게 상한만 건다(시스템 프롬프트
+        #    팽창 방지). 각 블록은 출처 헤더 한 줄 + 본문으로 구성한다.
         budget_chars = max_tokens * self._chars_per_token
         lines: list[str] = []
-        used = 0
+        used = 0  # 지금까지 누적한 글자수 (구분자 여유 포함)
         for r in results:
             title = r.get("title", "(untitled)")
             section = r.get("section") or ""

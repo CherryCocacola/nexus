@@ -41,7 +41,13 @@ class TestQueryLoopIntegration:
     async def test_single_turn_text_only_response(
         self, workspace: Path, tool_use_context: ToolUseContext, basic_tools: list[BaseTool]
     ) -> None:
-        """텍스트만 응답하는 단일 턴 — 도구 호출 없이 종료한다."""
+        """텍스트만 응답하는 단일 턴 — 도구 호출이 없으면 1턴으로 깔끔히 끝나는지 검증.
+
+        가장 단순한 happy path다. 모델이 도구를 안 부르면 query_loop이
+        추가 턴을 돌지 않고(_call_count==1), TEXT_DELTA·MESSAGE_STOP 이벤트와
+        assistant 메시지를 정상 산출하는지 본다. 여기가 깨지면 그 위 모든
+        다중 턴 시나리오도 의미가 없으므로 기초 회귀 가드 역할을 한다.
+        """
         # 모델이 텍스트만 응답 (도구 호출 없음 → 1턴으로 종료)
         provider = EnhancedMockModelProvider(
             responses=[
@@ -83,11 +89,51 @@ class TestQueryLoopIntegration:
         assistant_messages = [e for e in events if isinstance(e, Message)]
         assert len(assistant_messages) >= 1
 
+    async def test_sampling_params_forwarded_from_query_loop_to_stream(
+        self, workspace: Path, tool_use_context: ToolUseContext, basic_tools: list[BaseTool]
+    ) -> None:
+        """query_loop이 4개 샘플링 파라미터를 model_provider.stream()으로 전달한다.
+
+        degeneration 버그 수정(2026-06-18): query_loop → stream() 구간이 누락되면
+        repetition_penalty가 vLLM까지 도달하지 못해 무한 반복이 재발한다.
+        EnhancedMockModelProvider가 마지막 호출값(_last_*)을 기록하므로 이를 검증한다.
+        """
+        provider = EnhancedMockModelProvider(
+            responses=[MockResponse(text="확인했습니다.")]
+        )
+
+        messages = [Message.user("니체 철학 요약해줘")]
+
+        async for _event in query_loop(
+            messages=messages,
+            system_prompt="당신은 도움을 주는 AI입니다.",
+            model_provider=provider,
+            tools=basic_tools,
+            context=tool_use_context,
+            # KNOWLEDGE 프로필 값을 그대로 흘려보낸다
+            top_p=0.95,
+            repetition_penalty=1.15,
+            frequency_penalty=0.3,
+            presence_penalty=0.0,
+        ):
+            pass
+
+        # 마지막 stream() 호출에 KNOWLEDGE 샘플링 값이 그대로 전달돼야 한다
+        assert provider._last_top_p == pytest.approx(0.95)
+        assert provider._last_repetition_penalty == pytest.approx(1.15)
+        assert provider._last_frequency_penalty == pytest.approx(0.3)
+        assert provider._last_presence_penalty == pytest.approx(0.0)
+
     async def test_read_tool_then_respond(
         self, workspace: Path, tool_use_context: ToolUseContext, basic_tools: list[BaseTool]
     ) -> None:
-        """Read 도구 호출 → 파일 읽기 → 최종 텍스트 응답 (2턴)."""
-        # workspace에 테스트 파일 생성
+        """Read 도구 호출 → 파일 읽기 → 최종 텍스트 응답 (2턴) 흐름을 검증한다.
+
+        도구가 끼면 query_loop은 '턴1: 도구 호출 → 도구 실행 → 결과를 대화에 주입
+        → 턴2: 모델이 결과 보고 최종 답변'으로 한 번 더 돌아야 한다. 모델 호출이
+        정확히 2회였고 tool_result 메시지가 대화에 추가됐는지로 이 왕복을 확인한다.
+        """
+        # workspace에 테스트 파일 생성 — Read 도구가 실제로 읽을 대상
         test_file = workspace / "test.txt"
         test_file.write_text("hello world from test file", encoding="utf-8")
 
@@ -131,7 +177,12 @@ class TestQueryLoopIntegration:
     async def test_edit_tool_modifies_file(
         self, workspace: Path, tool_use_context: ToolUseContext, basic_tools: list[BaseTool]
     ) -> None:
-        """Edit 도구 호출로 파일이 실제로 변경되는지 검증한다."""
+        """Edit 도구 호출로 디스크의 파일이 실제로 바뀌는지 끝까지(부수효과까지) 검증한다.
+
+        이벤트만 보는 게 아니라 실제 Edit 도구를 태워 파일 내용이 old→new로
+        교체됐는지 read_text로 직접 확인한다. mock 도구였다면 잡지 못할,
+        '진짜 쓰기가 일어났는가'를 보장하는 통합 성격의 테스트다.
+        """
         test_file = workspace / "edit_target.py"
         test_file.write_text("x = old_value\ny = 2\n", encoding="utf-8")
 
@@ -173,7 +224,13 @@ class TestQueryLoopIntegration:
     async def test_max_turns_limit(
         self, workspace: Path, tool_use_context: ToolUseContext, basic_tools: list[BaseTool]
     ) -> None:
-        """max_turns 제한으로 무한 루프가 방지되는지 검증한다."""
+        """max_turns 안전장치가 무한 루프를 끊는지 검증한다(중요한 안전 가드).
+
+        모델이 매 턴 똑같이 도구 호출만 반환하도록 만들어 일부러 무한 루프를
+        유발한다. query_loop은 max_turns=3에서 멈춰야 하고(_call_count==3),
+        사용자에게 '최대 턴 도달'을 알리는 SYSTEM_WARNING을 내보내야 한다.
+        이 가드가 없으면 폭주한 에이전트가 GPU/예산을 통째로 태울 수 있다.
+        """
         # 테스트 파일 — Read 도구가 사용할 파일
         test_file = workspace / "loop_test.txt"
         test_file.write_text("loop content", encoding="utf-8")
@@ -222,7 +279,13 @@ class TestQueryLoopIntegration:
     async def test_multi_turn_context_maintained(
         self, workspace: Path, tool_use_context: ToolUseContext, basic_tools: list[BaseTool]
     ) -> None:
-        """이전 턴의 대화 컨텍스트가 유지되는지 검증한다."""
+        """여러 턴을 거치며 대화 이력이 누적·유지되는지 검증한다.
+
+        query_loop은 넘겨준 messages 리스트를 직접 mutate(추가)한다. 도구를 한 번
+        쓰는 시나리오를 돌린 뒤 messages에 user·assistant(도구호출)·tool_result·
+        assistant(최종답변)이 모두 쌓였는지(>=4건, role 종류 확인) 본다. 컨텍스트가
+        끊기면 모델이 직전 도구 결과를 못 보고 같은 작업을 반복하게 된다.
+        """
         test_file = workspace / "context_test.txt"
         test_file.write_text("important data", encoding="utf-8")
 
@@ -270,7 +333,12 @@ class TestToolChainIntegration:
     async def test_multi_tool_single_turn(
         self, workspace: Path, tool_use_context: ToolUseContext, basic_tools: list[BaseTool]
     ) -> None:
-        """한 턴에서 여러 Read 도구를 병렬로 호출한다."""
+        """한 턴에서 읽기 도구 여러 개를 동시에 호출했을 때 모두 처리되는지 검증한다.
+
+        Read는 읽기 전용(동시 실행 안전)이라 한 턴에 2개를 같이 부를 수 있다.
+        두 파일 각각에 대한 tool_result가 messages에 빠짐없이 추가됐는지(>=2건)로
+        '한 턴 다중 도구' 처리가 정상인지 확인한다.
+        """
         # 여러 파일 생성
         (workspace / "a.py").write_text("print('hello')", encoding="utf-8")
         (workspace / "b.py").write_text("print('world')", encoding="utf-8")
@@ -307,7 +375,12 @@ class TestToolChainIntegration:
     async def test_read_then_edit_chain(
         self, workspace: Path, tool_use_context: ToolUseContext, basic_tools: list[BaseTool]
     ) -> None:
-        """Read → Edit → 텍스트 응답 (3턴 체인)."""
+        """Read → Edit → 최종 응답으로 이어지는 3턴 도구 체인을 검증한다.
+
+        앞 도구 결과가 다음 도구 입력으로 자연스럽게 이어지는, 실제 작업에 가까운
+        시나리오다. 모델 호출이 정확히 3회였고 파일이 최종적으로 value=100으로
+        바뀌었는지로 '단계가 끊기지 않고 순서대로 흘렀는지'를 확인한다.
+        """
         target_file = workspace / "chain_target.py"
         target_file.write_text("value = 42\n", encoding="utf-8")
 
@@ -365,7 +438,11 @@ class TestSecurityIntegration:
     """보안 시스템(PathGuard + CommandFilter + PermissionPipeline) 통합 검증."""
 
     def test_path_traversal_blocked(self, workspace: Path) -> None:
-        """경로 순회 공격(../../etc/passwd)이 차단된다."""
+        """대표적 공격인 경로 순회(../../etc/passwd)가 차단되는지 검증한다.
+
+        is_path_safe는 (안전여부, 사유) 튜플을 돌려준다. 차단(False)되면서
+        사유에 '순회' 또는 '보호'가 담겨, 왜 막혔는지 운영자가 알 수 있어야 한다.
+        """
         pg = PathGuard()
         safe, reason = pg.is_path_safe("../../etc/passwd", str(workspace))
 
@@ -397,7 +474,11 @@ class TestSecurityIntegration:
         assert "보호" in reason
 
     def test_safe_path_allowed(self, workspace: Path) -> None:
-        """정상 경로는 허용된다."""
+        """정상 경로는 허용된다(거짓 양성 방지).
+
+        차단만 잘 되고 멀쩡한 경로까지 막으면 도구가 무용지물이 된다.
+        workspace 내부의 평범한 파일은 통과해야 함을 보장하는 반대 방향 가드다.
+        """
         pg = PathGuard()
         # workspace 내부의 일반 파일은 허용
         test_file = workspace / "safe_file.py"
@@ -415,7 +496,12 @@ class TestSecurityIntegration:
         assert severity == "critical"
 
     def test_dangerous_command_curl_blocked(self) -> None:
-        """curl 명령이 차단된다 (에어갭 위반)."""
+        """curl 같은 네트워크 명령이 에어갭 위반으로 차단되는지 검증한다.
+
+        check_command은 (안전여부, 심각도, 사유)를 돌려준다. 외부 통신 시도는
+        severity='high'로 막히고 사유에 '에어갭'이 명시돼야 한다. 폐쇄망 원칙(P10)을
+        명령어 레벨에서 강제하는 핵심 가드다.
+        """
         cf = CommandFilter()
         safe, severity, reason = cf.check_command("curl http://example.com")
 
@@ -439,7 +525,12 @@ class TestSecurityIntegration:
 
     @pytest.mark.asyncio
     async def test_permission_pipeline_plan_mode_blocks_writes(self, workspace: Path) -> None:
-        """PLAN 모드에서 쓰기 도구가 거부되는지 검증한다."""
+        """PLAN 모드에서는 쓰기 도구가 막히는지(5계층 통합) 검증한다.
+
+        PLAN 모드는 '실행 없이 계획만' 모드라 파일을 바꾸면 안 된다. 5계층
+        파이프라인을 끝까지 통과시킨 결정(decision)이 DENY 또는 ASK여야 한다
+        (Layer 5에서 PLAN의 쓰기를 ASK→DENY로 보정하기도 하므로 둘 다 허용한다).
+        """
         from core.permission.pipeline import PermissionPipeline
         from core.permission.types import (
             PermissionBehavior,
@@ -466,7 +557,12 @@ class TestSecurityIntegration:
 
     @pytest.mark.asyncio
     async def test_permission_pipeline_bypass_mode_allows(self, workspace: Path) -> None:
-        """BYPASS 모드에서 읽기 도구가 허용되는지 검증한다."""
+        """BYPASS 모드에서 읽기 도구가 곧바로 허용되는지 검증한다(반대 방향 가드).
+
+        위 PLAN 테스트가 '막아야 하는 경우'라면 이건 '허용해야 하는 경우'다.
+        BYPASS 모드 + 읽기 전용 도구는 5계층을 통과해 ALLOW로 떨어져야 한다.
+        둘을 함께 둬서 파이프라인이 과하게 막지도, 과하게 풀지도 않음을 보장한다.
+        """
         from core.permission.pipeline import PermissionPipeline
         from core.permission.types import (
             PermissionBehavior,
@@ -502,7 +598,11 @@ class TestThinkingIntegration:
     """Thinking Engine의 복잡도 평가 → 전략 선택 → 엔진 실행을 통합 검증한다."""
 
     async def test_simple_query_direct_strategy(self) -> None:
-        """단순 질문 → DIRECT 전략 (1-pass) 선택을 검증한다."""
+        """단순 질문은 DIRECT 전략(1-pass)으로 가서 비용을 아끼는지 검증한다.
+
+        '쉬운 질문에 비싼 다단계 추론을 쓰지 않는다'가 핵심이다. 복잡도 점수가
+        낮고(<0.4) 패스 수가 1이며 응답이 비어 있지 않은지로 가벼운 경로 선택을 본다.
+        """
         from core.thinking.orchestrator import ThinkingOrchestrator
         from core.thinking.strategy import ThinkingStrategy
 
@@ -521,7 +621,13 @@ class TestThinkingIntegration:
         assert result.score < 0.4  # 단순 질문은 낮은 복잡도
 
     async def test_moderate_query_hidden_cot(self) -> None:
-        """중간 복잡도 질문 → HIDDEN_COT 전략 (2-pass) 선택을 검증한다."""
+        """복잡도가 올라가면 DIRECT가 아닌 다단계 전략으로 승급하는지 검증한다.
+
+        'implement/error handling/optimize' 같은 복잡 키워드를 일부러 섞어 점수를
+        높인 뒤, 선택 전략이 DIRECT가 아니라 HIDDEN_COT/SELF_REFLECT/MULTI_AGENT 중
+        하나인지 확인한다. 정확히 어느 것인지는 임계값 튜닝에 따라 흔들릴 수 있어
+        '집합 멤버십'으로 느슨하게 검증해 깨지기 쉬움을 피한다.
+        """
         from core.thinking.orchestrator import ThinkingOrchestrator
         from core.thinking.strategy import ThinkingStrategy
 
@@ -548,7 +654,12 @@ class TestThinkingIntegration:
         assert result.passes >= 1
 
     async def test_thinking_cache_hit(self) -> None:
-        """동일 메시지 2회 호출 시 캐시 히트를 검증한다."""
+        """같은 질문을 두 번 하면 캐시가 모델 재호출을 막는지 검증한다.
+
+        모델 호출이 비싸므로 동일 입력은 캐시로 답해야 한다. 1회차 후 호출 수를
+        기록해 두고 2회차에서 호출 수가 그대로(증가 없음)인지, 결과(response/strategy)가
+        동일한지로 캐시 히트를 확인한다. 모델 호출 카운트가 곧 검증 지표다.
+        """
         from core.thinking.orchestrator import ThinkingOrchestrator
 
         provider = EnhancedMockModelProvider(
@@ -574,7 +685,12 @@ class TestThinkingIntegration:
         assert result1.strategy == result2.strategy
 
     async def test_complexity_score_range(self) -> None:
-        """ComplexityAssessor가 0.0~1.0 범위의 스코어를 반환하는지 검증한다."""
+        """ComplexityAssessor 점수가 0~1 범위를 지키고, 복잡할수록 커지는지 검증한다.
+
+        절대 점수는 튜닝에 따라 변하므로 두 가지 불변식만 확인한다:
+        (1) 항상 [0.0, 1.0] 안에 있을 것, (2) 복잡한 질문 점수 > 단순 질문 점수.
+        이 상대 비교가 전략 승급 로직(위 테스트)의 토대가 된다.
+        """
         from core.thinking.assessor import ComplexityAssessor
 
         assessor = ComplexityAssessor()
@@ -601,7 +717,12 @@ class TestMemoryIntegration:
     """Memory 시스템(ShortTerm + LongTerm + Manager)의 인메모리 폴백 통합 검증."""
 
     async def test_short_term_memory_in_memory_fallback(self) -> None:
-        """ShortTermMemory가 Redis 없이 인메모리로 동작하는지 검증한다."""
+        """Redis가 없어도 ShortTermMemory가 인메모리 딕셔너리로 정상 동작하는지 검증한다.
+
+        redis_client=None을 주면 외부 의존성 없이 set→get→delete가 일관되게
+        동작해야 한다(저장한 값이 그대로 나오고, 지우면 None). 단기 메모리가
+        Redis 장애에도 죽지 않는 graceful degradation을 보장하는 가드다.
+        """
         from core.memory.short_term import ShortTermMemory
 
         # redis_client=None → 인메모리 딕셔너리 폴백
@@ -619,7 +740,11 @@ class TestMemoryIntegration:
         assert result is None
 
     async def test_long_term_memory_in_memory_fallback(self) -> None:
-        """LongTermMemory가 PostgreSQL 없이 인메모리로 동작하는지 검증한다."""
+        """PostgreSQL이 없어도 LongTermMemory가 인메모리 리스트로 저장/조회되는지 검증한다.
+
+        pg_pool=None이면 DB 없이도 add()가 id를 돌려주고 get(id)로 같은 내용을
+        다시 꺼낼 수 있어야 한다. 장기 메모리가 DB 부재에도 폴백으로 살아남는지를 본다.
+        """
         from core.memory.long_term import LongTermMemory
         from core.memory.types import MemoryEntry, MemoryType
 
@@ -642,7 +767,13 @@ class TestMemoryIntegration:
         assert "Python" in retrieved.content
 
     async def test_memory_manager_turn_lifecycle(self) -> None:
-        """MemoryManager의 턴 시작/종료 라이프사이클을 검증한다."""
+        """MemoryManager의 턴 시작(on_turn_start)/종료(on_turn_end) 흐름이 깨지지 않는지 검증한다.
+
+        실제 운영 호출 순서를 그대로 흉내낸다: 첫 턴 시작은 빈 결과 → 턴 종료에서
+        대화를 저장 → 다음 턴 시작에서 이전 데이터를 검색. 인메모리 폴백에서는 검색
+        결과가 비어 있을 수도 있어 내용 단언은 하지 않고, 항상 list를 돌려주는지(타입
+        계약)와 전체 라이프사이클이 예외 없이 도는지를 중심으로 본다.
+        """
         from core.memory.long_term import LongTermMemory
         from core.memory.manager import MemoryManager
         from core.memory.short_term import ShortTermMemory
@@ -670,7 +801,12 @@ class TestMemoryIntegration:
         assert isinstance(entries2, list)
 
     async def test_memory_importance_assessment(self) -> None:
-        """ImportanceAssessor가 키워드 기반 중요도를 올바르게 평가하는지 검증한다."""
+        """ImportanceAssessor가 '평범한 대화 < 중요한 결정'으로 중요도를 매기는지 검증한다.
+
+        장기 메모리는 중요한 것만 오래 남겨야 하므로 중요도 점수가 선별 기준이 된다.
+        복잡도 평가와 마찬가지로 절대값 대신 두 불변식만 확인한다: [0,1] 범위 유지,
+        그리고 '중요한 결정' 문장 점수 >= 일반 인사 점수(상대 비교).
+        """
         from core.memory.importance import ImportanceAssessor
         from core.memory.types import MemoryType
 

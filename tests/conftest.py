@@ -98,8 +98,11 @@ def mock_gpu_client() -> AsyncMock:
 @pytest.fixture
 def mock_redis() -> AsyncMock:
     """
-    Redis 클라이언트를 mock한다.
-    fakeredis를 사용할 수 있으면 대체 가능하다.
+    Redis 클라이언트(단기 메모리)를 mock한다.
+
+    각 메서드의 기본 반환값은 "빈 캐시" 상태를 흉내낸다(get→None, keys→[]).
+    덕분에 단기 메모리 코드가 Redis 없이도 '캐시 미스' 경로를 그대로 탈 수 있다.
+    실서버에 가까운 검증이 필요하면 fakeredis로 교체해도 된다.
     """
     redis = AsyncMock()
     redis.get = AsyncMock(return_value=None)
@@ -117,18 +120,24 @@ def mock_redis() -> AsyncMock:
 @pytest.fixture
 def mock_pg_pool() -> AsyncMock:
     """
-    asyncpg 커넥션 풀을 mock한다.
+    asyncpg 커넥션 풀(장기 메모리/pgvector)을 mock한다.
+
+    실제 코드는 `async with pool.acquire() as conn:` 패턴으로 커넥션을 빌리므로,
+    acquire()가 돌려주는 객체의 __aenter__/__aexit__를 직접 mock해서
+    `as conn`에 우리가 만든 가짜 conn이 들어오도록 연결해 둔다.
+    conn의 fetch/fetchrow/execute는 '비어 있는 DB' 기본 응답을 돌려준다.
     """
     pool = AsyncMock()
     pool.acquire = AsyncMock()
     pool.release = AsyncMock()
     pool.close = AsyncMock()
 
-    # 커넥션 mock
+    # 커넥션 mock — 조회는 0건, 쓰기는 "INSERT 0 1"(1행 삽입)로 응답한다
     conn = AsyncMock()
     conn.fetch = AsyncMock(return_value=[])
     conn.fetchrow = AsyncMock(return_value=None)
     conn.execute = AsyncMock(return_value="INSERT 0 1")
+    # async with 컨텍스트가 우리가 만든 conn을 내어주도록 진입/종료를 연결한다
     pool.acquire.return_value.__aenter__ = AsyncMock(return_value=conn)
     pool.acquire.return_value.__aexit__ = AsyncMock(return_value=False)
 
@@ -205,6 +214,10 @@ class EnhancedMockModelProvider(ModelProvider):
         stop_sequences: list[str] | None = None,
         model_override: str | None = None,
         enable_thinking: bool | None = False,
+        top_p: float = 1.0,
+        repetition_penalty: float = 1.0,
+        frequency_penalty: float = 0.0,
+        presence_penalty: float = 0.0,
     ) -> AsyncGeneratorType[StreamEvent, None]:
         """
         MockResponse에 따라 StreamEvent를 yield한다.
@@ -214,10 +227,21 @@ class EnhancedMockModelProvider(ModelProvider):
 
         v7.0 Part 2.5 (2026-04-21): 쿼리 라우팅이 model_override/enable_thinking을
         전달할 수 있도록 시그니처에 동일 파라미터를 추가. Mock은 값을 무시한다.
+
+        degeneration 버그 수정 (2026-06-18): query_loop이 top_p/repetition_penalty/
+        frequency_penalty/presence_penalty 4개 샘플링 파라미터를 stream()으로
+        함께 전달하도록 바뀌었다. 실제 ModelProvider.stream() 시그니처와 동일하게
+        4개 인자를 받아야 하며(없으면 TypeError로 도구 호출이 깨짐), 검증 편의를
+        위해 마지막 호출값을 기록만 해둔다(Mock은 샘플링 동작을 흉내내지 않음).
         """
         # 라우팅 파라미터 — 테스트 검증 편의를 위해 마지막 값을 기록만 해둔다
         self._last_model_override = model_override
         self._last_enable_thinking = enable_thinking
+        # 샘플링 파라미터도 마지막 값을 기록 — 전파 검증용
+        self._last_top_p = top_p
+        self._last_repetition_penalty = repetition_penalty
+        self._last_frequency_penalty = frequency_penalty
+        self._last_presence_penalty = presence_penalty
         # 현재 턴에 해당하는 응답을 선택 (마지막 응답은 반복 사용)
         idx = min(self._call_count, len(self._responses) - 1)
         response = self._responses[idx]
@@ -293,7 +317,12 @@ def mock_model_factory() -> Callable[..., EnhancedMockModelProvider]:
 
 @pytest.fixture
 def tool_use_context(workspace: Path) -> ToolUseContext:
-    """통합 테스트용 도구 실행 컨텍스트."""
+    """통합 테스트용 도구 실행 컨텍스트.
+
+    cwd를 격리된 workspace로 두고 permission_mode=bypass로 잡아, 권한 확인에
+    막히지 않고 query_loop → 도구 실행 흐름 자체를 검증하는 데 집중한다.
+    (권한 레이어의 차단/허용 동작은 별도의 보안 통합 테스트에서 따로 본다.)
+    """
     return ToolUseContext(
         cwd=str(workspace),
         session_id="test-session",
@@ -304,8 +333,11 @@ def tool_use_context(workspace: Path) -> ToolUseContext:
 @pytest.fixture
 def basic_tools(workspace: Path) -> list[BaseTool]:
     """
-    통합 테스트용 실제 도구 인스턴스 목록.
-    ReadTool, WriteTool, EditTool, GrepTool, GlobTool을 생성한다.
+    통합 테스트용 '진짜' 도구 인스턴스 목록(mock 아님).
+
+    모델만 mock하고 도구는 실제 구현(ReadTool/WriteTool/EditTool/GrepTool/GlobTool)을
+    써서, workspace 안 실제 파일에 읽기·쓰기·수정이 일어나는지까지 검증한다.
+    import를 함수 안에 둔 건 무거운 도구 모듈을 이 fixture가 쓰일 때만 불러오기 위함이다.
     """
     from core.tools.implementations.edit_tool import EditTool
     from core.tools.implementations.glob_tool import GlobTool

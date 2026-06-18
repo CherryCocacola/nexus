@@ -32,9 +32,16 @@ logger = logging.getLogger("nexus.orchestrator.routing")
 # HeuristicClassifier는 기본 구현. 향후 LLM 분류기·학교별 커스터마이즈 등을
 # 플러그인할 수 있도록 ABC로 열어둔다.
 class QueryClassifier:
-    """질의 → ("KNOWLEDGE" | "TOOL") 분류기 인터페이스."""
+    """질의 → ("KNOWLEDGE" | "TOOL" | "CHAT") 분류기 인터페이스.
+
+    실제 분류 알고리즘은 하위 구현체(HeuristicClassifier 등)가 담당한다.
+    이 ABC는 "어떤 분류기를 쓰든 classify(텍스트) → 라벨" 계약만 강제한다.
+    """
 
     def classify(self, user_input: str) -> str:
+        # 인터페이스만 정의 — 반드시 하위 클래스에서 구현해야 한다.
+        # 미구현 분류기를 실수로 그대로 쓰면 NotImplementedError로 빨리 터뜨려
+        # "조용히 잘못된 라우팅"이 발생하지 않게 한다(fail-fast).
         raise NotImplementedError
 
 
@@ -62,6 +69,9 @@ class HeuristicClassifier(QueryClassifier):
     """
 
     def __init__(self, routing: RoutingConfig) -> None:
+        # 분류에 쓰는 모든 키워드/패턴을 생성자에서 "한 번만" 전처리해 둔다.
+        # classify()는 질의마다 호출되는 hot path이므로, 소문자 변환·정규식
+        # 컴파일 같은 비싼 작업을 매 호출이 아니라 여기서 미리 끝내 둔다.
         self._routing = routing
         # substring 키워드는 소문자로 미리 변환해 매 호출마다 반복 변환 제거.
         self._lowered_keywords = tuple(
@@ -110,8 +120,18 @@ class HeuristicClassifier(QueryClassifier):
             return None
 
     def classify(self, user_input: str) -> str:
+        """질의 텍스트 하나를 받아 "KNOWLEDGE"/"TOOL"/"CHAT" 중 하나로 분류한다.
+
+        클래스 docstring에 적힌 우선순위 규칙을 그대로 코드로 옮긴 것이다.
+        위에서 아래로 검사하다가 처음 매치되는 규칙의 라벨을 즉시 반환한다
+        (early return) — 그래서 검사 순서 자체가 곧 우선순위다.
+        """
+        # 0) 비상 스위치 — 라우팅 기능을 통째로 끈 경우. 분류를 시도하지 않고
+        #    무조건 TOOL로 보내 도구 호출 경로(가장 안전한 기본)로 흐르게 한다.
         if not self._routing.enabled:
             return "TOOL"
+        # 1) 너무 긴 입력은 문서를 통째로 붙여넣은 것으로 간주 — 도구 작업일
+        #    가능성이 높으니 TOOL. (KB RAG에 거대 입력을 태우지 않으려는 의도도 있음)
         if len(user_input) >= self._routing.long_input_threshold:
             return "TOOL"
         lowered = user_input.lower()
@@ -197,6 +217,15 @@ class RoutingDecision:
     allowed_knowledge_sources: list[str] | None        # KB 필터용 (None = 전체)
     tenant_id: str | None = None                       # 로깅/감사용
     profile_name: str = ""                             # 프로필 이름 (debug)
+    # ── 샘플링 파라미터 (degeneration/무한 반복 방지) ──────────────────
+    # 왜 여기에: 이 dataclass는 frozen이라 기본값 있는 필드를 무기본값 필드 뒤에
+    # 배치해야 한다(파이썬 dataclass 제약). 그래서 profile_name 뒤에 둔다.
+    # 기본값은 전부 "비활성"값 — enabled=False 폴백 경로처럼 신규 필드를 생략해도
+    # 동작이 바뀌지 않도록 보장한다(하위 호환).
+    top_p: float = 1.0
+    repetition_penalty: float = 1.0
+    frequency_penalty: float = 0.0
+    presence_penalty: float = 0.0
 
     @property
     def routing_enabled(self) -> bool:
@@ -257,7 +286,11 @@ class RoutingResolver:
                 profile_name="disabled",
             )
 
+        # 먼저 질의를 분류한다. 이 라벨이 아래의 모든 분기(프로필 선택, 테넌트
+        # override 적용 여부, KB 필터 적용 여부)를 결정하는 기준이 된다.
         query_class = self._classifier.classify(user_input)
+        # 분류 결과에 대응하는 RoutingProfile을 고른다. 각 프로필은 model 이름과
+        # temperature/max_tokens/샘플링 파라미터 묶음을 담고 있다.
         # CHAT 프로필은 v0.14.6 신규 — 구버전 RoutingConfig 객체에 chat_mode가
         # 없을 수도 있으므로 getattr로 안전하게 폴백한다 (없으면 KNOWLEDGE 사용).
         if query_class == "KNOWLEDGE":
@@ -270,7 +303,9 @@ class RoutingResolver:
         else:
             profile = self._routing.tool_mode
 
+        # 기본 모델은 프로필이 지정한 것 — 아래 테넌트 override가 있으면 덮어쓴다.
         model = profile.model
+        # KB 검색 소스 필터. KNOWLEDGE 질의 + 테넌트 제한이 있을 때만 채워진다.
         allowed_sources: list[str] | None = None
 
         # 테넌트 override — KNOWLEDGE/CHAT에 적용 (TOOL은 Phase LoRA 보존)
@@ -300,6 +335,13 @@ class RoutingResolver:
             allowed_knowledge_sources=allowed_sources,
             tenant_id=tenant.id if tenant else None,
             profile_name=query_class.lower(),
+            # 선택된 프로필의 샘플링 파라미터를 그대로 실어 보낸다.
+            # 여기서부터 query_loop → model_dispatcher → inference.stream()까지
+            # passthrough로 흘러가 최종 vLLM payload에 반영된다(degeneration 방지).
+            top_p=profile.top_p,
+            repetition_penalty=profile.repetition_penalty,
+            frequency_penalty=profile.frequency_penalty,
+            presence_penalty=profile.presence_penalty,
         )
 
 

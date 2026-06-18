@@ -4,13 +4,14 @@
 # =============================================================================
 
 # GPU 서버 (Machine B) 연결 설정
+# Machine A(오케스트레이터)는 GPU를 직접 만지지 않고 아래 OpenAI 호환 API로만 추론한다.
 gpu_server:
-  url: "http://192.168.21.112:8001"
-  embedding_url: "http://192.168.21.112:8002"
-  timeout_seconds: 120.0
-  max_retries: 10
-  retry_base_delay: 0.5
-  health_check_interval: 30.0
+  url: "http://192.168.21.112:8001"            # vLLM LLM 추론 서버 (Qwen 3.5 27B)
+  embedding_url: "http://192.168.21.112:8002"  # e5-large 임베딩 서버 (RAG 벡터화)
+  timeout_seconds: 120.0     # 단일 요청 타임아웃 — 27B 장문 생성 여유까지 고려한 값
+  max_retries: 10            # with_retry(Tier 4) 최대 재시도 횟수 (콜드/일시장애 흡수)
+  retry_base_delay: 0.5      # 지수 백오프 기준 지연(초) — 0.5→1→2…로 증가
+  health_check_interval: 30.0  # /health 폴링 주기(초)
 
 # 하드웨어 티어 — 오케스트레이션 모드(Scout 분리/컨텍스트 한계)를 결정한다.
 #   왜 "auto"가 아니라 명시하는가:
@@ -29,19 +30,19 @@ hardware_tier: "small"
 redis:
   host: "192.168.10.39"
   port: 6340
-  db: 6
+  db: 6                  # nexus 전용 논리 DB 번호 (다른 앱과 키 충돌 방지용 분리)
   password: "2a4a59309d85062c35989796bf4570a37806ff88cb823f1e3d2fa35dc95d25bf"
-  socket_timeout: 5.0
+  socket_timeout: 5.0    # 연결/명령 타임아웃(초) — 초과 시 인메모리 폴백으로 강등
 
 # PostgreSQL + pgvector (장기 메모리) — docutil-postgres 컨테이너, nexus DB
 postgresql:
   host: "192.168.10.39"
   port: 5440
-  database: "nexus"
+  database: "nexus"      # tb_memories / tb_knowledge / tb_symbols 가 사는 DB
   user: "nexus"
   password: "idino@12"
-  min_connections: 2
-  max_connections: 10
+  min_connections: 2     # asyncpg 풀 최소 유지 커넥션 (idle 시에도 상시 보유)
+  max_connections: 10    # 풀 상한 — 동시 검색·인덱싱 부하를 고려한 보수적 상한
 
 # 모델 설정 — Qwen 3.5 27B Dense AWQ (v7.0 모델 전환)
 # Dense 아키텍처 → vLLM LoRA 핫로딩 지원 (학교별/기업별 동적 전환)
@@ -56,12 +57,12 @@ postgresql:
 #   3. subagent_use_scout 프롬프트 10→30 확대로 탐색 시나리오 다양화
 #   학습 결과: train_loss=0.06946 (Phase 1 0.073, Phase 2 0.168 대비 최저)
 model:
-  primary_model: "nexus-phase3"
-  auxiliary_model: "exaone-7.8b"
-  embedding_model: "multilingual-e5-large"
-  max_context_tokens: 8192
-  default_temperature: 0.7
-  default_max_tokens: 4096
+  primary_model: "nexus-phase3"            # Worker 기본 모델 = vLLM served-model-name
+  auxiliary_model: "exaone-7.8b"           # 한국어 보조 모델 (필요 시 사용)
+  embedding_model: "multilingual-e5-large"  # RAG 임베딩 모델 (1024차원)
+  max_context_tokens: 8192   # 컨텍스트 상한 — RTX 5090(32GB) 실측 제약. 초과 시 압축 발동
+  default_temperature: 0.7   # routing 미적용/기본 경로의 샘플링 온도
+  default_max_tokens: 4096   # 1회 응답 기본 출력 상한 (라우팅 모드별 값이 우선)
 
 # v7.0 Part 2.5 — 쿼리 라우팅 (2026-04-21)
 # Phase 3 LoRA가 도구 호출은 강화했지만 일반 지식 표현을 좁히는 부작용 발생.
@@ -69,7 +70,7 @@ model:
 # 질의를 분류하여 KNOWLEDGE_MODE는 베이스 모델, TOOL_MODE는 Phase3 LoRA로 분기.
 # TIER_M 이상으로 업그레이드 시 enabled: false로 끄고 단일 경로로 회귀한다.
 routing:
-  enabled: true
+  enabled: true               # 질의 분류 활성화 (false면 단일 경로로 회귀)
   long_input_threshold: 500   # 이 글자수 이상이면 TOOL_MODE (문서 첨부 간주)
 
   # 분류기 종류 — 현재 지원: "heuristic" (기본)
@@ -196,44 +197,77 @@ routing:
     - "see you"
     - "cya"
 
+  # ── 샘플링 파라미터 (degeneration/무한 반복 방지) ──────────────────────
+  # 왜 추가했나: top_p/repetition_penalty/frequency_penalty/presence_penalty가
+  # vLLM 요청에서 누락되어 동일 문장이 무한 반복되는 결함이 있었다. 클래스별로
+  # 차등 적용한다. (TOOL은 repetition_penalty=1.0 비활성 — tool_call JSON/XML의
+  # 필수 반복 토큰이 페널티로 손상되어 파싱 실패하는 것을 막기 위함.)
   knowledge_mode:
     model: "qwen3.5-27b"      # 베이스 — LoRA 어댑터 미적용
     temperature: 0.2
     max_tokens: 2048
     enable_thinking: false
+    top_p: 0.95               # 꼬리 토큰 약간 차단
+    repetition_penalty: 1.15  # 사실형 QA — 반복 가장 강하게 억제
+    frequency_penalty: 0.3
+    presence_penalty: 0.0
     description: "일반 지식 QA"
   tool_mode:
     model: "nexus-phase3"     # Phase 3 LoRA — 도구 호출 특화
     temperature: 0.3
     max_tokens: 4096
     enable_thinking: false
+    top_p: 0.95
+    repetition_penalty: 1.0   # 비활성 — tool_call JSON/XML 반복 토큰 보호
+    frequency_penalty: 0.0
+    presence_penalty: 0.0
     description: "도구 호출 / 프로젝트 작업"
   chat_mode:
     model: "qwen3.5-27b"      # 베이스 — KNOWLEDGE와 동일 모델
     temperature: 0.5
     max_tokens: 512           # 인사·잡담은 짧게
     enable_thinking: false
+    top_p: 0.9                # 잡담은 다양성 위해 약간 더 좁힘
+    repetition_penalty: 1.1   # 같은 인사말 반복 방지(중간 강도)
+    frequency_penalty: 0.2
+    presence_penalty: 0.0
     description: "인사·잡담 — RAG 미주입, 짧은 응답"
 
 # 세션 설정
 session:
-  sessions_dir: ".nexus/sessions"
-  max_turns: 50
-  max_budget_seconds: 300.0
-  session_ttl_hours: 24
-  transcript_enabled: true
+  sessions_dir: ".nexus/sessions"  # JSONL 트랜스크립트 저장 디렉토리
+  max_turns: 50               # 세션당 최대 에이전트 턴 수 (폭주 방지 상한)
+  max_budget_seconds: 300.0   # 세션 누적 시간 예산(초) — 초과 시 강제 종료
+  session_ttl_hours: 24       # 세션 데이터 보존 기간(시간)
+  transcript_enabled: true    # CLI 세션 JSONL 영구 기록 on/off
 
 # 보안 설정
 security:
-  sandbox_enabled: true
-  sandbox_timeout_seconds: 30.0
-  max_file_size_bytes: 10485760  # 10MB
+  sandbox_enabled: true          # Bash 도구 샌드박스 실행 강제
+  sandbox_timeout_seconds: 30.0  # 샌드박스 명령 실행 타임아웃(초)
+  max_file_size_bytes: 10485760  # 10MB — 도구가 읽고/쓰는 파일 크기 상한
+  # 아래 정규식에 매칭되는 Bash 명령은 Layer 2에서 즉시 차단된다(파괴적 명령 방어).
   bash_deny_patterns:
-    - 'rm\s+-rf\s+/'
-    - ':(){ :\|:& };:'
-    - 'dd\s+if=/dev/zero'
-    - 'mkfs\.'
-    - '>\s*/dev/sd'
+    - 'rm\s+-rf\s+/'      # 루트/광범위 강제 삭제
+    - ':(){ :\|:& };:'    # fork bomb (자기복제 프로세스 폭발)
+    - 'dd\s+if=/dev/zero' # 디스크 덮어쓰기
+    - 'mkfs\.'            # 파일시스템 포맷
+    - '>\s*/dev/sd'       # 블록 디바이스 직접 덮어쓰기
+
+# =============================================================================
+# 지식 베이스 RAG 게이팅 — 무관 청크 주입 차단 (2026-06-18)
+# 실측: e5-large 코사인 유사도는 무관 문서끼리도 0.78~0.83에 몰린다.
+#   - 메타질문 "rag에 이런 정보가 있었어?" → top1 sim=0.824 (무관)
+#   - "요한 제바스티안 바흐"                → top1 sim=0.857 (관련)
+# 기존 코드 기본값 min_similarity=0.5는 사실상 무필터라 무관 청크가 무조건
+# 주입돼 할루시네이션을 유발했다. 절대(abs_threshold)+상대(relevance_margin)
+# 2단 게이팅으로 무관 질의는 전부 드롭하고 관련 질의는 핵심 청크만 통과시킨다.
+# =============================================================================
+knowledge_rag:
+  top_k: 5                  # 검색 상위 청크 개수 (컨텍스트 절약 위해 보수적)
+  min_similarity: 0.75      # DB 벡터 검색 1차 컷오프 (0.5→0.75 현실화)
+  abs_threshold: 0.84       # 최상위조차 이 값 미만이면 전부 드롭 (무관 분포 0.83 상한 바로 위)
+  relevance_margin: 0.03    # top_sim에서 이 폭 이내 결과만 유지 (노이즈 청크 절단)
 
 # =============================================================================
 # v7.2 MCP(Model Context Protocol) 통합 — LAN 내부 MCP 서버 연결
@@ -288,10 +322,10 @@ mcp:
       expose_to_worker: false
 
 # 운영 설정
-log_level: "INFO"
-log_file: null
-watch_files: false
-debug: false
+log_level: "INFO"      # 로그 레벨 (DEBUG/INFO/WARNING/ERROR)
+log_file: null         # 파일 로그 경로 — null이면 콘솔(stderr)만 사용
+watch_files: false     # 설정 파일 변경 감지 후 핫리로드 여부
+debug: false           # 디버그 모드 (상세 추적 활성화)
 
-# 에어갭 모드 (외부 네트워크 차단)
+# 에어갭 모드 (외부 네트워크 차단) — LAN 외 모든 호출을 fail-closed로 거부
 air_gap_mode: true

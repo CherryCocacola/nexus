@@ -206,9 +206,12 @@ class QueryEngine:
         decision = self._router.resolve(user_input, tenant)
         if decision.routing_enabled:
             logger.info(
-                "라우팅: class=%s, model=%s, temp=%.2f, max_tokens=%s, tenant=%s",
+                "라우팅: class=%s, model=%s, temp=%.2f, top_p=%.2f, "
+                "rep_pen=%.2f, max_tokens=%s, tenant=%s",
                 decision.query_class, decision.model_override,
-                decision.temperature, decision.max_tokens_cap, decision.tenant_id,
+                decision.temperature, decision.top_p,
+                decision.repetition_penalty, decision.max_tokens_cap,
+                decision.tenant_id,
             )
         else:
             logger.info("라우팅 비활성 — 프로바이더 기본 설정 사용")
@@ -236,6 +239,11 @@ class QueryEngine:
                 temperature=decision.temperature,
                 max_tokens_cap=decision.max_tokens_cap,
                 enable_thinking=decision.enable_thinking,
+                # 라우팅이 결정한 샘플링 파라미터를 dispatcher 경로로 전달.
+                top_p=decision.top_p,
+                repetition_penalty=decision.repetition_penalty,
+                frequency_penalty=decision.frequency_penalty,
+                presence_penalty=decision.presence_penalty,
             )
         else:
             # 폴백 — dispatcher 주입이 없는 경우 기존 단일 Worker 경로
@@ -252,6 +260,11 @@ class QueryEngine:
                 temperature=decision.temperature,
                 max_tokens_cap=decision.max_tokens_cap,
                 enable_thinking=decision.enable_thinking,
+                # 라우팅이 결정한 샘플링 파라미터를 query_loop 폴백 경로로 전달.
+                top_p=decision.top_p,
+                repetition_penalty=decision.repetition_penalty,
+                frequency_penalty=decision.frequency_penalty,
+                presence_penalty=decision.presence_penalty,
             )
 
         # ─── 스트림 소비 ─────────────────────────────────
@@ -261,10 +274,17 @@ class QueryEngine:
         #     중단되면 `_finalize_turn`이 스킵되어 "폴더만 있고 transcript.jsonl
         #     없는 유령 세션"이 생겼다 (2026-04-23 hang 진단).
         #  2) 예외는 재-raise하여 상위(웹 핸들러)가 인지하게 한다. swallow 금지.
+        # finalize_error에 예외를 담아 finally까지 전달한다 — finally 블록이
+        # "정상 종료였는지 / 중단됐는지"를 구분해 로그·트랜스크립트를 다르게
+        # 남기기 위해서다. None이면 정상 종료를 의미한다.
         finalize_error: BaseException | None = None
         try:
+            # 하위 Tier(stream)가 내보내는 이벤트를 그대로 상위(웹/CLI)로 흘려보낸다.
+            # QueryEngine은 이벤트를 가공하지 않고 통과시키되, 토큰 사용량만 옆에서
+            # 누적해 둔다(관측용).
             async for event in stream:
-                # 사용량 추적 — USAGE_UPDATE 이벤트에서 누적
+                # 사용량 추적 — USAGE_UPDATE 이벤트가 올 때마다 최신값으로 갱신.
+                # (누적이 아니라 최신 스냅샷을 그대로 보관 — 하위에서 이미 누적해 보냄)
                 if (
                     isinstance(event, StreamEvent)
                     and event.type == StreamEventType.USAGE_UPDATE
@@ -333,9 +353,13 @@ class QueryEngine:
         # 왜 쌍만? 전체 messages를 매번 덮어쓰면 append-only 규칙 위반 + 중복 누적
         if self._transcript is not None:
             try:
+                # user 쪽은 이번 턴 입력 원문을 그대로 쓴다.
                 last_user: str | None = user_input
                 last_assistant: str | None = None
-                # messages 끝부터 역순으로 탐색 — 가장 최근 assistant 텍스트
+                # assistant 쪽은 messages를 끝에서부터 거슬러 올라가며 가장 최근
+                # assistant 텍스트를 찾는다. role이 enum/문자열 둘 다일 수 있어
+                # .value 유무를 방어적으로 처리하고, text_content 속성이 없으면
+                # content를 문자열화해 폴백한다(메시지 구현 차이 흡수).
                 for m in reversed(self._messages):
                     role = m.role if isinstance(m.role, str) else m.role.value
                     if role == "assistant":
@@ -379,10 +403,17 @@ class QueryEngine:
                 )
 
     # ─── 대화 상태 조회 메서드 ───
+    # 아래 property들은 모두 내부 상태(_messages, _session_id 등)의 단순 조회용이다.
+    # 외부(웹 핸들러, 메트릭 엔드포인트, 테스트)가 엔진 내부를 들여다볼 수 있게
+    # 하되, 직접 _필드를 만지지 않도록 읽기 창구를 제공한다.
 
     @property
     def messages(self) -> list[Message]:
-        """현재 대화 히스토리를 반환한다 (읽기 전용 복사)."""
+        """현재 대화 히스토리를 반환한다 (읽기 전용 복사).
+
+        내부 리스트를 그대로 주면 호출자가 실수로 수정할 수 있으므로,
+        list(...)로 얕은 복사본을 만들어 내부 상태를 보호한다.
+        """
         return list(self._messages)
 
     @property
@@ -471,7 +502,12 @@ class QueryEngine:
         logger.info("대화 히스토리 초기화: session=%s", self._session_id)
 
     def get_last_assistant_text(self) -> str:
-        """마지막 assistant 메시지의 텍스트를 반환한다."""
+        """마지막 assistant 메시지의 텍스트를 반환한다.
+
+        히스토리를 끝에서부터 거슬러 올라가며 처음 만나는 assistant 메시지의
+        텍스트를 돌려준다. assistant 응답이 아직 없으면 빈 문자열을 반환한다
+        (호출부에서 None 체크 없이 바로 쓸 수 있게 한 안전한 기본값).
+        """
         for msg in reversed(self._messages):
             role = str(msg.role)
             if role == "assistant":
