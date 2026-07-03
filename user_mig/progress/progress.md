@@ -2671,4 +2671,12 @@ B200 정부 컨테이너에 "완벽한 버전" Nexus를 올리기 전, 지난 �
 - **C1 완료(20f5e7c)**: P0+P1 하네스+shadow. `permission_enforcement{enabled=false,mode=shadow}`+`audit` config, `mode_mapping`(state PermissionModeValue→permission PermissionMode: trust→BYPASS/headless·deny_all→DONT_ASK), bootstrap이 PermissionContext/Pipeline/AuditLogger 생성해 `ToolUseContext.options` 주입(4-Tier 시그니처 불변), executor Step 6-8a **shadow 관측**(판정을 AuditLogger JSONL 기록만, 차단 안 함). 무회귀 1330.
 - **C2 완료**: P2 **DENY 강제**. executor enforce 분기(deny면 실차단, ASK/allow는 통과=P3 범위), pipeline Layer 2 **공통 pre-check**로 PathGuard(순회/.env/.ssh/*.pem/*.key)+CommandFilter(pip/npm/apt install 등) 연결(**미주입 시 skip=무회귀**), 경로 cwd-절대정규화, 웹 세션 샌드박스 cwd(enabled 시만), 에어갭 설치차단 게이팅(`command_filter.block_package_install`: dev=false/b200=true). b200 config에 enforce 활성.
   - 시연(직접): .env·순회·pip install·rm -rf → **DENY**, 정상쓰기·ls → 통과. 무회귀 1330.
-- **후속**: **P3(ASK 강제)** — CLI 확인 프롬프트/웹 정책, shadow 로그 확인 후. config deny rule 로딩(현재 rules=None), hook_manager 배선(Layer 4 미실행). 그리고 **#5(웹 동시성)·#6~8(메모리)**.
+- **후속(권한)**: **P3(ASK 강제)** — CLI 확인 프롬프트/웹 정책, shadow 로그 확인 후. config deny rule 로딩(현재 rules=None), hook_manager 배선(Layer 4 미실행).
+
+### C-메모리. Critical #6·#7 (장기 메모리 버그)
+
+- **#6·#7 완료**: 감쇠 복리 + consolidate 세션 파괴 수정(database-architect).
+  - **#6** `decay.py run_decay_cycle`: 감쇠값을 `importance`에 되쓰던 update 제거 → **삭제 전용(멱등)**. importance=불변 base 유지(랭킹 ORDER BY importance가 오염 복리값 아닌 원본으로 정렬), 유효중요도는 읽을 때 `calculate_decay`로 계산. 검증: 사이클 N회 반복 = 1회(복리 없음).
+  - **#7** `manager.py`: turn/tool_result 자동 key를 `turn:{session_id}` → `turn:{session_id}:{sha256(content)[:16]}`. 서로 다른 턴 보존, 진짜 중복만 dedup(consolidate·명시 key 기능 유지). key는 조회 미사용이라 안전.
+  - 테스트 4건 추가, 전체 **1395 passed**. **실 PG 통합검증은 후속**(NEXUS_PG_PASSWORD 필요, SQL/DDL 의미 불변이라 저위험). 운영 레거시 `turn:{session_id}` 엔트리 1회 정리 고려.
+- **남은 Critical**: **#5(웹 QueryEngine 싱글톤 동시성)**, **#8(컨텍스트 오버플로 복구 도달불가)**.

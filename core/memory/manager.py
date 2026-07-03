@@ -164,11 +164,25 @@ class MemoryManager:
             # 중요도 평가
             importance = self._importance_assessor.assess(content, MemoryType.EPISODIC)
 
+            # 저장할 본문(최대 2000자로 제한)
+            stored_content = content[:2000]
+
             # EPISODIC 메모리 엔트리 생성
+            #
+            # key에 content 해시를 붙이는 이유 (consolidate 붕괴 버그 수정):
+            #   과거에는 key=f"turn:{session_id}" 로 "한 세션의 모든 assistant 턴"이
+            #   동일 key를 가졌다. consolidate()는 같은 key를 한 그룹으로 묶어 대표
+            #   1건만 남기고 나머지를 삭제하므로, 한 세션의 서로 다른 턴 기억 전체가
+            #   1건으로 붕괴됐다.
+            #   key에 본문 해시를 포함하면 서로 다른 내용의 턴은 서로 다른 key를 가져
+            #   보존되고, "완전히 동일한 내용"의 턴만 같은 key로 묶여 정상적으로
+            #   중복 제거(dedup)된다. (key는 조회/조인에 쓰이지 않으므로 형식 변경 안전)
+            key = f"turn:{session_id}:{self._content_hash(stored_content)}"
+
             entry = MemoryEntry(
                 memory_type=MemoryType.EPISODIC,
-                content=content[:2000],  # 최대 2000자로 제한
-                key=f"turn:{session_id}",
+                content=stored_content,
+                key=key,
                 tags=["conversation", session_id],
                 importance=importance,
                 metadata={"session_id": session_id, "role": role},
@@ -200,10 +214,15 @@ class MemoryManager:
 
                 importance = self._importance_assessor.assess(result_text, MemoryType.PROCEDURAL)
                 if importance > 0.6:
+                    stored_result = result_text[:2000]
+                    # turn 키와 동일한 이유로 content 해시를 붙인다:
+                    # 서로 다른 도구 결과가 consolidate로 붕괴되는 것을 막고,
+                    # 완전히 동일한 결과만 중복 제거되게 한다.
+                    key = f"tool_result:{session_id}:{self._content_hash(stored_result)}"
                     entry = MemoryEntry(
                         memory_type=MemoryType.PROCEDURAL,
-                        content=result_text[:2000],
-                        key=f"tool_result:{session_id}",
+                        content=stored_result,
+                        key=key,
                         tags=["tool_result", session_id],
                         importance=importance,
                         metadata={"session_id": session_id},
@@ -418,6 +437,19 @@ class MemoryManager:
 
         serialized = json.dumps(input_data, sort_keys=True, ensure_ascii=False)
         return hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:16]
+
+    @staticmethod
+    def _content_hash(content: str) -> str:
+        """
+        메모리 본문의 내용 해시를 생성한다 (자동 생성 key의 고유성 확보용).
+
+        왜 필요한가:
+          turn/tool_result 메모리의 key에 이 해시를 붙여, 서로 다른 내용의 엔트리가
+          consolidate()에서 같은 그룹으로 묶여 삭제되는 것을 방지한다. 반대로 완전히
+          동일한 내용은 같은 해시 → 같은 key를 가져 정상적으로 중복 제거된다.
+          16자 hex(64비트)면 세션 단위 턴 수 규모에서 충돌 확률이 사실상 0이다.
+        """
+        return hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
 
     # ─── 프로퍼티 ───
 

@@ -688,6 +688,79 @@ class TestMemoryDecayManager:
         assert stats["groups_found"] == 0
         assert stats["entries_merged"] == 0
 
+    # ─────────────────────────────────────────────
+    # 감사 Critical #6 회귀 방지 — 복리 감쇠(compounding decay) 버그
+    # ─────────────────────────────────────────────
+    # 배경(버그):
+    #   과거 run_decay_cycle은 유효 중요도를 importance 필드에 되썼지만
+    #   last_accessed는 갱신하지 않았다. 그러면 다음 사이클이 "이미 감쇠된
+    #   importance"를 base로 "여전히 옛 경과일"로 또 감쇠시켜, 지수 감쇠가 복리로
+    #   중복 적용됐다(며칠 만에 임계치 붕괴 → 조기 삭제).
+    # 수정: importance는 불변 base로 두고, 사이클은 삭제만 한다.
+    @pytest.mark.asyncio
+    async def test_run_decay_cycle_idempotent(self, decay_mgr):
+        """같은 상태로 감쇠 사이클을 여러 번 실행해도 결과가 1회 실행과 동일한지 확인한다.
+
+        핵심 불변식: base importance가 사이클로 변하지 않아야 한다(복리 없음).
+        """
+        ltm = LongTermMemory(pg_pool=None)
+
+        # 3일 지난 EPISODIC 메모리(반감기 7일) — 유효 중요도는 임계치보다 훨씬 높다.
+        # 0.8 * 2^(-3/7) ≈ 0.59 >> 0.05 이므로 절대 삭제되면 안 된다.
+        entry = MemoryEntry(
+            memory_type=MemoryType.EPISODIC,
+            content="important architecture decision",
+            importance=0.8,
+            last_accessed=datetime.now(UTC) - timedelta(days=3),
+        )
+        await ltm.add(entry)
+
+        # 사이클을 3회 반복 실행한다.
+        s1 = await decay_mgr.run_decay_cycle(ltm)
+        s2 = await decay_mgr.run_decay_cycle(ltm)
+        s3 = await decay_mgr.run_decay_cycle(ltm)
+
+        # 매 실행 통계가 동일해야 한다(멱등).
+        assert s1 == s2 == s3
+        # 삭제 전용 정책: 아무 것도 삭제되지 않고, updated는 항상 0이다.
+        assert s1["deleted"] == 0
+        assert s1["updated"] == 0
+        assert s1["total_checked"] == 1
+
+        # base importance가 원본 그대로여야 한다(감쇠값이 되쓰이지 않음 = 복리 없음).
+        # get()은 access_count/last_accessed를 변경하므로 get_all로 부작용 없이 읽는다.
+        stored = {e.id: e for e in await ltm.get_all()}
+        assert entry.id in stored
+        assert stored[entry.id].importance == 0.8
+
+    @pytest.mark.asyncio
+    async def test_run_decay_cycle_fresh_memory_survives_repeated_cycles(self, decay_mgr):
+        """신선한 EPISODIC 메모리가 사이클 반복만으로 조기 삭제되지 않는지 확인한다.
+
+        과거 버그에선 복리 감쇠 때문에 며칠 안 된 기억이 여러 사이클 만에 임계치
+        아래로 떨어져 삭제됐다. 수정 후에는 시간이 실제로 흐르지 않는 한(같은 상태
+        반복 실행) 삭제되지 않아야 한다.
+        """
+        ltm = LongTermMemory(pg_pool=None)
+
+        # 2일 지난 EPISODIC 메모리. 유효 중요도 = 0.6 * 2^(-2/7) ≈ 0.49 >> 0.05.
+        entry = MemoryEntry(
+            memory_type=MemoryType.EPISODIC,
+            content="a recent conversation turn worth keeping",
+            importance=0.6,
+            last_accessed=datetime.now(UTC) - timedelta(days=2),
+        )
+        await ltm.add(entry)
+
+        # 사이클을 5회 반복 실행한다(옛 버그라면 여기서 importance가 복리로 붕괴).
+        for _ in range(5):
+            await decay_mgr.run_decay_cycle(ltm)
+
+        # 여전히 존재하고 base importance가 그대로여야 한다.
+        stored = {e.id: e for e in await ltm.get_all()}
+        assert entry.id in stored, "신선한 메모리가 반복 사이클로 부당하게 삭제됨(복리 감쇠 회귀)"
+        assert stored[entry.id].importance == 0.6
+
 
 # ─────────────────────────────────────────────
 # MemoryManager 테스트
@@ -791,6 +864,79 @@ class TestMemoryManager:
         # 장기 메모리에 승격되었는지 확인
         all_memories = await manager.long_term.get_all()
         assert len(all_memories) >= 1
+
+    # ─────────────────────────────────────────────
+    # 감사 Critical #7 회귀 방지 — consolidate가 세션 턴 기억을 파괴하던 버그
+    # ─────────────────────────────────────────────
+    # 배경(버그):
+    #   과거 on_turn_end는 EPISODIC 엔트리에 key=f"turn:{session_id}"를 부여해
+    #   한 세션의 모든 assistant 턴이 동일 key를 가졌다. consolidate()는 같은 key를
+    #   한 그룹으로 묶어 대표 1건만 남기므로, 한 세션의 서로 다른 턴 기억 전체가
+    #   1건으로 붕괴됐다.
+    # 수정: key에 content 해시를 붙여 서로 다른 내용의 턴은 서로 다른 key를 갖게 한다.
+    #   완전히 동일한 내용만 같은 key로 묶여 정상 dedup된다.
+    @pytest.mark.asyncio
+    async def test_on_turn_end_distinct_turns_survive_consolidate(self, manager):
+        """서로 다른 내용의 세션 턴들이 consolidate 후에도 모두 보존되는지 확인한다."""
+        # 각기 다른 내용의 assistant 턴 3건 — 모두 승격되도록 고중요도 키워드 포함.
+        messages = [
+            Message.user("질문"),
+            Message.assistant(
+                "Critical architecture decision: we adopted the 4-Tier AsyncGenerator "
+                "chain to avoid the deprecated streaming bug in the old design."
+            ),
+            Message.assistant(
+                "Security hotfix: resolved the authentication permission vulnerability "
+                "and the critical auth bug in the layer 2 middleware."
+            ),
+            Message.assistant(
+                "Migration decision documented: the breaking change requires a careful "
+                "tradeoff between the two critical designs before deployment."
+            ),
+        ]
+        await manager.on_turn_end("session-777", messages)
+
+        # 3건이 각기 다른 key로 장기 메모리에 승격되어야 한다.
+        before = await manager.long_term.get_by_type(MemoryType.EPISODIC)
+        assert len(before) == 3
+        assert len({e.key for e in before}) == 3, "서로 다른 턴은 서로 다른 key를 가져야 함"
+
+        # consolidate 실행 — 서로 다른 내용이므로 아무 것도 병합되지 않아야 한다.
+        decay_mgr = MemoryDecayManager()
+        stats = await decay_mgr.consolidate(manager.long_term)
+        assert stats["entries_merged"] == 0
+
+        # 3건 모두 보존되어야 한다(세션 턴 붕괴 회귀 방지).
+        after = await manager.long_term.get_by_type(MemoryType.EPISODIC)
+        assert len(after) == 3
+
+    @pytest.mark.asyncio
+    async def test_on_turn_end_true_duplicate_turns_are_deduped(self, manager):
+        """완전히 동일한 내용의 턴은 consolidate로 정상 중복 제거되는지 확인한다.
+
+        dedup 기능 자체는 유지되어야 한다 — 서로 다른 턴만 보존, 진짜 중복은 병합.
+        """
+        dup_text = (
+            "Critical security decision about the authentication architecture "
+            "and the permission bug fix in the middleware."
+        )
+        # 동일 세션에서 완전히 동일한 assistant 응답이 두 번 저장되는 상황.
+        await manager.on_turn_end("session-888", [Message.assistant(dup_text)])
+        await manager.on_turn_end("session-888", [Message.assistant(dup_text)])
+
+        # 동일 내용 → 동일 key → 2건 저장됨.
+        before = await manager.long_term.get_by_type(MemoryType.EPISODIC)
+        assert len(before) == 2
+        assert before[0].key == before[1].key, "동일 내용은 동일 key여야 dedup 대상이 됨"
+
+        # consolidate 실행 — 진짜 중복이므로 1건으로 병합되어야 한다.
+        decay_mgr = MemoryDecayManager()
+        stats = await decay_mgr.consolidate(manager.long_term)
+        assert stats["groups_found"] == 1
+        assert stats["entries_merged"] == 1
+
+        after = await manager.long_term.get_by_type(MemoryType.EPISODIC)
+        assert len(after) == 1
 
     @pytest.mark.asyncio
     async def test_tool_result_cache(self, manager):

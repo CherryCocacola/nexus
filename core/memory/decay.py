@@ -11,9 +11,18 @@
   - USER_PROFILE: 365일 (거의 잊혀지지 않음)
   - FEEDBACK: 14일
 
+중요한 설계 원칙 — importance는 "불변 base(원본 중요도)"다:
+  - importance 필드는 저장된 원본 중요도를 그대로 유지한다(감쇠값을 되쓰지 않는다).
+  - "유효 중요도"는 항상 calculate_decay(entry)로 읽는 시점에 계산한다.
+  - 왜? 감쇠값을 importance에 되쓰면서 last_accessed는 그대로 두면, 다음
+    사이클이 "이미 감쇠된 값"을 base로 "같은 경과일"로 또 감쇠시켜 지수 감쇠가
+    복리(중복) 적용된다. 그 결과 EPISODIC(반감기 7일) 기억이 며칠 만에 임계치
+    밑으로 떨어져 부당하게 삭제된다. base를 불변으로 두면 이 복리 버그가 없다.
+
 감쇠 사이클(run_decay_cycle):
-  - 유효 중요도가 임계치(0.05) 이하인 메모리를 삭제
+  - 유효 중요도가 임계치(0.05) 이하인 메모리를 "삭제"만 한다 (importance는 안 건드림)
   - 자주 접근된 메모리는 감쇠가 느려진다 (access boost)
+  - 멱등(idempotent): 같은 상태에서 N번 반복 실행해도 결과가 1번 실행과 동일하다.
 
 통합(consolidate):
   - 동일 키(key)를 가진 메모리를 하나로 합친다
@@ -100,12 +109,24 @@ class MemoryDecayManager:
 
     async def run_decay_cycle(self, long_term: Any) -> dict:
         """
-        감쇠 사이클을 실행한다.
+        감쇠 사이클을 실행한다 — "삭제 전용(deletion-only)".
 
         모든 장기 메모리를 순회하며:
-          1. 유효 중요도를 계산
-          2. 임계치(0.05) 이하인 메모리를 삭제
-          3. 나머지 메모리의 importance를 유효 중요도로 갱신
+          1. calculate_decay로 유효 중요도를 계산(읽기 전용, 상태 변경 없음)
+          2. 임계치(0.05) 이하인 메모리만 "삭제"한다
+
+        왜 importance를 갱신하지 않는가 (복리 감쇠 버그 수정):
+          과거 구현은 유효 중요도를 importance 필드에 되썼지만 last_accessed는
+          갱신하지 않았다. 그러면 다음 사이클이 "이미 감쇠된 importance"를 base로
+          "여전히 옛 last_accessed 기준 경과일"로 또 감쇠시켜, 지수 감쇠가 복리로
+          중복 적용됐다(며칠 만에 임계치 붕괴 → 조기 삭제).
+          importance를 불변 base로 두고 유효 중요도는 읽는 시점에 calculate_decay로
+          계산하면, 이 사이클은 순수 함수처럼 동작한다.
+
+        멱등성(idempotent) 불변식:
+          같은 상태에서 이 사이클을 N번 반복 실행해도 결과가 1번 실행과 동일하다.
+          (base importance/last_accessed를 건드리지 않으므로 반복 실행이 추가 감쇠를
+           만들지 않는다.)
 
         Args:
             long_term: LongTermMemory 인스턴스
@@ -114,8 +135,10 @@ class MemoryDecayManager:
             실행 결과 통계:
               - total_checked: 검사한 메모리 수
               - deleted: 삭제된 메모리 수
-              - updated: 중요도가 갱신된 메모리 수
+              - updated: (deprecated) 항상 0 — 이제 importance를 갱신하지 않는다.
+                         호출측 호환성을 위해 키는 유지한다.
         """
+        # updated 키는 하위 호환을 위해 남기지만, 삭제 전용 정책상 항상 0이다.
         stats = {"total_checked": 0, "deleted": 0, "updated": 0}
 
         # 전체 메모리 조회 (최대 1000개씩 처리)
@@ -123,9 +146,10 @@ class MemoryDecayManager:
         stats["total_checked"] = len(all_entries)
 
         for entry in all_entries:
+            # 읽기 전용 계산 — entry(특히 importance/last_accessed)를 변경하지 않는다.
             effective_importance = self.calculate_decay(entry)
 
-            # 임계치 이하면 삭제
+            # 임계치 이하면 삭제 (그 외에는 아무 것도 하지 않는다)
             if effective_importance < DECAY_THRESHOLD:
                 deleted = await long_term.delete(entry.id)
                 if deleted:
@@ -136,20 +160,11 @@ class MemoryDecayManager:
                         effective_importance,
                         DECAY_THRESHOLD,
                     )
-                continue
-
-            # 유효 중요도가 원래 값과 크게 다르면 갱신
-            # (차이가 0.01 이상일 때만 DB 업데이트하여 I/O 최소화)
-            if abs(effective_importance - entry.importance) >= 0.01:
-                updated = await long_term.update(entry.id, importance=effective_importance)
-                if updated:
-                    stats["updated"] += 1
 
         logger.info(
-            "감쇠 사이클 완료: checked=%d, deleted=%d, updated=%d",
+            "감쇠 사이클 완료(삭제 전용): checked=%d, deleted=%d",
             stats["total_checked"],
             stats["deleted"],
-            stats["updated"],
         )
         return stats
 
