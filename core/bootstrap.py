@@ -186,6 +186,8 @@ async def init_phase2(state: GlobalState) -> dict:
     from core.permission.pipeline import PermissionPipeline
     from core.permission.types import PermissionContext
     from core.security.audit import AuditLogger
+    from core.security.command_filter import CommandFilter
+    from core.security.path_guard import PathGuard
 
     perm_cfg = config.permission_enforcement
     audit_cfg = config.audit
@@ -206,6 +208,18 @@ async def init_phase2(state: GlobalState) -> dict:
             working_directory=state.cwd or os.getcwd(),
             session_id=state.session_id,
         )
+        # Layer 2 사전검사기 — PathGuard(경로 순회/보호경로/UNC) + CommandFilter
+        # (위험 명령어 + 에어갭 설치차단 게이팅). 파이프라인에 주입하면 Layer 2가
+        # 도구 자체 검사 이전에 이 둘로 먼저 걸러낸다(fail-closed).
+        #   - PathGuard: 기본 보호경로 목록(.env/.ssh/*.pem/*.key/etc 등)만으로 충분해
+        #     별도 override 없이 생성한다(경로 override는 후속 필요 시 확장).
+        #   - CommandFilter: block_package_install을 config에서 받아 개발(false)/
+        #     배포(true) 정책을 코드 하드코딩 없이 분기한다(anti #4).
+        cmd_cfg = config.command_filter
+        path_guard = PathGuard()
+        command_filter = CommandFilter(
+            block_package_install=cmd_cfg.block_package_install,
+        )
         # hook_manager가 components에 있으면 주입(현재 부트스트랩엔 미배선 → None).
         # 주의(shadow 안전성): Layer 4 Hook는 PRE_TOOL_USE로 외부 명령을 실행할 수
         # 있어 "관측 전용"이 깨질 수 있다. 훗날 hook_manager가 실제로 배선되면
@@ -217,6 +231,8 @@ async def init_phase2(state: GlobalState) -> dict:
             #   자체 검사 Layer 2 + 모드 기반 Layer 3만으로 판정).
             rules=None,
             hook_manager=components.get("hook_manager"),
+            path_guard=path_guard,
+            command_filter=command_filter,
         )
     components["permission_pipeline"] = permission_pipeline
     components["audit_logger"] = audit_logger

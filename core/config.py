@@ -1015,6 +1015,27 @@ class AuditConfig(BaseModel):
 
 
 # ─────────────────────────────────────────────
+# 명령어 필터 설정 — 에어갭 설치차단 게이팅 (2026-07-03)
+# ─────────────────────────────────────────────
+class CommandFilterConfig(BaseModel):
+    """
+    Bash 명령어 필터(core/security/command_filter.py, CommandFilter) 설정.
+
+    권한 파이프라인 Layer 2 사전검사가 이 필터로 Bash 명령어를 검사한다.
+
+    핵심 정책(사용자 방침): "에어갭은 배포물에만 적용, 개발 중엔 설치해 진행".
+      - 개발 환경(config/nexus_config.yaml): block_package_install=false →
+        pip/npm/apt/yum/brew install을 허용해 개발을 막지 않는다.
+      - 배포 템플릿(config/examples/nexus_config.b200.yaml):
+        block_package_install=true → 런타임 패키지 설치를 차단(에어갭 준수).
+    """
+
+    # pip/npm/apt/yum/brew install 계열을 위험 패턴으로 취급해 차단할지 여부.
+    # 기본 False(개발 허용). 배포 config에서 True로 올려 에어갭 설치차단을 켠다.
+    block_package_install: bool = False
+
+
+# ─────────────────────────────────────────────
 # 메인 설정 클래스 (Pydantic BaseSettings)
 # ─────────────────────────────────────────────
 class NexusConfig(BaseSettings):
@@ -1130,6 +1151,10 @@ class NexusConfig(BaseSettings):
 
     # 감사 로그(AuditLogger) 배선 — 권한 결정을 JSONL로 기록.
     audit: AuditConfig = Field(default_factory=AuditConfig)
+
+    # 명령어 필터(CommandFilter) — 에어갭 설치차단 게이팅.
+    # 기본 block_package_install=False(개발 허용). 배포 config에서 True로 올린다.
+    command_filter: CommandFilterConfig = Field(default_factory=CommandFilterConfig)
 
     # 하드웨어 티어 — Scout 활성화/컨텍스트 길이 등 동작을 좌우한다.
     # "auto"면 GPU VRAM을 감지해 TIER_S/M/L 등을 자동 결정한다. 특정 티어를

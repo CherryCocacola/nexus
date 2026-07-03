@@ -2662,4 +2662,13 @@ B200 정부 컨테이너에 "완벽한 버전" Nexus를 올리기 전, 지난 �
   - tier=large, gpu 127.0.0.1:8001/8002, primary=ax-4.0, max_context=24576, web_auth.enabled=true, context_budgets 상향(2000/4000/2500/8000/6/3/8000/[4096,8192]).
   - **정합성 불변식**: max_context(24576)+max출력(8192)=32768 ≤ vLLM axmodel max_model_len(32768). 플랜의 128K 스케일 값(114688 등)은 단일 B200 KV 제약(A.X=32768)과 안 맞아 재산정.
   - **후속(Phase 0 시 처리)**: redis/postgresql host가 아직 온프렘 192.168.10.39 — B200 컨테이너 co-located(127.0.0.1)로 조정 필요(포트는 실제 DB 셋업 확정 후).
-- **B4 예정**: 동시 다모델 상주(ServingConfig + model_manager). 이후 C(Critical #1~3, #5~8).
+- **B4 예정**: 동시 다모델 상주(ServingConfig + model_manager) — interface-only, 순차 bake-off엔 불필요라 후순위.
+
+### C. 권한 강제 배선 (Critical #1~3) — 정부 플랫폼 배포 블로커
+
+감사: PermissionPipeline(5-Layer)·PathGuard·CommandFilter·AuditLogger가 모두 구현돼 있으나 **배선 harness가 통째로 빠짐**. executor는 도구 check_permissions의 **DENY만 차단**(ASK fail-open), PathGuard/CommandFilter 고아. 안전 롤아웃 순서: **config OFF 기본 → shadow → DENY 강제 → (ASK는 P3 후속)**.
+
+- **C1 완료(20f5e7c)**: P0+P1 하네스+shadow. `permission_enforcement{enabled=false,mode=shadow}`+`audit` config, `mode_mapping`(state PermissionModeValue→permission PermissionMode: trust→BYPASS/headless·deny_all→DONT_ASK), bootstrap이 PermissionContext/Pipeline/AuditLogger 생성해 `ToolUseContext.options` 주입(4-Tier 시그니처 불변), executor Step 6-8a **shadow 관측**(판정을 AuditLogger JSONL 기록만, 차단 안 함). 무회귀 1330.
+- **C2 완료**: P2 **DENY 강제**. executor enforce 분기(deny면 실차단, ASK/allow는 통과=P3 범위), pipeline Layer 2 **공통 pre-check**로 PathGuard(순회/.env/.ssh/*.pem/*.key)+CommandFilter(pip/npm/apt install 등) 연결(**미주입 시 skip=무회귀**), 경로 cwd-절대정규화, 웹 세션 샌드박스 cwd(enabled 시만), 에어갭 설치차단 게이팅(`command_filter.block_package_install`: dev=false/b200=true). b200 config에 enforce 활성.
+  - 시연(직접): .env·순회·pip install·rm -rf → **DENY**, 정상쓰기·ls → 통과. 무회귀 1330.
+- **후속**: **P3(ASK 강제)** — CLI 확인 프롬프트/웹 정책, shadow 로그 확인 후. config deny rule 로딩(현재 rules=None), hook_manager 배선(Layer 4 미실행). 그리고 **#5(웹 동시성)·#6~8(메모리)**.

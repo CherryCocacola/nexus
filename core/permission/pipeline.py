@@ -20,6 +20,7 @@ Ch.8.8 사양서 기반. 모든 도구 실행 전에 이 파이프라인을 통�
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING
 
 from core.permission.types import (
@@ -41,6 +42,8 @@ from core.tools.base import BaseTool, ToolUseContext
 
 if TYPE_CHECKING:
     from core.hooks.hook_manager import HookManager
+    from core.security.command_filter import CommandFilter
+    from core.security.path_guard import PathGuard
 
 logger = logging.getLogger("nexus.permission")
 
@@ -58,6 +61,8 @@ class PermissionPipeline:
         context: PermissionContext,
         rules: list[PermissionRule] | None = None,
         hook_manager: HookManager | None = None,
+        path_guard: PathGuard | None = None,
+        command_filter: CommandFilter | None = None,
     ) -> None:
         """
         파이프라인을 초기화한다.
@@ -66,11 +71,21 @@ class PermissionPipeline:
             context: 불변 권한 컨텍스트 (모드, 작업 디렉토리 등)
             rules: 추가 권한 규칙 목록 (YAML에서 로드된 것)
             hook_manager: Hook 매니저 (Layer 4용, None이면 건너뜀)
+            path_guard: 경로 보호기(Layer 2 사전검사용). None이면 경로 사전검사를
+                건너뛴다 — 이 인자를 주지 않는 기존 호출부/단위 테스트의 동작을
+                그대로 유지하기 위한 무회귀 안전장치다(부트스트랩만 주입).
+            command_filter: 명령어 필터(Layer 2 사전검사용). None이면 명령어
+                사전검사를 건너뛴다(위와 동일한 무회귀 안전장치).
         """
         self._context = context
         # context에 이미 포함된 규칙 + 추가 규칙을 합친다
         self._rules = list(context.rules) + (rules or [])
         self._hook_manager = hook_manager
+        # Layer 2 사전검사기(선택 주입). 주입이 없으면(None) 사전검사를 통째로
+        # 건너뛰므로, PathGuard/CommandFilter를 주입하지 않는 기존 파이프라인
+        # 단위 테스트의 판정 경로가 1비트도 바뀌지 않는다(무회귀 핵심).
+        self._path_guard = path_guard
+        self._command_filter = command_filter
         # 감사 로그 엔트리 목록 (최근 결정 추적)
         self._audit_log: list[PermissionAuditEntry] = []
 
@@ -231,6 +246,97 @@ class PermissionPipeline:
                 )
         return None
 
+    @staticmethod
+    def _normalize_path(path: str, cwd: str) -> str:
+        """
+        파일 경로를 cwd 기준 절대경로로 정규화한다(보호경로 매칭 정확도 향상용).
+
+        - 이미 절대경로면 그대로 둔다.
+        - 상대경로면 cwd와 결합해 os.path.abspath로 접는다(`..`/`.` 정리).
+        정규화 실패(비정상 문자 등) 시 원본을 그대로 반환한다(fail-safe).
+        """
+        try:
+            if os.path.isabs(path):
+                return path
+            return os.path.abspath(os.path.join(cwd, path))
+        except (OSError, ValueError):
+            return path
+
+    def _precheck_security_guards(
+        self,
+        tool: BaseTool,
+        tool_input: dict,
+        tool_use_context: ToolUseContext,
+    ) -> PermissionDecision | None:
+        """
+        Layer 2 공통 사전검사 — PathGuard(경로) + CommandFilter(명령어).
+
+        무회귀 원칙: path_guard/command_filter가 주입되지 않았으면(둘 다 None)
+        아무 것도 하지 않고 None을 반환한다. 즉 사전검사기를 넘기지 않는 기존
+        파이프라인 사용처의 판정은 전혀 바뀌지 않는다.
+
+        검사 대상:
+          1) 파일계열 도구 — tool_input에 file_path/path 키가 있거나 카테고리가
+             FILE_WRITE면 PathGuard로 경로를 검사한다. 쓰기 도구면 is_path_writable
+             (읽기전용 경로까지 차단), 그 외에는 is_path_safe(순회/보호경로/UNC).
+          2) Bash 도구 — tool_input에 command 키가 있으면 CommandFilter로 검사한다.
+             critical/high/medium 위험 severity면 DENY. "unknown"(안전 목록에 없음)은
+             여기서 차단하지 않는다 — 그건 확인(ASK) 영역이라 Layer 3에 맡긴다.
+
+        Returns:
+            DenyDecision(차단) 또는 None(사전검사 통과/미적용).
+        """
+        # 작업 디렉토리 — 상대경로 해석과 순회 검사의 기준점.
+        cwd = tool_use_context.cwd or "."
+
+        # ── ① 경로 사전검사(PathGuard) ──
+        if self._path_guard is not None:
+            # 파일 경로 입력을 표준 키에서 추출한다(도구마다 file_path 또는 path 사용).
+            path = tool_input.get("file_path") or tool_input.get("path")
+            category = self._categorize_tool(tool)
+            is_file_tool = path is not None or category == ToolCategory.FILE_WRITE
+            if is_file_tool and path:
+                # cwd 기준 절대경로로 정규화해 보호경로 매칭 정확도를 높인다.
+                # 왜: 상대경로 ".ssh/id_rsa"는 PathGuard의 `**/.ssh/*` 글롭에 부모
+                # 세그먼트가 없어 걸리지 않는다. cwd와 결합한 절대경로
+                # "{cwd}/.ssh/id_rsa"는 정확히 매칭돼 보호된다. 순회(../..)는
+                # 절대경로로 바꿔도 is_path_safe의 cwd-scope 검사가 그대로 잡는다
+                # (abspath가 `..`를 접어 cwd 밖으로 나가면 relative_to 실패 → 차단).
+                norm_path = self._normalize_path(str(path), cwd)
+                # 쓰기 여부 판정: 쓰기/위험 카테고리이거나 읽기전용이 아닌 도구는
+                # 쓰기로 간주해 읽기전용 경로까지 차단한다(fail-closed).
+                is_write = category in (
+                    ToolCategory.FILE_WRITE,
+                    ToolCategory.DANGEROUS,
+                ) or not tool.is_read_only
+                if is_write:
+                    ok, reason = self._path_guard.is_path_writable(norm_path, cwd)
+                else:
+                    ok, reason = self._path_guard.is_path_safe(norm_path, cwd)
+                if not ok:
+                    return DenyDecision(
+                        reason=PermissionDecisionReason.TOOL_CHECK_DENIED,
+                        source=PermissionRuleSource.SYSTEM,
+                        message=f"경로 정책 위반: {reason} (path={path})",
+                    )
+
+        # ── ② 명령어 사전검사(CommandFilter) ──
+        if self._command_filter is not None:
+            command = tool_input.get("command")
+            if isinstance(command, str) and command.strip():
+                safe, severity, reason = self._command_filter.check_command(command)
+                # 실제 "위험" 판정(critical/high/medium)만 차단한다. unknown은 통과시켜
+                # Layer 3의 ASK 흐름이 처리하도록 남긴다(과잉 차단 방지).
+                if not safe and severity in ("critical", "high", "medium"):
+                    return DenyDecision(
+                        reason=PermissionDecisionReason.TOOL_CHECK_DENIED,
+                        source=PermissionRuleSource.SYSTEM,
+                        message=f"명령어 정책 위반[{severity}]: {reason}",
+                    )
+
+        # 사전검사 통과(또는 미적용) — 다음 검사(도구 자체 check_permissions)로.
+        return None
+
     async def _check_tool_permissions(
         self,
         tool: BaseTool,
@@ -238,11 +344,21 @@ class PermissionPipeline:
         tool_use_context: ToolUseContext,
     ) -> PermissionDecision | None:
         """
-        Layer 2: 도구 자체의 check_permissions() 호출.
+        Layer 2: PathGuard/CommandFilter 사전검사 + 도구 자체의 check_permissions().
 
-        도구가 자체적으로 경로/명령어를 검증한다.
+        먼저 주입된 보안 사전검사기(path_guard/command_filter)로 파일 경로·Bash
+        명령어를 검사한다. 여기서 DENY가 나오면 도구 자체 검사까지 갈 것도 없이
+        즉시 거부한다(fail-closed). 사전검사기가 주입되지 않았으면(None) 이 단계를
+        건너뛰어 기존 동작을 그대로 유지한다.
+
+        그 다음 도구 자체 검사를 수행한다:
         DENY면 DenyDecision, ALLOW면 None (통과), ASK면 AskDecision.
         """
+        # ── Layer 2 사전검사: PathGuard / CommandFilter ──
+        guard_deny = self._precheck_security_guards(tool, tool_input, tool_use_context)
+        if guard_deny is not None:
+            return guard_deny
+
         result = await tool.check_permissions(tool_input, tool_use_context)
 
         if result.behavior == PermissionBehavior.DENY:

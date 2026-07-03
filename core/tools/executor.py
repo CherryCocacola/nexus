@@ -145,28 +145,51 @@ async def run_tool_use(
     _pe = context.options.get("permission_enforcement") or {}
     _pipeline = context.options.get("permission_pipeline")
     _audit_logger = context.options.get("audit_logger")
+    # 강제 방식 — "shadow"(기록만) 또는 "enforce"(deny면 실제 차단). 기본 shadow.
+    _pe_mode = _pe.get("mode", "shadow")
     if _pe.get("enabled") and _pipeline is not None:
         try:
-            # 5계층 파이프라인 판정(관측용). 이 호출은 tool.check_permissions()를
-            # Layer 2로 한 번 더 수행하지만, check_permissions는 순수 검증이라
-            # 부수효과가 없다(shadow 안전). Layer 4 Hook는 현재 미배선(None)이다.
+            # 5계층 파이프라인 판정. shadow에서는 관측용, enforce에서는 실제 게이트다.
+            # 이 호출은 tool.check_permissions()를 Layer 2로 한 번 더 수행하지만,
+            # check_permissions는 순수 검증이라 부수효과가 없다. Layer 4 Hook는
+            # 현재 미배선(None)이다.
             decision = await _pipeline.check(tool, tool_input, context)
             # 파이프라인이 방금 내부 감사 로그에 남긴 엔트리를 JSONL로도 영구 기록한다.
             # (엔트리에는 거친 레이어·사유·모드가 담겨 있어 그대로 재사용이 안전하다.)
+            # enforce에서 차단할 때도 "차단됐다는 사실"이 감사 로그에 남도록, 차단
+            # 처리보다 먼저 기록한다.
             if _audit_logger is not None:
                 recent = _pipeline.get_recent_audit(1)
                 if recent:
                     await _audit_logger.async_log_decision(recent[-1])
+
+            _decision_type = getattr(decision, "type", "?")
+            # ── enforce 모드: deny 판정이면 여기서 실제로 차단한다 ──
+            # ASK/allow는 아직 통과시킨다(ASK 강제는 P3 범위). shadow는 항상 통과.
+            if _pe_mode == "enforce" and _decision_type == "deny":
+                reason = getattr(decision, "message", "") or "권한 정책 위반"
+                logger.info(
+                    "[permission enforce] 도구=%s 차단: %s", tool.name, reason
+                )
+                yield Message.tool_result(
+                    tool_use_id,
+                    f"<tool_use_error>권한 거부: {reason}</tool_use_error>",
+                    is_error=True,
+                )
+                return
+
             logger.debug(
-                "[permission shadow] 도구=%s 판정=%s (기록만, 차단 안 함)",
+                "[permission %s] 도구=%s 판정=%s",
+                _pe_mode,
                 tool.name,
-                getattr(decision, "type", "?"),
+                _decision_type,
             )
         except Exception as e:
-            # 관측(shadow) 실패가 도구 실행을 막으면 안 된다 — 관측은 순수 부가 기능이다.
+            # 관측/강제 파이프라인 자체 실패가 도구 실행을 막으면 안 된다(fail-safe).
             # bare except가 아니라 Exception을 명시해 잡고(anti #8), 결함이 묻히지
-            # 않도록 경고로 남긴 뒤 실행을 계속한다(현행 경로에 영향 없음).
-            logger.warning("[permission shadow] 파이프라인 관측 실패(무시): %s", e)
+            # 않도록 경고로 남긴 뒤 실행을 계속한다. 아래 기존 게이트(도구 자체
+            # check_permissions의 DENY)가 최종 안전망으로 여전히 동작한다.
+            logger.warning("[permission %s] 파이프라인 처리 실패(무시): %s", _pe_mode, e)
 
     # ═══ Step 6-8: Hook + 권한 (간소화 — Phase 4에서 전체 구현) ═══
     # 현재는 도구 자체의 check_permissions만 실행

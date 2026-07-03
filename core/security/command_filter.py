@@ -149,6 +149,7 @@ class CommandFilter:
         self,
         safe_commands: list[str] | None = None,
         extra_dangerous_patterns: list[tuple[str, str, str]] | None = None,
+        block_package_install: bool = True,
     ) -> None:
         """
         CommandFilter를 초기화한다.
@@ -156,11 +157,31 @@ class CommandFilter:
         Args:
             safe_commands: 안전 명령어 목록을 덮어쓴다 (None이면 기본 목록 사용)
             extra_dangerous_patterns: 추가 위험 패턴 (기본 목록에 추가)
+            block_package_install: pip/npm/apt/yum/brew install 계열을 위험
+                패턴으로 취급할지 여부(에어갭 설치차단 게이팅).
+                - True(기본, 배포용): install 계열을 그대로 위험 패턴에 포함 →
+                  런타임 패키지 설치를 차단한다(에어갭 준수).
+                - False(개발용): install 계열 위험 패턴만 목록에서 제외한다 →
+                  개발 중에는 라이브러리 설치를 허용한다(사용자 방침: 에어갭은
+                  배포물에만 적용, 개발 중엔 설치해 진행).
+                기본값을 True로 둔 이유: 이 인자를 주지 않는 기존 호출부(및 기존
+                단위 테스트)의 동작을 100% 그대로 유지하기 위함이다(무회귀).
         """
         self._safe_commands: set[str] = set(
             safe_commands if safe_commands is not None else self.SAFE_COMMANDS
         )
+        # 위험 패턴 기본 목록을 복사한다(원본 클래스 상수는 건드리지 않는다).
         self._dangerous_patterns = list(self.DANGEROUS_PATTERNS)
+        # 개발 모드(block_package_install=False)에서는 "…패키지 설치" 사유가 붙은
+        # install 계열 위험 패턴만 골라 제외한다. 사유 문자열로 식별하는 이유:
+        # pip/npm/apt/yum/brew 5종이 모두 동일하게 "…패키지 설치" 사유를 쓰므로,
+        # 패턴 정규식을 하드코딩하지 않고도 한 번에 정확히 걸러낼 수 있다.
+        if not block_package_install:
+            self._dangerous_patterns = [
+                (pattern, severity, reason)
+                for (pattern, severity, reason) in self._dangerous_patterns
+                if "패키지 설치" not in reason
+            ]
         if extra_dangerous_patterns:
             self._dangerous_patterns.extend(extra_dangerous_patterns)
 

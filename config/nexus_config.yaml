@@ -374,3 +374,12 @@ permission_enforcement:
 audit:
   enabled: true              # 감사 기록 on/off (shadow 관측 결과 저장을 위해 기본 on)
   path: "logs/audit.log"     # 로그 파일 경로(상대경로면 작업 디렉토리 기준)
+
+# =============================================================================
+# 명령어 필터 (CommandFilter) — 에어갭 설치차단 게이팅
+# =============================================================================
+# 정책: "에어갭은 배포물에만 적용, 개발 중엔 설치해 진행".
+# 개발 환경에서는 pip/npm/apt/yum/brew install을 허용해 개발을 막지 않는다.
+# 배포 템플릿(config/examples/nexus_config.b200.yaml)에서는 true로 올려 차단한다.
+command_filter:
+  block_package_install: false   # 개발: 설치 허용(false). 배포: 차단(true).

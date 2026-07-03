@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 import uuid
@@ -253,9 +254,34 @@ def _build_web_query_engine(components: dict, state: Any) -> Any:
     # 곧 "현행 기본값 사용"을 의미하므로 엔진 조립을 막지 않는다.
     _web_budgets = getattr(state.config, "context_budgets", None)
 
+    # ── 웹 세션 샌드박스 작업 디렉토리(결정 #1) ──
+    # 웹 Worker가 파일을 쓸 때 프로젝트 루트가 아니라 세션별 격리 디렉토리
+    # ({sessions_dir}/{session_id}/workspace) 안으로 국한시킨다. PathGuard의
+    # cwd-scope 순회 검사가 이 디렉토리를 기준으로 동작하므로, 강제(enforce)
+    # 시 세션 밖(상위/시스템 경로) 쓰기가 자연히 차단된다.
+    #
+    # ★무회귀★: 이 cwd 변경은 파일도구의 상대경로 해석을 바꾸므로, 권한 강제가
+    # 꺼져 있을 때는 절대 적용하지 않는다. permission_enforcement.enabled=True일
+    # 때만 샌드박스로 전환하고, 기본(비활성)에서는 기존과 100% 동일하게
+    # state.cwd(프로젝트 루트)를 그대로 쓴다. 또한 config.session이 없는 경량
+    # 테스트 더블에서도 getattr 방어로 폴백해 회귀가 없다.
+    _sandbox_cwd = state.cwd or "."
+    _pe_cfg = getattr(state.config, "permission_enforcement", None)
+    if getattr(_pe_cfg, "enabled", False):
+        _sessions_dir = getattr(getattr(state.config, "session", None), "sessions_dir", None)
+        if _sessions_dir and state.session_id:
+            _candidate = os.path.join(_sessions_dir, str(state.session_id), "workspace")
+            try:
+                os.makedirs(_candidate, exist_ok=True)
+                _sandbox_cwd = _candidate
+                logger.info("[web] 세션 샌드박스 작업 디렉토리: %s", _candidate)
+            except OSError as e:
+                # 디렉토리 생성 실패 시 기존 cwd로 폴백(본류를 막지 않는다).
+                logger.warning("[web] 세션 샌드박스 생성 실패, 기본 cwd 사용: %s", e)
+
     # AgentTool·SymbolSearchTool이 해석할 의존성 일체를 options에 주입
     web_context = ToolUseContext(
-        cwd=state.cwd or ".",
+        cwd=_sandbox_cwd,
         session_id=state.session_id,
         permission_mode=state.permission_mode.value,
         options={
