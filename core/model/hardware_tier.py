@@ -30,25 +30,33 @@ class HardwareTier(str, Enum):
 
 
 # 티어별 오케스트레이션 설정
+#
+# 참고 — max_worker_tools는 "정보용(문서용) 필드"이며 실제 강제(enforcement)는
+# 하지 않는다. Worker가 실제로 보는 도구 개수는 bootstrap._create_*_tool_registry
+# 계열이 결정한다. 여기의 값은 각 티어에서 CLI Worker가 받는 레지스트리의 실측
+# 등록 개수로 맞춰 둔 것이다:
+#   - TIER_S : _create_cli_tool_registry() = 7개
+#   - TIER_M/L: _create_tool_registry()    = 23개(풀세트)
+# (레지스트리 구성이 바뀌면 이 값도 함께 갱신할 것 — 어긋나도 동작에는 영향 없음.)
 TIER_CONFIG = {
     HardwareTier.TIER_S: {
         "orchestration_mode": "multi_model",   # Scout(CPU) + Worker(GPU)
         "scout_enabled": True,
-        "max_worker_tools": 11,                # 도구 수 제한
+        "max_worker_tools": 7,                 # 정보용(강제 아님) — CLI Worker 실측
         "turn_state_enabled": True,            # 상태 외부화 활성
         "description": "RTX 5090 (32GB, 8K ctx)",
     },
     HardwareTier.TIER_M: {
         "orchestration_mode": "single_model",  # Worker 단독
         "scout_enabled": False,
-        "max_worker_tools": 24,                # 도구 전체
+        "max_worker_tools": 23,                # 정보용(강제 아님) — 풀세트 실측
         "turn_state_enabled": False,           # raw messages 누적 가능
         "description": "H100 (80GB, 32K ctx)",
     },
     HardwareTier.TIER_L: {
         "orchestration_mode": "single_model",  # Worker 단독
         "scout_enabled": False,
-        "max_worker_tools": 24,
+        "max_worker_tools": 23,                # 정보용(강제 아님) — 풀세트 실측
         "turn_state_enabled": False,
         "description": "H200/GB10 (128GB+, 128K ctx)",
     },

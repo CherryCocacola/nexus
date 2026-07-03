@@ -209,14 +209,14 @@ class TestGetTierConfig:
         assert cfg["orchestration_mode"] == "single_model"
 
     def test_tier_s_max_worker_tools_limited(self):
-        """TIER_S는 도구 수가 11개로 제한된다."""
+        """TIER_S max_worker_tools는 CLI Worker 실측 7개(정보용 필드)."""
         cfg = get_tier_config(HardwareTier.TIER_S)
-        assert cfg["max_worker_tools"] == 11
+        assert cfg["max_worker_tools"] == 7
 
     def test_tier_m_max_worker_tools_full(self):
-        """TIER_M은 도구 24개 전체를 사용한다."""
+        """TIER_M max_worker_tools는 풀세트 실측 23개(정보용 필드)."""
         cfg = get_tier_config(HardwareTier.TIER_M)
-        assert cfg["max_worker_tools"] == 24
+        assert cfg["max_worker_tools"] == 23
 
     def test_tier_s_turn_state_enabled(self):
         """TIER_S는 turn_state_enabled=True이다."""

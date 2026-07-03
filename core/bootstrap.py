@@ -128,7 +128,7 @@ async def init_phase2(state: GlobalState) -> dict:
     components["model_provider"] = provider
     logger.info("[Phase 2] ModelProvider 초기화: %s", config.gpu_server_url)
 
-    # ② ToolRegistry — 24개 도구 등록
+    # ② ToolRegistry — 23개 도구 등록 (실측: _create_tool_registry 등록 개수)
     registry = _create_tool_registry()
     components["tool_registry"] = registry
     logger.info("[Phase 2] ToolRegistry 초기화: %d개 도구", registry.tool_count)
@@ -233,13 +233,13 @@ async def init_phase2(state: GlobalState) -> dict:
     # AgentTool이 model_override="scout"을 해석할 때 꺼내간다
     context.options["scout_provider"] = scout_provider
 
-    # ⑧ 티어별 도구 레지스트리 자동 선택
-    # TIER_S: 11개 도구 (~1,472토큰) — 컨텍스트 절약
-    # TIER_M/L: 24개 도구 전체 — 컨텍스트 충분
+    # ⑧ 티어별 도구 레지스트리 자동 선택 (실측 개수)
+    # TIER_S: 7개 도구 (_create_cli_tool_registry) — 컨텍스트 절약
+    # TIER_M/L: 23개 도구 전체 (_create_tool_registry) — 컨텍스트 충분
     if tier == HardwareTier.TIER_S:
         cli_registry = _create_cli_tool_registry()
     else:
-        cli_registry = _create_tool_registry()  # 24개 전체
+        cli_registry = _create_tool_registry()  # 23개 전체
     cli_tools = cli_registry.get_all_tools()
 
     # ⑧-b Scout 전용 읽기 전용 도구 세트 (TIER_S만 사용)
@@ -676,10 +676,10 @@ async def _create_pg_pool(config: Any) -> Any:
 
 
 def _create_tool_registry():  # noqa: ANN202 — ToolRegistry는 함수 내부에서 import
-    """24개 도구를 모두 등록한 "풀세트" ToolRegistry를 생성한다.
+    """23개 도구를 모두 등록한 "풀세트" ToolRegistry를 생성한다(실측 등록 개수).
 
     TIER_M/L(컨텍스트 여유) 및 Phase 2 ②의 메트릭용 레지스트리로 쓰인다.
-    TIER_S에서는 컨텍스트 절약을 위해 대신 _create_cli_tool_registry(6개)를 사용한다.
+    TIER_S에서는 컨텍스트 절약을 위해 대신 _create_cli_tool_registry(7개)를 사용한다.
     lazy import 이유: 도구 구현 모듈이 core 하위를 import하므로 함수 진입 시점에만 끌어와
     Phase 1과의 의존성 분리(순환 import 방지)를 지킨다.
     """
@@ -790,7 +790,7 @@ def _create_cli_tool_registry():  # noqa: ANN202
     원칙: Worker는 "실행에만 집중". 탐색/조회는 Scout에 위임한다.
     사양서 Part 2.4 WORKER_TOOLS_TIER_S 정의:
         ["Edit", "Write", "Bash", "GitCommit", "GitDiff"]
-    본 구현은 여기에 Agent(서브에이전트 호출)을 추가해 6개다.
+    본 구현은 여기에 Agent(서브에이전트 호출) + SymbolSearch를 추가해 실측 7개다.
 
     Read/Glob/Grep/LS/GitLog/GitStatus는 **Scout 전용**으로 이관됨.
     Worker가 파일 탐색이 필요하면 Agent(subagent_type="scout")를 호출한다.
@@ -822,21 +822,30 @@ def _create_cli_tool_registry():  # noqa: ANN202
     return registry
 
 
-def _create_web_tool_registry():  # noqa: ANN202
+def _create_web_tool_registry(tier: Any = None):  # noqa: ANN202
     """
-    웹 Worker용 실행 전용 도구 레지스트리 (사양서 Part 2.4 원본 복원).
+    웹 Worker용 도구 레지스트리 (하드웨어 티어 연동, B200 Phase 2).
 
-    CLI보다 더 보수적으로 구성한다 — GitCommit/GitDiff는 제외.
-    웹 UI는 일반 사용자 인터페이스이므로 "대화 + 파일 편집 + 명령 실행 +
-    서브에이전트 호출"만 제공한다.
+    ── TIER_S (RTX 5090, 8K ctx) — 현행 그대로(무회귀) ──
+    실행 전용 5개: Edit / Write / Bash / Agent / SymbolSearch.
+    CLI보다 보수적으로 구성한다 — 파일 탐색(Read/Glob/Grep/LS)은 Scout 전용이며
+    Agent(subagent_type="scout")로 위임한다. 8K 컨텍스트에 큰 데이터가 직접
+    적재되는 상황을 구조적으로 차단하기 위함이다.
 
-    사양서 Part 2.4의 WORKER_TOOLS_TIER_S는 {Edit, Write, Bash, GitCommit,
-    GitDiff}이지만, 웹에서는 Git은 일반 사용자 용도가 아니므로 CLI로만.
+    ── TIER_M/L (80GB+ , 32K/128K ctx) — 탐색·문서 도구 추가 ──
+    컨텍스트가 넉넉하므로 Worker가 직접 탐색할 수 있게 다음 6개를 추가한다:
+    Read / Glob / Grep / LS / DocumentProcess / GitDiff.
+    GitCommit은 웹 정책상 **계속 제외**한다(일반 사용자 UI에서 커밋 금지).
 
-    Read/Glob/Grep/LS는 Scout 전용. 파일 탐색은 Agent(subagent_type="scout")
-    로 위임한다. 이렇게 하면 Worker 컨텍스트(8K)에 큰 데이터가 직접 적재되는
-    상황 자체를 구조적으로 차단한다.
+    fail-closed: tier가 None이거나 알 수 없는 값이면 TIER_S(5개)로 유지한다.
+
+    P5(anti-pattern #5) 준수: 최종 도구 순서는 registry.get_all_tools()가
+    name 기준으로 정렬하므로, 여기서의 등록 순서는 prompt cache 안정성에 무관하다.
+
+    Args:
+        tier: HardwareTier 열거형(또는 그 .value 문자열). 미지정 시 TIER_S.
     """
+    from core.model.hardware_tier import HardwareTier
     from core.tools.implementations.agent_tool import AgentTool
     from core.tools.implementations.bash_tool import BashTool
     from core.tools.implementations.edit_tool import EditTool
@@ -845,6 +854,7 @@ def _create_web_tool_registry():  # noqa: ANN202
     from core.tools.registry import ToolRegistry
 
     registry = ToolRegistry()
+    # TIER_S(기본) — 실행 전용 5개. 모든 티어의 공통 하위집합.
     registry.register_many(
         [
             EditTool(),  # 편집 (~325 토큰)
@@ -854,6 +864,28 @@ def _create_web_tool_registry():  # noqa: ANN202
             SymbolSearchTool(),  # Phase 10.0 심볼 검색 (~200 토큰)
         ]
     )
+
+    # TIER_M/L 확장 — enum이면 .value, 문자열이면 그대로 비교(둘 다 허용).
+    # 매칭 실패(None/미지 값) 시 아래 블록을 건너뛰어 TIER_S로 폴백 = fail-closed.
+    tier_val = getattr(tier, "value", tier)
+    if tier_val in (HardwareTier.TIER_M.value, HardwareTier.TIER_L.value):
+        from core.tools.implementations.document_tool import DocumentProcessTool
+        from core.tools.implementations.git_tools import GitDiffTool
+        from core.tools.implementations.glob_tool import GlobTool
+        from core.tools.implementations.grep_tool import GrepTool
+        from core.tools.implementations.ls_tool import LSTool
+        from core.tools.implementations.read_tool import ReadTool
+
+        registry.register_many(
+            [
+                ReadTool(),  # 파일 읽기
+                GlobTool(),  # 파일명 패턴 검색
+                GrepTool(),  # 내용 정규식 검색
+                LSTool(),  # 디렉토리 목록
+                DocumentProcessTool(),  # 업로드 문서(.pdf/.docx/.xlsx/.hwp/.pptx) 파싱
+                GitDiffTool(),  # git 변경 조회(읽기 전용). GitCommit은 제외.
+            ]
+        )
 
     return registry
 

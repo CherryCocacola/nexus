@@ -157,18 +157,42 @@ def _combine_scout_pool(web_tools: list, scout_tools: list) -> list:
     return combined
 
 
-def _load_worker_system_prompt(agent_registry: Any | None) -> str:
+def _load_worker_system_prompt(agent_registry: Any | None, tier: Any = None) -> str:
     """
-    Worker 시스템 프롬프트를 `web/prompts/worker_system.md`에서 로드하고
-    AgentRegistry로부터 서브에이전트 가이드를 동적으로 추가한다.
+    Worker 시스템 프롬프트를 하드웨어 티어에 맞춰 로드하고,
+    AgentRegistry로부터 서브에이전트 가이드를 동적으로 추가한다(B200 Phase 2).
 
-    프롬프트 파일이 없거나 읽기에 실패해도 안전한 폴백 문자열을 돌려준다.
+    티어별 프롬프트 파일:
+      - TIER_S       → `web/prompts/worker_system.md`      (현행: Scout 위임)
+      - TIER_M/L     → `web/prompts/worker_system_full.md` (탐색 도구 직접 사용)
+
+    tier가 None이거나 알 수 없는 값이면 TIER_S(worker_system.md)로 폴백한다
+    = fail-closed(현행 동작 유지). TIER_M/L 파일이 없으면 worker_system.md로,
+    그것도 없으면 하드코딩 문자열로 단계적 폴백해 항상 유효한 프롬프트를 보장한다.
     """
-    prompt_path = Path(__file__).parent / "prompts" / "worker_system.md"
+    from core.model.hardware_tier import HardwareTier
+
+    # enum이면 .value, 문자열이면 그대로 비교(둘 다 허용). 미매칭 시 TIER_S.
+    tier_val = getattr(tier, "value", tier)
+    is_expanded = tier_val in (HardwareTier.TIER_M.value, HardwareTier.TIER_L.value)
+    fname = "worker_system_full.md" if is_expanded else "worker_system.md"
+
+    prompts_dir = Path(__file__).parent / "prompts"
+    prompt_path = prompts_dir / fname
+    base: str | None = None
     try:
         base = prompt_path.read_text(encoding="utf-8")
     except OSError as e:
         logger.warning("Worker 프롬프트 파일 읽기 실패 (%s): %s", prompt_path, e)
+        # TIER_M/L 전용 파일이 없으면 현행 TIER_S 프롬프트로 폴백.
+        if fname != "worker_system.md":
+            fallback_path = prompts_dir / "worker_system.md"
+            try:
+                base = fallback_path.read_text(encoding="utf-8")
+                logger.warning("worker_system.md로 폴백: %s", fallback_path)
+            except OSError:
+                base = None
+    if base is None:
         base = (
             "You are Nexus, the Worker agent developed by IDINO.\n"
             "Respond in the user's language. Be helpful and detailed."
@@ -205,7 +229,11 @@ def _build_web_query_engine(components: dict, state: Any) -> Any:
     from core.orchestrator.query_engine import QueryEngine
     from core.tools.base import ToolUseContext
 
-    web_registry = _create_web_tool_registry()
+    # 하드웨어 티어를 넘겨 웹 도구 풀을 티어별로 구성한다(B200 Phase 2).
+    # TIER_S: 현행 5개, TIER_M/L: +Read/Glob/Grep/LS/DocumentProcess/GitDiff.
+    # components에 hardware_tier가 없으면 None → _create_web_tool_registry가
+    # TIER_S(5개)로 폴백 = fail-closed.
+    web_registry = _create_web_tool_registry(components.get("hardware_tier"))
     web_tools = web_registry.get_all_tools()
     # v7.2 MCP — 부트스트랩이 LAN MCP 서버에서 등록한 도구(mcp__db__query 등)를
     # 웹 Worker 풀에도 흡수한다. 웹은 cli_registry가 아니라 _create_web_tool_registry
@@ -264,7 +292,9 @@ def _build_web_query_engine(components: dict, state: Any) -> Any:
         context_manager=components.get("context_manager"),
         memory_manager=components.get("memory_manager"),
         knowledge_retriever=components.get("knowledge_retriever"),
-        system_prompt=_load_worker_system_prompt(components.get("agent_registry")),
+        system_prompt=_load_worker_system_prompt(
+            components.get("agent_registry"), components.get("hardware_tier")
+        ),
         max_turns=200,
         routing_config=state.config.routing,
         # 컨텍스트 예산(하드코딩 외부화, 2026-07-03) — RAG 주입 예산 + 출력
