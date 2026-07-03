@@ -2649,5 +2649,17 @@ B200 정부 컨테이너에 "완벽한 버전" Nexus를 올리기 전, 지난 �
   - 배선: bootstrap→QueryEngine→(PromptAssembler / ModelDispatcher→query_loop) + document_tool(context.options) + web/app.py(운영 진입점, getattr 방어). 모두 **None이면 현행 상수 폴백=무회귀**.
   - 무회귀: 기본값 8종 = HEAD 하드코딩값 정확 일치(1000/1500/1000/2048/3/2/2500/[4096,8192,16384]),
     전체 unit+integration **1327 passed** 무회귀. 회귀테스트 `test_context_budget_config.py` 추가.
-- B2(web/cli 도구풀·프롬프트 티어 연동, `worker_system_full.md`), B3(`nexus_config.b200.yaml` +
-  HyperCLOVA 프롬프트 어댑터) — 순차 진행 예정.
+- **B2 완료**: web 도구풀 + Worker 프롬프트 티어 연동.
+  - `_create_web_tool_registry(tier)` 파라미터화 — TIER_S=현행 5개(Agent/Bash/Edit/SymbolSearch/Write) 무회귀,
+    TIER_M/L=11개(+Read/Glob/Grep/LS/DocumentProcess/GitDiff, GitCommit 제외, 이름순 정렬).
+  - `web/prompts/worker_system_full.md` 신설(TIER_M/L용 — Scout 위임 제거 + 직접 탐색 지침, Grounding/anti-sycophancy 유지).
+    `_load_worker_system_prompt(tier)` 분기(TIER_S→기존, M/L→full, 단계적 폴백).
+  - 실측 주석 정정: `_create_tool_registry` 24→**23개**, `_create_cli_tool_registry` 6→**7개**,
+    `hardware_tier.max_worker_tools` 11/24→**7/23**("정보용 필드, 런타임 미강제"). test_hardware_tier 단언 동기화(약화 아님).
+  - 무회귀: 웹 도구풀 TIER_S 스냅샷 동일, 전체 unit+integration **1330 passed**.
+  - **후속(미착수)**: CLI `_build_default_system_prompt` 티어 분기 스킵 — CLI가 TIER_M/L에서 `_create_tool_registry`(23개, Read/Glob 포함·Agent 미포함)를 쓰는데 인라인 프롬프트는 "Read/Glob 없음, scout 써라"라 **프롬프트↔도구 불일치(기존 버그)**. CLI full 프롬프트 저술 필요(별도 지시 대기).
+- **B3 완료**: `config/examples/nexus_config.b200.yaml` 신설(완전 standalone 배포 템플릿).
+  - tier=large, gpu 127.0.0.1:8001/8002, primary=ax-4.0, max_context=24576, web_auth.enabled=true, context_budgets 상향(2000/4000/2500/8000/6/3/8000/[4096,8192]).
+  - **정합성 불변식**: max_context(24576)+max출력(8192)=32768 ≤ vLLM axmodel max_model_len(32768). 플랜의 128K 스케일 값(114688 등)은 단일 B200 KV 제약(A.X=32768)과 안 맞아 재산정.
+  - **후속(Phase 0 시 처리)**: redis/postgresql host가 아직 온프렘 192.168.10.39 — B200 컨테이너 co-located(127.0.0.1)로 조정 필요(포트는 실제 DB 셋업 확정 후).
+- **B4 예정**: 동시 다모델 상주(ServingConfig + model_manager). 이후 C(Critical #1~3, #5~8).

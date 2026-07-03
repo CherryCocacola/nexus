@@ -1,0 +1,367 @@
+# =============================================================================
+# Project Nexus — B200 배포용 설정 템플릿 (standalone)
+# =============================================================================
+# 이 파일은 무엇인가:
+#   NHN/정부 B200(180GB) 단일 컨테이너에서 Nexus를 기동할 때 쓰는 "완전한"
+#   설정 템플릿이다. 승인된 B200 플랜 Phase 3 산출물.
+#
+# 왜 완전한(standalone) 설정인가:
+#   설정 로더(core/config.py load_and_validate_config)는 지정된 파일을
+#   NexusConfig(**file_data)로 "통째로" 읽는다. base(nexus_config.yaml)와
+#   병합하지 않는다. 따라서 이 파일 하나만으로 모든 섹션이 다 있어야 한다
+#   (gpu_server/redis/postgresql/model/routing/session/security/knowledge_rag/
+#    mcp/context_budgets/web_auth/log_*/air_gap_mode). 아래는 현행 5090용
+#   nexus_config.yaml을 복사한 뒤 B200용 값만 오버라이드한 것이다.
+#
+# 사용법 (둘 중 하나):
+#   1) CLI 인자로 지정:  --config config/examples/nexus_config.b200.yaml
+#   2) 환경변수로 지정:  NEXUS_CONFIG=config/examples/nexus_config.b200.yaml
+#
+# 필수 환경변수 (비밀번호/자격증명은 파일에 넣지 않고 주입한다):
+#   - NEXUS_PG_PASSWORD      : PostgreSQL 비밀번호 (미주입 시 원격 DB는 인증 실패 = fail-closed)
+#   - NEXUS_REDIS_PASSWORD   : Redis requirepass 값 (미주입 시 무인증 접속 시도)
+#   - NEXUS_DIAG_GPU_PASS    : (선택) 진단 스크립트가 GPU 노드에 접속할 때만 사용
+#
+# ★정합성 불변식 (절대 — 어기면 vLLM이 요청을 거부하거나 잘림 발생)★:
+#   model.max_context_tokens(입력) + 최대 출력 토큰  ≤  vLLM max_model_len
+#   이 템플릿은 1차 bake-off 모델인 A.X-4.0 기준으로 잡았다.
+#   config/vllm_launch.yaml 의 axmodel.max_model_len = 32768 이므로:
+#     입력 24576 + 출력 8192 = 32768 ≤ 32768  (딱 맞음, 여유 0)
+#   HyperCLOVA(hyperclova.max_model_len = 65536)로 교체 시에는 아래
+#   model/context_budgets 값들을 상향할 수 있다(각 항목 주석 참조).
+#
+# ⚠ 기동일 재조정 대상:
+#   여기 토큰 예산은 A.X-4.0 BF16의 KV 캐시 실측 이전의 "설계 상한"이다.
+#   기동일에 BF16 KV 캐시 여유를 실측한 뒤(가능하면 상향/하향) 재조정한다.
+# =============================================================================
+
+# GPU 서버 (Machine B) 연결 설정
+# B200은 5090처럼 원격(192.168.21.112)이 아니라, 같은 컨테이너 안에서 localhost로
+# co-located 기동된다(vllm_launch.yaml defaults.host = 127.0.0.1). 그래서 URL을
+# 원격 LAN 주소가 아니라 컨테이너 내부 루프백(127.0.0.1)으로 지정한다.
+gpu_server:
+  url: "http://127.0.0.1:8001"            # B200 컨테이너 내부 vLLM 추론 서버(co-located)
+  embedding_url: "http://127.0.0.1:8002"  # e5-large 임베딩 서버(같은 컨테이너 내부)
+  timeout_seconds: 120.0     # 단일 요청 타임아웃 — 장문 생성 여유까지 고려한 값
+  max_retries: 10            # with_retry(Tier 4) 최대 재시도 횟수 (콜드/일시장애 흡수)
+  retry_base_delay: 0.5      # 지수 백오프 기준 지연(초) — 0.5→1→2…로 증가
+  health_check_interval: 30.0  # /health 폴링 주기(초)
+
+# 하드웨어 티어 — 오케스트레이션 모드(Scout 분리/컨텍스트 한계)를 결정한다.
+#   5090은 "small"이지만 B200(180GB)은 대용량 GPU이므로 "large"로 명시한다.
+#   왜 "auto"가 아닌가: 2-Machine이 아닌 단일 컨테이너라 해도 GPU 자동 감지는
+#   환경에 따라 흔들릴 수 있어, 의도를 분명히 하기 위해 명시한다.
+#   값: small(RTX 5090 32GB) / medium(H100 80GB) / large(H200·A100·B200 128GB+).
+hardware_tier: "large"
+
+# Redis (단기 메모리 / 세션 캐시)
+# 비밀번호는 커밋 금지 — 환경변수 NEXUS_REDIS_PASSWORD 로 주입한다.
+redis:
+  host: "192.168.10.39"
+  port: 6340
+  db: 6                  # nexus 전용 논리 DB 번호 (다른 앱과 키 충돌 방지용 분리)
+  # 비밀번호는 커밋 금지(보안) — 환경변수 NEXUS_REDIS_PASSWORD 로 주입한다.
+  #   (미주입 시 무인증 접속을 시도)
+  socket_timeout: 5.0    # 연결/명령 타임아웃(초) — 초과 시 인메모리 폴백으로 강등
+
+# PostgreSQL + pgvector (장기 메모리)
+# 비밀번호는 커밋 금지 — 환경변수 NEXUS_PG_PASSWORD 로 주입한다.
+postgresql:
+  host: "192.168.10.39"
+  port: 5440
+  database: "nexus"      # tb_memories / tb_knowledge / tb_symbols 가 사는 DB
+  user: "nexus"
+  # 비밀번호는 커밋 금지(보안) — 환경변수 NEXUS_PG_PASSWORD 로 주입한다.
+  #   (미주입 시 빈 문자열 → 원격 DB면 인증 실패로 즉시 드러남 = fail-closed)
+  min_connections: 2     # asyncpg 풀 최소 유지 커넥션 (idle 시에도 상시 보유)
+  max_connections: 10    # 풀 상한 — 동시 검색·인덱싱 부하를 고려한 보수적 상한
+
+# 모델 설정 — 1차 bake-off 모델은 A.X-4.0 72B (SKT, Apache 2.0, Qwen2.5 기반)
+# primary_model: vLLM의 served-model-name. vllm_launch.yaml axmodel.served_model_name
+#   = "ax-4.0" 과 반드시 일치해야 한다(불일치 시 모델 조회 실패).
+#   ※ HyperCLOVA로 bake-off 대상을 바꿀 때는 "hyperclova-seed-32b" 로 교체한다.
+model:
+  primary_model: "ax-4.0"                  # Worker 기본 모델 = vLLM served-model-name (A.X-4.0)
+  auxiliary_model: "exaone-7.8b"           # 한국어 보조 모델 (필요 시 사용)
+  embedding_model: "multilingual-e5-large"  # RAG 임베딩 모델 (1024차원)
+  # 컨텍스트(입력) 상한. A.X-4.0 window(32768) = 입력 24576 + 출력 8192.
+  #   ★불변식: 24576(입력) + 8192(출력, output_token_escalation 최대값) = 32768
+  #     ≤ vllm_launch.yaml axmodel.max_model_len(32768). 딱 맞음.
+  #   HyperCLOVA(max_model_len 65536)로 바꾸면 ~49152 까지 상향 가능.
+  max_context_tokens: 24576
+  default_temperature: 0.7   # routing 미적용/기본 경로의 샘플링 온도
+  default_max_tokens: 8192   # 1회 응답 기본 출력 상한 (라우팅 모드별 값이 우선)
+
+# v7.0 Part 2.5 — 쿼리 라우팅
+# ★주의: base(nexus_config.yaml)의 "TIER_M 이상 업그레이드 시 enabled:false로 끈다"
+#   주석은 부정확하므로 여기서 정정한다.
+#   라우팅이 존재하는 진짜 이유는 "컨텍스트 부족"이 아니다. Phase 3 LoRA 어댑터가
+#   도구 호출은 강화하지만 일반 지식 표현을 좁히는 부작용이 있어, 지식 질의는 베이스
+#   모델로, 도구 질의는 LoRA로 분기하려는 것이다. 이 부작용은 GPU가 B200으로 커져도
+#   동일하므로, 대용량 하드웨어라고 해서 라우팅을 끄지 않는다 → enabled: true 유지.
+#
+#   ※ 단, 1차 bake-off 단계에는 아직 테넌트 LoRA 어댑터가 없다(단일 서브드 모델).
+#     그래서 세 모드(knowledge/tool/chat)의 model을 모두 "ax-4.0" 하나로 통일한다.
+#     즉 현재 라우팅은 "모델 분기"가 아니라 "샘플링 파라미터/RAG 주입 여부 분기"로만
+#     작동한다(KNOWLEDGE/CHAT은 사실형·짧은 응답, TOOL은 도구 호출 안정화, CHAT은
+#     KB RAG 미주입). 테넌트 LoRA 도입 시 tool_mode.model 을 해당 어댑터명으로 전환한다.
+routing:
+  enabled: true               # 질의 분류 활성화 (B200에서도 유지 — 위 주석 참조)
+  long_input_threshold: 500   # 이 글자수 이상이면 TOOL_MODE (문서 첨부 간주)
+
+  # 분류기 종류 — 현재 지원: "heuristic" (기본)
+  classifier_type: "heuristic"
+
+  # 질의 본문에 아래 키워드 중 하나라도 포함되면 TOOL_MODE로 분류.
+  tool_keywords:
+    # 한국어 — 파일/프로젝트/도구 명시 힌트
+    - "파일"
+    - "첨부"
+    - "업로드"
+    - "이 프로젝트"
+    - "코드베이스"
+    - "디렉토리"
+    - "폴더"
+    - "리포지토리"
+    - "리포지터리"
+    - "읽어줘"
+    - "읽어 줘"
+    - "편집해"
+    - "수정해"
+    - "모듈 구조"
+    - "디렉토리 구조"
+    - "프로젝트 구조"
+    # 영어
+    - "file"
+    - "attached"
+    - "upload"
+    - "this project"
+    - "codebase"
+    - "repository"
+    - "directory"
+    - "folder"
+    # 도구 이름 — 괄호 포함(함수 호출 스타일)
+    - "Read("
+    - "Write("
+    - "Edit("
+    - "Bash("
+    - "Glob("
+    - "Grep("
+    - "Agent("
+    - "DocumentProcess"
+    # 도구 이름 — 대문자 + 공백 (Read 도구 / Edit the file 등)
+    - "Read "
+    - "Write "
+    - "Edit "
+    - "Bash "
+    - "Glob "
+    - "Grep "
+    - "Agent "
+    - " LS "
+    # 확장자 힌트 (공백 뒤 경로 패턴)
+    - ".py "
+    - ".md "
+    - ".yaml "
+    - ".json "
+    # 프로젝트 내부 디렉토리 prefix
+    - "core/"
+    - "web/"
+    - "tests/"
+    - "training/"
+    - "deployment/"
+    - "cli/"
+    - "config/"
+    - "scripts/"
+    - "tools/"
+
+  # 단어 경계 매칭 — 비어 있으면 규칙 미적용.
+  tool_word_patterns: []
+
+  # 정규식 매칭 — 복잡한 패턴이 필요한 경우에만 사용.
+  tool_regex_patterns: []
+
+  # CHAT_MODE 분류 임계 (Part 2.5.9)
+  chat_max_length: 30
+  chat_keywords:
+    # 한국어 인사·잡담
+    - "안녕"
+    - "안뇽"
+    - "좋은 아침"
+    - "좋은 저녁"
+    - "좋은 밤"
+    - "굿모닝"
+    - "굿나잇"
+    - "잘 자"
+    - "잘자"
+    - "반가워"
+    - "반갑습니다"
+    - "반갑네"
+    - "고마워"
+    - "고맙습니다"
+    - "감사"
+    - "땡큐"
+    - "잘 가"
+    - "잘가"
+    - "다음에 봐"
+    - "다음에 보자"
+    - "ㅋㅋ"
+    - "ㅎㅎ"
+    # 영어 인사·잡담
+    - "hi"
+    - "hello"
+    - "hey"
+    - "yo"
+    - "sup"
+    - "good morning"
+    - "good evening"
+    - "good night"
+    - "thanks"
+    - "thank you"
+    - "thx"
+    - "ty"
+    - "bye"
+    - "goodbye"
+    - "see you"
+    - "cya"
+
+  # ── 모드별 프로필 (degeneration/무한 반복 방지 + B200 단일 모델) ────────────
+  # 1차 bake-off: LoRA 어댑터가 없으므로 model 은 세 모드 모두 "ax-4.0" 로 통일.
+  # max_tokens 는 A.X 32768 window(입력 24576)에 맞춰 상향했다.
+  knowledge_mode:
+    model: "ax-4.0"           # 단일 서브드 모델 (LoRA 어댑터 미적용)
+    temperature: 0.2
+    max_tokens: 4096          # 사실형 QA — 24K 입력 window에 맞춰 상향(2048→4096)
+    enable_thinking: false    # 회귀 이력으로 전부 false 유지
+    top_p: 0.95               # 꼬리 토큰 약간 차단
+    repetition_penalty: 1.15  # 사실형 QA — 반복 가장 강하게 억제
+    frequency_penalty: 0.3
+    presence_penalty: 0.0
+    description: "일반 지식 QA"
+  tool_mode:
+    model: "ax-4.0"           # 단일 서브드 모델. 테넌트 LoRA 도입 시 어댑터명으로 전환
+    temperature: 0.3
+    max_tokens: 8192          # 도구 호출/프로젝트 작업 — 8192로 상향(4096→8192)
+    enable_thinking: false
+    top_p: 0.95
+    repetition_penalty: 1.0   # 비활성 — tool_call JSON/XML 반복 토큰 보호
+    frequency_penalty: 0.0
+    presence_penalty: 0.0
+    description: "도구 호출 / 프로젝트 작업"
+  chat_mode:
+    model: "ax-4.0"           # KNOWLEDGE와 동일 단일 모델
+    temperature: 0.5
+    max_tokens: 1024          # 인사·잡담은 짧게(512→1024, 그래도 가장 작게 유지)
+    enable_thinking: false
+    top_p: 0.9                # 잡담은 다양성 위해 약간 더 좁힘
+    repetition_penalty: 1.1   # 같은 인사말 반복 방지(중간 강도)
+    frequency_penalty: 0.2
+    presence_penalty: 0.0
+    description: "인사·잡담 — RAG 미주입, 짧은 응답"
+
+# 세션 설정 (base 유지)
+session:
+  sessions_dir: ".nexus/sessions"  # JSONL 트랜스크립트 저장 디렉토리
+  max_turns: 50               # 세션당 최대 에이전트 턴 수 (폭주 방지 상한)
+  max_budget_seconds: 300.0   # 세션 누적 시간 예산(초) — 초과 시 강제 종료
+  session_ttl_hours: 24       # 세션 데이터 보존 기간(시간)
+  transcript_enabled: true    # CLI 세션 JSONL 영구 기록 on/off
+
+# 보안 설정 (base 유지)
+security:
+  sandbox_enabled: true          # Bash 도구 샌드박스 실행 강제
+  sandbox_timeout_seconds: 30.0  # 샌드박스 명령 실행 타임아웃(초)
+  max_file_size_bytes: 10485760  # 10MB — 도구가 읽고/쓰는 파일 크기 상한
+  # 아래 정규식에 매칭되는 Bash 명령은 Layer 2에서 즉시 차단된다(파괴적 명령 방어).
+  bash_deny_patterns:
+    - 'rm\s+-rf\s+/'      # 루트/광범위 강제 삭제
+    - ':(){ :\|:& };:'    # fork bomb (자기복제 프로세스 폭발)
+    - 'dd\s+if=/dev/zero' # 디스크 덮어쓰기
+    - 'mkfs\.'            # 파일시스템 포맷
+    - '>\s*/dev/sd'       # 블록 디바이스 직접 덮어쓰기
+
+# =============================================================================
+# 지식 베이스 RAG 게이팅 — 무관 청크 주입 차단 (base 유지)
+# =============================================================================
+knowledge_rag:
+  top_k: 5                  # 검색 상위 청크 개수 (컨텍스트 절약 위해 보수적)
+  min_similarity: 0.75      # DB 벡터 검색 1차 컷오프
+  abs_threshold: 0.84       # 최상위조차 이 값 미만이면 전부 드롭 (무관 분포 상한 바로 위)
+  relevance_margin: 0.03    # top_sim에서 이 폭 이내 결과만 유지 (노이즈 청크 절단)
+
+# =============================================================================
+# 웹(FastAPI) API 키 인증 — B200 배포 필수
+# =============================================================================
+# 코드 기본값(WebAuthConfig.enabled)은 무회귀를 위해 False(무인증)이지만,
+# 신뢰되지 않은 네트워크에 노출되는 배포 환경에서는 반드시 인증을 켠다.
+# 켜지면 web/middleware.py ApiKeyAuthMiddleware가 `Authorization: Bearer <key>`
+# 헤더의 API 키를 TenantRegistry.resolve_by_api_key()로 검증한다.
+# 테넌트별 api_keys는 config/tenants.yaml에서 관리한다.
+# 유효하지 않은 키/누락 시 401로 거부한다(fail-closed).
+web_auth:
+  enabled: true             # 배포는 인증 필수 (테넌트 api_keys는 config/tenants.yaml)
+
+# =============================================================================
+# v7.2 MCP(Model Context Protocol) 통합 — 기본 비활성(에어갭 fail-closed)
+# 운영자가 명시적으로 켜기 전까지 연결하지 않는다(base 유지).
+# =============================================================================
+mcp:
+  enabled: false              # 전역 마스터 스위치 (에어갭 fail-closed) — 별도 활성화
+  connect_timeout_sec: 5.0    # 연결/요청 타임아웃 (실패 시 fail-closed)
+  servers:
+    # ⚠ 포트 8810~8814는 모두 placeholder다 (v7.2 Part 8 미확정).
+    - name: "db"
+      transport: "http_sse"
+      base_url: "http://192.168.10.39:8810"   # 사내 DB MCP (LAN, 포트 placeholder)
+      enabled: false
+      trust: { read_only: true }
+    - name: "diag"
+      transport: "http_sse"
+      base_url: "http://192.168.21.112:8811"   # 운영 진단 MCP (LAN, 포트 placeholder)
+      enabled: false
+      trust: { read_only: true }
+    - name: "docingest"
+      transport: "http_sse"
+      base_url: "http://192.168.21.112:8814"   # docingest 문서 MCP (LAN, 포트 placeholder)
+      enabled: false
+      trust: { read_only: true }
+      # docingest는 parse/search(read-only) + ingest(쓰기) 도구를 제공한다.
+      # trust.read_only=true이므로 자동 등록 대상이지만, 쓰기 도구(ingest)는
+      # allow_write를 명시하지 않는 한 등록에서 제외된다(fail-closed 기본 false).
+    - name: "kowiki"
+      transport: "http_sse"
+      base_url: "http://192.168.21.112:8813"   # kowiki RAG MCP (LAN, 포트 placeholder)
+      enabled: false
+      trust: { read_only: true }
+      # kowiki 검색은 KNOWLEDGE 모드 자동 RAG 주입이 담당하므로 Worker 도구로는
+      # 중복 노출하지 않음.
+      expose_to_worker: false
+
+# =============================================================================
+# 컨텍스트 예산 (context budgets) — B200(TIER_large, A.X 24K 입력 window) 상향값
+# base(5090, 8K) 대비 각 항목을 상향했다. 합이 입력 window(24576)를 넘지 않도록
+# 잡았다. HyperCLOVA(65536)로 확장 시 추가 상향 가능.
+# =============================================================================
+context_budgets:
+  # RAG/프롬프트 조립 주입 상한 (출처: prompt_assembler.py)
+  turn_state_tokens: 2000        # 이전 턴 요약(TurnState) 주입 상한 (1000→2000)
+  project_rag_tokens: 4000       # 프로젝트 RAG(관련 파일 청크) 주입 상한 (1500→4000)
+  knowledge_rag_tokens: 2500     # 지식베이스(KB) RAG 주입 상한 (1000→2500)
+  # 컨텍스트 압축 예산 (출처: context_manager.py 생성자)
+  tool_result_budget: 8000       # 개별 도구 결과 최대 토큰 수 (2048→8000)
+  preserve_recent_turns: 6       # 압축해도 원본 보존할 최근 턴 수 (3→6)
+  preserve_recent_tool_results: 3  # 압축해도 원본 보존할 최근 도구 결과 수 (2→3)
+  # 문서 도구 청크 크기 (출처: document_tool.py CHUNK_SIZE)
+  document_chunk_size: 8000      # DocumentProcess가 문서를 나눌 청크 글자 수 (2500→8000)
+  # 출력 토큰 에스컬레이션 단계 (출처: query_loop.py OUTPUT_TOKEN_ESCALATION)
+  #   ★불변식 준수: 최대값 8192 → 입력 24576 + 8192 = 32768 ≤ axmodel max_model_len(32768).
+  #   base의 16384 단계는 제거했다(24576+16384=40960 > 32768 이라 불변식 위반).
+  output_token_escalation: [4096, 8192]
+
+# 운영 설정 (base 유지)
+log_level: "INFO"      # 로그 레벨 (DEBUG/INFO/WARNING/ERROR)
+log_file: null         # 파일 로그 경로 — null이면 콘솔(stderr)만 사용
+watch_files: false     # 설정 파일 변경 감지 후 핫리로드 여부
+debug: false           # 디버그 모드 (상세 추적 활성화)
+
+# 에어갭 모드 (외부 네트워크 차단) — LAN/localhost 외 모든 호출을 fail-closed로 거부
+air_gap_mode: true
