@@ -123,7 +123,9 @@ class CommandFilter:
         (r"\bncat\b", "high", "에어갭: ncat 연결 시도"),
         (r"\btelnet\b", "high", "에어갭: telnet 연결 시도"),
         (r"\bftp\b", "high", "에어갭: FTP 연결 시도"),
-        (r"pip\s+install", "high", "에어갭: 런타임 패키지 설치"),
+        # pip / pip3 / pip3.11 등 버전 접미사까지 포괄한다(에어갭 우회 방지).
+        # (`python -m pip install`은 "pip install" 부분문자열이 이미 걸린다.)
+        (r"pip[0-9.]*\s+install", "high", "에어갭: 런타임 패키지 설치"),
         (r"npm\s+install", "high", "에어갭: 런타임 패키지 설치"),
         (r"apt(-get)?\s+install", "high", "에어갭: 시스템 패키지 설치"),
         (r"yum\s+install", "high", "에어갭: 시스템 패키지 설치"),
