@@ -9,8 +9,10 @@ diag MCP 서버 — Nexus 인프라 진단을 도구로 노출한다.
 
 왜 scripts 로직을 "포팅" 하는가 (재사용이 아니라 복제):
   scripts/_diag_*.py 는 일회성 진단 스크립트이며 mcp_servers 가 import 하면
-  의존성 경계가 모호해진다. 동일 점검 로직을 이 서버 안에 정리해 담고, 자격
-  정보(GPU/DB 비밀번호)는 scripts 와 동일하게 상수로 둔다(LAN 전용).
+  의존성 경계가 모호해진다. 동일 점검 로직을 이 서버 안에 정리해 담는다.
+  자격 정보(GPU SSH 비밀번호)는 소스에 하드코딩하지 않고 환경변수
+  (NEXUS_DIAG_GPU_PASS)에서 읽는다. 값이 없으면 GPU SSH 점검만 fail-soft
+  로 건너뛰고 사유를 결과에 담는다(에어갭·보안 fail-closed 원칙).
 
 에어갭:
   모든 점검 대상은 LAN 주소(192.168.x / localhost)다. 외부 도메인 호출 없음.
@@ -26,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import socket
 import ssl
 import time
@@ -43,19 +46,16 @@ logger = logging.getLogger("nexus.mcp_servers.diag")
 # ─────────────────────────────────────────────
 GPU_HOST = "192.168.21.112"
 GPU_USER = "idino"
-GPU_PASS = "dkdlelsh@12"  # noqa: S105 — LAN 내부 진단용 고정 자격(에어갭)
+# GPU SSH 비밀번호는 소스에 박지 않고 환경변수에서 읽는다(보안 fail-closed).
+#   - 값이 있으면 그 비밀번호로 GPU SSH 도달성 점검을 수행한다.
+#   - 값이 없으면(None/빈문자열) GPU 점검을 건너뛰고 사유를 결과에 담는다.
+GPU_PASS = os.environ.get("NEXUS_DIAG_GPU_PASS")
 
 DB_HOST = "192.168.10.39"
 DB_PORTS = {"PostgreSQL": 5440, "Redis": 6340}
 
 WEB_URL = "https://localhost:8443/metrics"
 EMBED_URL = "http://192.168.21.112:8002"
-
-# RAG 지연 측정에 쓰는 DB 컨테이너 자격(scripts/_diag_rag_latency 와 동일).
-PG_CONTAINER = "docutil-postgres"
-PG_USER = "nexus"
-PG_DB = "nexus"
-PG_PASS = "idino@12"  # noqa: S105 — LAN 내부 진단용 고정 자격(에어갭)
 
 
 # ─────────────────────────────────────────────
@@ -105,6 +105,14 @@ def _check_db_blocking() -> dict[str, Any]:
 
 def _check_gpu_blocking() -> dict[str, Any]:
     """GPU 서버에 SSH 접속해 vLLM/Scout 프로세스·포트·GPU 메모리를 점검한다."""
+    # 자격 미설정이면 SSH 점검을 fail-soft로 건너뛴다(paramiko 미설치와 동일 패턴).
+    # 비밀번호를 소스에 두지 않으므로, 환경변수가 없으면 GPU 점검은 하지 않는다.
+    if not GPU_PASS:
+        return {
+            "reachable": False,
+            "error": "NEXUS_DIAG_GPU_PASS 미설정으로 GPU SSH 점검 생략",
+        }
+
     try:
         import paramiko
     except ImportError:

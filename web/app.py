@@ -76,7 +76,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from web.middleware import CORSConfig, RequestLoggingMiddleware
+from web.middleware import ApiKeyAuthMiddleware, CORSConfig, RequestLoggingMiddleware
 
 logger = logging.getLogger("nexus.web.app")
 
@@ -441,6 +441,28 @@ app = FastAPI(
 
 # CORS 미들웨어 적용 — 로컬/LAN만 허용
 app.add_middleware(CORSMiddleware, **CORSConfig.get_cors_kwargs())
+
+
+# API 키 인증 미들웨어 (Security Critical #4) — CORS 뒤에 등록한다.
+# 설정·테넌트 레지스트리는 lifespan 기동 후에야 _app_state에 채워지므로,
+# 미들웨어가 dispatch 시점에 지연 조회할 수 있도록 무인자 함수로 넘긴다
+# (생성 시점 조회 금지 — 순환 import 및 기동 순서 문제 방지).
+def _get_web_auth_config() -> Any:
+    """현재 로드된 WebAuthConfig를 반환한다(없으면 None → 인증 비활성 취급)."""
+    cfg = _app_state.get("config")
+    return getattr(cfg, "web_auth", None) if cfg is not None else None
+
+
+def _get_tenant_registry() -> Any:
+    """현재 TenantRegistry를 반환한다(없으면 None → fail-closed 차단)."""
+    return _app_state.get("tenant_registry")
+
+
+app.add_middleware(
+    ApiKeyAuthMiddleware,
+    get_auth_config=_get_web_auth_config,
+    get_tenant_registry=_get_tenant_registry,
+)
 
 # 요청 로깅 미들웨어 적용
 _logging_middleware = RequestLoggingMiddleware(app)

@@ -674,6 +674,44 @@ class TenantRegistry(BaseModel):
 
 
 # ─────────────────────────────────────────────
+# 웹 API 인증 설정 (Security Critical #4, 2026-07-02)
+# ─────────────────────────────────────────────
+class WebAuthConfig(BaseModel):
+    """
+    웹(FastAPI) API 키 인증 설정.
+
+    web/middleware.py의 ApiKeyAuthMiddleware가 이 설정을 읽어 요청을 통과/차단한다.
+    인증이 켜지면 `Authorization: Bearer <key>` 헤더의 API 키가
+    TenantRegistry.resolve_by_api_key()로 유효 테넌트를 찾을 때만 요청을 허용한다.
+
+    왜 enabled 기본값이 False인가 (무회귀 원칙):
+      기존 5090/로컬 개발 환경은 전 엔드포인트 무인증으로 동작해 왔다. 기본값을
+      True로 바꾸면 기존 개발/테스트 흐름이 즉시 401로 깨진다(회귀). 따라서 기본은
+      현행 동작(무인증)을 유지하고, 배포(에어갭 운영) 환경에서만 명시적으로 켠다.
+
+    배포 시 반드시 True로 설정할 것:
+      운영 배포에서는 NEXUS_WEB_AUTH__ENABLED=true (또는 config.yaml)로 인증을
+      활성화해야 한다. 비활성 상태로 신뢰되지 않은 네트워크에 노출하면 안 된다.
+    """
+
+    # 인증 게이트 on/off. 기본 False = 현행 무인증(무회귀). 배포 시 True 필수.
+    enabled: bool = False
+
+    # 인증 없이 접근을 허용할 경로 목록.
+    # 매칭 규칙: "/"는 정확히 루트("/")만 허용(prefix로 쓰면 모든 경로가 열림),
+    #           그 외 항목은 prefix 매칭(예: "/static" → "/static/app.js"도 허용).
+    exempt_paths: list[str] = Field(
+        default_factory=lambda: [
+            "/health",  # 헬스체크 — 모니터링 도구가 무인증으로 폴링
+            "/",  # 루트 랜딩 페이지(정확 매칭)
+            "/docs",  # Swagger UI
+            "/openapi.json",  # OpenAPI 스키마
+            "/static",  # 정적 자산(HTML/CSS/JS)
+        ]
+    )
+
+
+# ─────────────────────────────────────────────
 # OCR(스캔 PDF/이미지) 설정 — v7.3 로드맵 단계 8
 # ─────────────────────────────────────────────
 class OcrConfig(BaseModel):
@@ -962,6 +1000,10 @@ class NexusConfig(BaseSettings):
     # 멀티테넌시 (Part 5 Ch 15, 2026-04-21)
     tenants: TenantRegistry = Field(default_factory=TenantRegistry)
 
+    # 웹 API 키 인증 (Security Critical #4, 2026-07-02)
+    # 기본 비활성(무회귀). 배포 시 NEXUS_WEB_AUTH__ENABLED=true로 활성화한다.
+    web_auth: WebAuthConfig = Field(default_factory=WebAuthConfig)
+
     # v7.2 MCP 통합 — LAN 내부 MCP 서버 연결 (기본 비활성, 에어갭 fail-closed)
     mcp: McpConfig = Field(default_factory=McpConfig)
 
@@ -1062,10 +1104,37 @@ def load_and_validate_config(
             with open(path, encoding="utf-8") as f:
                 file_data = json.load(f)
 
+        # 비밀번호 주입(보안): DB/Redis 비밀번호는 설정 파일(yaml)에 평문으로 두지
+        # 않고, 실행 환경의 환경변수에서만 주입한다. 이렇게 하면 설정 파일을 git에
+        # 올려도 자격증명이 노출되지 않는다.
+        #   - NEXUS_PG_PASSWORD    → postgresql.password
+        #   - NEXUS_REDIS_PASSWORD → redis.password
+        # 왜 여기서 직접 채우나: 아래 NexusConfig(**file_data)는 yaml 값을 init 인자로
+        # 넘기는데, pydantic-settings 우선순위상 "init 인자 > 환경변수"라 yaml에 빈
+        # 값이 있으면 오히려 환경변수 주입을 덮어버린다. 그래서 yaml에서 비번을 비우고
+        # (키 없음) 여기서 file_data에 직접 넣어 환경변수 값이 확실히 반영되게 한다.
+        _pg_pw = os.environ.get("NEXUS_PG_PASSWORD")
+        if _pg_pw:
+            file_data.setdefault("postgresql", {})["password"] = _pg_pw
+        _redis_pw = os.environ.get("NEXUS_REDIS_PASSWORD")
+        if _redis_pw:
+            file_data.setdefault("redis", {})["password"] = _redis_pw
+
         # 파일에서 읽은 dict를 펼쳐 Pydantic 모델에 주입한다. 이 시점에 환경변수
         # (NEXUS_*)와 각종 validator가 함께 적용되어 최종 설정이 검증·확정된다.
         config = NexusConfig(**file_data)
         logger.info(f"설정 파일 로드 완료: {config_path}")
+        # fail-closed 경고: 원격 PostgreSQL인데 비밀번호가 비어 있으면(환경변수 미설정)
+        # 접속이 인증 실패로 조용히 깨질 수 있으므로 기동 시 명확히 알린다.
+        if not config.postgresql.password and config.postgresql.host not in (
+            "localhost",
+            "127.0.0.1",
+        ):
+            logger.warning(
+                "PostgreSQL 비밀번호가 비어 있습니다(host=%s). "
+                "NEXUS_PG_PASSWORD 환경변수로 자격증명을 주입하세요.",
+                config.postgresql.host,
+            )
     else:
         # 후보 파일이 하나도 없으면 전부 기본값으로 초기화한다(테스트/최초 실행).
         config = NexusConfig()

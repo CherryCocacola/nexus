@@ -14,13 +14,139 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable
 from typing import Any
 
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.requests import Request
-from starlette.responses import Response
+from starlette.responses import JSONResponse, Response
 
 logger = logging.getLogger("nexus.web.middleware")
+
+
+# ─────────────────────────────────────────────
+# API 키 인증 미들웨어 (Security Critical #4, 2026-07-02)
+# ─────────────────────────────────────────────
+class ApiKeyAuthMiddleware(BaseHTTPMiddleware):
+    """
+    웹 API 키 인증 게이트 (fail-closed).
+
+    동작 요약:
+      - 인증이 꺼져 있으면(enabled=False) 모든 요청을 통과시키되, 최초 1회
+        경고 로그를 남긴다(신뢰된 네트워크 전용임을 운영자에게 알림).
+      - 인증이 켜져 있으면(enabled=True) exempt_paths(면제 경로)가 아닌 모든
+        요청에 대해 `Authorization: Bearer <key>` 헤더를 요구하고, 그 키가
+        TenantRegistry.resolve_by_api_key()로 유효 테넌트를 찾을 때만 통과시킨다.
+        헤더 없음/형식 오류/미매칭은 모두 401로 차단한다(fail-closed).
+
+    왜 설정/레지스트리를 "콜러블"로 주입받는가 (순환 import 방지):
+      web/middleware.py는 core/, web/app.py를 직접 import하지 않는다. 대신
+      app.py가 `_app_state`에서 설정·테넌트 레지스트리를 읽어오는 무인자 함수를
+      넘겨준다. 미들웨어는 요청 시점(dispatch)에 그 함수를 호출해 최신 값을 얻는다.
+      (미들웨어는 앱 import 시점에 등록되지만, 설정은 lifespan 기동 후에야 채워지므로
+       생성 시점이 아니라 dispatch 시점에 지연 조회해야 한다.)
+
+    인증과 테넌트 해석의 분리:
+      이 미들웨어는 "유효한 키인가"만 판정한다(인증). 실제 어떤 테넌트로 라우팅할지
+      (body.tenant_id > X-Tenant-ID > Bearer 키 우선순위)는 기존 app._resolve_tenant가
+      그대로 담당한다(인가/해석). 두 관심사를 섞지 않는다.
+    """
+
+    def __init__(
+        self,
+        app: Any,
+        *,
+        get_auth_config: Callable[[], Any],
+        get_tenant_registry: Callable[[], Any],
+    ):
+        """
+        미들웨어를 초기화한다.
+
+        Args:
+            app: FastAPI/Starlette ASGI 앱 인스턴스
+            get_auth_config: WebAuthConfig(또는 None)를 반환하는 무인자 함수
+            get_tenant_registry: TenantRegistry(또는 None)를 반환하는 무인자 함수
+        """
+        super().__init__(app)
+        self._get_auth_config = get_auth_config
+        self._get_tenant_registry = get_tenant_registry
+        # 인증 비활성 경고를 최초 1회만 남기기 위한 플래그(dispatch마다 폭주 방지).
+        self._warned_disabled: bool = False
+
+    def _is_exempt(self, path: str, exempt_paths: list[str]) -> bool:
+        """요청 경로가 면제 경로에 해당하는지 판정한다.
+
+        매칭 규칙:
+          - "/" 항목은 정확히 루트 경로("/")에만 매칭한다. (prefix로 처리하면
+            모든 경로가 "/"로 시작하므로 인증이 통째로 무력화되는 사고를 막는다.)
+          - 그 외 항목은 prefix 매칭한다(예: "/static" → "/static/app.js" 허용).
+        """
+        for exempt in exempt_paths:
+            if exempt == "/":
+                if path == "/":
+                    return True
+            elif path.startswith(exempt):
+                return True
+        return False
+
+    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
+        """요청을 인증 검사한 뒤 다음 핸들러로 넘기거나 401로 차단한다."""
+        auth = self._get_auth_config()
+
+        # 설정이 아직 없거나(기동 전) 인증이 꺼져 있으면 통과시킨다(무회귀).
+        # enabled는 반드시 "명시적 boolean True"일 때만 인증을 켠다(`is True`).
+        #   - WebAuthConfig.enabled는 Pydantic이 실제 bool로 강제하므로 정상 동작.
+        #   - 설정이 잘못 배선돼 bool이 아닌 truthy 값(예: 테스트의 MagicMock)이
+        #     들어와도 "실수로 인증이 켜지는" 오작동을 막는다(fail-safe 방향).
+        if auth is None or getattr(auth, "enabled", False) is not True:
+            if not self._warned_disabled:
+                self._warned_disabled = True
+                logger.warning(
+                    "웹 인증이 비활성화됨 — 신뢰된 네트워크(에어갭 LAN)에서만 사용하십시오. "
+                    "배포 환경에서는 NEXUS_WEB_AUTH__ENABLED=true로 인증을 켜야 합니다."
+                )
+            return await call_next(request)
+
+        path = request.url.path
+
+        # CORS 프리플라이트(OPTIONS)는 자격증명을 싣지 않으므로 인증에서 면제한다.
+        # (이 미들웨어가 CORS보다 바깥이라 프리플라이트를 먼저 만나므로, 여기서
+        #  막으면 브라우저 CORS가 깨진다. 실제 요청은 여전히 인증 대상이다.)
+        if request.method == "OPTIONS":
+            return await call_next(request)
+
+        # 면제 경로는 인증 없이 통과.
+        if self._is_exempt(path, list(getattr(auth, "exempt_paths", []))):
+            return await call_next(request)
+
+        # Authorization: Bearer <key> 헤더를 요구한다(fail-closed).
+        authorization = request.headers.get("Authorization", "")
+        if not authorization.lower().startswith("bearer "):
+            return self._unauthorized()
+
+        api_key = authorization[7:].strip()
+        if not api_key:
+            return self._unauthorized()
+
+        registry = self._get_tenant_registry()
+        # 레지스트리가 없으면 검증 불가 → fail-closed로 차단한다.
+        if registry is None:
+            return self._unauthorized()
+
+        tenant = registry.resolve_by_api_key(api_key)
+        if tenant is None:
+            return self._unauthorized()
+
+        # 인증 통과 — 다음 핸들러로 진행(테넌트 해석은 기존 _resolve_tenant가 담당).
+        return await call_next(request)
+
+    @staticmethod
+    def _unauthorized() -> JSONResponse:
+        """표준 401 JSON 응답을 만든다."""
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "인증 실패: 유효한 API 키가 필요합니다"},
+        )
 
 
 class RequestLoggingMiddleware(BaseHTTPMiddleware):
