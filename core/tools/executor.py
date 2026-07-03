@@ -130,6 +130,44 @@ async def run_tool_use(
         command = tool_input.get("command", "")
         security_task = asyncio.create_task(_speculative_bash_security(command))
 
+    # ═══ Step 6-8a: 권한 파이프라인 관측 (P1 shadow — 감사 Critical #1~3, 2026-07-03) ═══
+    # ★무회귀 핵심★: 이 블록은 "관측 전용"이다. 5계층 파이프라인 판정을 계산해
+    # 감사 로그(AuditLogger)에 기록만 하고, 실행 경로(무엇을 차단할지)는 조금도
+    # 바꾸지 않는다. 실제 차단은 바로 아래 "현행 로직"(도구 check_permissions의 DENY
+    # 만 차단)이 그대로 담당한다.
+    #
+    # 동작 조건:
+    #   - permission_enforcement.enabled=False 또는 파이프라인 미주입(None)이면 이
+    #     블록을 통째로 건너뛴다(파이프라인 호출조차 없음). → executor 동작 100% 현행 동일.
+    #   - enabled=True + 파이프라인 있음이면 pipeline.check()로 판정을 계산해
+    #     AuditLogger에 남긴다(shadow). 이 판정으로는 절대 차단하지 않는다.
+    #     (실제 차단 전환은 후속 단계에서 mode="enforce"로 수행한다.)
+    _pe = context.options.get("permission_enforcement") or {}
+    _pipeline = context.options.get("permission_pipeline")
+    _audit_logger = context.options.get("audit_logger")
+    if _pe.get("enabled") and _pipeline is not None:
+        try:
+            # 5계층 파이프라인 판정(관측용). 이 호출은 tool.check_permissions()를
+            # Layer 2로 한 번 더 수행하지만, check_permissions는 순수 검증이라
+            # 부수효과가 없다(shadow 안전). Layer 4 Hook는 현재 미배선(None)이다.
+            decision = await _pipeline.check(tool, tool_input, context)
+            # 파이프라인이 방금 내부 감사 로그에 남긴 엔트리를 JSONL로도 영구 기록한다.
+            # (엔트리에는 거친 레이어·사유·모드가 담겨 있어 그대로 재사용이 안전하다.)
+            if _audit_logger is not None:
+                recent = _pipeline.get_recent_audit(1)
+                if recent:
+                    await _audit_logger.async_log_decision(recent[-1])
+            logger.debug(
+                "[permission shadow] 도구=%s 판정=%s (기록만, 차단 안 함)",
+                tool.name,
+                getattr(decision, "type", "?"),
+            )
+        except Exception as e:
+            # 관측(shadow) 실패가 도구 실행을 막으면 안 된다 — 관측은 순수 부가 기능이다.
+            # bare except가 아니라 Exception을 명시해 잡고(anti #8), 결함이 묻히지
+            # 않도록 경고로 남긴 뒤 실행을 계속한다(현행 경로에 영향 없음).
+            logger.warning("[permission shadow] 파이프라인 관측 실패(무시): %s", e)
+
     # ═══ Step 6-8: Hook + 권한 (간소화 — Phase 4에서 전체 구현) ═══
     # 현재는 도구 자체의 check_permissions만 실행
     try:

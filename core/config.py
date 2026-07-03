@@ -963,6 +963,58 @@ class ContextBudgetConfig(BaseModel):
 
 
 # ─────────────────────────────────────────────
+# 권한 강제(permission enforcement) 설정 — 감사 Critical #1~3 무회귀 토대 (2026-07-03)
+# ─────────────────────────────────────────────
+class PermissionEnforcementConfig(BaseModel):
+    """
+    5계층 권한 파이프라인(PermissionPipeline)을 도구 실행 경로에 배선할지 결정하는 설정.
+
+    배경(왜 필요한가):
+      현재 executor(core/tools/executor.py)의 유일한 권한 게이트는 도구 자체
+      check_permissions()의 DENY만 차단하고, 파이프라인의 Layer 1/3/4/5는 전혀
+      실행하지 않는다(코드 주석에 "간소화 — Phase 4에서 전체 구현"이라 명시됨).
+      이 설정은 그 파이프라인을 단계적으로 배선하기 위한 마스터 스위치다.
+
+    ★무회귀 원칙(이 단계의 최우선 규칙)★:
+      - enabled 기본값은 False = 파이프라인을 호출조차 하지 않는다. 즉 executor
+        동작이 현행과 100% 동일하다(도구 check_permissions의 DENY만 차단).
+      - enabled=True 여도 mode="shadow"이면 파이프라인 결정을 "기록만" 하고
+        실행 경로는 전혀 바꾸지 않는다(차단 안 함 — 관측 전용). 새 차단이 절대
+        생기지 않는다. 실제 차단(enforce)은 다음 단계에서 mode="enforce"로 전환한다.
+
+    필드 설명:
+      - enabled: 파이프라인 배선 on/off. 기본 False(무회귀). 배포/검증 시 명시 활성.
+      - mode: "shadow"(판정을 감사 로그에 기록만, 차단 안 함) 또는
+              "enforce"(파이프라인 결정으로 실제 차단 — 다음 단계). 기본 "shadow".
+    """
+
+    # 마스터 스위치. 기본 False = 현행 동작 100% 유지(파이프라인 미호출, 무회귀).
+    enabled: bool = False
+    # 강제 방식. "shadow"=기록만(차단 안 함), "enforce"=실제 차단(후속 단계).
+    # 기본 "shadow" — enabled를 켜더라도 우선은 관측만 한다(fail-safe).
+    mode: str = "shadow"
+
+
+class AuditConfig(BaseModel):
+    """
+    감사 로그(AuditLogger, core/security/audit.py) 설정.
+
+    권한 파이프라인이 내린 모든 결정을 JSONL로 남겨 무회귀·보안 검증의 근거로
+    삼는다. AuditLogger는 이미 구현돼 있으나 런타임에 배선되지 않은 상태였고,
+    이 설정으로 경로/활성 여부를 코드에 하드코딩하지 않고 외부화한다(anti #4).
+
+    필드 설명:
+      - enabled: 감사 로그 기록 on/off. 기본 True(관측은 항상 켜두는 게 안전).
+      - path: 로그 파일 경로. 상대경로면 작업 디렉토리 기준. 기본 "logs/audit.log".
+    """
+
+    # 감사 로그 활성 여부. 기본 True — shadow 관측 결과를 남기려면 켜져 있어야 한다.
+    enabled: bool = True
+    # 로그 파일 경로(하드코딩 금지 — yaml/환경변수로 오버라이드 가능).
+    path: str = "logs/audit.log"
+
+
+# ─────────────────────────────────────────────
 # 메인 설정 클래스 (Pydantic BaseSettings)
 # ─────────────────────────────────────────────
 class NexusConfig(BaseSettings):
@@ -1068,6 +1120,16 @@ class NexusConfig(BaseSettings):
     # 기본값=현행 5090(TIER_S) 하드코딩 값과 동일 → 미지정 시 무회귀.
     # B200/H200 티어는 별도 config에서 이 섹션을 상향 오버라이드한다.
     context_budgets: ContextBudgetConfig = Field(default_factory=ContextBudgetConfig)
+
+    # 권한 강제 파이프라인 배선 (감사 Critical #1~3, 2026-07-03)
+    # 기본 enabled=False = 현행 executor 동작 100% 유지(무회귀). enabled=True 여도
+    # 기본 mode="shadow"라 판정을 기록만 하고 차단하지 않는다(관측 전용).
+    permission_enforcement: PermissionEnforcementConfig = Field(
+        default_factory=PermissionEnforcementConfig
+    )
+
+    # 감사 로그(AuditLogger) 배선 — 권한 결정을 JSONL로 기록.
+    audit: AuditConfig = Field(default_factory=AuditConfig)
 
     # 하드웨어 티어 — Scout 활성화/컨텍스트 길이 등 동작을 좌우한다.
     # "auto"면 GPU VRAM을 감지해 TIER_S/M/L 등을 자동 결정한다. 특정 티어를

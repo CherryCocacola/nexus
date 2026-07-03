@@ -172,6 +172,62 @@ async def init_phase2(state: GlobalState) -> dict:
     agent_registry = build_default_agent_registry()
     components["agent_registry"] = agent_registry
 
+    # ④-a 권한 강제 파이프라인 배선 (감사 Critical #1~3, 2026-07-03) — P0 하네스 + P1 shadow
+    # ───────────────────────────────────────────────────────────────────────
+    # 세션 1회만 만든다. executor까지 ToolUseContext.options로 전달한다(아래 ④-b).
+    # ★무회귀★:
+    #   - config.permission_enforcement.enabled 가 False(기본)면 파이프라인을
+    #     아예 만들지 않는다(None). executor는 None을 보고 현행 로직(도구
+    #     check_permissions의 DENY만 차단)을 그대로 탄다 → 동작 100% 동일.
+    #   - True 여도 mode="shadow"면 executor가 판정을 감사 로그에 기록만 하고
+    #     실행 경로는 바꾸지 않는다(차단 안 함). 실제 차단은 후속 단계(enforce).
+    # lazy import — Phase 2 모듈 패턴(필요 시점 import, 순환 의존 방지)을 따른다.
+    from core.permission.mode_mapping import map_mode_value_to_permission_mode
+    from core.permission.pipeline import PermissionPipeline
+    from core.permission.types import PermissionContext
+    from core.security.audit import AuditLogger
+
+    perm_cfg = config.permission_enforcement
+    audit_cfg = config.audit
+
+    permission_pipeline = None
+    audit_logger = None
+    # AuditLogger는 audit.enabled만 켜져 있으면 만든다(관측은 파이프라인과 독립).
+    # 파이프라인이 없어도(무회귀 상태) 감사 로거 자체는 존재할 수 있으나, executor는
+    # 파이프라인이 있을 때만 기록하므로 enforcement가 꺼져 있으면 실제 쓰기는 없다.
+    if audit_cfg.enabled:
+        audit_logger = AuditLogger(log_path=audit_cfg.path)
+    # 파이프라인은 enforcement.enabled가 True일 때만 생성한다(무회귀 핵심).
+    if perm_cfg.enabled:
+        # 세션 권한 모드(PermissionModeValue) → 파이프라인 모드(PermissionMode) 변환.
+        perm_mode = map_mode_value_to_permission_mode(state.permission_mode)
+        perm_context = PermissionContext(
+            mode=perm_mode,
+            working_directory=state.cwd or os.getcwd(),
+            session_id=state.session_id,
+        )
+        # hook_manager가 components에 있으면 주입(현재 부트스트랩엔 미배선 → None).
+        # 주의(shadow 안전성): Layer 4 Hook는 PRE_TOOL_USE로 외부 명령을 실행할 수
+        # 있어 "관측 전용"이 깨질 수 있다. 훗날 hook_manager가 실제로 배선되면
+        # shadow 단계에서의 Hook 실행 정책을 반드시 재검토해야 한다.
+        permission_pipeline = PermissionPipeline(
+            context=perm_context,
+            # TODO(nexus): config 기반 deny rule 로딩은 후속 단계. 현재 NexusConfig에
+            #   PermissionRule 목록 필드가 없어 rules=None으로 둔다(파이프라인은 도구
+            #   자체 검사 Layer 2 + 모드 기반 Layer 3만으로 판정).
+            rules=None,
+            hook_manager=components.get("hook_manager"),
+        )
+    components["permission_pipeline"] = permission_pipeline
+    components["audit_logger"] = audit_logger
+    logger.info(
+        "[Phase 2] 권한 파이프라인 배선: enforcement=%s(mode=%s), pipeline=%s, audit=%s",
+        perm_cfg.enabled,
+        perm_cfg.mode,
+        "생성" if permission_pipeline else "미생성(무회귀)",
+        "생성" if audit_logger else "비활성",
+    )
+
     # ④-b ToolUseContext 생성
     # options는 AgentTool이 서브에이전트를 해석할 때 필요한 모든 의존성을 제공한다:
     #   - agent_registry: subagent_type → AgentDefinition 조회
@@ -190,6 +246,20 @@ async def init_phase2(state: GlobalState) -> dict:
             # 문서 청크 크기 — 하드코딩 외부화(2026-07-03). DocumentProcess 도구가
             # 이 값을 읽어 청크를 나눈다. 미주입 시 도구가 CHUNK_SIZE(2500)로 폴백.
             "document_chunk_size": config.context_budgets.document_chunk_size,
+            # 권한 강제 파이프라인 배선(감사 Critical #1~3, 2026-07-03) — executor가
+            # options에서 꺼내 쓴다. 왜 options인가: ToolUseContext는 이미 executor까지
+            # 흐르고, memory_manager/agent_registry 등 세션 의존성도 전부 options로
+            # 주입되는 기존 패턴을 따른다. query_loop/stream_handler 시그니처를 전혀
+            # 바꾸지 않아 4-Tier 체인·무회귀를 지킨다.
+            #   - permission_pipeline: enforcement 꺼짐 시 None → executor 현행 로직
+            #   - audit_logger: shadow 판정을 JSONL로 기록(관측 전용)
+            #   - permission_enforcement: {enabled, mode} — executor의 게이트 판단용
+            "permission_pipeline": permission_pipeline,
+            "audit_logger": audit_logger,
+            "permission_enforcement": {
+                "enabled": perm_cfg.enabled,
+                "mode": perm_cfg.mode,
+            },
         },
     )
     components["tool_use_context"] = context
