@@ -906,6 +906,63 @@ class KnowledgeRagConfig(BaseModel):
 
 
 # ─────────────────────────────────────────────
+# 컨텍스트 예산 설정 — 하드코딩 외부화 (2026-07-03, B200 티어 준비 Phase 1)
+# ─────────────────────────────────────────────
+class ContextBudgetConfig(BaseModel):
+    """
+    컨텍스트 예산(context budget) 설정 — 여기저기 하드코딩돼 있던 토큰/청크
+    상한값을 한곳에 모은 것.
+
+    왜 모으는가:
+      그동안 RAG 주입 토큰 수, 도구 결과 예산, 문서 청크 크기, 출력 토큰
+      에스컬레이션 단계 등이 각 소비 파일(prompt_assembler / context_manager /
+      document_tool / query_loop)에 상수로 박혀 있었다. RTX 5090(TIER_S,
+      8K 컨텍스트) 기준으로 잡힌 값이라, 컨텍스트가 훨씬 큰 B200/H200 티어에서는
+      그대로 두면 큰 컨텍스트를 못 살린다. 이 모델로 모아두면 티어별 config
+      (예: B200용 nexus_config)에서 한 번에 상향 오버라이드할 수 있다.
+
+    ★무회귀 원칙★:
+      아래 모든 기본값은 "현재(2026-07-03) 각 파일에 하드코딩돼 있던 실측 값"과
+      정확히 동일하다. 즉 이 섹션을 yaml에 쓰지 않아도(=기본값으로만 동작해도)
+      5090(TIER_S)·기존 테스트 동작이 1비트도 바뀌지 않는다. B200 상향은 별도
+      config에서 이 값들을 덮어쓰는 후속 작업으로 처리한다.
+    """
+
+    # ── RAG/프롬프트 조립 예산 (출처: core/orchestrator/prompt_assembler.py) ──
+    # ① 이전 턴 요약(TurnState) 주입 상한. _attach_turn_state()에서
+    #    turn_state_store.get_context(max_tokens=...)로 쓰이던 값(현행 1000).
+    turn_state_tokens: int = 1000
+    # ② 프로젝트 RAG(관련 파일 청크) 주입 상한. _attach_project_rag()에서
+    #    rag_retriever.get_context(max_tokens=...)로 쓰이던 값(현행 1500).
+    project_rag_tokens: int = 1500
+    # ③ 지식베이스(KB) RAG 주입 상한. _attach_knowledge_base()에서
+    #    knowledge_retriever.get_context(max_tokens=...)로 쓰이던 값(현행 1000).
+    knowledge_rag_tokens: int = 1000
+
+    # ── 컨텍스트 압축 예산 (출처: core/orchestrator/context_manager.py 생성자) ──
+    # ④ 개별 도구 결과(tool_result)의 최대 토큰 수. 초과분은 head+tail로 잘린다.
+    #    ContextManager(tool_result_budget=2048) 생성자 기본값과 동일(현행 2048).
+    tool_result_budget: int = 2048
+    # ⑤ 압축 시에도 항상 원본 보존할 최근 턴 수(현행 3).
+    preserve_recent_turns: int = 3
+    # ⑥ 압축 시에도 항상 원본 보존할 최근 도구 결과 수(현행 2).
+    preserve_recent_tool_results: int = 2
+
+    # ── 문서 도구 예산 (출처: core/tools/implementations/document_tool.py) ──
+    # ⑦ DocumentProcess 도구가 문서를 나눌 청크 크기(글자 수). 8192 ctx 기준으로
+    #    tool_result가 컨텍스트를 넘지 않도록 잡은 값(현행 CHUNK_SIZE=2500).
+    document_chunk_size: int = 2500
+
+    # ── 출력 토큰 에스컬레이션 (출처: core/orchestrator/query_loop.py) ──
+    # ⑧ 응답이 max_tokens로 잘렸을 때 출력 한도를 점진 상향하는 단계.
+    #    query_loop의 OUTPUT_TOKEN_ESCALATION 상수와 동일(현행 [4096,8192,16384]).
+    #    list 기본값이므로 mutable 공유를 피하려 default_factory를 쓴다.
+    output_token_escalation: list[int] = Field(
+        default_factory=lambda: [4096, 8192, 16384]
+    )
+
+
+# ─────────────────────────────────────────────
 # 메인 설정 클래스 (Pydantic BaseSettings)
 # ─────────────────────────────────────────────
 class NexusConfig(BaseSettings):
@@ -1006,6 +1063,11 @@ class NexusConfig(BaseSettings):
 
     # v7.2 MCP 통합 — LAN 내부 MCP 서버 연결 (기본 비활성, 에어갭 fail-closed)
     mcp: McpConfig = Field(default_factory=McpConfig)
+
+    # 컨텍스트 예산 — 하드코딩 외부화(2026-07-03, B200 Phase 1)
+    # 기본값=현행 5090(TIER_S) 하드코딩 값과 동일 → 미지정 시 무회귀.
+    # B200/H200 티어는 별도 config에서 이 섹션을 상향 오버라이드한다.
+    context_budgets: ContextBudgetConfig = Field(default_factory=ContextBudgetConfig)
 
     # 하드웨어 티어 — Scout 활성화/컨텍스트 길이 등 동작을 좌우한다.
     # "auto"면 GPU VRAM을 감지해 TIER_S/M/L 등을 자동 결정한다. 특정 티어를

@@ -110,6 +110,9 @@ class ModelDispatcher:
         repetition_penalty: float = 1.0,
         frequency_penalty: float = 0.0,
         presence_penalty: float = 0.0,
+        # 출력 토큰 에스컬레이션 단계(하드코딩 외부화). None이면 query_loop이
+        # 모듈 상수로 폴백 → 무회귀. QueryEngine이 config 값을 넘겨준다.
+        output_token_escalation: list[int] | None = None,
     ) -> AsyncGenerator[StreamEvent | Message, None]:
         """
         Worker query_loop으로 직행한다 (passthrough).
@@ -140,6 +143,8 @@ class ModelDispatcher:
             repetition_penalty=repetition_penalty,
             frequency_penalty=frequency_penalty,
             presence_penalty=presence_penalty,
+            # 출력 토큰 에스컬레이션 단계 passthrough (None이면 상수 폴백).
+            output_token_escalation=output_token_escalation,
         ):
             yield event
 

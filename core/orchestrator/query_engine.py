@@ -29,7 +29,7 @@ import uuid
 from collections.abc import AsyncGenerator
 from typing import Any
 
-from core.config import RoutingConfig
+from core.config import ContextBudgetConfig, RoutingConfig
 from core.message import (
     Message,
     StreamEvent,
@@ -41,7 +41,7 @@ from core.orchestrator.context_manager import ContextManager
 from core.orchestrator.prompt_assembler import PromptAssembler
 from core.orchestrator.query_loop import query_loop
 from core.orchestrator.routing import (
-    RoutingDecision,
+    RoutingDecision,  # noqa: F401 — 하위 호환 export
     RoutingResolver,
     _resolve_profile,  # noqa: F401 — 하위 호환 export
     classify_query,  # noqa: F401 — 하위 호환 export
@@ -88,6 +88,9 @@ class QueryEngine:
         memory_manager: Any | None = None,
         transcript: Any | None = None,
         knowledge_retriever: Any | None = None,
+        # 컨텍스트 예산(하드코딩 외부화, 2026-07-03). None이면 PromptAssembler·
+        # query_loop이 각자 현행 상수로 폴백 → 기존 호출부(테스트 포함) 동작 불변.
+        context_budgets: ContextBudgetConfig | None = None,
     ) -> None:
         """
         QueryEngine을 초기화한다.
@@ -133,10 +136,28 @@ class QueryEngine:
         # 라우팅·시스템 프롬프트 조립은 별도 객체로 캡슐화 (2026-04-21 리팩토링)
         # → submit_message()가 조율만 담당, 세부 로직은 Resolver/Assembler가 담당.
         self._router = RoutingResolver(self._routing_config)
+        # 컨텍스트 예산 보관 — None이면 하위(PromptAssembler/query_loop)가 현행
+        # 상수로 폴백한다(무회귀). B200 티어는 bootstrap이 config 값을 주입한다.
+        self._context_budgets = context_budgets
+        # PromptAssembler에 RAG/프롬프트 예산을 전달. 예산이 없으면 None을 넘겨
+        # PromptAssembler 내부 기본 상수(현행값)로 폴백시킨다.
         self._prompt_assembler = PromptAssembler(
             turn_state_store=turn_state_store,
             rag_retriever=rag_retriever,
             knowledge_retriever=None,  # 아래 setattr 이후 바인딩
+            turn_state_tokens=(
+                context_budgets.turn_state_tokens if context_budgets else None
+            ),
+            project_rag_tokens=(
+                context_budgets.project_rag_tokens if context_budgets else None
+            ),
+            knowledge_rag_tokens=(
+                context_budgets.knowledge_rag_tokens if context_budgets else None
+            ),
+        )
+        # 출력 토큰 에스컬레이션 — query_loop/dispatcher로 넘길 값(없으면 None).
+        self._output_token_escalation = (
+            context_budgets.output_token_escalation if context_budgets else None
         )
 
         # Ch 16 세션 영속화: MemoryManager와 트랜스크립트
@@ -244,6 +265,8 @@ class QueryEngine:
                 repetition_penalty=decision.repetition_penalty,
                 frequency_penalty=decision.frequency_penalty,
                 presence_penalty=decision.presence_penalty,
+                # 출력 토큰 에스컬레이션 단계(config 값, None이면 상수 폴백).
+                output_token_escalation=self._output_token_escalation,
             )
         else:
             # 폴백 — dispatcher 주입이 없는 경우 기존 단일 Worker 경로
@@ -265,6 +288,8 @@ class QueryEngine:
                 repetition_penalty=decision.repetition_penalty,
                 frequency_penalty=decision.frequency_penalty,
                 presence_penalty=decision.presence_penalty,
+                # 출력 토큰 에스컬레이션 단계(config 값, None이면 상수 폴백).
+                output_token_escalation=self._output_token_escalation,
             )
 
         # ─── 스트림 소비 ─────────────────────────────────

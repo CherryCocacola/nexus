@@ -2607,3 +2607,47 @@ H200(141GB)의 32~128K 컨텍스트에서 자연 해소**. db/kowiki 둘 다 Wor
 - PDF 고품질(Docling) + 스캔 OCR(Tesseract/PaddleOCR) 고품질 파서(어댑터 슬롯).
 - `.hwp`(LibreOffice 변환), `scripts/prepare_documents.py` 배치 스크립트.
 - yaml `mcp.servers` 를 실제 구현 서버(db/diag/kowiki/docingest)로 정렬(docutil 제거).
+
+---
+
+## 2026-07-03 — B200 배포 준비: 보안 하드닝 (branch feature/b200-bakeoff)
+
+B200 정부 컨테이너에 "완벽한 버전" Nexus를 올리기 전, 지난 감사 Critical 8건 중
+보안 최우선 항목을 **배포 선결 조건으로 승격**해 착수. (승인 플랜: B200 bake-off)
+현재 디렉토리(D:\workspace\nexus)는 그대로 두고 worktree D:\workspace\nexus-b200 에서 진행.
+
+### A. Critical #4 — 자격증명 평문 제거 + 웹 API 키 인증 (커밋 6cd1eb1)
+
+- **diag_server.py**: GPU 평문 비번 하드코딩 제거 → `NEXUS_DIAG_GPU_PASS` 환경변수,
+  미설정 시 GPU SSH 점검만 fail-soft 생략(웹/DB 점검은 정상). 죽은 PG 상수 4개
+  (평문 `idino@12` 포함) 삭제.
+- **web 인증**: `ApiKeyAuthMiddleware` 신설 — `WebAuthConfig.enabled`(기본 False=무회귀)
+  활성 시 `Authorization: Bearer`를 `TenantRegistry.resolve_by_api_key`로 검증, 실패는
+  모두 401(fail-closed). 면제 경로·OPTIONS만 통과. CORS 뒤 등록. `enabled is True`
+  명시 체크로 비-bool truthy 오활성 차단.
+- **config 시크릿**: `nexus_config.yaml`의 PG/Redis 평문 비번 제거 →
+  `load_and_validate_config`에서 `NEXUS_PG_PASSWORD`/`NEXUS_REDIS_PASSWORD` 주입.
+  yaml을 `NexusConfig(**file_data)` init 인자로 넘기는 구조상 "init>env" 우선순위
+  quirk를 피하려 file_data에 직접 주입. 원격 DB 빈 비번 시 경고 로그.
+- **테스트 27건 추가**: `test_web_auth_middleware.py`(18), `test_diag_server_credentials.py`(4),
+  `test_config_secret_injection.py`(5). 관련 회귀 **269 passed** 무회귀.
+- **배포 시 필수**: `NEXUS_WEB_AUTH__ENABLED=true` + 테넌트 `api_keys`,
+  `NEXUS_PG_PASSWORD`/`NEXUS_REDIS_PASSWORD`, (GPU 진단 쓰면) `NEXUS_DIAG_GPU_PASS`.
+
+### 후속(별도 트랙, 미착수)
+
+- Critical #1~3(권한 파이프라인 배선·ASK fail-open·PathGuard/CommandFilter),
+  #5~8(웹 QueryEngine 싱글톤 동시성·메모리 감쇠 복리·consolidate 세션 파괴·컨텍스트
+  복구 도달 불가) — B/C 이후 순차.
+- `web/app.py`의 `RequestLoggingMiddleware`가 `add_middleware` 미등록(기존 구조).
+- git 이력에는 과거 평문 비번이 잔존 → 실 배포 전 자격증명 rotate 권장.
+
+### B. B200 티어 활성화 (진행 중) — 플랜 Phase 1
+
+- **B1 완료**: `ContextBudgetConfig` 외부화(하드코딩 컨텍스트 예산 8종 → yaml).
+  - `core/config.py`에 `ContextBudgetConfig` 신설(기본값=현행값 정확 일치), `NexusConfig.context_budgets` 배선.
+  - 배선: bootstrap→QueryEngine→(PromptAssembler / ModelDispatcher→query_loop) + document_tool(context.options) + web/app.py(운영 진입점, getattr 방어). 모두 **None이면 현행 상수 폴백=무회귀**.
+  - 무회귀: 기본값 8종 = HEAD 하드코딩값 정확 일치(1000/1500/1000/2048/3/2/2500/[4096,8192,16384]),
+    전체 unit+integration **1327 passed** 무회귀. 회귀테스트 `test_context_budget_config.py` 추가.
+- B2(web/cli 도구풀·프롬프트 티어 연동, `worker_system_full.md`), B3(`nexus_config.b200.yaml` +
+  HyperCLOVA 프롬프트 어댑터) — 순차 진행 예정.

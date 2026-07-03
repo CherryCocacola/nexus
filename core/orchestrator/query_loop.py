@@ -145,6 +145,11 @@ async def query_loop(
     repetition_penalty: float = 1.0,
     frequency_penalty: float = 0.0,
     presence_penalty: float = 0.0,
+    # 출력 토큰 에스컬레이션 단계(하드코딩 외부화, 2026-07-03).
+    # None이면 모듈 상수 OUTPUT_TOKEN_ESCALATION으로 폴백 → 기존 호출부(테스트
+    # 포함)는 [4096,8192,16384] 그대로 사용해 동작 불변(무회귀). config 값은
+    # bootstrap→QueryEngine→(dispatcher.route/폴백 query_loop) 경로로 주입된다.
+    output_token_escalation: list[int] | None = None,
 ) -> AsyncGenerator[StreamEvent | Message, None]:
     """
     핵심 에이전트 턴 루프.
@@ -191,6 +196,10 @@ async def query_loop(
     # stop_resolver: 매 턴 끝에서 "도구 호출이 남았는지"를 판정해 계속/종료를 결정한다.
     state = LoopState(messages=messages)
     stop_resolver = StopResolver()
+
+    # 출력 토큰 에스컬레이션 단계 확정 — 주입값 우선, 미주입 시 모듈 상수 폴백.
+    # (하드코딩 외부화 무회귀: config 미주입 경로/기존 테스트는 상수 그대로 사용)
+    escalation_steps = output_token_escalation or OUTPUT_TOKEN_ESCALATION
 
     # ── while(True) 에이전트 턴 루프 (Tier 2의 심장부) ──
     # 모델이 도구 사용을 멈추거나(정상 종료), 7가지 Continue Transition 중 하나로
@@ -573,7 +582,9 @@ async def query_loop(
             for msg in reversed(state.messages):
                 role = msg.role if isinstance(msg.role, str) else msg.role.value
                 if role == "user":
-                    _user_req = msg.text_content if hasattr(msg, "text_content") else str(msg.content)
+                    _user_req = (
+                        msg.text_content if hasattr(msg, "text_content") else str(msg.content)
+                    )
                     break
 
             turn_state = extract_turn_state(
@@ -607,18 +618,18 @@ async def query_loop(
                         # 현재 max_tokens가 에스컬레이션 단계(4K/8K/16K) 중 하나면
                         # 그 다음 단계로, 아니면 0번(4K)부터 시작한다.
                         current_idx = (
-                            OUTPUT_TOKEN_ESCALATION.index(max_tokens)
-                            if max_tokens in OUTPUT_TOKEN_ESCALATION
+                            escalation_steps.index(max_tokens)
+                            if max_tokens in escalation_steps
                             else 0
                         )
                         # 마지막 단계(16K)를 넘지 않도록 min으로 상한을 건다.
                         next_idx = min(
                             current_idx + 1,
-                            len(OUTPUT_TOKEN_ESCALATION) - 1,
+                            len(escalation_steps) - 1,
                         )
                         # override를 세팅하면 다음 턴 Phase 1에서 동적 계산 대신
                         # 이 값을 그대로 max_tokens로 사용한다.
-                        state.max_output_tokens_override = OUTPUT_TOKEN_ESCALATION[next_idx]
+                        state.max_output_tokens_override = escalation_steps[next_idx]
                         state.continue_reason = ContinueReason.MAX_OUTPUT_TOKENS_ESCALATE
                         logger.info(
                             f"출력 토큰 에스컬레이션: "

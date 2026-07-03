@@ -187,6 +187,9 @@ async def init_phase2(state: GlobalState) -> dict:
             "task_manager": task_manager,
             "agent_registry": agent_registry,
             "model_provider": provider,
+            # 문서 청크 크기 — 하드코딩 외부화(2026-07-03). DocumentProcess 도구가
+            # 이 값을 읽어 청크를 나눈다. 미주입 시 도구가 CHUNK_SIZE(2500)로 폴백.
+            "document_chunk_size": config.context_budgets.document_chunk_size,
         },
     )
     components["tool_use_context"] = context
@@ -470,16 +473,26 @@ async def init_phase2(state: GlobalState) -> dict:
     # 기존 동작과 호환: QueryEngine은 None도 허용하므로 주입 없이도 동작함
     from core.orchestrator.context_manager import ContextManager
 
+    # 컨텍스트 예산을 config에서 주입(하드코딩 외부화, 2026-07-03).
+    # 기본값=현행 하드코딩 값(2048/3/2)이라 미지정 시 동작 불변(무회귀).
+    _budgets = config.context_budgets
     context_manager = ContextManager(
         model_provider=provider,
         max_context_tokens=config.model.max_context_tokens,
+        tool_result_budget=_budgets.tool_result_budget,
+        preserve_recent_turns=_budgets.preserve_recent_turns,
+        preserve_recent_tool_results=_budgets.preserve_recent_tool_results,
         tier=tier,  # HardwareTier 전달 → TIER_S에서는 자동 pass-through
     )
     components["context_manager"] = context_manager
     logger.info(
-        "[Phase 2] ContextManager 초기화: tier=%s, passthrough=%s",
+        "[Phase 2] ContextManager 초기화: tier=%s, passthrough=%s, "
+        "budgets(tool_result=%d, recent_turns=%d, recent_tool_results=%d)",
         tier.value,
         context_manager.passthrough,
+        _budgets.tool_result_budget,
+        _budgets.preserve_recent_turns,
+        _budgets.preserve_recent_tool_results,
     )
 
     # ⑫ QueryEngine — Tier 1 세션 오케스트레이터
@@ -507,6 +520,7 @@ async def init_phase2(state: GlobalState) -> dict:
         memory_manager=memory_manager,  # Ch 16: Redis + tb_memories 자동 저장
         transcript=cli_transcript,  # Ch 16: JSONL 영구 기록
         knowledge_retriever=knowledge_retriever,  # Part 2.5.8: tb_knowledge RAG
+        context_budgets=_budgets,  # 하드코딩 외부화(2026-07-03): RAG 예산 + 출력 에스컬레이션
     )
     components["query_engine"] = engine
     logger.info(

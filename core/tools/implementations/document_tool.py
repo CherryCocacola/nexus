@@ -130,6 +130,11 @@ class DocumentProcessTool(BaseTool):
         if not path.exists():
             return ToolResult.error(f"파일을 찾을 수 없습니다: {file_path}")
 
+        # 청크 크기 확정 — 하드코딩 외부화(2026-07-03). bootstrap이 config의
+        # context_budgets.document_chunk_size를 ToolUseContext.options에 주입한다.
+        # 미주입(테스트/경량 경로)이면 모듈 상수 CHUNK_SIZE(현행 2500)로 폴백 → 무회귀.
+        chunk_size = context.options.get("document_chunk_size") or CHUNK_SIZE
+
         # 청크 캐시 확인 또는 새로 파싱
         cache_key = str(path.resolve())
         if cache_key not in _document_cache:
@@ -139,8 +144,8 @@ class DocumentProcessTool(BaseTool):
                 logger.error("문서 파싱 실패: %s — %s", file_path, e)
                 return ToolResult.error(f"문서 파싱 실패: {type(e).__name__}: {e}")
 
-            # 청크로 분할
-            _document_cache[cache_key] = self._split_chunks(full_text)
+            # 청크로 분할 (확정한 chunk_size 사용)
+            _document_cache[cache_key] = self._split_chunks(full_text, chunk_size)
 
         chunks = _document_cache[cache_key]
         total_chunks = len(chunks)
@@ -199,12 +204,15 @@ class DocumentProcessTool(BaseTool):
     # ─── 청크 분할 ───
 
     @staticmethod
-    def _split_chunks(text: str) -> list[str]:
+    def _split_chunks(text: str, chunk_size: int = CHUNK_SIZE) -> list[str]:
         """
-        텍스트를 CHUNK_SIZE 단위로 분할한다.
+        텍스트를 chunk_size 단위로 분할한다.
         단락(빈 줄) 경계에서 나누어 문맥이 끊기지 않도록 한다.
+
+        chunk_size 기본값은 모듈 상수 CHUNK_SIZE(현행 2500) — 인자 없이 호출하는
+        기존 코드/테스트는 동작 불변(무회귀). 호출부(call)는 config에서 받은 값을 넘긴다.
         """
-        if len(text) <= CHUNK_SIZE:
+        if len(text) <= chunk_size:
             return [text]
 
         chunks: list[str] = []
@@ -214,7 +222,7 @@ class DocumentProcessTool(BaseTool):
 
         for para in paragraphs:
             para_len = len(para) + 1  # +1 for newline
-            if current_len + para_len > CHUNK_SIZE and current_chunk:
+            if current_len + para_len > chunk_size and current_chunk:
                 chunks.append("\n".join(current_chunk))
                 current_chunk = []
                 current_len = 0

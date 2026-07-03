@@ -26,6 +26,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("nexus.orchestrator.prompt_assembler")
 
+# ─── 예산 폴백 상수 (하드코딩 외부화 무회귀용) ───────────────
+# 생성자에 예산이 주입되지 않으면 아래 현행 값으로 폴백한다. 값의 단일 출처는
+# core/config.py ContextBudgetConfig이며, 이 상수는 그 기본값과 반드시 동일하게
+# 유지한다(테스트·경량 환경에서 config 없이 생성해도 기존 동작 보장 = 무회귀).
+_DEFAULT_TURN_STATE_TOKENS = 1000  # 이전 턴 요약 주입 상한(현행)
+_DEFAULT_PROJECT_RAG_TOKENS = 1500  # 프로젝트 RAG 주입 상한(현행)
+_DEFAULT_KNOWLEDGE_RAG_TOKENS = 1000  # 지식베이스 RAG 주입 상한(현행)
+
 
 class PromptAssembler:
     """system_prompt 조립을 한 객체로 캡슐화.
@@ -38,10 +46,29 @@ class PromptAssembler:
         turn_state_store: Any | None = None,
         rag_retriever: Any | None = None,
         knowledge_retriever: Any | None = None,
+        # ── 컨텍스트 예산 주입 (하드코딩 외부화, 2026-07-03) ──
+        # None이면 현행 상수로 폴백 → 기존 호출부(테스트 포함)는 동작 불변(무회귀).
+        # bootstrap→QueryEngine 경로에서 config.context_budgets 값이 주입된다.
+        turn_state_tokens: int | None = None,
+        project_rag_tokens: int | None = None,
+        knowledge_rag_tokens: int | None = None,
     ) -> None:
         self._turn_state_store = turn_state_store
         self._rag_retriever = rag_retriever
         self._knowledge_retriever = knowledge_retriever
+        # 예산 확정 — 주입값 우선, 미주입 시 현행 상수 폴백(무회귀).
+        self._turn_state_tokens = (
+            turn_state_tokens if turn_state_tokens is not None
+            else _DEFAULT_TURN_STATE_TOKENS
+        )
+        self._project_rag_tokens = (
+            project_rag_tokens if project_rag_tokens is not None
+            else _DEFAULT_PROJECT_RAG_TOKENS
+        )
+        self._knowledge_rag_tokens = (
+            knowledge_rag_tokens if knowledge_rag_tokens is not None
+            else _DEFAULT_KNOWLEDGE_RAG_TOKENS
+        )
 
     async def assemble(
         self,
@@ -91,7 +118,9 @@ class PromptAssembler:
         if self._turn_state_store is None:
             return prompt
         try:
-            prev = self._turn_state_store.get_context(session_id, max_tokens=1000)
+            prev = self._turn_state_store.get_context(
+                session_id, max_tokens=self._turn_state_tokens
+            )
         except Exception as e:
             logger.debug("TurnState 조회 실패 (무시): %s", e)
             return prompt
@@ -107,7 +136,9 @@ class PromptAssembler:
         if self._rag_retriever is None:
             return prompt
         try:
-            ctx = await self._rag_retriever.get_context(user_input, max_tokens=1500)
+            ctx = await self._rag_retriever.get_context(
+                user_input, max_tokens=self._project_rag_tokens
+            )
         except Exception as e:
             logger.debug("RAG 검색 실패 (무시): %s", e)
             return prompt
@@ -135,7 +166,7 @@ class PromptAssembler:
         try:
             kb_ctx = await self._knowledge_retriever.get_context(
                 user_input,
-                max_tokens=1000,
+                max_tokens=self._knowledge_rag_tokens,
                 allowed_sources=decision.allowed_knowledge_sources,
             )
         except Exception as e:

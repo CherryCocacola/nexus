@@ -219,6 +219,12 @@ def _build_web_query_engine(components: dict, state: Any) -> Any:
     scout_tools = components.get("scout_tools") or []
     combined_pool = _combine_scout_pool(web_tools, scout_tools)
 
+    # 컨텍스트 예산(하드코딩 외부화, 2026-07-03). 실 NexusConfig에는 항상 존재하나,
+    # 부분 config/테스트 더블에는 없을 수 있어 getattr로 방어(없으면 None → 하위가
+    # 현행 상수로 폴백 = 무회귀). fail-closed가 아니라 fail-safe: 예산 미제공이
+    # 곧 "현행 기본값 사용"을 의미하므로 엔진 조립을 막지 않는다.
+    _web_budgets = getattr(state.config, "context_budgets", None)
+
     # AgentTool·SymbolSearchTool이 해석할 의존성 일체를 options에 주입
     web_context = ToolUseContext(
         cwd=state.cwd or ".",
@@ -232,6 +238,11 @@ def _build_web_query_engine(components: dict, state: Any) -> Any:
             "scout_provider": components.get("scout_provider"),
             "available_tools": combined_pool,
             "symbol_store": components.get("symbol_store"),  # Phase 10.0
+            # 문서 청크 크기 — 하드코딩 외부화(2026-07-03). DocumentProcess가 읽음.
+            # 예산 미제공(None)이면 도구가 CHUNK_SIZE(2500)로 폴백.
+            "document_chunk_size": (
+                _web_budgets.document_chunk_size if _web_budgets else None
+            ),
         },
     )
 
@@ -256,6 +267,9 @@ def _build_web_query_engine(components: dict, state: Any) -> Any:
         system_prompt=_load_worker_system_prompt(components.get("agent_registry")),
         max_turns=200,
         routing_config=state.config.routing,
+        # 컨텍스트 예산(하드코딩 외부화, 2026-07-03) — RAG 주입 예산 + 출력
+        # 토큰 에스컬레이션. 실 config는 항상 존재, 없으면 None → 현행 상수 폴백.
+        context_budgets=_web_budgets,
     )
     # web_tools(= MCP 머지 후 실제 Worker 도구 풀)를 반환한다. 이전엔 bare
     # web_registry를 반환했는데, 그것은 MCP 머지 전 5개만 담고 있어 /v1/tools가

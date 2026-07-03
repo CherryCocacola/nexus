@@ -323,6 +323,27 @@ mcp:
       # 재사용용으로 유지한다(설정에는 남기되 Worker 도구 풀에서만 제외).
       expose_to_worker: false
 
+# =============================================================================
+# 컨텍스트 예산 (context budgets) — 하드코딩 외부화 (2026-07-03, B200 Phase 1)
+# 여기 적힌 값은 전부 RTX 5090(TIER_S, 8K) 기준 "현행 하드코딩 값"과 동일하다.
+# ★이 섹션을 통째로 지워도 코드 기본값(core/config.py ContextBudgetConfig)이
+#  똑같은 값으로 동작하므로 무회귀★. B200/H200 티어는 별도 config에서 이 값들을
+#  상향 오버라이드한다(현재 파일은 5090 현행값을 명시만 해둔 것).
+# =============================================================================
+context_budgets:
+  # RAG/프롬프트 조립 주입 상한 (출처: prompt_assembler.py)
+  turn_state_tokens: 1000        # 이전 턴 요약(TurnState) 주입 상한
+  project_rag_tokens: 1500       # 프로젝트 RAG(관련 파일 청크) 주입 상한
+  knowledge_rag_tokens: 1000     # 지식베이스(KB) RAG 주입 상한
+  # 컨텍스트 압축 예산 (출처: context_manager.py 생성자)
+  tool_result_budget: 2048       # 개별 도구 결과 최대 토큰 수(초과분 head+tail 절단)
+  preserve_recent_turns: 3       # 압축해도 원본 보존할 최근 턴 수
+  preserve_recent_tool_results: 2  # 압축해도 원본 보존할 최근 도구 결과 수
+  # 문서 도구 청크 크기 (출처: document_tool.py CHUNK_SIZE)
+  document_chunk_size: 2500      # DocumentProcess가 문서를 나눌 청크 글자 수
+  # 출력 토큰 에스컬레이션 단계 (출처: query_loop.py OUTPUT_TOKEN_ESCALATION)
+  output_token_escalation: [4096, 8192, 16384]  # 응답 잘림 시 출력 한도 점진 상향
+
 # 운영 설정
 log_level: "INFO"      # 로그 레벨 (DEBUG/INFO/WARNING/ERROR)
 log_file: null         # 파일 로그 경로 — null이면 콘솔(stderr)만 사용
