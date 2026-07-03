@@ -28,6 +28,7 @@ import os
 import re
 import time
 import uuid
+from collections import OrderedDict
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -215,20 +216,26 @@ def _load_worker_system_prompt(agent_registry: Any | None, tier: Any = None) -> 
     return base
 
 
-def _build_web_query_engine(components: dict, state: Any) -> Any:
+def _build_web_engine_parts(components: dict, state: Any) -> dict:
     """
-    Phase 2 부트스트랩 결과를 받아 웹 전용 QueryEngine을 조립한다.
+    요청과 무관한(상태 없는) 무거운 부품을 '한 번만' 조립해 모아 반환한다.
 
-    독립 함수로 분리한 이유 (2026-04-21 리팩토링):
-      - lifespan()이 한 함수에 너무 많은 책임을 짊어졌던 것을 분해
-      - 단위 테스트에서 mock components로 QueryEngine 조립 경로를 검증 가능
+    왜 분리하는가 (동시성 결함 수정 — 감사 Critical #5, 2026-07-03):
+      기존에는 QueryEngine을 앱 전역 싱글톤 1개로 두고, 모든 HTTP 요청이 그 하나의
+      `_messages`/`_session_id`/tenant 상태를 락 없이 덮어써서 두 사용자의 대화·
+      테넌트가 뒤섞였다(멀티테넌트 프로덕션 최대 블로커). 이를 고치려면 요청/세션
+      별로 **독립된 QueryEngine 상태**를 써야 한다. 다만 도구 레지스트리 생성·시스템
+      프롬프트 조립·MCP 머지는 무겁고 '요청과 무관'하므로, 여기서 딱 한 번 만들고
+      모든 세션이 공유 재사용한다. 세션별로 격리하는 건 오직 _messages/_session_id/
+      tenant/context 뿐이다(→ _assemble_session_engine).
 
-    반환값: (query_engine, web_dispatcher, combined_pool) — _app_state에 저장할 것들.
+    공유해도 안전한 이유(내부 mutable 상태 없음):
+      model_provider·tool 인스턴스·knowledge_retriever·memory_manager 등은 요청별
+      가변 상태를 인스턴스 필드에 담지 않고, 호출 시점에 넘어오는 context/인자로
+      동작한다. 따라서 여러 세션이 동시에 참조해도 서로를 오염시키지 않는다.
+      (반대로 tenant/cwd는 요청마다 다르므로 반드시 세션 context로 격리한다.)
     """
     from core.bootstrap import _create_web_tool_registry
-    from core.orchestrator.model_dispatcher import ModelDispatcher
-    from core.orchestrator.query_engine import QueryEngine
-    from core.tools.base import ToolUseContext
 
     # 하드웨어 티어를 넘겨 웹 도구 풀을 티어별로 구성한다(B200 Phase 2).
     # TIER_S: 현행 5개, TIER_M/L: +Read/Glob/Grep/LS/DocumentProcess/GitDiff.
@@ -254,83 +261,156 @@ def _build_web_query_engine(components: dict, state: Any) -> Any:
     # 곧 "현행 기본값 사용"을 의미하므로 엔진 조립을 막지 않는다.
     _web_budgets = getattr(state.config, "context_budgets", None)
 
-    # ── 웹 세션 샌드박스 작업 디렉토리(결정 #1) ──
-    # 웹 Worker가 파일을 쓸 때 프로젝트 루트가 아니라 세션별 격리 디렉토리
-    # ({sessions_dir}/{session_id}/workspace) 안으로 국한시킨다. PathGuard의
-    # cwd-scope 순회 검사가 이 디렉토리를 기준으로 동작하므로, 강제(enforce)
-    # 시 세션 밖(상위/시스템 경로) 쓰기가 자연히 차단된다.
-    #
-    # ★무회귀★: 이 cwd 변경은 파일도구의 상대경로 해석을 바꾸므로, 권한 강제가
-    # 꺼져 있을 때는 절대 적용하지 않는다. permission_enforcement.enabled=True일
-    # 때만 샌드박스로 전환하고, 기본(비활성)에서는 기존과 100% 동일하게
-    # state.cwd(프로젝트 루트)를 그대로 쓴다. 또한 config.session이 없는 경량
-    # 테스트 더블에서도 getattr 방어로 폴백해 회귀가 없다.
-    _sandbox_cwd = state.cwd or "."
+    # ── 세션 샌드박스 '입력값'만 보관 ──
+    # 실제 cwd 결정은 세션 ID가 정해지는 요청 시점(_session_sandbox_cwd)에서 한다.
+    # 예전엔 부트스트랩 시점의 state.session_id 하나로 cwd를 고정해, 모든 세션이
+    # 같은 샌드박스를 공유하는 잠재 결함이 있었다(이번 격리로 함께 해소).
     _pe_cfg = getattr(state.config, "permission_enforcement", None)
-    if getattr(_pe_cfg, "enabled", False):
-        _sessions_dir = getattr(getattr(state.config, "session", None), "sessions_dir", None)
-        if _sessions_dir and state.session_id:
-            _candidate = os.path.join(_sessions_dir, str(state.session_id), "workspace")
-            try:
-                os.makedirs(_candidate, exist_ok=True)
-                _sandbox_cwd = _candidate
-                logger.info("[web] 세션 샌드박스 작업 디렉토리: %s", _candidate)
-            except OSError as e:
-                # 디렉토리 생성 실패 시 기존 cwd로 폴백(본류를 막지 않는다).
-                logger.warning("[web] 세션 샌드박스 생성 실패, 기본 cwd 사용: %s", e)
+    _pe_enabled = bool(getattr(_pe_cfg, "enabled", False))
+    _sessions_dir = getattr(getattr(state.config, "session", None), "sessions_dir", None)
 
-    # AgentTool·SymbolSearchTool이 해석할 의존성 일체를 options에 주입
-    web_context = ToolUseContext(
-        cwd=_sandbox_cwd,
-        session_id=state.session_id,
-        permission_mode=state.permission_mode.value,
-        options={
-            "memory_manager": components.get("memory_manager"),
-            "task_manager": components.get("task_manager"),
-            "agent_registry": components.get("agent_registry"),
-            "model_provider": components["model_provider"],
-            "scout_provider": components.get("scout_provider"),
-            "available_tools": combined_pool,
-            "symbol_store": components.get("symbol_store"),  # Phase 10.0
-            # 문서 청크 크기 — 하드코딩 외부화(2026-07-03). DocumentProcess가 읽음.
-            # 예산 미제공(None)이면 도구가 CHUNK_SIZE(2500)로 폴백.
-            "document_chunk_size": (
-                _web_budgets.document_chunk_size if _web_budgets else None
-            ),
-        },
+    # AgentTool·SymbolSearchTool이 해석할 의존성 일체 — tenant를 제외한 '공용' 옵션.
+    # 세션별 assemble에서 {**base_options, "tenant": tenant}로 얕은 복제해 격리한다.
+    base_options = {
+        "memory_manager": components.get("memory_manager"),
+        "task_manager": components.get("task_manager"),
+        "agent_registry": components.get("agent_registry"),
+        "model_provider": components["model_provider"],
+        "scout_provider": components.get("scout_provider"),
+        "available_tools": combined_pool,
+        "symbol_store": components.get("symbol_store"),  # Phase 10.0
+        # 문서 청크 크기 — 하드코딩 외부화(2026-07-03). DocumentProcess가 읽음.
+        # 예산 미제공(None)이면 도구가 CHUNK_SIZE(2500)로 폴백.
+        "document_chunk_size": (
+            _web_budgets.document_chunk_size if _web_budgets else None
+        ),
+    }
+
+    # 시스템 프롬프트는 파일 읽기 + 서브에이전트 가이드 조립이라 비교적 무겁다 →
+    # 한 번만 만들어 문자열로 공유한다(요청마다 다시 읽지 않는다).
+    system_prompt = _load_worker_system_prompt(
+        components.get("agent_registry"), components.get("hardware_tier")
     )
 
-    web_dispatcher = ModelDispatcher(
-        tier=components["hardware_tier"],
-        worker_provider=components["model_provider"],
-        worker_tools=web_tools,
-        context=web_context,
-        scout_provider=components.get("scout_provider"),
-        scout_tools=scout_tools,
+    return {
+        "tier": components["hardware_tier"],
+        "worker_provider": components["model_provider"],
+        "scout_provider": components.get("scout_provider"),
+        "web_tools": web_tools,
+        "scout_tools": scout_tools,
+        "combined_pool": combined_pool,
+        "context_manager": components.get("context_manager"),
+        "memory_manager": components.get("memory_manager"),
+        "knowledge_retriever": components.get("knowledge_retriever"),
+        "system_prompt": system_prompt,
+        "routing_config": state.config.routing,
+        "budgets": _web_budgets,
+        "base_options": base_options,
+        "permission_mode": state.permission_mode.value,
+        "base_cwd": state.cwd or ".",
+        "pe_enabled": _pe_enabled,
+        "sessions_dir": _sessions_dir,
+    }
+
+
+def _session_sandbox_cwd(parts: dict, session_id: str) -> str:
+    """세션별 샌드박스 작업 디렉토리를 결정한다.
+
+    ★무회귀★: permission_enforcement.enabled=False(기본)면 항상 base_cwd(프로젝트
+    루트)를 그대로 쓴다 — 파일 도구의 상대경로 해석이 현행과 100% 동일. 강제가
+    켜진 경우에만 세션별 격리 디렉토리({sessions_dir}/{session_id}/workspace)로
+    전환한다. PathGuard의 cwd-scope 순회 검사가 이 디렉토리를 기준으로 동작하므로,
+    세션 밖(상위/시스템 경로) 쓰기가 자연히 차단된다.
+    """
+    base_cwd = parts["base_cwd"]
+    if parts["pe_enabled"] and parts["sessions_dir"] and session_id:
+        candidate = os.path.join(parts["sessions_dir"], str(session_id), "workspace")
+        try:
+            os.makedirs(candidate, exist_ok=True)
+            return candidate
+        except OSError as e:
+            # 디렉토리 생성 실패 시 기존 cwd로 폴백(본류를 막지 않는다).
+            logger.warning("[web] 세션 샌드박스 생성 실패, 기본 cwd 사용: %s", e)
+    return base_cwd
+
+
+def _assemble_session_engine(parts: dict, session_id: str, tenant: Any) -> tuple[Any, Any]:
+    """
+    공유 부품(parts)으로 '세션 전용' QueryEngine을 가볍게 조립한다.
+
+    반환: (engine, dispatcher). dispatcher를 engine.model_dispatcher로 되꺼내지 않고
+    직접 돌려주는 이유는, engine을 mock으로 대체하는 단위 테스트에서도 실제 조립된
+    dispatcher를 검증할 수 있게 하기 위함이다.
+
+    세션마다 새로 만드는 것(격리 대상):
+      - ToolUseContext: session_id / cwd(샌드박스) / options["tenant"]
+      - ModelDispatcher: 위 격리 context를 바인딩해 도구 실행이 올바른 tenant를 봄
+        (dispatcher.route → query_loop → 도구가 context.options["tenant"]를 읽는다.
+         만약 dispatcher를 공유하면 tenant가 세션 간 새어나간다 → 반드시 세션별 생성)
+      - QueryEngine: _messages / _session_id / _cumulative_usage 등 요청별 가변 상태
+
+    무거운 부품(도구 인스턴스·시스템 프롬프트·프로바이더·retriever)은 parts에서
+    공유 재사용한다. 이 조립은 객체 참조 저장 + 로그 몇 줄 수준이라 매우 가벼워
+    (수 마이크로초), 모델 추론(초 단위) 대비 무시할 만한 비용이다 → 요청/세션별
+    생성이 정당하다.
+    """
+    from core.orchestrator.model_dispatcher import ModelDispatcher
+    from core.orchestrator.query_engine import QueryEngine
+    from core.tools.base import ToolUseContext
+
+    context = ToolUseContext(
+        cwd=_session_sandbox_cwd(parts, session_id),
+        session_id=session_id,
+        permission_mode=parts["permission_mode"],
+        # 공용 base_options를 '새 dict'로 얕은 복제한 뒤 이 세션의 tenant만 얹는다.
+        # (원본 base_options를 mutate하지 않아야 다른 세션이 오염되지 않는다.)
+        options={**parts["base_options"], "tenant": tenant},
+    )
+
+    dispatcher = ModelDispatcher(
+        tier=parts["tier"],
+        worker_provider=parts["worker_provider"],
+        worker_tools=parts["web_tools"],
+        context=context,
+        scout_provider=parts["scout_provider"],
+        scout_tools=parts["scout_tools"],
         max_turns=200,
     )
 
     engine = QueryEngine(
-        model_provider=components["model_provider"],
-        tools=web_tools,
-        context=web_context,
-        model_dispatcher=web_dispatcher,
-        context_manager=components.get("context_manager"),
-        memory_manager=components.get("memory_manager"),
-        knowledge_retriever=components.get("knowledge_retriever"),
-        system_prompt=_load_worker_system_prompt(
-            components.get("agent_registry"), components.get("hardware_tier")
-        ),
+        model_provider=parts["worker_provider"],
+        tools=parts["web_tools"],
+        context=context,
+        model_dispatcher=dispatcher,
+        context_manager=parts["context_manager"],
+        memory_manager=parts["memory_manager"],
+        knowledge_retriever=parts["knowledge_retriever"],
+        system_prompt=parts["system_prompt"],
         max_turns=200,
-        routing_config=state.config.routing,
+        routing_config=parts["routing_config"],
         # 컨텍스트 예산(하드코딩 외부화, 2026-07-03) — RAG 주입 예산 + 출력
         # 토큰 에스컬레이션. 실 config는 항상 존재, 없으면 None → 현행 상수 폴백.
-        context_budgets=_web_budgets,
+        context_budgets=parts["budgets"],
     )
-    # web_tools(= MCP 머지 후 실제 Worker 도구 풀)를 반환한다. 이전엔 bare
-    # web_registry를 반환했는데, 그것은 MCP 머지 전 5개만 담고 있어 /v1/tools가
-    # 모델이 실제로 보는 도구와 어긋났다(MCP 도구 누락). 이제 실제 풀을 노출한다.
-    return engine, web_dispatcher, web_tools
+    return engine, dispatcher
+
+
+def _build_web_query_engine(components: dict, state: Any) -> Any:
+    """
+    (하위 호환) Phase 2 부트스트랩 결과로 웹 QueryEngine 1개를 조립해
+    (query_engine, dispatcher, web_tools) 3-튜플로 반환한다.
+
+    동시성 수정(2026-07-03) 이후 실제 요청 처리는 세션별 엔진
+    (_acquire_session_engine → _assemble_session_engine)을 쓴다. 이 함수는 부품
+    조립 + MCP 머지 결과를 검증하는 기존 단위 테스트(tests/unit/test_mcp_web_pool.py)
+    와의 계약(3-튜플 반환, web_tools에 MCP 머지)을 유지하기 위해 남긴다.
+
+    web_tools(= MCP 머지 후 실제 Worker 도구 풀)를 반환한다 — /v1/tools가 모델이
+    실제로 보는 도구와 일치하도록.
+    """
+    parts = _build_web_engine_parts(components, state)
+    engine, dispatcher = _assemble_session_engine(parts, state.session_id or "", tenant=None)
+    return engine, dispatcher, parts["web_tools"]
 
 
 # ─────────────────────────────────────────────
@@ -468,7 +548,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # RTX 5090 (8192 ctx)에서 도구 24개(~6,102토큰)는 컨텍스트 초과.
         # 핵심 도구 8개(~1,851토큰)만 사용하여 입력+출력 공간 확보.
         # (2026-04-21 리팩토링 3: 인라인 조립 로직을 _build_web_query_engine으로 분리)
-        web_engine, web_dispatcher, web_tools = _build_web_query_engine(components, state)
+        # (2026-07-03 동시성 수정 #5: 공유 부품(parts)을 한 번만 만들어 저장하고,
+        #  실제 요청은 세션별 격리 엔진을 조립해 쓴다. web_engine은 하위 호환/메타데이터
+        #  용 템플릿으로만 남긴다 — 채팅 핸들러는 이걸 공유 mutable 상태로 쓰지 않는다.)
+        web_parts = _build_web_engine_parts(components, state)
+        web_engine, web_dispatcher = _assemble_session_engine(
+            web_parts, state.session_id or "", tenant=None
+        )
+        web_tools = web_parts["web_tools"]
+        # 세션별 엔진 팩토리가 참조할 공유 부품. 이 키가 존재하면 채팅 핸들러는
+        # 요청마다 격리된 QueryEngine을 새로 조립한다(_acquire_session_engine).
+        _app_state["web_engine_parts"] = web_parts
         _app_state["model_dispatcher"] = web_dispatcher
         _app_state["query_engine"] = web_engine
         # /v1/tools가 모델이 실제로 보는 웹 Worker 도구 풀(MCP 포함)을 노출하도록 저장.
@@ -587,6 +677,73 @@ def _restore_messages_from_saved(saved: list[dict] | None, session_id: str) -> l
     return restored
 
 
+# ─────────────────────────────────────────────
+# 세션별 엔진 격리 + 세션 락 (동시성 결함 수정 — 감사 Critical #5, 2026-07-03)
+# ─────────────────────────────────────────────
+# 기존: QueryEngine 싱글톤 1개를 모든 요청이 공유 → 동시 요청이 _messages/tenant를
+# 락 없이 뒤섞음(멀티테넌트 최대 블로커). 수정: (1) 요청/세션별로 격리된 QueryEngine을
+# 조립하고(_acquire_session_engine), (2) '같은 세션'의 동시 요청만 세션별 asyncio.Lock
+# 으로 직렬화한다. 서로 다른 세션은 병렬을 유지하므로 멀티테넌트 처리량이 죽지 않는다.
+
+# 세션 락 상한 — 무한 증가를 막는 바운드 LRU. 도달 시 '사용 중이 아닌' 가장 오래된
+# 락부터 축출한다(사용 중 락은 절대 축출하지 않음).
+_SESSION_LOCK_MAX = 4096
+
+
+def _get_session_lock(session_id: str) -> asyncio.Lock:
+    """세션 ID별 asyncio.Lock을 얻는다(없으면 생성). 바운드 LRU로 개수를 제한한다.
+
+    반드시 실행 중인 이벤트 루프 안(async 핸들러)에서 호출한다.
+
+    루프 인지(loop-aware)로 저장하는 이유: asyncio.Lock은 최초 acquire 시 특정
+    이벤트 루프에 바인딩된다. 그런데 _app_state는 모듈 싱글톤이라 프로세스 수명 동안
+    유지되고, pytest는 테스트마다 새 이벤트 루프를 쓴다(asyncio_default_fixture_
+    loop_scope=function). 만약 락을 루프와 무관하게 캐시하면, 이전 테스트 루프에
+    바인딩된 락을 다음 테스트 루프에서 acquire하다 'attached to a different loop'
+    오류가 난다. 그래서 현재 실행 루프가 바뀌면 락 저장소를 새로 만든다. 프로덕션은
+    단일 장수명 루프라 저장소가 유지되어 LRU가 정상 동작한다.
+
+    동기 함수인 이유: dict 접근/삽입 사이에 await가 없어 단일 이벤트 루프에서 원자적
+    이다(별도 async 가드 락이 필요 없다).
+    """
+    loop = asyncio.get_running_loop()
+    store = _app_state.get("session_locks_store")
+    if store is None or store[0] is not loop:
+        # 최초 호출이거나 이벤트 루프가 교체됨(주로 테스트) → 저장소를 새로 시작.
+        store = (loop, OrderedDict())
+        _app_state["session_locks_store"] = store
+    locks: OrderedDict[str, asyncio.Lock] = store[1]
+    lock = locks.get(session_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        locks[session_id] = lock
+    else:
+        locks.move_to_end(session_id)  # 최근 사용 표시(LRU)
+    # 바운드 축출 — 가장 오래된 것부터. 단, 현재 잠겨 있는(사용 중) 락이나 방금
+    # 만든 이 세션의 락은 건드리지 않는다(사용 중 락 축출 시 직렬화 무력화).
+    while len(locks) > _SESSION_LOCK_MAX:
+        old_sid, old_lock = next(iter(locks.items()))
+        if old_lock.locked() or old_sid == session_id:
+            break
+        locks.popitem(last=False)
+    return lock
+
+
+def _acquire_session_engine(session_id: str, tenant: Any) -> Any:
+    """요청/세션별로 격리된 QueryEngine을 반환한다.
+
+    - 프로덕션(부트스트랩 성공 → web_engine_parts 존재): 세션 전용 엔진을 새로
+      조립한다. 공유 mutable 상태(_messages/_session_id/tenant)를 원천 제거한다.
+    - 부트스트랩 미완/테스트(parts 없음): 기존 _app_state['query_engine'] 싱글톤을
+      그대로 반환한다(무회귀 — 기존 웹 테스트가 주입한 fake 엔진/placeholder 경로 유지).
+    """
+    parts = _app_state.get("web_engine_parts")
+    if parts is not None:
+        engine, _dispatcher = _assemble_session_engine(parts, session_id, tenant)
+        return engine
+    return _app_state.get("query_engine")
+
+
 @app.post("/v1/chat", response_model=ChatResponse)
 async def chat(
     request: ChatRequest,
@@ -603,7 +760,9 @@ async def chat(
     session_id = request.session_id or str(uuid.uuid4())
     tenant = _resolve_tenant(request.tenant_id, x_tenant_id, authorization)
 
-    engine = _app_state.get("query_engine")
+    # 동시성 수정(#5): 요청/세션별 격리 엔진을 얻는다(프로덕션). parts가 없으면
+    # 기존 싱글톤/placeholder 경로로 폴백(무회귀).
+    engine = _acquire_session_engine(session_id, tenant)
     if engine is None:
         # QueryEngine이 초기화되지 않은 경우 placeholder 응답
         return ChatResponse(
@@ -613,96 +772,97 @@ async def chat(
             usage=UsageInfo(),
         )
 
-    # Ch 16 + 리팩토링 2: 세션/tenant/transcript를 공식 bind_request로 한 번에 주입
-    transcript = _build_transcript(session_id)
-    engine.bind_request(
-        session_id=session_id,
-        tenant=tenant,
-        transcript=transcript,
-    )
-    if tenant is not None:
-        logger.info("tenant 해석: %s (sources=%s)", tenant.id, tenant.allowed_knowledge_sources)
-
-    # Ch 16: Redis에서 해당 세션의 이전 히스토리 복원
-    memory_manager = _app_state.get("memory_manager")
-    if memory_manager is not None:
-        try:
-            engine.clear_messages()
-            saved = await memory_manager.short_term.get_conversation_context(session_id)
-            engine._messages.extend(_restore_messages_from_saved(saved, session_id))
-        except Exception as e:
-            logger.warning("비스트리밍 세션 복원 실패 (%s): %s", session_id, e)
-
-    # QueryEngine으로 메시지를 처리하고 모든 이벤트를 수집한다
     from core.message import StreamEvent, StreamEventType
 
     response_text_parts: list[str] = []
     usage = UsageInfo()
-
     # ─── 도구 호출 수집 (tool_calls 응답 필드 보강) ─────────────────
-    # 스트리밍 경로는 SSE 프레임으로 이벤트를 실시간 전달하지만, 비스트리밍
-    # 경로는 최종 ChatResponse 한 번만 돌려준다. 기존 구현은 TEXT_DELTA/USAGE만
-    # 보고 tool_use 이벤트를 무시했기 때문에, 도구가 실제로 실행돼도(로그·결과
-    # 정상) 응답의 tool_calls가 항상 비어 있었다.
-    #
-    # 4-Tier 체인을 우회하지 않고 submit_message가 yield하는 StreamEvent만
-    # 소비하여 누적한다(이벤트 소비 = 정당한 상위 Tier 동작).
-    #   - TOOL_USE_STOP: 도구 호출 확정(이름/입력/tool_use_id). 증분(DELTA)이 아닌
-    #     STOP에서 input이 완성되므로 STOP을 기준으로 한 건씩 등록한다.
-    #   - TOOL_RESULT : 같은 tool_use_id로 결과 요약/에러 여부를 매칭해 채운다.
-    # tool_use_id로 매칭하여 한 호출당 ToolCallInfo 하나를 유지한다.
+    # 4-Tier 체인을 우회하지 않고 submit_message가 yield하는 StreamEvent만 소비하여
+    # 누적한다. TOOL_USE_STOP에서 input이 완성되므로 STOP 기준 등록, TOOL_RESULT로
+    # 같은 tool_use_id를 매칭해 요약/에러를 채운다(한 호출당 ToolCallInfo 하나).
     tool_calls_by_id: dict[str, ToolCallInfo] = {}
-    # id가 없는(혹은 누락된) 경우를 위해 등장 순서도 함께 보존한다.
     tool_calls_order: list[str] = []
-
     # 결과 본문이 과도하게 길면 응답이 비대해지므로 요약 길이를 제한한다(과설계 금지).
     result_summary_max = 500
+    response_session_id = session_id
 
-    async for event in engine.submit_message(request.message):
-        if not isinstance(event, StreamEvent):
-            continue
-
-        if event.type == StreamEventType.TEXT_DELTA and event.text:
-            response_text_parts.append(event.text)
-
-        elif event.type == StreamEventType.USAGE_UPDATE and event.usage:
-            usage = UsageInfo(
-                input_tokens=event.usage.input_tokens,
-                output_tokens=event.usage.output_tokens,
-                total_tokens=event.usage.total_tokens,
+    # 같은 세션의 동시 요청만 직렬화(다른 세션은 병렬 유지). 프로덕션에서는 engine
+    # 자체가 세션 전용이라 _messages는 이미 격리되지만, 공유 히스토리(Redis)·트랜스
+    # 크립트 기록 순서를 안정화하기 위해 세션 단위로 감싼다(전역 처리량은 안 죽음).
+    session_lock = _get_session_lock(session_id)
+    async with session_lock:
+        # Ch 16 + 리팩토링 2: 세션/tenant/transcript를 공식 bind_request로 한 번에 주입
+        transcript = _build_transcript(session_id)
+        engine.bind_request(
+            session_id=session_id,
+            tenant=tenant,
+            transcript=transcript,
+        )
+        if tenant is not None:
+            logger.info(
+                "tenant 해석: %s (sources=%s)",
+                tenant.id,
+                tenant.allowed_knowledge_sources,
             )
 
-        elif event.type == StreamEventType.TOOL_USE_STOP and event.tool_use:
-            # 도구 호출 확정 — 이름/입력/tool_use_id를 등록한다.
-            tu = event.tool_use
-            tu_id = tu.id
-            if tu_id not in tool_calls_by_id:
-                tool_calls_by_id[tu_id] = ToolCallInfo(
-                    name=tu.name,
-                    input=tu.input,
-                )
-                tool_calls_order.append(tu_id)
+        # Ch 16: Redis에서 해당 세션의 이전 히스토리 복원
+        memory_manager = _app_state.get("memory_manager")
+        if memory_manager is not None:
+            try:
+                engine.clear_messages()
+                saved = await memory_manager.short_term.get_conversation_context(session_id)
+                engine._messages.extend(_restore_messages_from_saved(saved, session_id))
+            except Exception as e:
+                logger.warning("비스트리밍 세션 복원 실패 (%s): %s", session_id, e)
 
-        elif event.type == StreamEventType.TOOL_RESULT and event.tool_result:
-            # 도구 결과 — 같은 tool_use_id의 호출 정보에 요약/에러 여부를 채운다.
-            tr = event.tool_result
-            info = tool_calls_by_id.get(tr.tool_use_id)
-            if info is None:
-                # STOP 이벤트를 못 본 경우(방어적): 결과만으로 항목을 만든다.
-                info = ToolCallInfo(name="", input={})
-                tool_calls_by_id[tr.tool_use_id] = info
-                tool_calls_order.append(tr.tool_use_id)
-            summary = tr.content or ""
-            if len(summary) > result_summary_max:
-                summary = summary[:result_summary_max] + "…(truncated)"
-            info.result = summary
-            info.is_error = tr.is_error
+        async for event in engine.submit_message(request.message):
+            if not isinstance(event, StreamEvent):
+                continue
+
+            if event.type == StreamEventType.TEXT_DELTA and event.text:
+                response_text_parts.append(event.text)
+
+            elif event.type == StreamEventType.USAGE_UPDATE and event.usage:
+                usage = UsageInfo(
+                    input_tokens=event.usage.input_tokens,
+                    output_tokens=event.usage.output_tokens,
+                    total_tokens=event.usage.total_tokens,
+                )
+
+            elif event.type == StreamEventType.TOOL_USE_STOP and event.tool_use:
+                # 도구 호출 확정 — 이름/입력/tool_use_id를 등록한다.
+                tu = event.tool_use
+                tu_id = tu.id
+                if tu_id not in tool_calls_by_id:
+                    tool_calls_by_id[tu_id] = ToolCallInfo(
+                        name=tu.name,
+                        input=tu.input,
+                    )
+                    tool_calls_order.append(tu_id)
+
+            elif event.type == StreamEventType.TOOL_RESULT and event.tool_result:
+                # 도구 결과 — 같은 tool_use_id의 호출 정보에 요약/에러 여부를 채운다.
+                tr = event.tool_result
+                info = tool_calls_by_id.get(tr.tool_use_id)
+                if info is None:
+                    # STOP 이벤트를 못 본 경우(방어적): 결과만으로 항목을 만든다.
+                    info = ToolCallInfo(name="", input={})
+                    tool_calls_by_id[tr.tool_use_id] = info
+                    tool_calls_order.append(tr.tool_use_id)
+                summary = tr.content or ""
+                if len(summary) > result_summary_max:
+                    summary = summary[:result_summary_max] + "…(truncated)"
+                info.result = summary
+                info.is_error = tr.is_error
+
+        # 응답에 실을 세션 ID는 엔진이 확정한 값을 쓴다(fake 엔진 테스트 호환).
+        response_session_id = engine.session_id
 
     # 등장 순서대로 ToolCallInfo 목록을 만든다.
     tool_calls_info: list[ToolCallInfo] = [tool_calls_by_id[tid] for tid in tool_calls_order]
 
     return ChatResponse(
-        session_id=engine.session_id,
+        session_id=response_session_id,
         response="".join(response_text_parts),
         tool_calls=tool_calls_info,
         usage=usage,
@@ -724,16 +884,15 @@ async def chat_stream(
     session_id = request.session_id or str(uuid.uuid4())
     tenant = _resolve_tenant(request.tenant_id, x_tenant_id, authorization)
 
-    async def generate() -> AsyncGenerator[str, None]:
-        """
-        SSE 이벤트를 생성하는 AsyncGenerator.
+    async def _locked_generate() -> AsyncGenerator[str, None]:
+        """세션별 격리 엔진 획득 + 세션 락으로 감싼 뒤 실제 스트림을 위임한다.
 
-        QueryEngine의 StreamEvent를 수신하여
-        'data: {json}\n\n' 형식으로 실시간 전송한다.
+        동시성 수정(#5): (1) 요청/세션별 격리 QueryEngine을 얻고(_acquire_session_engine),
+        (2) 같은 세션의 동시 요청만 세션 락으로 직렬화한다(다른 세션은 병렬 유지 →
+        멀티테넌트 처리량 보존). 락은 스트림 전체 수명 동안 유지되며, 클라이언트 연결
+        종료로 제너레이터가 닫혀도 async with가 반드시 해제한다.
         """
-        from core.message import StreamEvent
-
-        engine = _app_state.get("query_engine")
+        engine = _acquire_session_engine(session_id, tenant)
         if engine is None:
             placeholder = {
                 "type": "text_delta",
@@ -742,13 +901,25 @@ async def chat_stream(
             }
             yield f"data: {json.dumps(placeholder, ensure_ascii=False)}\n\n"
             return
+        session_lock = _get_session_lock(session_id)
+        async with session_lock:
+            async for _frame in generate(engine):
+                yield _frame
 
-        # 세션별 대화 히스토리 관리
-        # QueryEngine._messages는 모든 세션이 공유하므로,
-        # 매 요청마다 초기화하고 해당 세션의 히스토리만 복원한다.
-        if "chat_histories" not in _app_state:
-            _app_state["chat_histories"] = {}
-        histories = _app_state["chat_histories"]
+    async def generate(engine: Any) -> AsyncGenerator[str, None]:
+        """
+        SSE 이벤트를 생성하는 AsyncGenerator.
+
+        QueryEngine의 StreamEvent를 수신하여
+        'data: {json}\n\n' 형식으로 실시간 전송한다. engine은 요청/세션별로 격리된
+        인스턴스다(호출부 _locked_generate가 세션 락을 잡은 채 소비한다).
+        """
+        from core.message import StreamEvent
+
+        # 세션별 대화 히스토리 관리 — 요청마다 엔진 messages를 해당 세션 이력으로
+        # 복원한다. histories 자체는 세션 키로 분리돼 있고, 같은 세션의 동시 접근은
+        # 상위 _locked_generate의 세션 락으로 직렬화된다.
+        histories = _app_state.setdefault("chat_histories", {})
 
         # Ch 16: 세션 영속화 — 메모리 매니저가 있으면 Redis에서 복원
         # 첫 요청(인메모리 비어 있음)일 때만 Redis에서 이전 히스토리를 가져온다.
@@ -774,7 +945,7 @@ async def chat_stream(
         # (세션이 enable_thinking=false 전의 오염된 상태일 수 있다)
         _sanitize_history_inplace(histories[session_id])
 
-        # Ch 16: 세션별 JSONL 트랜스크립트 주입 (웹은 QueryEngine 싱글톤이라 동적 세팅)
+        # Ch 16: 세션별 JSONL 트랜스크립트 주입 (요청/세션별 격리 엔진에 동적 세팅)
         try:
             from core.memory.transcript import SessionTranscript as _Trans
 
@@ -992,7 +1163,7 @@ async def chat_stream(
                 logger.warning("세션 Redis 저장 실패 (%s): %s", session_id, e)
 
     return StreamingResponse(
-        generate(),
+        _locked_generate(),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

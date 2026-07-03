@@ -2679,4 +2679,12 @@ B200 정부 컨테이너에 "완벽한 버전" Nexus를 올리기 전, 지난 �
   - **#6** `decay.py run_decay_cycle`: 감쇠값을 `importance`에 되쓰던 update 제거 → **삭제 전용(멱등)**. importance=불변 base 유지(랭킹 ORDER BY importance가 오염 복리값 아닌 원본으로 정렬), 유효중요도는 읽을 때 `calculate_decay`로 계산. 검증: 사이클 N회 반복 = 1회(복리 없음).
   - **#7** `manager.py`: turn/tool_result 자동 key를 `turn:{session_id}` → `turn:{session_id}:{sha256(content)[:16]}`. 서로 다른 턴 보존, 진짜 중복만 dedup(consolidate·명시 key 기능 유지). key는 조회 미사용이라 안전.
   - 테스트 4건 추가, 전체 **1395 passed**. **실 PG 통합검증은 후속**(NEXUS_PG_PASSWORD 필요, SQL/DDL 의미 불변이라 저위험). 운영 레거시 `turn:{session_id}` 엔트리 1회 정리 고려.
-- **남은 Critical**: **#5(웹 QueryEngine 싱글톤 동시성)**, **#8(컨텍스트 오버플로 복구 도달불가)**.
+### C-동시성. Critical #5 (웹 QueryEngine 싱글톤)
+
+- **#5 완료**: 웹이 QueryEngine을 앱 전역 싱글톤 1개로 공유해 동시 요청이 `_messages`/`_session_id`/tenant를 뒤섞던 결함을 **세션별 엔진 격리**로 수정(backend-specialist).
+  - 무거운 부품(도구 인스턴스·시스템 프롬프트·provider·retriever)은 `_build_web_engine_parts`로 1회 조립·공유, 요청마다 가벼운 `ToolUseContext`+`ModelDispatcher`+`QueryEngine`만 세션별 생성(`_assemble_session_engine`). **핵심**: dispatcher가 context를 붙들고 도구까지 전파하므로 dispatcher도 세션별 생성해야 tenant 누출 없음. base_options는 얕은복제 후 tenant만 얹어 원본 미오염.
+  - **세션 락**(`_get_session_lock`, loop-aware + 바운드 LRU, locked 스킵): 같은 세션 동시 요청만 직렬화, 다른 세션은 병렬(멀티테넌트 처리량 보존). 스트리밍은 `async with`로 스트림 전체 수명 락 유지(연결 종료 시에도 해제).
+  - 부트스트랩 실패/테스트(parts 없음) → 기존 싱글톤 폴백(무회귀). `_build_web_query_engine` 3-튜플 계약 유지.
+  - 테스트: `test_web_concurrency_isolation.py` 2건(격리 + **control이 원버그 재현**). 전체 **1397 passed**, ruff 신규 위반 0(기존 7 baseline). **실서버 동시부하 최종검증은 후속**(러닝 vLLM/Redis/PG 필요).
+  - 부수: 세션별 샌드박스 cwd(`_session_sandbox_cwd`) — permission_enforcement OFF(기본)에선 `state.cwd` 그대로(무회귀).
+- **남은 Critical**: **#8(컨텍스트 오버플로 복구 도달불가 — Tier3/4 미호출, inference.stream이 예외를 ERROR 이벤트로 삼켜 복구 트리거 안 됨)**. B200 대용량 컨텍스트에선 영향 작음(5090 8K 제약에서 주로 발현).
