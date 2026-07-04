@@ -25,7 +25,14 @@ defaults:
   enable_prefix_caching: true      # 프롬프트 캐시 — 시스템 프롬프트/RAG 접두부 재사용
   enforce_eager: false             # B200은 CUDA graph 사용(지연 단축). 5090처럼 끄지 않는다
   enable_auto_tool_choice: true    # OpenAI tool_calls 자동 선택 활성
-  log_dir: "/opt/nexus-gpu/logs"   # 기동 로그 저장 위치
+  log_dir: "/NHNHOME/nexus/logs"   # 기동 로그(영구 400GB 볼륨). 컨테이너 실측 경로
+
+# 모델 참조 방식(중요):
+#   컨테이너에 HF_HOME=/NHNHOME/nexus/hf_cache 가 설정되어 있고 외부망(huggingface.co)이
+#   되므로(실측 HTTP 200), 모델을 로컬 경로 대신 HuggingFace repo id로 지정한다.
+#   vLLM이 이 캐시에 1회 받아 영구 재사용한다(400GB 디스크 위).
+#   에어갭 최종 배포 시에는: repo를 미리 HF_HOME 캐시에 받아두거나 로컬 경로
+#   (예: /NHNHOME/nexus/models/A.X-4.0)로 바꾸고 가중치를 사전 반입한다.
 
 profiles:
   # -------------------------------------------------------------------------
@@ -33,7 +40,7 @@ profiles:
   #   Qwen 계열이라 Nexus의 기존 Qwen 프롬프트/파서 자산을 대부분 재사용한다.
   # -------------------------------------------------------------------------
   axmodel:
-    model: "/opt/nexus-gpu/models/A.X-4.0"   # BF16 원본 가중치 경로(컨테이너 내부)
+    model: "skt/A.X-4.0"                     # HF repo id → HF_HOME 캐시에 받아 재사용
     served_model_name: "ax-4.0"              # OpenAI API에 노출되는 모델 이름
     dtype: "bfloat16"                        # 양자화 없음(B200은 VRAM 여유)
     # 단일 B200(180GB): 가중치 144GB + util 0.92(=166GB) → KV 예산 ~22GB.
@@ -54,7 +61,7 @@ profiles:
   #   텍스트 백본 자체개발. 전용 vLLM 플러그인/chat template가 필요할 수 있다.
   # -------------------------------------------------------------------------
   hyperclova:
-    model: "/opt/nexus-gpu/models/HyperCLOVAX-SEED-Think-32B"
+    model: "naver-hyperclovax/HyperCLOVAX-SEED-Think-32B"   # HF repo id
     served_model_name: "hyperclova-seed-32b"
     dtype: "bfloat16"
     # 가중치 ~64GB + util 0.90(=162GB) → KV 예산 ~98GB로 여유. 긴 컨텍스트 가능.
