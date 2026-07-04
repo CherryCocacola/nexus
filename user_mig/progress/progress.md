@@ -2687,4 +2687,13 @@ B200 정부 컨테이너에 "완벽한 버전" Nexus를 올리기 전, 지난 �
   - 부트스트랩 실패/테스트(parts 없음) → 기존 싱글톤 폴백(무회귀). `_build_web_query_engine` 3-튜플 계약 유지.
   - 테스트: `test_web_concurrency_isolation.py` 2건(격리 + **control이 원버그 재현**). 전체 **1397 passed**, ruff 신규 위반 0(기존 7 baseline). **실서버 동시부하 최종검증은 후속**(러닝 vLLM/Redis/PG 필요).
   - 부수: 세션별 샌드박스 cwd(`_session_sandbox_cwd`) — permission_enforcement OFF(기본)에선 `state.cwd` 그대로(무회귀).
-- **남은 Critical**: **#8(컨텍스트 오버플로 복구 도달불가 — Tier3/4 미호출, inference.stream이 예외를 ERROR 이벤트로 삼켜 복구 트리거 안 됨)**. B200 대용량 컨텍스트에선 영향 작음(5090 8K 제약에서 주로 발현).
+### C-복구. Critical #8 (컨텍스트 오버플로 복구 도달불가)
+
+- **#8 완료**: Tier 3 `inference.stream`이 컨텍스트 초과/HTTP 오류를 raise 안 하고 ERROR 이벤트로 yield → Tier 2 `query_loop`의 복구(emergency_compact 등)가 `except`에만 있어 영구 미도달, CONTEXT_OVERFLOW는 그냥 abort하던 결함 수정(backend-specialist).
+  - 복구 판정을 헬퍼 `_try_recover_from_model_error`(str→압축+continue_reason+cancel_all, `_RecoveryOutcome` 반환)로 추출, `except` 3복구를 **비트 단위 동일**하게 옮김(무회귀). OOM 경고는 events로 반환해 호출부가 yield → 4-Tier yield 흐름 유지.
+  - `_error_event_to_recovery_text`: CONTEXT_OVERFLOW→"context too long"(emergency_compact 매핑), HTTP_4xx→vLLM 본문 메시지, 그 외→None(현행 유지). ERROR 이벤트 경로에서 헬퍼 호출→복구 시 재시도(continue), 아니면 기존 abort 유지.
+  - 테스트 7건(신규 test_query_loop.py): ERROR 이벤트 복구+재시도 / HTTP_400 prompt-too-long / 예산소진 abort / **raise 경로 무회귀** / OOM 경고 / CONNECT_ERROR 미복구. 전체 **1404 passed**, ruff clean.
+
+## 감사 Critical 8건 전부 완료 (feature/b200-bakeoff)
+
+- #1~3 권한 강제 · #4 자격증명/웹 인증 · #5 웹 동시성 · #6~7 메모리 · #8 컨텍스트 복구. 9커밋, 전부 무회귀(최종 1404 passed) + 테스트 동반. **후속(비차단)**: P3(ASK 강제, 배포 후 shadow 로그), 실 PG/실서버 동시부하 최종검증, b200 config DB host→127.0.0.1, CLI 프롬프트 티어 불일치, hook_manager/deny rule 로딩.

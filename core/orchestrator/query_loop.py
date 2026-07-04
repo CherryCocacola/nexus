@@ -125,6 +125,153 @@ OUTPUT_TOKEN_ESCALATION = [4096, 8192, 16384]
 
 
 # ─────────────────────────────────────────────
+# 모델 에러 복구 헬퍼 (감사 Critical #8 대응)
+# ─────────────────────────────────────────────
+#
+# 배경(왜 이 헬퍼가 필요한가):
+#   Tier 3(core/model/inference.py stream())는 컨텍스트 초과·HTTP 오류를
+#   예외로 raise하지 않고 ERROR StreamEvent로 "yield"해서 내려보낸다.
+#   그런데 기존 query_loop의 진짜 복구 로직(긴급 압축/반응적 압축/OOM 축소)은
+#   `except Exception` 블록 안에만 있어서, raise가 나지 않는 이 오류들에 대해서는
+#   영구 미도달이었다(= 컨텍스트 오버플로 복구 도달불가 결함).
+#
+#   그래서 세 가지 복구 판정을 이 헬퍼로 추출해, 두 경로에서 재사용한다:
+#     (1) 기존 `except Exception` 블록  — 모델 provider가 예외를 raise한 경우
+#     (2) Phase 2의 ERROR 이벤트 소비 경로 — provider가 ERROR 이벤트를 yield한 경우
+#
+#   헬퍼는 async generator로 만들지 않는다(4-Tier yield 흐름을 헬퍼가 가로채면
+#   체인 구조가 흐트러지기 때문). 대신 "복구가 발동했는지"와 "호출부가 yield해야 할
+#   이벤트 목록(예: OOM 경고)"을 담은 결과 객체를 반환하고, 실제 yield는 호출부가 한다.
+
+
+@dataclass
+class _RecoveryOutcome:
+    """
+    _try_recover_from_model_error()의 반환값.
+
+    recovered: 세 가지 복구(collapse_drain/reactive_compact/OOM) 중 하나가
+        실제로 발동했는지 여부. True면 호출부는 다음 턴으로 재시도(continue)한다.
+    events: 호출부가 순서대로 yield해야 하는 StreamEvent 목록.
+        (OOM 복구는 SYSTEM_WARNING을 사용자에게 보여줘야 하는데, 4-Tier yield
+        흐름을 유지하려고 헬퍼가 직접 yield하지 않고 여기에 담아 되돌려준다.)
+    """
+
+    recovered: bool
+    events: list[StreamEvent] = field(default_factory=list)
+
+
+def _error_event_to_recovery_text(event: StreamEvent) -> str | None:
+    """
+    Tier 3가 yield한 ERROR StreamEvent를, 복구 판정 헬퍼가 이해하는
+    "에러 텍스트"로 변환한다. 복구 대상이 아니면 None을 반환한다.
+
+    왜 변환이 필요한가:
+      - `CONTEXT_OVERFLOW`(입력 과다)는 message가 한글 안내문이라 영어 패턴
+        매칭이 안 된다. 이 오류는 "입력이 너무 길다" = 긴급 압축(collapse_drain)
+        경로로 처리해야 하므로, 헬퍼가 collapse_drain으로 인식하도록
+        "context too long" 계열 텍스트를 합성해 돌려준다.
+      - `HTTP_4xx`는 message에 vLLM 본문이 담겨 있다(‘maximum context length’/
+        ‘prompt is too long’/‘out of memory’ 등). 그 본문을 그대로 넘겨
+        헬퍼의 세 패턴이 판정하게 한다.
+      - 그 외(CONNECT_ERROR/READ_TIMEOUT/UNKNOWN/HTTP_5xx 등)는 압축으로
+        해결되지 않는 오류이므로 None을 반환한다 → 호출부는 현행 동작을 유지한다.
+    """
+    code = event.error_code or ""
+    # 입력 과다(CONTEXT_OVERFLOW) → 긴급 압축(collapse_drain) 경로로 매핑.
+    # "context"와 "long"을 모두 포함시켜 헬퍼의 collapse_drain 조건에 걸리게 한다.
+    if code == "CONTEXT_OVERFLOW":
+        return "context too long"
+    # 4xx 응답만 복구 후보 — 본문(message)을 헬퍼의 패턴 매칭에 넘긴다.
+    # (패턴에 안 걸리면 헬퍼가 recovered=False를 반환 → 호출부는 현행 동작 유지)
+    if code.startswith("HTTP_4"):
+        return event.message or ""
+    return None
+
+
+async def _try_recover_from_model_error(
+    error_text: str,
+    state: LoopState,
+    context_manager: Any | None,
+    streaming_executor: Any,
+) -> _RecoveryOutcome:
+    """
+    모델 에러 텍스트를 보고 세 가지 복구(긴급 압축/반응적 압축/OOM 축소) 중
+    적용 가능한 것을 수행한다. 기존 `except Exception` 블록(:447/:462/:480)의
+    복구 로직을 그대로 옮긴 것으로, 동작은 비트 단위로 동일하다(무회귀).
+
+    각 복구는 (a) 압축/축소 수행, (b) state.continue_reason 설정,
+    (c) streaming_executor.cancel_all()을 하고 recovered=True로 반환한다.
+    어떤 패턴에도 걸리지 않거나 재시도 예산이 소진되면 recovered=False.
+
+    주의(무회귀 핵심): 원본과 동일하게 세 조건을 순차 `if`로 검사한다.
+      - 조건은 매칭됐지만 카운터 상한에 도달한 경우, 원본은 그 자리에서 종료하지
+        않고 다음 조건으로 "fall-through"했다. 여기서도 return 하지 않고 다음
+        조건 검사로 넘어가 동일한 fall-through를 재현한다.
+      - collapse_drain/reactive_compact는 카운터를 `if 카운터 < 상한` 안에서만
+        증가시키고, OOM은 원본처럼 매칭 시 먼저 +1 한 뒤 상한을 검사한다
+        (상한 초과 시에도 카운터는 이미 증가된 상태로 fall-through).
+    """
+    text = error_text.lower()
+    events: list[StreamEvent] = []
+
+    # ─── Transition 1: collapse_drain_retry ───
+    # "context too long" 류 → 긴급 압축 후 재시도
+    if "context" in text and "long" in text:
+        if state.collapse_drain_count < MAX_COLLAPSE_DRAIN:
+            state.collapse_drain_count += 1
+            logger.warning(
+                f"컨텍스트 초과, 긴급 압축 수행 "
+                f"({state.collapse_drain_count}/{MAX_COLLAPSE_DRAIN})"
+            )
+            if context_manager is not None:
+                state.messages = await context_manager.emergency_compact(state.messages)
+            state.continue_reason = ContinueReason.COLLAPSE_DRAIN_RETRY
+            await streaming_executor.cancel_all()
+            return _RecoveryOutcome(recovered=True, events=events)
+
+    # ─── Transition 2: reactive_compact_retry ───
+    # "prompt is too long" → 압축 후 재시도
+    if "prompt is too long" in text:
+        if state.compact_retry_count < MAX_COMPACT_RETRY:
+            state.compact_retry_count += 1
+            logger.warning(
+                f"Prompt 초과, 반응적 압축 수행 "
+                f"({state.compact_retry_count}/{MAX_COMPACT_RETRY})"
+            )
+            if context_manager is not None:
+                state.messages = await context_manager.auto_compact_if_needed(
+                    state.messages, force=True
+                )
+            state.continue_reason = ContinueReason.REACTIVE_COMPACT_RETRY
+            await streaming_executor.cancel_all()
+            return _RecoveryOutcome(recovered=True, events=events)
+
+    # ─── GPU OOM → 컨텍스트 30% 감소 후 재시도 ───
+    # 왜 0.7배: vLLM이 메모리를 다 못 잡으면 입력을 줄이는 것 외엔 방법이 없으므로,
+    # 다음 시도에서 컨텍스트 상한을 70%로 낮춰 메모리를 확보한다.
+    if "out of memory" in text:
+        state.model_error_count += 1
+        if state.model_error_count <= MAX_MODEL_ERROR_RETRY:
+            if context_manager is not None:
+                context_manager.max_tokens = int(context_manager.max_tokens * 0.7)
+            events.append(
+                StreamEvent(
+                    type=StreamEventType.SYSTEM_WARNING,
+                    message=(
+                        f"[GPU OOM] 컨텍스트 축소 후 재시도 "
+                        f"({state.model_error_count}/{MAX_MODEL_ERROR_RETRY})"
+                    ),
+                )
+            )
+            state.continue_reason = ContinueReason.REACTIVE_COMPACT_RETRY
+            await streaming_executor.cancel_all()
+            return _RecoveryOutcome(recovered=True, events=events)
+
+    # 어떤 복구도 발동하지 못함 (미대상 패턴 또는 예산 소진)
+    return _RecoveryOutcome(recovered=False, events=events)
+
+
+# ─────────────────────────────────────────────
 # Query Loop (핵심 함수)
 # ─────────────────────────────────────────────
 async def query_loop(
@@ -320,6 +467,11 @@ async def query_loop(
         turn_usage = TokenUsage()  # 이번 턴의 토큰 사용량
         stop_reason: StopReason | None = None  # 모델 종료 이유
         model_error: str | None = None  # 모델 에러 메시지
+        # ERROR 이벤트 기반 복구가 발동했는지 표시하는 플래그(감사 Critical #8).
+        # Tier 3가 예외 대신 ERROR StreamEvent로 컨텍스트 초과를 내려보낸 경우,
+        # Phase 2 안에서 헬퍼로 복구한 뒤 이 플래그를 세워, except/Phase 3를 건너뛰고
+        # 곧장 다음 턴으로 재시도(continue)하게 한다.
+        error_event_recovered = False
 
         # StreamingToolExecutor 생성 — 스트리밍 중 도구를 병렬 실행
         # 모델이 응답을 다 만들 때까지 기다리지 않고, tool_use가 완성되는 즉시
@@ -401,7 +553,32 @@ async def query_loop(
                 elif event_type == StreamEventType.ERROR.value:
                     # 모델 에러 (스트리밍 중)
                     model_error = event.message
-                    # 컨텍스트 초과는 재시도해도 해결 불가 — 즉시 종료
+
+                    # ─── 감사 Critical #8: ERROR 이벤트 경로 복구 배선 ───
+                    # Tier 3(inference)는 컨텍스트 초과/HTTP 오류를 raise하지 않고
+                    # ERROR 이벤트로 내려보내므로, 여기서도 except 블록과 동일한
+                    # 복구(긴급 압축/반응적 압축/OOM)를 시도해야 한다. 예전에는
+                    # CONTEXT_OVERFLOW를 무조건 즉시 종료해 복구가 도달불가였다.
+                    recovery_text = _error_event_to_recovery_text(event)
+                    if recovery_text is not None:
+                        outcome = await _try_recover_from_model_error(
+                            recovery_text,
+                            state,
+                            context_manager,
+                            streaming_executor,
+                        )
+                        if outcome.recovered:
+                            # 헬퍼가 돌려준 이벤트(예: OOM 경고)를 호출부가 yield —
+                            # 4-Tier yield 흐름을 유지하기 위해 여기서 흘려보낸다.
+                            for _ev in outcome.events:
+                                yield _ev
+                            # 복구 성공 → 스트림 소비 중단하고 다음 턴 재시도.
+                            # (cancel_all은 헬퍼가 이미 호출함)
+                            error_event_recovered = True
+                            break
+
+                    # 복구 대상이 아니거나(현행 유지 오류) 재시도 예산이 소진된 경우:
+                    # 컨텍스트 초과는 기존과 동일하게 즉시 종료(abort)한다.
                     if event.error_code == "CONTEXT_OVERFLOW":
                         await streaming_executor.cancel_all()
                         return
@@ -442,56 +619,18 @@ async def query_loop(
                     await streaming_executor.cancel_all()
                     continue
 
-            # ─── Transition 1: collapse_drain_retry ───
-            # "context too long" 류의 에러 → 긴급 압축 후 재시도
-            if "context" in str(e).lower() and "long" in str(e).lower():
-                if state.collapse_drain_count < MAX_COLLAPSE_DRAIN:
-                    state.collapse_drain_count += 1
-                    logger.warning(
-                        f"컨텍스트 초과, 긴급 압축 수행 "
-                        f"({state.collapse_drain_count}/{MAX_COLLAPSE_DRAIN})"
-                    )
-                    if context_manager is not None:
-                        state.messages = await context_manager.emergency_compact(state.messages)
-                    state.continue_reason = ContinueReason.COLLAPSE_DRAIN_RETRY
-                    await streaming_executor.cancel_all()
-                    continue
-
-            # ─── Transition 2: reactive_compact_retry ───
-            # "prompt is too long" 에러 → 압축 후 재시도
-            if "prompt is too long" in str(e).lower():
-                if state.compact_retry_count < MAX_COMPACT_RETRY:
-                    state.compact_retry_count += 1
-                    logger.warning(
-                        f"Prompt 초과, 반응적 압축 수행 "
-                        f"({state.compact_retry_count}/{MAX_COMPACT_RETRY})"
-                    )
-                    if context_manager is not None:
-                        state.messages = await context_manager.auto_compact_if_needed(
-                            state.messages, force=True
-                        )
-                    state.continue_reason = ContinueReason.REACTIVE_COMPACT_RETRY
-                    await streaming_executor.cancel_all()
-                    continue
-
-            # GPU OOM → 컨텍스트 30% 감소 후 재시도
-            # 왜 0.7배: vLLM이 메모리를 다 못 잡으면 입력을 줄이는 것 외엔 방법이
-            # 없으므로, 다음 시도에서 컨텍스트 상한을 70%로 낮춰 메모리를 확보한다.
-            if "out of memory" in str(e).lower():
-                state.model_error_count += 1
-                if state.model_error_count <= MAX_MODEL_ERROR_RETRY:
-                    if context_manager is not None:
-                        context_manager.max_tokens = int(context_manager.max_tokens * 0.7)
-                    yield StreamEvent(
-                        type=StreamEventType.SYSTEM_WARNING,
-                        message=(
-                            f"[GPU OOM] 컨텍스트 축소 후 재시도 "
-                            f"({state.model_error_count}/{MAX_MODEL_ERROR_RETRY})"
-                        ),
-                    )
-                    state.continue_reason = ContinueReason.REACTIVE_COMPACT_RETRY
-                    await streaming_executor.cancel_all()
-                    continue
+            # ─── Transition 1/2 + OOM: 복구 헬퍼로 위임 ───
+            # 예외 메시지(str(e))를 그대로 헬퍼에 넘긴다. 헬퍼는 예전에 이 자리에
+            # 인라인으로 있던 세 복구(긴급 압축/반응적 압축/OOM)를 비트 단위로 동일하게
+            # 수행한다(무회귀). recovered=True면 헬퍼가 돌려준 이벤트를 yield하고
+            # 다음 턴으로 재시도(continue)한다.
+            outcome = await _try_recover_from_model_error(
+                str(e), state, context_manager, streaming_executor
+            )
+            if outcome.recovered:
+                for _ev in outcome.events:
+                    yield _ev
+                continue
 
             # 복구 불가능한 에러
             logger.error(f"복구 불가능한 모델 에러: {error_name}: {e}")
@@ -502,6 +641,13 @@ async def query_loop(
             )
             await streaming_executor.cancel_all()
             return
+
+        # ─── 감사 Critical #8: ERROR 이벤트 경로 복구 후 다음 턴 재시도 ───
+        # Phase 2에서 provider가 raise 대신 ERROR 이벤트로 컨텍스트 초과를 내려보내
+        # 헬퍼로 복구한 경우, except 블록을 거치지 않으므로 여기서 continue한다.
+        # (예외 경로는 except 안에서 이미 continue/return으로 처리됨)
+        if error_event_recovered:
+            continue
 
         # ═══════════════════════════════════════
         # Phase 3: Post-API 처리
