@@ -69,6 +69,19 @@ fail-soft (anti-pattern #8):
 의존성 방향 (P2): core.ingest.types / parser_base / core.config 만 의존.
   core/rag·core/model 무관(역방향/순환 위험 없음).
 에어갭: paddleocr/pypdfium2/PIL 은 로컬 파일만 다룬다(모델 가중치는 사전 배치 전제).
+
+주요 구성(한눈에 보기):
+  - PaddleOcrParser: DocumentParser 를 상속한 이 파일의 유일한 공개 클래스.
+    can_parse()(처리 가능 여부 판정) / parse()(핵심 진입점)를 제공한다.
+  - 내부 헬퍼: _ensure_config(설정 1회 로드), _ensure_ocr(PaddleOCR 지연 생성),
+    _parse_image(이미지 1장 OCR), _parse_pdf(스캔 PDF 페이지별 OCR),
+    _ocr_pdf_page(PDF 한 페이지 렌더+OCR), _ocr_pil(공통 OCR 호출),
+    _empty_tree(치명 실패 시 빈 트리).
+호출 관계: 문서 적재 서버(docingest_server)가 이 파서를 레지스트리에 등록하고,
+  적재 파이프라인이 parse() 를 await 해 DocumentTree 를 받아 후단(청킹/임베딩)에
+  넘긴다. 이 파일은 "파일 → 구조 트리" 변환까지만 책임진다.
+
+작성자: 이현수 / 작성일: 2026-07-05
 """
 
 from __future__ import annotations
@@ -557,8 +570,11 @@ class PaddleOcrParser(DocumentParser):
             texts = res.get("rec_texts") or []
             scores = res.get("rec_scores") or []
             for idx, line in enumerate(texts):
-                # 신뢰도 하한 미만 라인은 노이즈로 보고 버린다(점수 없으면 채택).
+                # 라인별 신뢰도(rec_scores)를 같은 인덱스에서 꺼낸다. texts 와
+                # scores 길이가 어긋날 수 있으니 범위를 벗어나면 1.0(=무조건 채택)
+                # 으로 본다. 신뢰도 하한(_MIN_REC_SCORE) 미만 라인은 노이즈로 버린다.
                 score = scores[idx] if idx < len(scores) else 1.0
+                # score 가 None 이면(점수 정보 없음) 그대로 채택한다.
                 if score is None or float(score) >= _MIN_REC_SCORE:
                     text = (line or "").strip()
                     if text:

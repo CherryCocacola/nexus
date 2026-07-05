@@ -16,12 +16,35 @@
   - DocumentChunk는 청킹 과정에서 parent_chunk_id 등을 채워야 하므로
     frozen으로 두지 않는다(가변). 단 외부에서 함부로 바꾸지 않는 약속.
   - 외부 네트워크/무거운 의존성 없음 — 순수 데이터 모델만 둔다(에어갭).
+
+인제스트 파이프라인에서의 위치 (데이터 흐름):
+  파일 → parser.parse() → DocumentTree(구조 트리)
+       → chunker → DocumentChunk 리스트(소청크/부모청크)
+       → KnowledgeEntry 변환 → tb_knowledge 적재(임베딩 + 검색).
+  즉 이 파일은 파서와 청커 사이에서 오가는 "데이터 계약(스키마)"만 정의하고,
+  파싱·청킹의 실제 로직은 각각 parser/chunker 모듈이 담당한다.
+
+이 파일이 정의하는 것 (한눈에):
+  - ElementType : 트리 노드의 종류를 나타내는 문자열 Enum.
+  - DocumentNode: 재귀 구조의 트리 노드(불변).
+  - DocumentTree: 문서 1개의 루트 컨테이너(불변, 파서 반환 타입).
+  - DocumentChunk: 임베딩 단위 청크(가변, 청커 산출물).
+
+외부 의존성: pydantic(BaseModel/ConfigDict/Field), 표준 라이브러리 enum 뿐.
+
+작성자: 이현수 / 작성일: 2026-07-05
 """
 
+# from __future__ import annotations:
+#   타입 힌트를 "문자열(지연 평가)"로 취급하게 해, DocumentNode 가 자기 자신을
+#   children 타입으로 참조하는 전방참조(self-reference)를 문제없이 쓰게 해준다.
+#   (이 선언 덕분에 아래 self-reference 정의 순서에 얽매이지 않는다.)
 from __future__ import annotations
 
-from enum import Enum
+from enum import Enum  # 문자열 값을 갖는 Enum(ElementType) 정의에 사용
 
+# BaseModel: 데이터 모델의 기반 클래스, ConfigDict: frozen 등 모델 설정,
+# Field: 필드 메타/검증 지정용(현재는 향후 확장 대비로만 import — 파일 끝 참조).
 from pydantic import BaseModel, ConfigDict, Field
 
 

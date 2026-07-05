@@ -48,6 +48,22 @@ fail-soft (anti-pattern #8):
   core/rag·core/model 무관(역방향/순환 없음).
 에어갭: soffice/python-docx 모두 로컬 파일만 다룬다(외부 네트워크 없음).
   import/호출만 하며 런타임 설치 코드는 넣지 않는다(anti-pattern #10).
+
+이 파일의 주요 구성 (온보딩용 지도):
+  · HwpViaLibreOfficeParser — DocumentParser 를 구현한 파서 클래스(진입점).
+  · parse() — 외부에서 호출하는 유일한 공개 메서드(async). 아래 흐름을 총괄한다.
+      _ensure_config → _convert_to_docx → _parse_docx_structured → _cleanup_tmpdir.
+  · _ensure_config() — soffice 경로/타임아웃 설정 로딩(+캐시).
+  · _convert_to_docx() — subprocess 로 .hwp → .docx 변환.
+  · _parse_docx_structured() — 변환된 .docx 를 순서 보존 노드 트리로 변환.
+  · _handle_paragraph / _heading_level / _table_node — 문단·제목·표 노드화 헬퍼.
+  · _cleanup_tmpdir / _empty_tree — 정리/빈 결과 헬퍼.
+
+누가 이 파서를 쓰나: ingest 파이프라인이 확장자(.hwp)로 파서를 고를 때 등록되어
+  있다가, 구포맷 .hwp 가 들어오면 can_parse() 로 자신이 맡을지 판정하고 parse()
+  로 구조 트리를 돌려준다. 반환한 DocumentTree 는 이후 청킹·임베딩 단계로 넘어간다.
+
+작성자: 이현수 / 작성일: 2026-07-05
 """
 
 from __future__ import annotations
@@ -85,9 +101,17 @@ class HwpViaLibreOfficeParser(DocumentParser):
     """
     구포맷 .hwp 파일을 LibreOffice 로 .docx 변환 후 python-docx 로 파싱하는 파서.
 
+    DocumentParser(ABC)를 구현한다. ingest 레지스트리에 등록되어 있다가, 확장자와
+    매직바이트로 자신이 처리할 파일인지 can_parse() 로 판정하고, 실제 변환·파싱은
+    parse() 에서 수행한다.
+
     LibreOffice 변환은 CPU 만으로 도는 외부 프로세스이므로 GPU 가 필요 없다
     (requires_gpu=False). HWPX(.hwpx)는 HwpxParser 가 담당하고, 이 파서는 구포맷
     바이너리 .hwp 만 처리한다.
+
+    상태(state)는 거의 없다: 유일한 인스턴스 필드 _cfg 는 첫 parse() 에서 읽은
+    soffice 설정 캐시뿐이다. 변환 임시 파일은 호출마다 독립 tmpdir 을 써서 서로
+    간섭하지 않는다(동시 호출 안전).
     """
 
     def __init__(self) -> None:

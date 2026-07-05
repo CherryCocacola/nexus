@@ -41,6 +41,19 @@ fail-soft (anti-pattern #8):
 
 의존성 방향 (P2): core.ingest.types / parser_base 만 의존. core/rag·model 무관.
 에어갭: python-hwpx / zipfile 모두 로컬 파일만 읽는다(외부 네트워크 없음).
+
+이 파일의 구성(빠르게 훑고 싶은 사람을 위한 지도):
+  - HwpxParser            : DocumentParser 를 상속한 파서 본체(아래 메서드들 보유)
+  - can_parse()           : 확장자 + 매직바이트로 "내가 처리할 파일인지" 판정
+  - parse()               : 진입점 — python-hwpx 시도 후 실패 시 폴백으로 위임
+  - _nodes_from_document(): 섹션→문단을 읽기 순서 노드 목록으로 변환
+  - _paragraph_to_nodes() : 문단 1개 → (표 노드들 + 텍스트 노드) 변환
+  - _table_node()         : 표 1개 → 행/열 보존 TABLE 노드
+  - _classify_paragraph() : 텍스트를 SUBHEADING/PARAGRAPH 로 분류(길이 휴리스틱)
+  - _fallback_parse()     : python-hwpx 실패 시 zipfile+XML 로 본문만 구제
+  - _extract_xml_texts()  : OWPML XML 바이트에서 텍스트만 긁는 헬퍼
+
+작성자: 이현수 / 작성일: 2026-07-05
 """
 
 from __future__ import annotations
@@ -78,6 +91,14 @@ class HwpxParser(DocumentParser):
     한글(.hwpx) 파일을 python-hwpx 로 구조 트리로 파싱하는 파서.
 
     OWPML(XML) 네이티브 구조를 읽으므로 GPU 가 필요 없다(requires_gpu=False).
+
+    상속: DocumentParser(core.ingest.parser_base) — 인제스트 레지스트리는 각
+    파서의 supported_extensions 로 파일을 라우팅하고, can_parse() 로 최종 확인한
+    뒤 parse() 를 호출한다. 즉 이 클래스는 "한글 문서 하나를 DocumentTree 로
+    바꾸는 책임"만 진다(파일 탐색·라우팅은 상위 레지스트리 몫).
+
+    설계 원칙 한 줄 요약: 구조는 최대한 살리되, 깨지면 본문만이라도 살린다
+    (fail-soft) — 검색 인제스트에서는 "부분 성공"이 "전체 실패"보다 낫기 때문.
     """
 
     # ─── 정체성/플래그 ───

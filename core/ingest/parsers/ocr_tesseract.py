@@ -31,9 +31,19 @@ fail-soft (anti-pattern #8):
   예외로 포착해 빈 트리(또는 부분 트리) + warnings 로 표현하고 예외를 전파하지
   않는다. 페이지 1장이 깨져도 나머지 페이지는 계속 OCR 한다. bare except 금지.
 
+주요 구성 (이 파일을 처음 보는 사람을 위한 지도):
+  - TesseractParser: DocumentParser 를 상속한 유일한 공개 클래스. 아래 흐름으로 동작.
+  - can_parse(): 확장자 + 매직바이트로 처리 가능 여부만 빠르게 판단(파일을 열지 않음).
+  - parse(): 진입점. 설정 적용 → 이미지/PDF 분기 → DocumentTree 반환.
+  - _ensure_config(): OCR 설정을 최초 1회만 읽어 캐시하고 tesseract 전역에 적용.
+  - _parse_image() / _parse_pdf() / _ocr_pdf_page(): 실제 OCR 수행부(fail-soft).
+  - _ocr_image(): pytesseract 를 호출하는 최하위 헬퍼(예외를 잡지 않고 올림).
+
 의존성 방향 (P2): core.ingest.types / parser_base 만 의존. core/rag·model 무관.
 에어갭: pytesseract/pypdfium2/PIL 은 로컬 파일만 다룬다(외부 네트워크 없음).
   import / 호출만 하며 런타임 pip/바이너리 설치 코드는 넣지 않는다(anti-pattern #10).
+
+작성자: 이현수 / 작성일: 2026-07-05
 """
 
 from __future__ import annotations
@@ -91,6 +101,16 @@ class TesseractParser(DocumentParser):
     구조 트리로 변환하는 경량 파서.
 
     CPU 만으로 동작하므로 requires_gpu=False 다(v7.3 단계 8 — 경량 CPU OCR).
+
+    전체 흐름 한눈에 보기:
+      parse() 가 오케스트레이터 역할을 한다. 먼저 _ensure_config() 로 tesseract
+      경로/언어/DPI 를 확정하고, 확장자에 따라 이미지면 _parse_image(), PDF 면
+      _parse_pdf() 로 분기한다. 두 경로 모두 OCR 결과를 PARAGRAPH 노드로 만들어
+      DocumentTree 로 감싸 돌려준다. 어떤 단계가 실패해도 예외를 던지지 않고
+      warnings 에 사유를 적어 부분/빈 트리로 반환한다(fail-soft).
+
+    상태(state): 인스턴스는 _cfg(설정 캐시) 하나만 들고 있어 사실상 무상태에
+      가깝다. 레지스트리에 1개 인스턴스로 등록해 재사용해도 안전하다.
     """
 
     def __init__(self) -> None:

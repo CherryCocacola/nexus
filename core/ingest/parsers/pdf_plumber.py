@@ -27,6 +27,24 @@ fail-soft (anti-pattern #8):
 
 의존성 방향 (P2): core.ingest.types / parser_base 만 의존. core/rag·model 무관.
 에어갭: pdfplumber 는 로컬 파일만 읽는다(외부 네트워크 없음).
+
+이 파일의 구성(온보딩용 지도):
+  - PdfPlumberParser        : DocumentParser 를 상속한 PDF 전용 파서(공개 진입점).
+  - can_parse()             : 확장자 + 매직바이트로 처리 가능 여부 판단(fail-closed).
+  - parse()                 : PDF → DocumentTree(페이지별 노드) 변환의 최상위 흐름.
+  - _parse_page()           : 페이지 1장 → 표 노드 + 텍스트 라인 노드.
+  - _table_node()           : 표 2차원 리스트 → TABLE 노드 직렬화.
+  - _group_words_into_lines(): 단어(좌표+크기)를 같은 줄끼리 묶어 라인 복원.
+  - _finish_line()          : 한 라인 마감(텍스트 합치기 + 평균 글자 크기).
+  - _median_line_size()     : 본문 글자 크기 중앙값(헤딩 판정 기준선).
+  - _classify_line()        : 라인을 SUBHEADING / PARAGRAPH 로 분류.
+
+호출 관계:
+  parse() → _parse_page() → (_table_node, _group_words_into_lines →
+  _finish_line, _median_line_size, _classify_line) 순으로 아래로 내려간다.
+  parse() 는 인제스트 파이프라인이 DocumentParser 인터페이스로 호출한다.
+
+작성자: 이현수 / 작성일: 2026-07-05
 """
 
 from __future__ import annotations
@@ -67,8 +85,17 @@ class PdfPlumberParser(DocumentParser):
     """
     PDF(.pdf) 파일을 pdfplumber 로 구조 트리로 파싱하는 경량 파서.
 
+    DocumentParser(추상 베이스)를 상속한다. 인제스트 파이프라인은 이 베이스
+    인터페이스만 알고 있고, 실제 PDF 처리 로직은 이 클래스가 채운다.
+
     텍스트(글자)와 표를 좌표 기반으로 추출하므로 GPU 가 필요 없다
     (requires_gpu=False). 스캔(이미지) PDF 의 OCR 은 이번 범위가 아니다.
+
+    구현하는 계약(베이스가 요구하는 것):
+      - supported_extensions : 이 파서가 맡는 확장자 목록(여기선 (".pdf",)).
+      - requires_gpu         : GPU 필요 여부(여기선 False).
+      - can_parse(path)      : 실제로 이 파일을 처리할 수 있는지 판정.
+      - parse(path)          : 파일을 DocumentTree 로 변환(비동기).
     """
 
     # ─── 정체성/플래그 ───

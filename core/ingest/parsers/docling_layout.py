@@ -52,6 +52,22 @@ fail-soft (anti-pattern #8):
 
 의존성 방향 (P2): core.ingest.types / parser_base 만 의존. core/rag·model 무관.
 에어갭: convert() 는 로컬 파일만 읽는다(모델 가중치는 사전 배치 전제).
+
+이 파일의 구성 (온보딩용 지도):
+  - DoclingParser        : DocumentParser 를 상속한 고품질 PDF 파서 본체.
+  - can_parse()          : 확장자 + 매직바이트로 처리 가능 여부 판정(fail-closed).
+  - parse()              : PDF → DocumentTree 변환 진입점(비동기, fail-soft).
+  - _ensure_converter()  : DocumentConverter 지연 생성/캐시(모델 적재 1회).
+  - _nodes_from_document(): DoclingDocument 를 읽기 순서대로 노드 목록으로.
+  - _item_to_node()      : 아이템 1개를 타입/라벨로 분류해 노드로 매핑.
+  - _text_node() / _table_node() / _picture_node() : 종류별 노드 생성기.
+  - _page_of() / _empty_tree() : 페이지 번호 추출 / 빈 트리 팩토리.
+
+호출 관계: 적재 파이프라인(parser_registry)이 확장자(.pdf)와 GPU 유무를
+보고 이 파서를 고른 뒤 parse() 를 부르고, 반환된 DocumentTree 를 청커가
+받아 청크로 나눈다. 이 파서는 "구조 복원"까지만 책임진다(임베딩/저장 X).
+
+작성자: 이현수 / 작성일: 2026-07-05
 """
 
 from __future__ import annotations
@@ -411,7 +427,11 @@ class DoclingParser(DocumentParser):
             if 0 <= r < num_rows and 0 <= c < num_cols:
                 grid[r][c] = (getattr(cell, "text", "") or "").strip()
 
+        # 각 행을 " | " 로 이어 한 줄 문자열로 만든다.
         rows_text = [" | ".join(row) for row in grid]
+        # 완전히 빈 행(칸이 모두 공백이라 " | | " 처럼 구분자만 남는 행)은 버린다.
+        # strip(" |") 은 공백과 파이프만 벗겨내므로, 실제 글자가 하나도 없으면
+        # 빈 문자열이 되어 필터에서 탈락한다.
         content = "\n".join(rt for rt in rows_text if rt.strip(" |"))
         if not content.strip():
             return None
