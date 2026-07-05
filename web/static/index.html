@@ -1776,13 +1776,52 @@ function setSendButtonMode(mode) {
   }
 }
 
+// ============================================================================
+// SSE 실시간 스트리밍 채팅 전송
+// 작성자: 이현수 / 작성일: 2026-07-05
+//
+// 이 함수 하나가 "사용자가 입력창에 글을 써서 보내면, 서버가 답변을 만들어가는
+// 과정을 화면에 토큰 단위로 실시간으로 그려주는" 전체 흐름을 맡는다.
+// 한 번에 완성된 답을 받는 게 아니라, 서버가 글자를 조금씩 흘려보내면 그때그때
+// 말풍선에 이어붙이는 방식이라 체감 반응이 빠르다.
+//
+// 전체 흐름을 단계로 풀면:
+//   1) 입력창 글자 + (있다면) 첨부파일 내용을 하나의 message 문자열로 합친다.
+//   2) 화면에 내 말풍선을 먼저 띄우고, 전송 버튼을 '취소' 버튼으로 바꾼다.
+//      (스트리밍 도중 같은 버튼을 눌러 중간에 끊을 수 있게 하려는 것)
+//   3) 서버 API 를 호출한다:  POST /v1/chat/stream
+//        - 요청 본문(JSON): { message: 내가 쓴 글, session_id: 지금 대화방 id }
+//        - 응답 형식      : 일반 JSON 이 아니라 text/event-stream (SSE).
+//          즉 답이 다 만들어질 때까지 기다리지 않고, 서버가 만드는 즉시 조각을 보낸다.
+//   4) fetch 응답의 본문 스트림을 reader 로 직접 읽는다(response.body.getReader()).
+//      네트워크로 오는 건 바이트라서 TextDecoder 로 글자로 풀고, 줄바꿈('\n') 기준으로
+//      잘라 한 줄씩 본다. 한 줄이 도중에 끊길 수 있으니 마지막 조각은 buffer 에 남겨
+//      다음 수신분과 이어붙인다.
+//      각 데이터 줄은 "data: {JSON}" 모양이고, ':' 로 시작하는 줄은 연결이 살아있음을
+//      알리는 heartbeat(주석 줄)이라 그냥 버린다.
+//   5) 줄에서 꺼낸 JSON 의 data.type 값에 따라 갈래를 나눠 처리한다:
+//        · tool_use_start / tool_use_stop  → "지금 무슨 도구를 쓰는 중"을 활동영역에 표시
+//        · thinking_start / thinking_stop  → "생각하는 중" 표시
+//        · tool_use_delta / thinking_delta → 도구 인자·사고 과정의 부스러기(노이즈) → 무시
+//        · data.text 가 들어있으면          → 답변 본문에 그대로 이어붙임(말풍선 실시간 갱신)
+//        · usage_update                    → 입력/출력 토큰 수 갱신
+//        · message_stop                    → 답변 끝 신호(토큰 수가 안 왔으면 글자 길이로 추정)
+//        · error                           → 서버가 준 오류 메시지를 답변 자리에 표시
+//        · download                        → 파일 생성 도구가 만든 다운로드 링크를 모아둠
+//   6) 스트림이 끝나면 말풍선을 최종본으로 확정(마크다운 렌더 등)하고, 모아둔 다운로드가
+//      있으면 버튼을 그린 뒤, 미리볼 수 있는 문서는 오른쪽 캔버스를 자동으로 연다.
+//   7) 성공이든 취소든 오류든, 마지막엔 스트리밍 상태를 풀고 버튼을 '전송'으로 되돌린다.
+// ============================================================================
 async function sendMessage() {
+  // 입력창 요소를 잡고, 앞뒤 공백을 정리한 실제 보낼 텍스트를 만든다.
   const input = document.getElementById('userInput');
   let text = input.value.trim();
+  // 보낼 글도 없고 첨부파일도 없으면 할 일이 없다. 또, 이미 스트리밍 중이면 중복 전송을 막는다.
   if (!text && attachedFiles.length === 0) return;
   if (isStreaming) return;
 
-  // 첨부파일 내용을 메시지에 추가
+  // 첨부파일이 있으면 그 내용을 읽어 본문 앞에 붙인다. 이렇게 하면 모델이 "파일 내용 + 내 지시"를
+  // 한 메시지로 함께 보게 된다. 붙인 뒤에는 첨부 목록을 비우고 미리보기도 다시 그린다.
   if (attachedFiles.length > 0) {
     const fileContents = await readFileContents();
     text = fileContents + (text ? '\n\n' + text : '\n\n위 첨부파일을 분석해 주세요.');
@@ -1790,94 +1829,105 @@ async function sendMessage() {
     renderAttachPreview();
   }
 
+  // 입력창을 비우고 높이를 원래대로 줄인 뒤, 방금 보낸 글을 내 말풍선으로 화면에 먼저 띄운다.
   input.value = '';
   autoResize(input);
   appendMessage('user', text);
 
+  // 이제부터 스트리밍이 진행 중임을 표시하고, 전송 버튼을 '취소' 모드로 바꿔 중간 중단을 허용한다.
   isStreaming = true;
-  // 전송 → 취소 모드 전환. 사용자는 같은 버튼으로 중단 가능.
   setSendButtonMode('cancel');
 
+  // 답변 도착 전까지 "생각 중..." 인디케이터를 보여준다.
   showThinking();
-  let streamStarted = false;
-  let userAborted = false;
-  let pendingDownloads = [];  // 서버가 보낸 정확한 다운로드 링크({url, filename})
+  let streamStarted = false;          // 답변 말풍선을 아직 안 만들었으면 false (첫 조각 도착 시 생성)
+  let userAborted = false;            // 사용자가 취소를 눌러 끝났는지 여부
+  let pendingDownloads = [];          // 서버가 보낸 정확한 다운로드 링크들을 모아두는 곳({url, filename, content, format})
+  // 취소 버튼으로 fetch 자체를 끊기 위한 AbortController. 이 signal 을 아래 fetch 에 물린다.
   _activeAbortController = new AbortController();
 
   try {
+    // 스트리밍 채팅 API 호출. 응답이 SSE 라서 아래에서 body 스트림을 직접 읽어 나간다.
     const response = await fetch('/v1/chat/stream', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        message: text,
-        session_id: currentSessionId,
+        message: text,               // 사용자가 보낸 (첨부 포함) 전체 메시지
+        session_id: currentSessionId, // 대화 이어가기용 세션 식별자
       }),
-      signal: _activeAbortController.signal,
+      signal: _activeAbortController.signal, // 취소 시 이 요청을 중단
     });
 
+    // 응답 본문(ReadableStream)을 조각 단위로 읽기 위한 reader 와, 바이트→글자 변환기.
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
-    let buffer = '';
+    let buffer = '';                  // 아직 한 줄로 완성되지 않은 꼬리 텍스트를 담아두는 버퍼
 
+    // 스트림이 끝날 때까지 계속 읽는다.
     while (true) {
       const { done, value } = await reader.read();
-      if (done) break;
+      if (done) break;               // 서버가 스트림을 닫으면 종료
 
+      // 이번에 받은 바이트를 글자로 풀어 버퍼에 이어붙인 뒤, 줄 단위로 자른다.
+      // 마지막 조각(buffer)은 다음 수신분과 합쳐야 하므로 pop 으로 떼어 보관한다.
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split('\n');
       buffer = lines.pop() || '';
 
       for (const line of lines) {
-        // ':'로 시작하는 라인은 SSE 주석(heartbeat 등). 무시한다.
+        // ':' 로 시작하는 줄은 SSE 주석(연결 유지용 heartbeat)이라 의미가 없으니 건너뛴다.
         if (line.startsWith(':')) continue;
+        // 실제 데이터는 "data: " 로 시작한다. 그 뒤(6글자 이후)의 JSON 을 파싱한다.
         if (line.startsWith('data: ')) {
           try {
             const data = JSON.parse(line.substring(6));
 
-            // ─── 활동(도구/사고) 이벤트 우선 처리 ───
-            // Claude처럼 "지금 무슨 일을 하는지"를 스트리밍 메시지 안에 표시한다.
-            // 도구 이벤트는 답변 텍스트보다 먼저 오므로, 스트리밍 메시지가 아직
-            // 없으면 여기서 먼저 만든다(빈 본문 + 활동 영역만 보이는 상태).
+            // ─── (A) 활동(도구/사고) 이벤트를 먼저 처리 ───
+            // "지금 무슨 일을 하는 중인지"를 말풍선 안에 실시간으로 보여주는 부분이다.
+            // 도구/사고 이벤트는 보통 답변 텍스트보다 먼저 오므로, 답변 말풍선이 아직
+            // 없으면 여기서 먼저 만들어 둔다(본문은 비어 있고 활동 영역만 보이는 상태).
             if (data.type === 'tool_use_start') {
               if (!streamStarted) { streamStarted = true; startStreamingMessage(); }
-              // (1b) 도구 시작 시점까지의 답변 본문은 중간 나레이션 → 리셋하여 최종 답변을 깨끗하게
+              // 도구를 쓰기 직전까지 흘러나온 본문은 대개 "이제 ~를 해볼게요" 같은 중간 나레이션이다.
+              // 최종 답변을 깨끗하게 남기려고 그 부분을 리셋한다.
               resetStreamingBody();
-              activityStart('tool', data.tool_name);
+              activityStart('tool', data.tool_name);   // 활동영역에 "○○ 도구 실행 중" 표시 시작
             } else if (data.type === 'tool_use_stop') {
-              activityStop('tool', data.tool_name);
+              activityStop('tool', data.tool_name);     // 해당 도구 실행 완료 처리(중복은 ×N 으로 접힘)
             } else if (data.type === 'thinking_start') {
               if (!streamStarted) { streamStarted = true; startStreamingMessage(); }
-              activityStart('thinking', null);
+              activityStart('thinking', null);          // "생각하는 중" 표시 시작
             } else if (data.type === 'thinking_stop') {
-              activityStop('thinking', null);
+              activityStop('thinking', null);           // 생각 종료
             } else if (data.type === 'tool_use_delta' || data.type === 'thinking_delta') {
-              // 노이즈(도구 인자 조각 / 사고 조각) — 활동 표시엔 쓰지 않는다.
-              // 특히 thinking_delta는 text 필드를 갖고 있으므로 아래 답변 누적
-              // 경로로 새지 않도록 여기서 확실히 가로챈다.
+              // 도구 인자 조각 / 사고 과정 조각은 화면에 그대로 보여줄 내용이 아니다(노이즈).
+              // 특히 thinking_delta 는 text 필드를 갖고 있어서, 아래 "답변 누적" 경로로 새어들면
+              // 사고 과정이 답변에 섞여버린다. 그래서 여기서 확실히 가로채 아무 것도 안 한다.
             } else {
-              // ─── 기존 처리 (답변 텍스트 / 토큰 / 에러 / 다운로드) ───
+              // ─── (B) 그 외: 실제 답변 텍스트 / 토큰 / 오류 / 다운로드 처리 ───
+              // 답변의 첫 글자 조각이 도착했는데 말풍선이 아직 없으면 지금 만든다.
               if (data.text && !streamStarted) {
                 streamStarted = true;
                 startStreamingMessage();
               }
 
               if (data.text) {
-                // 답변 텍스트가 시작되면 진행 중 인디케이터는 감춘다.
-                // (완료 트레일은 답변 위에 흐리게 그대로 남는다)
+                // 답변이 실제로 흐르기 시작하면 진행 중 인디케이터는 감춘다.
+                // (완료된 활동 기록은 답변 위에 흐리게 그대로 남겨 둔다.)
                 activityHideLive();
-                appendStreamChunk(data.text);
+                appendStreamChunk(data.text);           // 도착한 글자 조각을 말풍선 본문에 이어붙임
               }
 
-              // 토큰 사용량 업데이트
+              // 토큰 사용량이 오면 입력/출력 카운터를 갱신한다(하단 표시용).
               if (data.type === 'usage_update' && data.usage) {
                 totalInputTokens = data.usage.input_tokens || totalInputTokens;
                 totalOutputTokens = data.usage.output_tokens || totalOutputTokens;
                 updateTokenDisplay();
               }
 
-              // message_stop에서도 토큰 확인
+              // 답변 종료 신호. 서버가 출력 토큰 수를 안 줬다면, 렌더된 글자 수로 대략 추정한다
+              // (한글/영문 섞임을 감안해 4글자 ≈ 1토큰의 러프한 근사).
               if (data.type === 'message_stop') {
-                // 출력 토큰을 텍스트 길이로 추정 (서버에서 안 오는 경우)
                 if (totalOutputTokens === 0 && streamStarted) {
                   const body = document.getElementById('streamingBody');
                   if (body) {
@@ -1888,6 +1938,7 @@ async function sendMessage() {
                 }
               }
 
+              // 서버가 오류를 보고하면, 답변 말풍선을 (없으면 만들어) 그 자리에 오류 문구를 표시한다.
               if (data.type === 'error' && data.message) {
                 if (!streamStarted) {
                   streamStarted = true;
@@ -1897,21 +1948,24 @@ async function sendMessage() {
                 appendStreamChunk(`[오류] ${data.message}\n`);
               }
 
-              // 파일 생성 도구의 정확한 다운로드 링크(서버 발신). 스트림 종료 후 버튼 렌더.
+              // 파일 생성 도구(DocumentExport 등)가 만든 "정확한" 다운로드 링크는 서버가 직접 보낸다.
+              // 모델 텍스트에서 URL 을 추측하지 않고 이 이벤트 값을 신뢰한다. 스트림이 끝난 뒤
+              // 한꺼번에 버튼으로 그리려고 여기서는 목록에 모아만 둔다.
               if (data.type === 'download' && data.url) {
                 pendingDownloads.push({
                   url: data.url,
                   filename: data.filename || data.url.split('/').pop(),
-                  content: data.content || '',   // 문서 마크다운 본문(미리보기 캔버스용)
-                  format: data.format || '',     // docx|pptx|hwpx|md|txt (배지 표시용)
+                  content: data.content || '',   // 문서의 마크다운 본문(오른쪽 미리보기 캔버스에 사용)
+                  format: data.format || '',     // docx|pptx|hwpx|md|txt (버튼 배지 표시용)
                 });
               }
             }
-          } catch (e) { /* JSON 파싱 실패 무시 */ }
+          } catch (e) { /* 한 프레임의 JSON 파싱이 실패해도 전체 스트림은 계속 진행 — 조용히 넘어간다 */ }
         }
       }
     }
   } catch (error) {
+    // fetch/스트림 도중 예외. 취소(AbortError)와 그 밖의 연결 오류를 구분해 안내한다.
     if (error && error.name === 'AbortError') {
       userAborted = true;
       if (!streamStarted) startStreamingMessage();
@@ -1922,26 +1976,31 @@ async function sendMessage() {
     }
   }
 
+  // ─── 마무리 정리 ───
   hideThinking();
-  // finalize 가 streamingMessage id를 제거하므로, 그 전에 요소 참조를 잡아둔다.
+  // finalizeStreamingMessage() 가 'streamingMessage' id 를 떼어내므로, 그 전에 요소 참조를 잡아둔다
+  // (아래 다운로드 버튼을 이 말풍선에 붙이기 위함).
   const _streamMsgEl = document.getElementById('streamingMessage');
+  // 답변 말풍선이 만들어졌었다면 최종본으로 확정(마크다운 렌더링/스트리밍 표식 제거 등).
   if (streamStarted) finalizeStreamingMessage();
   if (pendingDownloads.length) {
+    // 다운로드 버튼을 붙일 대상 말풍선. 답변 말풍선이 없던 경우(문서만 생성)엔 안내 버블을 새로 만든다.
     const target = _streamMsgEl || appendMessage('assistant', '문서를 생성했습니다.');
     renderDownloadButtons(target, pendingDownloads);
-    // (2) claude 아티팩트처럼: content(마크다운 본문)를 가진 가장 최근 생성 문서를
-    //     우측 캔버스에 자동으로 연다. 이미 열려 있으면 openCanvas가 내용만 교체한다.
+    // Claude 아티팩트처럼, 본문(content)이 있는 가장 최근 생성 문서를 오른쪽 캔버스에 자동으로 연다.
+    // 캔버스가 이미 열려 있으면 openCanvas 가 내용만 갈아끼운다.
     const previewable = pendingDownloads.filter(d => d.content);
     if (previewable.length) {
       openCanvas(previewable[previewable.length - 1]);
     }
   }
+  // 스트리밍 상태를 풀고, 취소 컨트롤러를 비우고, 버튼을 '전송'으로 되돌린 뒤 입력창에 포커스를 준다.
   isStreaming = false;
   _activeAbortController = null;
   setSendButtonMode('send');
   input.focus();
-  // 취소로 종료된 경우 사용자가 같은 메시지를 다시 보내도록 입력란에 복원하지는 않는다
-  // (원본 메시지는 이미 화면에 'user' 버블로 남아 있음).
+  // 취소로 끝난 경우라도 입력창에 원문을 되살리지는 않는다(원본은 이미 'user' 말풍선으로 남아 있음).
+  // userAborted 는 위 흐름에서 표식 용도로만 쓰였으므로, 미사용 경고를 피하려 명시적으로 소비한다.
   void userAborted;
 }
 
