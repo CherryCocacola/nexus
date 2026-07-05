@@ -33,6 +33,19 @@
 anti-pattern #8 (bare except 금지):
   도구 실행 중 발생한 예외는 구체 타입으로 포착해 JSON-RPC error 로 변환한다.
   도구 하나가 실패해도 서버 프로세스는 죽지 않는다.
+
+전체 구성(온보딩용 지도):
+  - McpServerTool(ABC): 서버가 노출하는 도구 1개의 계약. 실제 도구는 이 클래스를
+    상속해 name/description/input_schema/call 을 채운다.
+  - _rpc_success / _rpc_error: JSON-RPC 응답 봉투를 만드는 작은 헬퍼.
+  - create_mcp_app(): 도구 목록 + 인증 키를 받아 FastAPI 앱을 조립해 돌려주는
+    팩토리. 각 MCP 서버(run.py)는 자기 도구를 모아 이 함수만 호출하면 된다.
+
+한눈에 보는 호출 흐름:
+  클라이언트(core/tools/mcp/client.py) → POST "/" (JSON-RPC) → 인증 검사 →
+  method 분기(tools/list | tools/call) → 도구 call() 실행 → JSON 응답.
+
+작성자: 이현수 / 작성일: 2026-07-05
 """
 
 from __future__ import annotations
@@ -84,17 +97,17 @@ class McpServerTool(ABC):
     @property
     @abstractmethod
     def name(self) -> str:
-        """도구 이름(고유)."""
+        """도구 이름(서버 안에서 고유). tools/call 의 params.name 과 매칭된다."""
 
     @property
     @abstractmethod
     def description(self) -> str:
-        """도구 설명."""
+        """도구 설명. 모델이 '언제 이 도구를 부를지' 판단하는 근거가 된다."""
 
     @property
     @abstractmethod
     def input_schema(self) -> dict[str, Any]:
-        """JSON Schema(dict). tools/list 에서 inputSchema 로 노출."""
+        """입력 인자 규격(JSON Schema dict). tools/list 응답에서 inputSchema 로 노출."""
 
     @abstractmethod
     async def call(self, arguments: dict[str, Any]) -> Any:
@@ -118,12 +131,22 @@ class McpServerTool(ABC):
 # JSON-RPC 응답 헬퍼 — 항상 동일한 봉투(envelope)로 직렬화
 # ─────────────────────────────────────────────
 def _rpc_success(request_id: Any, result: Any) -> dict[str, Any]:
-    """성공 응답 봉투를 만든다."""
+    """
+    성공 응답 봉투를 만든다.
+
+    request_id 는 요청에 담겨 온 id 를 그대로 되돌려 준다(요청-응답 짝 맞춤용).
+    result 에는 도구 실행 결과나 tools/list 목록이 들어간다.
+    """
     return {"jsonrpc": "2.0", "id": request_id, "result": result}
 
 
 def _rpc_error(request_id: Any, code: int, message: str) -> dict[str, Any]:
-    """에러 응답 봉투를 만든다(client 는 message 만 사용)."""
+    """
+    에러 응답 봉투를 만든다.
+
+    code 는 위에서 정의한 JSON-RPC 표준 코드, message 는 사람이 읽는 사유다.
+    클라이언트(client.py)는 실제로 message 만 읽어 ConnectionError 로 정규화한다.
+    """
     return {
         "jsonrpc": "2.0",
         "id": request_id,

@@ -1,13 +1,27 @@
 """
-미들웨어 — 요청 로깅 + CORS 설정.
+웹 미들웨어 모음 — API 키 인증 + 요청 로깅 + CORS 설정.
 
-FastAPI 앱에 적용되는 미들웨어를 정의한다.
+이 파일은 FastAPI(Starlette) 앱에 add_middleware로 붙는 미들웨어들을 정의한다.
+미들웨어란 "모든 HTTP 요청이 실제 라우트 핸들러에 닿기 전/후에 반드시 거쳐가는
+가로채기 계층"이다. 여기서는 인증 게이트, 접근 로그/메트릭 수집, CORS 정책을
+한곳에 모아 관리한다.
 
-의존성 방향: web/ → core/ (단방향)
+미들웨어 실행 순서(바깥→안쪽) 주의:
+  add_middleware로 나중에 추가한 것이 더 "바깥"에 놓인다. 인증 미들웨어는
+  CORS보다 바깥에 있어 브라우저의 CORS 프리플라이트(OPTIONS)를 먼저 만난다.
+  그래서 아래 ApiKeyAuthMiddleware는 OPTIONS 요청을 인증에서 면제한다(자세한
+  이유는 해당 dispatch 주석 참조).
+
+의존성 방향: web/ → core/ (단방향). 단, 이 파일은 순환 import를 피하려고 core/나
+web/app.py를 직접 import하지 않는다. 필요한 설정·레지스트리는 app.py가 "무인자
+콜러블" 형태로 주입해 준다(ApiKeyAuthMiddleware 참조).
 
 주요 구성:
+  - ApiKeyAuthMiddleware: Bearer API 키를 검증하는 인증 게이트(fail-closed)
   - RequestLoggingMiddleware: 모든 요청/응답을 로깅하고 메트릭스를 수집한다
-  - CORSConfig: 로컬 환경에 적합한 CORS 설정을 제공한다
+  - CORSConfig: 에어갭/로컬 환경에 적합한 CORS 설정을 제공한다
+
+작성자: 이현수 / 작성일: 2026-07-05
 """
 
 from __future__ import annotations
@@ -21,6 +35,8 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
+# 모듈 전용 로거. 프로젝트 규칙에 따라 "nexus.{module}" 네임스페이스를 쓴다.
+# 이렇게 계층형 이름을 주면 상위 "nexus" 로거 설정으로 레벨/핸들러를 일괄 제어할 수 있다.
 logger = logging.getLogger("nexus.web.middleware")
 
 
@@ -153,11 +169,18 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
     """
     요청/응답 로깅 + 메트릭스 수집 미들웨어.
 
+    운영/관측(observability)용 계층이다. 앱이 실제로 어떤 요청을 얼마나 빠르게
+    처리했는지, 에러율은 어떤지를 로그와 누적 카운터로 남긴다. 인증처럼 요청을
+    막는 역할은 전혀 하지 않고, 통과시키면서 관찰만 한다.
+
     모든 HTTP 요청에 대해:
-      1. 요청 시작 시간을 기록한다
-      2. 응답 완료 후 지연 시간을 계산한다
-      3. JSONL 형식으로 로그를 남긴다
-      4. 메트릭스를 누적한다 (총 요청 수, 에러 수, 평균 지연)
+      1. 요청 시작 시간을 기록한다(단조 시계 time.monotonic 사용)
+      2. 응답 완료 후 지연 시간(latency)을 계산한다
+      3. 시작/완료/실패 로그를 남긴다
+      4. 메트릭스를 누적한다 (총 요청 수, 에러 수, 누적 지연)
+
+    누적된 메트릭스는 metrics 프로퍼티로 읽어 /metrics 엔드포인트가 노출한다.
+    카운터는 프로세스 메모리에만 쌓이므로 재시작하면 0으로 초기화된다.
     """
 
     def __init__(self, app: Any):
@@ -187,26 +210,28 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         Returns:
             처리된 HTTP 응답
         """
-        # 요청 시작 시간 기록
+        # 요청 시작 시각 기록. 지연 측정에는 벽시계(time.time)가 아니라 단조 시계를 쓴다.
+        # 단조 시계는 NTP 보정 등으로 시각이 뒤로 튀어도 음수 지연이 나오지 않는다.
         start_time = time.monotonic()
         self._total_requests += 1
 
-        # 요청 정보 로깅
+        # 로그에 남길 요청 기본 정보 추출.
         method = request.method
         path = request.url.path
+        # 프록시 뒤 등에서 client가 None일 수 있으므로 방어적으로 "unknown" 처리.
         client_ip = request.client.host if request.client else "unknown"
 
         logger.info(f"요청 시작: {method} {path} | client={client_ip}")
 
         try:
-            # 다음 핸들러 실행
+            # 다음 미들웨어/실제 라우트 핸들러 실행. 여기서 실제 응답이 만들어진다.
             response = await call_next(request)
 
-            # 지연 시간 계산
+            # 시작 시각과의 차이로 처리 소요 시간(ms) 계산 후 누적.
             latency_ms = (time.monotonic() - start_time) * 1000
             self._total_latency_ms += latency_ms
 
-            # 에러 응답 카운트
+            # 4xx/5xx는 에러로 집계한다(에러율 계산에 사용).
             if response.status_code >= 400:
                 self._total_errors += 1
 
@@ -218,13 +243,14 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
                 f"client={client_ip}"
             )
 
-            # 응답 헤더에 처리 시간을 추가한다
+            # 응답 헤더에 처리 시간을 실어 클라이언트/디버깅에서 지연을 바로 볼 수 있게 한다.
             response.headers["X-Process-Time-Ms"] = f"{latency_ms:.1f}"
 
             return response
 
         except Exception as e:
-            # 처리되지 않은 예외 로깅
+            # 하위 핸들러가 던진 미처리 예외를 잡아 로그를 남기고 에러로 집계한다.
+            # 단, 여기서 삼키지 않고 raise로 다시 던져 상위(에러 핸들러)가 처리하게 한다.
             latency_ms = (time.monotonic() - start_time) * 1000
             self._total_errors += 1
             self._total_latency_ms += latency_ms
@@ -239,9 +265,11 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
     @property
     def metrics(self) -> dict[str, Any]:
         """
-        누적 메트릭스를 반환한다.
+        누적 메트릭스를 계산해 dict로 반환한다.
 
-        /metrics 엔드포인트에서 이 데이터를 노출한다.
+        /metrics 엔드포인트에서 이 데이터를 노출한다. 매 호출마다 현재까지의
+        카운터로 평균 지연과 에러율을 즉석 계산한다. 요청이 0건이면 0으로
+        나누는 것을 피하려고 방어적으로 0.0을 돌려준다.
         """
         avg_latency = (
             self._total_latency_ms / self._total_requests if self._total_requests > 0 else 0.0
@@ -258,10 +286,18 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
 
 class CORSConfig:
     """
-    로컬 환경 CORS 설정.
+    로컬/에어갭 환경 CORS 설정 도우미.
 
-    에어갭 환경이므로 외부 도메인은 허용하지 않는다.
-    로컬 개발 환경(localhost, LAN IP)만 허용한다.
+    CORS(Cross-Origin Resource Sharing)는 브라우저가 "이 웹페이지가 다른 출처
+    (origin)의 API를 호출해도 되는가"를 검사하는 보안 장치다. 이 클래스는 미들웨어
+    인스턴스가 아니라, FastAPI 기본 CORSMiddleware에 넘길 "허용 목록/설정을 모아둔
+    설정 홀더"다. get_cors_kwargs()로 kwargs를 만들어 app.add_middleware에 전달한다.
+
+    에어갭 환경이므로 외부 인터넷 도메인은 절대 허용하지 않는다.
+    로컬 개발 환경(localhost)과 LAN IP(add_lan_origin으로 추가)만 허용한다.
+
+    주의: ALLOWED_ORIGINS는 클래스 변수(공유 상태)라 add_lan_origin이 여기에 직접
+    항목을 append한다. 즉 프로세스 전체에서 하나의 목록을 공유한다.
     """
 
     # 허용할 오리진 목록 — 로컬/LAN 주소만 허용한다
@@ -311,7 +347,8 @@ class CORSConfig:
             ip: LAN IP 주소 (192.168.x.x, 10.x.x.x, 172.16~31.x.x)
             port: 포트 번호
         """
-        # 에어갭 검증: LAN 주소만 허용한다
+        # 에어갭 검증: 사설망(RFC1918) 대역으로 시작하는 IP만 허용한다.
+        # 172.16~172.31 대역은 표기가 넓어 각 옥텟을 하나씩 나열해 안전하게 매칭한다.
         allowed_prefixes = (
             "192.168.",
             "10.",
@@ -336,6 +373,7 @@ class CORSConfig:
             logger.warning(f"LAN이 아닌 주소 거부: {ip}")
             return
 
+        # "http://IP:포트" 형태의 오리진 문자열을 만들어 중복이 아니면 허용 목록에 추가.
         origin = f"http://{ip}:{port}"
         if origin not in cls.ALLOWED_ORIGINS:
             cls.ALLOWED_ORIGINS.append(origin)

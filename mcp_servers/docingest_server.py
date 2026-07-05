@@ -1,5 +1,18 @@
 """
-docingest MCP 서버 — 문서 인제스트 파이프라인을 도구로 노출한다.
+docingest MCP 서버 — 문서 인제스트 파이프라인을 MCP 도구로 노출한다.
+
+한눈에 보기(온보딩용):
+  이 파일은 "문서 파일을 읽어 지식 베이스에 넣고, 그 안에서 검색"하는 기능을
+  MCP(Model Context Protocol) 서버 형태로 감싼 것이다. Nexus 오케스트레이터는
+  이 서버가 노출하는 parse/ingest/search 3개 도구를 원격 도구처럼 호출한다.
+  실제 파싱·임베딩·DB 적재 로직은 이 파일이 아니라 core/ingest, core/rag,
+  core/model 에 이미 구현돼 있고, 여기서는 그 부품들을 조립(build_app)해
+  MCP 앱으로 내보내는 "얇은 서버 레이어" 역할만 한다.
+
+구성 요소:
+  · DocParseTool  / DocIngestTool / DocSearchTool — 3개 MCP 도구 클래스.
+  · build_app()   — 파서 레지스트리·임베딩·DB·파이프라인을 조립하는 진입점.
+  · _gpu_available() / _paddleocr_available() — 호스트 능력 감지 헬퍼.
 
 도구 3개:
   parse  (read-only) — 파일을 파싱·청킹만 하고 적재하지 않는다(dry_run). 구조
@@ -40,6 +53,8 @@ read-only 구분 (fail-closed 정신):
 
 에어갭:
   임베딩/DB 접속은 LAN. 파일 경로는 서버 로컬 파일 시스템만 대상으로 한다.
+
+작성자: 이현수 / 작성일: 2026-07-05
 """
 
 from __future__ import annotations
@@ -49,17 +64,24 @@ from typing import Any
 
 from fastapi import FastAPI
 
+# McpServerTool: 모든 MCP 도구가 상속하는 ABC(name/description/input_schema/call).
+# create_mcp_app: 도구 목록을 받아 인증·라우팅이 붙은 FastAPI 앱을 만들어 주는 팩토리.
 from mcp_servers.framework import McpServerTool, create_mcp_app
 
+# 모듈 전용 로거 — 규칙에 따라 "nexus.{module}" 네임스페이스를 사용한다.
 logger = logging.getLogger("nexus.mcp_servers.docingest")
 
 # docingest 가 적재하는 지식 소스 식별자 — pipeline.INGEST_SOURCE 와 동일해야 한다.
+# 이 값으로 tb_knowledge 에 태깅하고, search 도 이 값으로 필터해 다른 소스와 섞이지
+# 않게 한다(예: kowiki 덤프와 격리).
 _INGEST_SOURCE = "docingest"
 
 # 검색 질의 임베딩 접두사(e5-large 규약 — kowiki 서버와 동일).
+# e5 계열 임베딩 모델은 "query: " / "passage: " 접두사로 질의와 문서를 구분하도록
+# 학습돼 있어, 검색 질의에는 반드시 이 접두사를 붙여야 정확도가 나온다.
 _QUERY_PREFIX = "query: "
-_DEFAULT_TOP_K = 5
-_MAX_TOP_K = 50
+_DEFAULT_TOP_K = 5  # search 에서 top_k 미지정 시 기본 반환 개수
+_MAX_TOP_K = 50  # 과도한 결과 요청 방지를 위한 상한(초과 시 이 값으로 클램프)
 
 
 def _gpu_available() -> bool:
@@ -107,9 +129,22 @@ def _paddleocr_available() -> bool:
 
 
 class DocParseTool(McpServerTool):
-    """파일을 파싱·청킹만 하고 적재하지 않는 read-only 도구(dry_run)."""
+    """
+    파일을 파싱·청킹만 하고 적재하지 않는 read-only 도구(dry_run).
+
+    왜 필요한가:
+      실제로 DB 에 넣기(ingest) 전에 "이 파일이 제대로 파싱되는지, 청크가 몇 개
+      나오는지, 구조 경고는 없는지"를 미리 확인하는 안전 점검용이다. 부작용이
+      전혀 없어(DB 미접근) read-only 로 분류되며, 권한 파이프라인이 이를 보고
+      확인 없이 통과시킬 수 있다.
+
+    핵심 흐름:
+      call() → pipeline.ingest_file(path, dry_run=True) → 요약(dict) 반환.
+    """
 
     def __init__(self, pipeline: Any) -> None:
+        # DocumentIngestPipeline 인스턴스를 주입받아 보관한다(파싱/청킹 로직은
+        # 전부 파이프라인에 있고, 이 도구는 dry_run 플래그만 켜서 위임한다).
         self._pipeline = pipeline
 
     @property
@@ -137,20 +172,48 @@ class DocParseTool(McpServerTool):
         }
 
     async def call(self, arguments: dict[str, Any]) -> Any:
-        """dry_run=True 로 파이프라인을 돌려 적재 없이 요약만 반환한다."""
+        """
+        dry_run=True 로 파이프라인을 돌려 적재 없이 요약만 반환한다.
+
+        매개변수:
+          arguments["path"] — 서버 로컬 파일 시스템의 문서 경로(필수, 문자열).
+        반환:
+          파이프라인이 만든 요약 dict(제목/청크 수/구조 경고 등).
+        예외:
+          path 누락/빈 문자열이면 ValueError, 파싱 중 오류는 RuntimeError 로
+          정규화해 올린다(호출 측이 메시지만 보고 처리하도록).
+        """
+        # 입력 방어 — MCP 인자는 외부에서 오므로 타입/공백을 직접 검증한다.
         path = arguments.get("path")
         if not isinstance(path, str) or not path.strip():
             raise ValueError("필수 인자 'path'(문자열)가 없습니다.")
         try:
+            # dry_run=True 이면 파이프라인이 임베딩/DB 적재를 건너뛰고 요약만 만든다.
             return await self._pipeline.ingest_file(path, dry_run=True)
         except (OSError, ValueError, RuntimeError) as e:
+            # 파일 없음/파싱 실패 등 구체 예외를 하나의 RuntimeError 로 감싸 올린다
+            # (bare except 금지 — anti-pattern #8. 예외 종류를 메시지에 남긴다).
             raise RuntimeError(f"파싱 실패: {type(e).__name__}: {e}") from e
 
 
 class DocIngestTool(McpServerTool):
-    """파일을 파싱→청킹→임베딩→tb_knowledge 적재하는 쓰기 도구."""
+    """
+    파일을 파싱→청킹→임베딩→tb_knowledge 적재하는 쓰기 도구.
+
+    왜 필요한가:
+      실제로 지식 베이스에 문서를 넣는 유일한 도구다. DB 에 쓰기 때문에(부작용)
+      read-only 가 아니며, 권한 파이프라인이 쓰기 도구로 취급한다.
+
+    멱등성:
+      동일 파일을 다시 적재해도 UPSERT 로 처리돼 중복 행이 쌓이지 않는다
+      (같은 파일 재인제스트가 안전하다).
+
+    핵심 흐름:
+      call() → pipeline.ingest_file(path, dry_run=False) → 적재 행수/오류 목록 반환.
+    """
 
     def __init__(self, pipeline: Any) -> None:
+        # parse 도구와 동일한 파이프라인을 공유한다. 차이는 dry_run 플래그뿐이다.
         self._pipeline = pipeline
 
     @property
@@ -179,20 +242,46 @@ class DocIngestTool(McpServerTool):
         }
 
     async def call(self, arguments: dict[str, Any]) -> Any:
-        """dry_run=False 로 실제 적재를 수행한다."""
+        """
+        dry_run=False 로 실제 적재를 수행한다.
+
+        매개변수:
+          arguments["path"] — 적재할 문서 경로(필수, 문자열).
+        반환:
+          적재 행수와 오류 목록을 담은 파이프라인 결과 dict.
+        예외:
+          path 누락/빈 문자열이면 ValueError, 적재 중 오류는 RuntimeError.
+        """
+        # parse 와 동일한 입력 검증. path 만 필요하다.
         path = arguments.get("path")
         if not isinstance(path, str) or not path.strip():
             raise ValueError("필수 인자 'path'(문자열)가 없습니다.")
         try:
+            # dry_run=False 이면 임베딩까지 태워 tb_knowledge 에 실제로 UPSERT 한다.
             return await self._pipeline.ingest_file(path, dry_run=False)
         except (OSError, ValueError, RuntimeError) as e:
+            # 적재 중 발생한 구체 예외를 RuntimeError 로 정규화해 올린다.
             raise RuntimeError(f"적재 실패: {type(e).__name__}: {e}") from e
 
 
 class DocSearchTool(McpServerTool):
-    """적재된 docingest 문서를 벡터 검색하는 read-only 도구."""
+    """
+    적재된 docingest 문서를 벡터 검색하는 read-only 도구.
+
+    왜 필요한가:
+      ingest 로 넣어 둔 문서를 자연어 질의로 되찾기 위한 도구다. 질의를 임베딩해
+      코사인 유사도가 높은 청크를 돌려준다. DB 를 읽기만 하므로 read-only.
+
+    parse/ingest 와 달리 파이프라인을 쓰지 않고, 임베딩 프로바이더와 지식 저장소를
+    직접 받아 "질의 임베딩 → 벡터 검색" 두 단계만 수행한다.
+
+    핵심 흐름:
+      call() → model.embed(["query: "+질의]) → store.search_by_vector(...) → 결과.
+    """
 
     def __init__(self, model_provider: Any, knowledge_store: Any) -> None:
+        # _model: 질의 문장을 임베딩 벡터로 바꾸는 프로바이더(LocalModelProvider).
+        # _store: 벡터 유사도 검색을 담당하는 지식 저장소(KnowledgeStore).
         self._model = model_provider
         self._store = knowledge_store
 
@@ -222,7 +311,18 @@ class DocSearchTool(McpServerTool):
         }
 
     async def call(self, arguments: dict[str, Any]) -> Any:
-        """질의 임베딩 → source='docingest' 로 필터한 벡터 검색."""
+        """
+        질의 임베딩 → source='docingest' 로 필터한 벡터 검색.
+
+        매개변수:
+          arguments["query"]  — 검색할 자연어 질의(필수, 비어 있지 않은 문자열).
+          arguments["top_k"]  — 반환 개수(선택, 기본 5, 최대 50).
+        반환:
+          {"query": 원질의, "count": 결과 수, "results": 청크 리스트} 형태 dict.
+        예외:
+          입력 검증 실패는 ValueError, 임베딩/검색 실패는 RuntimeError.
+        """
+        # 질의 검증 — 빈 문자열/비문자열이면 임베딩할 것이 없으므로 거부한다.
         query = arguments.get("query")
         if not isinstance(query, str) or not query.strip():
             raise ValueError("필수 인자 'query'(비어 있지 않은 문자열)가 없습니다.")
@@ -236,9 +336,12 @@ class DocSearchTool(McpServerTool):
         top_k = min(top_k, _MAX_TOP_K)
 
         try:
+            # e5 규약대로 "query: " 접두사를 붙여 임베딩한다. embed 는 리스트를
+            # 받아 리스트를 돌려주므로, 한 문장이라도 [문장] 으로 감싸 호출한다.
             embeddings = await self._model.embed([f"{_QUERY_PREFIX}{query}"])
         except Exception as e:  # noqa: BLE001 — embed 예외 → RuntimeError 정규화
             raise RuntimeError(f"임베딩 실패: {type(e).__name__}: {e}") from e
+        # 서버가 빈 리스트나 빈 벡터를 주면 이후 검색이 무의미하므로 조기 실패시킨다.
         if not embeddings or not embeddings[0]:
             raise RuntimeError("임베딩 서버가 빈 결과를 반환했습니다.")
 
@@ -250,21 +353,37 @@ class DocSearchTool(McpServerTool):
         except Exception as e:  # noqa: BLE001 — 검색 예외 → RuntimeError 정규화
             raise RuntimeError(f"벡터 검색 실패: {type(e).__name__}: {e}") from e
 
+        # 호출 측이 원질의를 그대로 되돌려받고 결과 수도 바로 알 수 있게 함께 담아 준다.
         return {"query": query, "count": len(results), "results": results}
 
 
 async def build_app(api_key: str = "local-key") -> FastAPI:
     """
-    docingest MCP 서버 FastAPI 앱을 조립한다.
+    docingest MCP 서버 FastAPI 앱을 조립한다(이 파일의 진입점).
+
+    이 함수 한 곳에서 필요한 부품을 전부 만들어 배선한 뒤 완성된 앱을 돌려준다.
+    서버 기동 스크립트는 build_app() 을 await 해서 얻은 앱을 uvicorn 등으로 띄운다.
+
+    매개변수:
+      api_key — MCP 프레임워크가 요구하는 인증 키(LAN 내부용 기본값 "local-key").
 
     동작:
-      1) core/config 로드.
+      1) core/config 로드(GPU 서버 URL, DB 접속 정보 등).
       2) ParserRegistry 에 PptxParser/PdfPlumberParser/HwpxParser/
-         HwpViaLibreOfficeParser/TesseractParser 등록 + GPU 가용 시
-         DoclingParser(.pdf 고품질)를 더 높은 priority 로 등록.
-      3) LocalModelProvider(embed) + KnowledgeStore(pg_pool) 구성.
-      4) DocumentIngestPipeline 조립 → parse/ingest/search 도구 등록.
+         HwpViaLibreOfficeParser/TesseractParser 등록 + 호스트 능력에 따라
+         PaddleOcrParser / DoclingParser(.pdf 고품질)를 더 높은 priority 로 등록.
+      3) LocalModelProvider(embed) + KnowledgeStore(pg_pool) 구성
+         (DB 연결 실패 시 인메모리로 폴백해 서버 자체는 뜨게 한다).
+      4) DocumentIngestPipeline 조립 → parse/ingest/search 도구를 MCP 앱으로 등록.
+
+    반환:
+      create_mcp_app 이 만든 FastAPI 인스턴스(종료 훅으로 리소스 정리 포함).
+
+    주의:
+      무거운 core 모듈들은 서버 기동 시점에만 필요하므로 함수 안에서 지연 import
+      한다(모듈 로드 비용 절감 + 순환 import 회피).
     """
+    # --- 지연 import: 실제 서버를 조립할 때만 무거운 core 부품을 끌어온다 ---
     from core.config import load_and_validate_config
     from core.ingest.parser_base import ParserRegistry
     from core.ingest.parsers.docling_layout import DoclingParser
@@ -277,6 +396,7 @@ async def build_app(api_key: str = "local-key") -> FastAPI:
     from core.model.inference import LocalModelProvider
     from core.rag.knowledge_store import KnowledgeStore
 
+    # 설정 로드 및 검증 — 이후 GPU/DB/모델 접속 정보를 여기서 꺼내 쓴다.
     config = load_and_validate_config()
 
     # 파서 레지스트리 — 청정(MIT/OWPML) 기본 파서들을 등록(어댑터 슬롯 구조).
@@ -327,7 +447,9 @@ async def build_app(api_key: str = "local-key") -> FastAPI:
     else:
         logger.info("docingest MCP 서버: GPU 미감지 — PdfPlumberParser(.pdf 경량)만 사용")
 
-    # 임베딩 프로바이더(embed 전용).
+    # 임베딩 프로바이더(embed 전용) — 질의/문서를 벡터로 바꾸는 데만 쓴다.
+    # 생성 LLM URL 과 임베딩 URL 을 따로 받는다(임베딩 모델은 별도 엔드포인트일 수
+    # 있음). primary_model 은 여기서 직접 쓰이진 않지만 프로바이더 계약상 채워 준다.
     model_provider = LocalModelProvider(
         base_url=config.gpu_server.url,
         api_key=config.scout.api_key,
@@ -337,6 +459,8 @@ async def build_app(api_key: str = "local-key") -> FastAPI:
     )
 
     # PostgreSQL 풀 — 실패 시 인메모리 폴백.
+    # DB 가 없어도 서버는 떠야 하므로(개발/데모 환경 대비), 연결 실패를 흡수하고
+    # pg_pool=None 으로 남긴다. None 이면 KnowledgeStore 가 인메모리 모드로 동작한다.
     pg_pool: Any | None = None
     try:
         import asyncpg
@@ -359,9 +483,12 @@ async def build_app(api_key: str = "local-key") -> FastAPI:
 
     knowledge_store = KnowledgeStore(pg_pool=pg_pool)
     # pg_pool 이 있으면 스키마 멱등 생성(실 DB 에만 DDL 실행).
+    # ensure_schema 는 테이블/인덱스가 없을 때만 만들므로 반복 호출해도 안전하다.
     if pg_pool is not None:
         await knowledge_store.ensure_schema()
 
+    # 파서 레지스트리 + 임베딩 + 저장소를 하나로 묶은 인제스트 파이프라인.
+    # parse/ingest 도구는 이 파이프라인 하나를 공유하며 dry_run 플래그로만 갈린다.
     pipeline = DocumentIngestPipeline(
         parser_registry=parser_registry,
         model_provider=model_provider,
@@ -369,11 +496,14 @@ async def build_app(api_key: str = "local-key") -> FastAPI:
     )
 
     async def _cleanup() -> None:
+        # 서버 종료 시(shutdown 훅) 열려 있던 HTTP 클라이언트와 DB 풀을 닫아
+        # 커넥션 누수를 막는다. create_mcp_app 에 넘겨 lifespan 종료 때 호출되게 한다.
         await model_provider.close()
         if pg_pool is not None:
             await pg_pool.close()
         logger.info("docingest MCP 서버: 리소스 정리 완료")
 
+    # 3개 도구를 등록해 인증·라우팅이 붙은 MCP FastAPI 앱을 완성해 돌려준다.
     return create_mcp_app(
         tools=[
             DocParseTool(pipeline),

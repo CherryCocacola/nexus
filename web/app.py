@@ -1,23 +1,46 @@
 """
-FastAPI 웹 인터페이스 — HTTP API 서버.
+FastAPI 웹 인터페이스 — Nexus HTTP API 서버.
 
-CLI 외에 HTTP API로도 Nexus를 사용할 수 있게 한다.
-SSE 스트리밍, 세션 관리, 도구/모델 조회 등을 제공한다.
+[이 파일이 하는 일]
+CLI(터미널) 말고도 HTTP/SSE로 Nexus를 사용할 수 있게 해 주는 웹 진입점이다.
+브라우저 채팅 UI, 외부 시스템(AgentHub·.NET·LangChain 등 OpenAI 클라이언트),
+관리/모니터링(도구·모델·테넌트·메트릭 조회)이 모두 이 서버를 통해 들어온다.
+핵심 책임은 세 가지다:
+  1) HTTP 요청을 받아 core의 QueryEngine(4-Tier 오케스트레이터)에 전달하고,
+     QueryEngine이 yield하는 StreamEvent를 응답(JSON/SSE)으로 변환한다.
+  2) 요청/세션별로 '격리된' QueryEngine을 조립해 멀티테넌트 동시 요청이
+     서로의 대화·테넌트를 오염시키지 않게 한다(감사 Critical #5 수정).
+  3) 세션 히스토리를 Redis(단기)·JSONL 트랜스크립트(영구)와 오가며 복원/저장한다.
 
-의존성 방향: web/ → core/ (단방향)
+[의존성 방향] web/ → core/ (단방향). 이 파일은 core를 import하지만 core는 web을
+절대 import하지 않는다(아키텍처 규칙 P2). GPU/vLLM 직접 호출도 없다(전부 core 경유).
 
-엔드포인트:
-  POST /v1/chat          — 비스트리밍 채팅
-  POST /v1/chat/stream   — SSE 스트리밍 채팅
+[주요 헬퍼/구성요소]
+  - _strip_thinking / _sanitize_history_inplace : Qwen3.5 <think> 찌꺼기 정제
+  - _extract_download / _collect_downloads      : 문서 생성 도구의 다운로드 URL 추출
+  - _resolve_tenant                             : 요청→TenantConfig 해석(멀티테넌시)
+  - _build_web_engine_parts / _assemble_session_engine
+        : 무거운 '공유 부품'을 한 번만 만들고, 세션 전용 상태만 가볍게 격리 조립
+  - _acquire_session_engine / _get_session_lock : 세션별 엔진 획득 + 세션 락 직렬화
+  - Pydantic 요청/응답 모델(ChatRequest, ChatResponse, OpenAI* 등)
+
+[제공 엔드포인트]
+  POST /v1/chat          — 비스트리밍 채팅(모든 StreamEvent를 모아 한 번에 응답)
+  POST /v1/chat/stream   — SSE 스트리밍 채팅(이벤트를 실시간 전송)
   POST /v1/chat/completions — OpenAI 호환 채팅(비스트림 JSON / stream=true SSE)
-  GET  /v1/sessions      — 세션 목록 조회 (title_hint 포함)
+  GET  /v1/sessions      — 세션 목록 조회 (Redis + 트랜스크립트 병합)
   GET  /v1/sessions/{session_id}/messages — 특정 세션 대화 복원 (Ch 16)
   DELETE /v1/sessions/{session_id} — 특정 세션 삭제 (Redis + 트랜스크립트)
-  GET  /v1/tools         — 도구 목록 조회
+  GET  /v1/tools         — 도구 목록 조회(웹 Worker가 실제로 보는 풀, MCP 포함)
   GET  /v1/models        — 모델 목록 조회
   GET  /v1/tenants       — 테넌트 목록 조회 (멀티테넌시, Part 5 Ch 15)
-  GET  /health           — 헬스체크
-  GET  /metrics          — 메트릭스 조회
+  GET  /health           — 헬스체크(오케스트레이터 + GPU 서버 상태)
+  GET  /metrics          — 메트릭스 조회(HTTP/세션/MCP/에이전트/테넌트 통계)
+  POST /v1/upload        — 문서 분석용 파일 업로드
+  GET  /v1/download/{filename} — DocumentExport가 생성한 문서 다운로드
+  GET  /                 — 채팅 UI(정적 index.html) 서빙
+
+작성자: 이현수 / 작성일: 2026-07-05
 """
 
 from __future__ import annotations
@@ -478,7 +501,12 @@ def _build_web_query_engine(components: dict, state: Any) -> Any:
 # 요청/응답 모델 (Pydantic v2)
 # ─────────────────────────────────────────────
 class ChatRequest(BaseModel):
-    """채팅 요청 모델."""
+    """채팅 요청 본문 스키마 (POST /v1/chat, /v1/chat/stream 공용).
+
+    브라우저 채팅 UI가 보내는 최소 입력이다. session_id를 함께 주면 그 세션의
+    이전 대화를 이어가고, 없으면 서버가 새 UUID 세션을 만든다. tenant_id는
+    멀티테넌시 선택 필드로, 헤더/API 키와 함께 _resolve_tenant에서 해석된다.
+    """
 
     message: str = Field(..., description="사용자 메시지")
     session_id: str | None = Field(default=None, description="세션 ID (없으면 새 세션 생성)")
@@ -494,7 +522,13 @@ class ChatRequest(BaseModel):
 
 
 class ToolCallInfo(BaseModel):
-    """도구 호출 정보."""
+    """한 번의 도구 호출을 응답에 실어 보내기 위한 요약 스키마.
+
+    채팅 핸들러가 StreamEvent(TOOL_USE_STOP → 이름/입력, TOOL_RESULT → 결과/에러)
+    를 소비하며 tool_use_id 기준으로 채운다. UI가 "무슨 도구를 어떤 입력으로
+    호출해 어떤 결과가 나왔는지"를 사용자에게 보여줄 때 쓴다.
+    input_data는 외부로는 alias 'input'으로 직렬화된다(OpenAI 관례와 정합).
+    """
 
     name: str
     input_data: dict[str, Any] = Field(default_factory=dict, alias="input")
@@ -503,7 +537,11 @@ class ToolCallInfo(BaseModel):
 
 
 class UsageInfo(BaseModel):
-    """토큰 사용량 정보."""
+    """이번 응답의 토큰 사용량(입력/출력/합계).
+
+    USAGE_UPDATE StreamEvent에서 채워지며, UI의 사용량 표시와 예산 관측에 쓰인다.
+    (OpenAI 규격의 prompt/completion/total 명칭과는 다른 Nexus 내부 표기다.)
+    """
 
     input_tokens: int = 0
     output_tokens: int = 0
@@ -511,7 +549,12 @@ class UsageInfo(BaseModel):
 
 
 class ChatResponse(BaseModel):
-    """채팅 응답 모델."""
+    """비스트리밍 채팅(/v1/chat)의 최종 응답 스키마.
+
+    submit_message가 흘려보낸 모든 StreamEvent를 서버가 다 모은 뒤 한 번에 담아
+    돌려준다: assistant 최종 텍스트(response), 실행된 도구 목록(tool_calls),
+    토큰 사용량(usage), 그리고 생성 문서 다운로드 링크(downloads).
+    """
 
     session_id: str = Field(description="세션 ID")
     response: str = Field(description="assistant 응답 텍스트")
@@ -571,14 +614,21 @@ class OpenAIChatCompletionRequest(BaseModel):
 
 
 class OpenAIResponseMessage(BaseModel):
-    """비스트림 응답의 assistant 메시지."""
+    """OpenAI 비스트림 응답에서 assistant가 낸 메시지 한 개.
+
+    role은 관례상 항상 "assistant", content는 최종 텍스트(+다운로드 마크다운)이다.
+    """
 
     role: str = "assistant"
     content: str = ""
 
 
 class OpenAIChoice(BaseModel):
-    """비스트림 응답의 choice 한 개."""
+    """OpenAI 비스트림 응답의 choice 한 개(index/message/finish_reason).
+
+    Nexus는 후보를 하나만 내므로 index=0 단일 choice만 반환한다. finish_reason은
+    정상 종료 시 "stop"으로 고정한다(길이 제한/도구 호출 등 다른 사유는 미노출).
+    """
 
     index: int = 0
     message: OpenAIResponseMessage
@@ -610,7 +660,11 @@ class OpenAIChatCompletionResponse(BaseModel):
 
 
 class ToolInfo(BaseModel):
-    """도구 정보 (목록 조회용)."""
+    """도구 목록 조회(GET /v1/tools)용 요약 스키마.
+
+    BaseTool 인스턴스에서 UI/관리자가 알아야 할 최소 정보만 뽑아 노출한다:
+    이름, 설명, 그룹, 그리고 읽기 전용 여부(권한/안전성 판단 힌트).
+    """
 
     name: str
     description: str
@@ -619,7 +673,11 @@ class ToolInfo(BaseModel):
 
 
 class ModelInfo(BaseModel):
-    """모델 정보 (목록 조회용)."""
+    """모델 목록 조회(GET /v1/models)용 요약 스키마.
+
+    role은 모델의 쓰임을 구분한다: primary(주 추론), auxiliary(한국어 보조),
+    embedding(임베딩). id는 config에 정의된 실제 모델 식별자다.
+    """
 
     id: str
     name: str
@@ -647,7 +705,11 @@ class TenantInfo(BaseModel):
 
 
 class HealthResponse(BaseModel):
-    """헬스체크 응답."""
+    """헬스체크(GET /health) 응답 스키마.
+
+    status는 오케스트레이터(이 서버) 자체의 상태, gpu_server는 GPU 서버(Machine B)
+    핑 결과다: healthy/unhealthy/unreachable/unknown 중 하나.
+    """
 
     status: str = "ok"
     version: str = "0.1.0"
@@ -671,9 +733,21 @@ _app_state: dict[str, Any] = {
 # ─────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    """
-    앱 시작 시 Phase 1 부트스트랩을 수행하고,
-    종료 시 리소스를 정리한다.
+    """FastAPI 수명주기 훅 — 서버 기동/종료 시 딱 한 번씩 실행된다.
+
+    기동(yield 이전):
+      1) Phase 1 init() — 환경 비의존 초기화(설정 로드 등).
+      2) Phase 2 init_phase2() — ToolRegistry/MemoryManager/모델 프로바이더 등 조립.
+      3) 웹 전용 '공유 부품'(web_engine_parts)을 _build_web_engine_parts로 한 번만
+         만들어 _app_state에 저장한다. 이후 각 요청은 이 부품으로 세션 전용 엔진을
+         가볍게 조립한다(_acquire_session_engine). 여기서 부트스트랩이 실패해도
+         서버는 뜨되(placeholder 응답), 채팅은 "미초기화" 안내로 폴백한다.
+
+    종료(yield 이후):
+      - 임베딩 keepalive task를 깨끗이 취소하고, 세션 요약을 로그로 남긴다.
+
+    ★주의★ init/init_phase2는 무겁고 요청과 무관하므로 반드시 여기서 한 번만 한다.
+    요청 핸들러 안에서 이 초기화를 다시 하지 않는다(비용·경합 방지).
     """
     # 시작: Phase 1 + Phase 2 부트스트랩
     try:
@@ -899,11 +973,22 @@ async def chat(
     x_tenant_id: str | None = Header(default=None, alias="X-Tenant-ID"),
     authorization: str | None = Header(default=None),
 ) -> ChatResponse:
-    """
-    비스트리밍 채팅.
+    """비스트리밍 채팅 엔드포인트 (POST /v1/chat).
 
-    사용자 메시지를 QueryEngine에 전달하고,
-    모든 StreamEvent를 수집하여 최종 응답으로 반환한다.
+    사용자 메시지를 세션 전용 QueryEngine에 넘기고, submit_message가 yield하는
+    모든 StreamEvent를 끝까지 소비·누적한 뒤 한 번에 ChatResponse로 돌려준다
+    (스트리밍이 아니라 "다 모아서 반환"). 처리 흐름:
+      1) 세션 ID 확정 + 테넌트 해석(_resolve_tenant).
+      2) 세션별 격리 엔진 획득(_acquire_session_engine) — 없으면 미초기화 폴백.
+      3) 같은 세션 동시요청은 세션 락으로 직렬화하고, Redis에서 이전 이력을 복원.
+      4) StreamEvent 소비: TEXT_DELTA(응답 텍스트), USAGE_UPDATE(토큰),
+         TOOL_USE_STOP/TOOL_RESULT(도구 호출 요약), 그리고 생성 문서 다운로드 추출.
+
+    매개변수:
+      request        — ChatRequest(message/session_id/model/tenant_id).
+      x_tenant_id    — X-Tenant-ID 헤더(테넌트 지정 경로 중 하나).
+      authorization  — Authorization 헤더(Bearer API 키로도 테넌트 해석 가능).
+    반환: ChatResponse.
     """
     # 세션 ID 생성 또는 재사용
     session_id = request.session_id or str(uuid.uuid4())
@@ -1910,10 +1995,11 @@ async def list_tools() -> dict[str, Any]:
 # ─────────────────────────────────────────────
 @app.get("/v1/models")
 async def list_models() -> dict[str, Any]:
-    """
-    사용 가능한 모델 목록을 반환한다.
+    """사용 가능한 모델 목록을 반환한다 (GET /v1/models).
 
-    설정에서 정의된 모델 정보를 반환한다.
+    config가 로드돼 있으면 실제 설정값(primary/auxiliary/embedding 모델 id)을 읽어
+    ModelInfo 목록으로 만든다. config가 아직 없으면(부트스트랩 전/실패) 하드코딩된
+    기본 2종을 폴백으로 돌려준다 — 목록 조회가 500으로 죽지 않게 하기 위함이다.
     """
     config = _app_state.get("config")
     if config:
@@ -1998,10 +2084,12 @@ async def list_tenants() -> dict[str, Any]:
 # ─────────────────────────────────────────────
 @app.get("/health", response_model=HealthResponse)
 async def health_check() -> HealthResponse:
-    """
-    서버 상태를 확인한다.
+    """헬스체크 (GET /health) — 오케스트레이터 + GPU 서버 상태를 반환한다.
 
-    Nexus 오케스트레이터와 GPU 서버 양쪽의 상태를 반환한다.
+    이 서버(오케스트레이터)가 응답한다는 것 자체가 status="ok"의 근거다. GPU 서버는
+    config에 적힌 gpu_server_url/health 로 5초 타임아웃 핑을 보내 판정한다:
+    200이면 healthy, 그 외 응답이면 unhealthy, 연결 실패면 unreachable,
+    config가 없으면 unknown. GPU 핑 실패는 예외로 죽지 않고 상태 문자열로만 표시한다.
     """
     config = _app_state.get("config")
     gpu_status = "unknown"
@@ -2028,11 +2116,17 @@ async def health_check() -> HealthResponse:
 # ─────────────────────────────────────────────
 @app.get("/metrics")
 async def metrics() -> dict[str, Any]:
-    """
-    서버 메트릭스를 반환한다.
+    """서버 메트릭스를 반환한다 (GET /metrics).
 
-    요청 로깅 미들웨어에서 수집한 메트릭스와
-    GlobalState에서 추적하는 세션 메트릭스를 반환한다.
+    여러 소스의 관측 지표를 하나의 dict로 합쳐 대시보드/모니터링에 노출한다:
+      - http    : 요청 로깅 미들웨어가 집계한 HTTP 통계.
+      - session : GlobalState의 세션 요약.
+      - mcp     : 연결된 MCP 서버 수 + 서버별 도구 개수.
+      - agents  : 서브에이전트(scout 등) 호출 통계.
+      - agent_cache : Scout 결과 캐시 히트/미스 통계.
+      - scout   : (하위 호환 alias) 기존 대시보드용 평탄화 뷰.
+      - tenants : 등록 테넌트 목록 + 테넌트별 요청 카운트.
+    각 소스는 없을 수 있어(부트스트랩 전 등) 존재할 때만 채운다 — 부분 실패에 견고.
     """
     result: dict[str, Any] = {}
 
@@ -2107,9 +2201,12 @@ async def metrics() -> dict[str, Any]:
 # ─────────────────────────────────────────────
 @app.post("/v1/upload")
 async def upload_file(file: UploadFile) -> dict[str, Any]:
-    """
-    파일을 서버 임시 디렉토리에 저장하고 경로를 반환한다.
-    반환된 경로를 DocumentProcess 도구로 분석할 수 있다.
+    """문서 분석용 파일 업로드 (POST /v1/upload).
+
+    브라우저가 첨부한 파일을 서버 임시 디렉토리({tempdir}/nexus_uploads)에 저장하고
+    그 서버 경로를 돌려준다. 이후 채팅에서 그 경로를 DocumentProcess 도구로 넘기면
+    모델이 파일 내용을 읽어 분석할 수 있다(모델은 파일 자체가 아니라 경로를 받는다).
+    반환: {status, file_path, file_name, size_bytes}.
     """
     import tempfile
 
@@ -2164,7 +2261,11 @@ async def download_file(filename: str):
 # ─────────────────────────────────────────────
 @app.get("/")
 async def root():
-    """루트 경로에서 채팅 UI를 반환한다."""
+    """루트 경로(GET /) — 브라우저 채팅 UI(static/index.html)를 서빙한다.
+
+    정적 index.html이 있으면 그 파일을 그대로 내려주고, 없으면(정적 자산 미배포 등)
+    API 안내용 JSON을 폴백으로 반환한다(/docs 로 Swagger UI 안내).
+    """
     index_path = Path(__file__).parent / "static" / "index.html"
     if index_path.exists():
         return FileResponse(str(index_path))

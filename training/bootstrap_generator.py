@@ -1,15 +1,41 @@
 """
-부트스트랩 데이터 생성기 — Phase 1용 합성 학습 데이터를 만든다.
+부트스트랩 데이터 생성기 — LoRA 초기 학습용 합성(synthetic) 데이터를 만든다.
 
-실 사용 데이터가 없는 초기 단계에서 LoRA 학습에 사용할
-합성 데이터를 생성한다. 두 가지 유형의 데이터를 생성한다:
-  1. 도구 사용 데이터: Nexus 도구(Read, Write, Bash 등)의 올바른 사용 패턴
-  2. 추론 데이터: 단계별 사고 과정을 포함한 문제 해결 패턴
+[이 파일이 하는 일 — 한눈에 보기]
+아직 실제 사용자 대화 로그가 쌓이지 않은 프로젝트 초기 단계에서는, 모델을
+파인튜닝(LoRA)할 학습 데이터가 부족하다. 이 모듈은 그 공백을 메우기 위해
+"미리 준비한 템플릿"에서 값을 무작위로 뽑아 조합해, 바로 학습에 넣을 수 있는
+JSONL 학습 샘플을 대량으로 찍어낸다.
 
-왜 합성 데이터인가:
-  - 에어갭 환경에서 외부 API(OpenAI 등)로 데이터를 생성할 수 없다
-  - 템플릿 기반 생성으로 일관된 품질의 학습 데이터를 확보한다
-  - 도구 사용 패턴은 정형화되어 있어 템플릿이 효과적이다
+[생성하는 4가지 데이터 카테고리]
+  1. 도구 사용(tool_use)   : Nexus 24개 도구(Read/Write/Bash/Git 등)의 올바른
+                             호출 패턴. OpenAI tool_calls 형식으로 만든다.
+  2. 추론(reasoning)       : 디버깅/아키텍처/코드리뷰/보안/성능/리팩토링에 대한
+                             단계별 사고 과정(chain-of-thought) 답변.
+  3. 서브에이전트(subagent): "언제 Agent(scout)를 부르고 언제 직접 답할지"를
+                             가르치는 대조 샘플(긍정/부정).
+  4. 지식(knowledge)       : OOP·REST·GIL 등 개념을 3~6단락으로 설명하는 장문 답변.
+
+[핵심 구성요소]
+  - 모듈 상단 상수 4개: _TOOL_USE_TEMPLATES / _REASONING_TEMPLATES /
+    _SUBAGENT_TEMPLATES / _KNOWLEDGE_TEMPLATES — 각 카테고리의 "원본 템플릿 풀".
+  - BootstrapGenerator 클래스: 위 템플릿에서 샘플을 뽑아 조합하고 파일로 저장한다.
+    · generate()                  : 진입점. 비율대로 4종 샘플을 만들고 JSONL 저장.
+    · _generate_tool_sample()     : 도구 사용 샘플 1개 생성.
+    · _generate_reasoning_sample(): 추론 샘플 1개 생성.
+    · _generate_subagent_sample() : 서브에이전트 판단 샘플 1개 생성.
+    · _generate_knowledge_sample(): 장문 지식 샘플 1개 생성.
+
+[외부 의존]
+  - training.adapter_naming: 테넌트 ID 정규화(normalize_tenant_id)와 기본값 상수.
+    멀티테넌시(M7)에서 테넌트별 데이터를 서브디렉토리로 격리하기 위해 사용한다.
+
+[왜 "합성" 데이터인가 — 설계 배경]
+  - 에어갭(폐쇄망) 환경이라 OpenAI 같은 외부 API로 데이터를 만들 수 없다.
+  - 템플릿 기반이라 품질이 균일하고 재현 가능(seed 고정)하다.
+  - 특히 도구 호출은 형식이 정형화되어 있어 템플릿으로 뽑아내기에 적합하다.
+
+작성자: 이현수 / 작성일: 2026-07-05
 """
 
 from __future__ import annotations
@@ -20,11 +46,21 @@ import random
 from pathlib import Path
 from typing import Any
 
+# 모듈 전용 로거 — "nexus.{module}" 네이밍 규약을 따른다. 생성 통계/진행 로그를 남긴다.
 logger = logging.getLogger("nexus.training.bootstrap_generator")
 
 
 # ─────────────────────────────────────────────
 # 도구 사용 템플릿 — Nexus 24개 도구의 대표 사용 패턴
+#
+# [자료구조 설명]
+# 각 원소는 dict 하나이며 아래 규약을 따른다:
+#   - "instruction": 사용자 발화 문자열. {path}·{command} 같은 플레이스홀더를 포함할 수 있다.
+#   - "tool"       : 이 발화가 유도해야 할 도구 이름(예: "Read", "Bash").
+#   - "input"      : 도구에 넘길 인자 dict. 값에도 플레이스홀더가 들어갈 수 있다.
+#   - 그 외 키(paths/ranges/commands/patterns/queries/tasks/contents/edits):
+#     플레이스홀더를 실제 값으로 치환할 때 무작위로 뽑아 쓸 "후보 값 목록".
+# 실제 치환은 _generate_tool_sample()이 담당한다(어떤 키가 있으면 어떤 토큰을 바꾸는지).
 # ─────────────────────────────────────────────
 _TOOL_USE_TEMPLATES: list[dict[str, Any]] = [
     # ── Read 도구 ──
@@ -419,7 +455,16 @@ _TOOL_USE_TEMPLATES: list[dict[str, Any]] = [
 ]
 
 # ─────────────────────────────────────────────
-# 추론 템플릿 — 단계별 사고 과정 포함
+# 추론 템플릿 — 단계별 사고 과정(chain-of-thought)을 담은 답변 패턴
+#
+# [자료구조 설명]
+# 각 원소는 "category"로 구분되며(debugging/architecture/code_review/
+# security_analysis/performance/refactoring), 공통으로 아래 키를 갖는다:
+#   - "instruction": 사용자 발화. {error}/{code}/{question} 등 플레이스홀더 포함.
+#   - "reasoning"  : "1. ... 2. ..." 형태의 번호 매긴 단계별 답변 템플릿.
+#   - 카테고리별 후보 목록(errors/questions/reviews/analyses/perf_issues/smells):
+#     각 원소에서 하나를 뽑아 instruction·reasoning의 플레이스홀더를 채운다.
+# 치환 규칙은 카테고리마다 다르며 _generate_reasoning_sample()의 분기에서 처리한다.
 # ─────────────────────────────────────────────
 _REASONING_TEMPLATES: list[dict[str, Any]] = [
     {
@@ -711,9 +756,15 @@ _REASONING_TEMPLATES: list[dict[str, Any]] = [
 
 # ─────────────────────────────────────────────
 # 장문 지식 답변 템플릿 — Phase 3 추가 (2026-04-17)
-# Phase 2 학습에서 "짧은 답변 샘플" 편중으로 장문 설명 능력이 퇴보하는 문제를
-# 완화하기 위해 도입. 사용자가 "알려줘 / 자세히 / 설명해줘"를 요청했을 때
-# 3~6개 단락의 구조화된 한국어 답변을 생성하도록 학습시킨다.
+#
+# [도입 배경]
+# Phase 2 학습에서 direct_answer 샘플이 인사·단답 위주라, 정작 사용자가
+# "자세히 설명해줘" 같은 장문을 요청하면 응답이 짧아지는 퇴보가 관찰됐다.
+# 이 상수는 그 퇴보를 상쇄하려고 "질문→구조화된 3~6단락 답변" 쌍을 모아둔 것이다.
+#
+# [자료구조 설명]
+# 각 원소는 단순히 {"question": 사용자 질문, "answer": 장문 답변} 형태다.
+# 플레이스홀더 치환이 없어 _generate_knowledge_sample()에서 그대로 뽑아 쓴다.
 # ─────────────────────────────────────────────
 _KNOWLEDGE_TEMPLATES: list[dict[str, Any]] = [
     {
@@ -996,15 +1047,21 @@ _KNOWLEDGE_TEMPLATES: list[dict[str, Any]] = [
 
 # ─────────────────────────────────────────────
 # 서브에이전트 판단 템플릿 — v7.0 Phase 9 (B 방식)
-# Worker에게 "언제 Agent(scout)를 호출하고 언제 직접 응답할지" 학습시킨다.
 #
-# 각 템플릿은 "trigger" 타입에 따라 두 방향의 응답을 생성한다:
-#   - "use_scout": Agent 도구로 scout를 호출하는 assistant 메시지
-#   - "direct_answer": 도구 호출 없이 텍스트만 반환하는 assistant 메시지
-#   - "single_tool": 특정 단일 도구(Read/Grep 등)만 호출 (scout 없이)
+# [목적]
+# Worker(Qwen)에게 "언제 Agent(scout)를 호출하고 언제 직접 응답할지"를 가르친다.
+# scout는 프로젝트 전체를 훑는 무거운(그리고 CPU에서 느린) 탐색 에이전트라,
+# 아무 때나 부르면 응답이 느려진다. 그래서 "정말 필요할 때만" 부르도록 학습시킨다.
 #
-# 목표 분포: use_scout 40% / direct_answer 40% / single_tool 20%
-# (부정 샘플 60%로 남용 방지를 강화 — CPU Scout는 느리므로 보수적 기본값)
+# [trigger 타입 — 이 값에 따라 생성되는 응답 모양이 달라진다]
+#   - "use_scout"    : 대규모/다중 파일 탐색이 필요 → Agent(scout) 도구 호출(긍정 샘플).
+#   - "direct_answer": 인사·단순 지식 질문 → 도구 없이 텍스트만 반환(부정 샘플).
+#   - "single_tool"  : 단일 파일/단일 도구로 충분 → Read/LS 등 직접 호출(부정 샘플).
+#
+# [의도한 분포]
+# use_scout 40% / direct_answer 40% / single_tool 20%.
+# 즉 부정 샘플(직접 답변+단일 도구)이 60%로 더 많다. 이렇게 부정을 과대표집해
+# Scout 남용을 억제하는 것이 의도다(느린 도구이므로 보수적 기본값을 학습).
 # ─────────────────────────────────────────────
 _SUBAGENT_TEMPLATES: list[dict[str, Any]] = [
     # ── use_scout: 대규모/다중 파일 탐색이 필요한 요청 ──
@@ -1113,18 +1170,36 @@ _SUBAGENT_TEMPLATES: list[dict[str, Any]] = [
 
 class BootstrapGenerator:
     """
-    Phase 1용 합성 학습 데이터를 생성한다.
+    합성 부트스트랩 학습 데이터를 생성하는 메인 클래스.
 
-    도구 사용 패턴과 추론 패턴을 템플릿에서 무작위로 조합하여
-    JSONL 형식의 학습 데이터를 생성한다.
+    [역할]
+    모듈 상단의 4개 템플릿 풀(도구/추론/서브에이전트/지식)에서 샘플을 무작위로
+    뽑아 조합하고, 정해진 비율로 섞은 뒤 JSONL 파일로 저장한다.
+
+    [사용 흐름 — 호출하는 쪽 관점]
+        gen = BootstrapGenerator(seed=42)          # seed를 주면 매번 같은 결과(재현성)
+        stats = await gen.generate(count=1000, ...) # 1000개 샘플을 만들어 파일로 저장
+        # stats["output_file"]에 저장 경로, 나머지 키에 카테고리별 개수가 담긴다.
+
+    [상태]
+    생성기 인스턴스는 self._rng(시드 고정 난수기)와 4개 템플릿 풀에 대한 참조만
+    가진다. 템플릿 자체는 수정하지 않고 읽기만 하므로 여러 번 generate()를 불러도
+    안전하다(단, 같은 인스턴스로 연속 호출하면 난수 상태가 이어져 결과가 달라짐).
     """
 
     def __init__(self, seed: int | None = None) -> None:
         """
+        생성기를 초기화한다.
+
         Args:
-            seed: 재현성을 위한 랜덤 시드. None이면 비결정적.
+            seed: 재현성을 위한 랜덤 시드. 정수를 주면 항상 같은 샘플이 나오고,
+                None이면 매 실행마다 다른(비결정적) 결과가 나온다. 학습 데이터
+                재현·디버깅을 위해 실무에서는 보통 고정 seed를 넘긴다.
         """
+        # random.Random 인스턴스를 별도로 둔다(전역 random 오염 방지 + seed 격리).
+        # noqa: S311 — 암호용이 아닌 학습 데이터 샘플링 용도라 표준 PRNG로 충분하다.
         self._rng = random.Random(seed)  # noqa: S311
+        # 아래 4개는 모듈 상단 상수에 대한 참조. 복사하지 않으므로 읽기 전용으로만 쓴다.
         self._tool_templates = _TOOL_USE_TEMPLATES
         self._reasoning_templates = _REASONING_TEMPLATES
         self._subagent_templates = _SUBAGENT_TEMPLATES
@@ -1137,19 +1212,30 @@ class BootstrapGenerator:
         tenant_id: str | None = None,
     ) -> dict[str, Any]:
         """
-        부트스트랩 데이터를 JSONL로 생성한다.
+        부트스트랩 데이터를 만들어 JSONL 파일 한 개로 저장한다. (이 클래스의 진입점)
 
-        도구 사용 샘플과 추론 샘플을 지정된 비율(7:3)로 생성한다.
+        [처리 순서]
+          1. tenant_id를 정규화하고(잘못된 값은 조기에 ValueError) 저장 경로를 정한다.
+          2. count를 카테고리 비율(도구45/추론25/서브15/지식15)로 나눈다.
+          3. 각 카테고리별로 _generate_*_sample()을 반복 호출해 샘플 리스트를 채운다.
+          4. 리스트를 셔플해 학습 시 카테고리 편향을 없앤다.
+          5. 각 샘플 metadata에 tenant_id를 찍고, 한 줄에 하나씩 JSONL로 기록한다.
+          6. 카테고리별 개수 통계를 로그로 남기고 dict로 반환한다.
 
         Args:
-            count: 생성할 총 샘플 수
-            output_path: 출력 디렉토리 경로
+            count: 생성할 총 샘플 수(카테고리 비율로 자동 분배됨).
+            output_path: 출력 디렉토리 경로. 파일명은 항상 bootstrap_data.jsonl.
             tenant_id: M7 멀티테넌시 — 값이 있으면 `{output_path}/{tenant_id}/` 하위에
                 저장하고 각 샘플 metadata에 `tenant_id`를 스탬프한다. None/`"default"`는
                 기존 경로(`{output_path}/bootstrap_data.jsonl`) 그대로 사용해 하위 호환.
 
         Returns:
-            생성 통계: tool_samples, reasoning_samples, total, output_file, tenant_id
+            생성 통계 dict: tool_samples / reasoning_samples / subagent_samples /
+            knowledge_samples / total / output_file / tenant_id.
+
+        Note:
+            async 함수지만 내부에 await가 없다(동기 파일 I/O 사용). 호출 규약을
+            상위 학습 파이프라인의 async 인터페이스와 맞추기 위한 시그니처다.
         """
         # tenant_id 정규화 — 불허 문자는 ValueError로 조기 차단 (잘못된 경로 생성 방지).
         # normalize_tenant_id는 None/빈값/'default'를 모두 'default'로 수렴시킨다.
@@ -1167,6 +1253,8 @@ class BootstrapGenerator:
 
         # Phase 3 비율 (2026-04-17): 도구 45% / 추론 25% / 서브에이전트 15% / 지식 15%
         # Phase 2에서 "짧은 답변 편중" 문제를 장문 지식 카테고리 신규 추가로 완화.
+        # 앞 3개는 int()로 내림하고, 지식 개수는 "나머지 전부"로 계산한다. 이렇게 하면
+        # 반올림으로 몇 개가 새어나가더라도 총합이 정확히 count가 되도록 보정된다.
         tool_count = int(count * 0.45)
         reasoning_count = int(count * 0.25)
         subagent_count = int(count * 0.15)
@@ -1239,16 +1327,28 @@ class BootstrapGenerator:
 
     def _generate_tool_sample(self) -> dict[str, Any]:
         """
-        도구 사용 템플릿에서 하나의 학습 샘플을 생성한다.
+        도구 사용 템플릿에서 학습 샘플 1개를 생성한다.
 
-        OpenAI의 tool_calls 형식에 맞춰 messages 배열을 구성한다.
+        [흐름]
+          1. _TOOL_USE_TEMPLATES에서 템플릿 하나를 무작위로 고른다.
+          2. 템플릿에 어떤 후보-키(paths/commands 등)가 있는지 보고, 해당 토큰을
+             instruction 문자열과 tool_input 값 양쪽에서 실제 값으로 치환한다.
+          3. 완성된 발화와 인자를 OpenAI tool_calls 형식의 messages로 감싸 반환한다.
+
+        Returns:
+            {"messages": [...], "metadata": {...}} 형태의 학습 샘플 dict.
         """
+        # 원본 템플릿을 훼손하지 않도록 input은 dict()로 얕은 복사해서 다룬다.
         template = self._rng.choice(self._tool_templates)
         tool_name = template["tool"]
         instruction = template["instruction"]
         tool_input = dict(template["input"])
 
-        # 템플릿 변수를 구체적인 값으로 치환한다
+        # ── 이하: 템플릿에 존재하는 후보-키에 따라 플레이스홀더를 실제 값으로 치환 ──
+        # 각 블록은 "이 키가 있으면 이 토큰을 바꾼다" 규칙이다. 발화(instruction)와
+        # 도구 인자(tool_input) 양쪽을 함께 바꿔 둘의 내용이 어긋나지 않게 맞춘다.
+
+        # paths: {path} 토큰을 파일 경로 후보 중 하나로 치환.
         if "paths" in template:
             path = self._rng.choice(template["paths"])
             instruction = instruction.replace("{path}", path)
@@ -1256,6 +1356,8 @@ class BootstrapGenerator:
                 if isinstance(val, str) and "{path}" in val:
                     tool_input[key] = val.replace("{path}", path)
 
+        # ranges: Read의 라인 범위 읽기용. {start}/{count} 두 토큰을 동시에 치환한다.
+        # offset/limit 값이 문자열 플레이스홀더로 들어있어 tool_input도 함께 갱신한다.
         if "ranges" in template:
             rng_choice = self._rng.choice(template["ranges"])
             instruction = instruction.replace("{start}", str(rng_choice["start"]))
@@ -1266,30 +1368,38 @@ class BootstrapGenerator:
                     val = val.replace("{count}", str(rng_choice["count"]))
                     tool_input[key] = val
 
+        # commands: Bash용. {command} 토큰을 셸 명령어 후보로 치환.
         if "commands" in template:
             command = self._rng.choice(template["commands"])
             instruction = instruction.replace("{command}", command)
             tool_input["command"] = command
 
+        # patterns: Glob용. {pattern} 토큰을 glob 패턴 후보로 치환.
         if "patterns" in template:
             pattern = self._rng.choice(template["patterns"])
             instruction = instruction.replace("{pattern}", pattern)
             tool_input["pattern"] = pattern
 
+        # queries: Grep용. 발화에는 {query}를, 도구 인자에는 pattern 키를 채운다
+        # (Grep의 인자 이름이 pattern이라 토큰 이름과 키 이름이 다른 점에 주의).
         if "queries" in template:
             query = self._rng.choice(template["queries"])
             instruction = instruction.replace("{query}", query)
             tool_input["pattern"] = query
 
+        # tasks: Agent 위임용. {task} 토큰을 서브 작업 설명 후보로 치환.
         if "tasks" in template:
             task = self._rng.choice(template["tasks"])
             instruction = instruction.replace("{task}", task)
             tool_input["task"] = task
 
+        # contents: Write용. 발화에는 토큰이 없고 도구 인자 content에만 파일 본문을 채운다.
         if "contents" in template:
             content = self._rng.choice(template["contents"])
             tool_input["content"] = content
 
+        # edits: Edit용. {old}/{new} 두 토큰을 치환하고, 도구 인자의
+        # old_string/new_string도 같은 쌍으로 채워 발화와 인자를 일치시킨다.
         if "edits" in template:
             edit = self._rng.choice(template["edits"])
             instruction = instruction.replace("{old}", edit["old"])
@@ -1297,10 +1407,14 @@ class BootstrapGenerator:
             tool_input["old_string"] = edit["old"]
             tool_input["new_string"] = edit["new"]
 
-        # OpenAI tool_calls 형식의 assistant 메시지
-        # 재현성을 위해 seeded RNG로 ID를 생성한다 (uuid4는 비결정적)
+        # 도구 호출 ID 생성. uuid4는 비결정적이라 seed를 줘도 재현되지 않으므로,
+        # 시드가 걸린 self._rng.randbytes로 ID를 만들어 재현성을 확보한다.
         tool_call_id = f"call_{self._rng.randbytes(12).hex()}"
 
+        # 최종 샘플: user 발화 + assistant의 tool_calls 응답.
+        # 도구를 호출하는 assistant 메시지는 content=None이고 tool_calls에 호출 정보를 담는다.
+        # arguments는 문자열이어야 하므로 json.dumps로 직렬화한다
+        # (한글 보존 위해 ensure_ascii=False).
         return {
             "messages": [
                 {"role": "user", "content": instruction},
@@ -1328,16 +1442,27 @@ class BootstrapGenerator:
 
     def _generate_reasoning_sample(self) -> dict[str, Any]:
         """
-        추론 템플릿에서 하나의 학습 샘플을 생성한다.
+        추론 템플릿에서 학습 샘플 1개를 생성한다.
 
-        단계별 사고 과정(chain-of-thought)을 포함한 응답을 구성한다.
+        [흐름]
+        _REASONING_TEMPLATES에서 템플릿을 하나 고르고, 그 "category"에 따라 서로 다른
+        후보-키(errors/questions/reviews/analyses/perf_issues/smells)에서 값을 뽑아
+        instruction과 reasoning 문자열의 플레이스홀더를 채운다. 도구 호출이 없는 순수
+        텍스트 답변이므로 assistant 메시지의 content에 단계별 설명을 그대로 담는다.
+
+        Returns:
+            {"messages": [user, assistant], "metadata": {...}} 형태의 샘플 dict.
+            metadata.category는 "reasoning_{원본카테고리}" 형태로 기록된다.
         """
         template = self._rng.choice(self._reasoning_templates)
         category = template["category"]
         instruction_tpl = template["instruction"]
         reasoning_tpl = template["reasoning"]
 
-        # 카테고리별 구체적 값 선택 및 치환
+        # 카테고리마다 치환할 토큰과 후보-키가 다르므로 아래에서 분기 처리한다.
+        # (각 분기는 발화의 {code}/{error} 등과 답변의 세부 토큰을 함께 채운다)
+
+        # debugging: 에러 메시지·원인·해결책을 채운다.
         if category == "debugging" and "errors" in template:
             chosen = self._rng.choice(template["errors"])
             instruction = instruction_tpl.replace("{error}", chosen["error"])
@@ -1345,12 +1470,14 @@ class BootstrapGenerator:
             reasoning = reasoning.replace("{cause}", chosen["cause"])
             reasoning = reasoning.replace("{solution}", chosen["solution"])
 
+        # architecture: 질문·선택지·결론을 채운다.
         elif category == "architecture" and "questions" in template:
             chosen = self._rng.choice(template["questions"])
             instruction = instruction_tpl.replace("{question}", chosen["question"])
             reasoning = reasoning_tpl.replace("{options}", chosen["options"])
             reasoning = reasoning.replace("{conclusion}", chosen["conclusion"])
 
+        # code_review: 리뷰 대상 코드·문제점·개선안을 채운다.
         elif category == "code_review" and "reviews" in template:
             chosen = self._rng.choice(template["reviews"])
             instruction = instruction_tpl.replace("{code}", chosen["code"])
@@ -1382,10 +1509,13 @@ class BootstrapGenerator:
             reasoning = reasoning.replace("{refactoring}", chosen["refactoring"])
 
         else:
-            # 알 수 없는 카테고리 — 기본 처리
+            # 알 수 없는/후보-키가 없는 카테고리 — 안전 폴백.
+            # 치환 없이 템플릿 원문을 그대로 사용한다(플레이스홀더가 남을 수 있으나
+            # 데이터 파괴보다는 낫다). 정상적으로는 위 분기에서 모두 처리되어야 한다.
             instruction = instruction_tpl
             reasoning = reasoning_tpl
 
+        # 추론 샘플은 도구 호출이 없다 → assistant.content에 단계별 답변을 그대로 담는다.
         return {
             "messages": [
                 {"role": "user", "content": instruction},
@@ -1410,16 +1540,22 @@ class BootstrapGenerator:
 
         부정 샘플(direct_answer + single_tool)이 긍정(use_scout)의 1.5배로
         많이 생성되어 Scout 남용을 억제한다.
+
+        Returns:
+            trigger에 따라 모양이 다른 샘플 dict. 알 수 없는 trigger면 None을 반환하며,
+            generate()의 `if sample:` 필터에서 걸러진다.
         """
         template = self._rng.choice(self._subagent_templates)
         trigger = template["trigger"]
         user_prompt = self._rng.choice(template["user_prompts"])
 
-        # OpenAI tool_calls 형식의 ID (재현성을 위해 seeded RNG 사용)
+        # 도구 호출 ID — Read/Agent 등 도구를 부르는 분기에서만 실제로 쓰인다.
+        # 재현성을 위해 uuid4가 아니라 시드가 걸린 self._rng.randbytes로 생성한다.
         tool_call_id = f"call_{self._rng.randbytes(12).hex()}"
 
+        # ── 분기 1: use_scout — 대규모 탐색이 필요하다고 판단해 Agent(scout)를 호출 ──
         if trigger == "use_scout":
-            # 긍정 샘플 — Agent(scout) 호출
+            # subagent_type="scout"으로 고정. scout에 넘길 지시문은 템플릿의 공용 문구를 사용.
             scout_prompt = template["scout_prompt"]
             return {
                 "messages": [
@@ -1452,8 +1588,10 @@ class BootstrapGenerator:
                 },
             }
 
+        # ── 분기 2: direct_answer — 도구 없이 텍스트로만 답하는 부정 샘플 ──
         if trigger == "direct_answer":
-            # 부정 샘플 — 텍스트만 응답, 도구 호출 없음
+            # user_prompts와 answers는 같은 인덱스로 1:1 대응한다.
+            # 그래서 고른 발화의 위치(index)를 찾아 같은 자리의 정답 문장을 꺼낸다.
             idx = template["user_prompts"].index(user_prompt)
             answer = template["answers"][idx]
             return {
@@ -1467,8 +1605,10 @@ class BootstrapGenerator:
                 },
             }
 
+        # ── 분기 3: single_tool — Scout 없이 단일 도구(Read/LS 등)만 직접 호출 ──
         if trigger == "single_tool":
-            # 부정 샘플 — 단일 도구 직접 호출 (Scout 경유 안 함)
+            # 발화 개수와 tool_inputs 개수가 다를 수 있어, %(모듈러)로 인덱스를 감아
+            # 항상 유효한 도구 인자를 고르도록 한다(원본 훼손 방지 위해 dict로 복사).
             idx = template["user_prompts"].index(user_prompt) % len(template["tool_inputs"])
             tool_input = dict(template["tool_inputs"][idx])
             return {
@@ -1498,16 +1638,21 @@ class BootstrapGenerator:
                 },
             }
 
-        # 알 수 없는 trigger — 안전하게 None 반환 (generate에서 필터됨)
+        # 위 세 분기 어디에도 안 걸리는 알 수 없는 trigger는 None을 반환한다.
+        # 호출부 generate()의 `if sample:` 검사에서 조용히 걸러지므로 안전하다.
+        # type: ignore[return-value] — 시그니처는 dict이지만 방어적으로 None을 허용한다.
         return None  # type: ignore[return-value]
 
     def _generate_knowledge_sample(self) -> dict[str, Any]:
         """
-        Phase 3 신규: 장문 지식/설명 답변 샘플을 생성한다.
+        Phase 3 신규: 장문 지식/설명 답변 샘플 1개를 생성한다.
 
-        Phase 2 학습에서 direct_answer 샘플이 "인사/단답" 중심이라 Worker가
-        긴 설명 요청 시 응답이 짧아지는 퇴보가 관찰됐다. 이를 상쇄하기 위해
-        구조화된 3~6개 단락 답변 샘플을 별도 카테고리로 학습시킨다.
+        [배경] Phase 2 학습에서 direct_answer 샘플이 "인사/단답" 중심이라 Worker가
+        긴 설명을 요청받아도 응답이 짧아지는 퇴보가 관찰됐다. 이를 상쇄하려고
+        구조화된 3~6단락 답변을 별도 카테고리로 학습시킨다.
+
+        [흐름] _KNOWLEDGE_TEMPLATES는 {question, answer} 쌍이라 치환 로직 없이
+        하나를 골라 그대로 user/assistant 메시지로 감싸 반환한다.
         """
         template = self._rng.choice(self._knowledge_templates)
         return {
