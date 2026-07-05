@@ -826,9 +826,25 @@ class LocalModelProvider(ModelProvider):
             if tc.get("function", {}).get("name"):
                 # 누적된 arguments 문자열을 dict로 파싱. 깨진 JSON이면 빈 dict로
                 # 폴백해 도구 실행 단계에서 스키마 검증이 처리하도록 넘긴다.
+                #
+                # 왜 경고 로그를 남기나(관측성): vLLM은 auto tool choice에서 tool
+                # 인자에 guided decoding을 기본 적용하므로 실측상 깨진 JSON은 거의
+                # 없다(스키마·enum 준수 확인됨). 그래도 복잡한 스키마·모델 부하 시
+                # 드물게 깨질 수 있는데, 지금까지는 조용히 {}로 삼켜 프로덕션에서
+                # 발생 여부조차 알 수 없었다. 여기서 원문(절단)과 도구명을 warning으로
+                # 남겨, guided decoding이 실제로 실패하는지 감지한다(반복되면 그때
+                # 명시적 guided 강제를 검토). {} 폴백은 유지 — 도구 스키마 검증이
+                # 거부하면 tool_use_error가 되어 모델이 자기교정(재호출)한다.
+                raw_args = tc["function"].get("arguments", "{}")
                 try:
-                    args = json.loads(tc["function"].get("arguments", "{}"))
+                    args = json.loads(raw_args)
                 except json.JSONDecodeError:
+                    logger.warning(
+                        "tool_call arguments JSON 파싱 실패 — 빈 dict 폴백 "
+                        "(tool=%s, raw=%.200r)",
+                        tc["function"]["name"],
+                        raw_args,
+                    )
                     args = {}
                 events.append(
                     StreamEvent(
