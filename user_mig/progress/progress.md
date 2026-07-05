@@ -2697,3 +2697,197 @@ B200 정부 컨테이너에 "완벽한 버전" Nexus를 올리기 전, 지난 �
 ## 감사 Critical 8건 전부 완료 (feature/b200-bakeoff)
 
 - #1~3 권한 강제 · #4 자격증명/웹 인증 · #5 웹 동시성 · #6~7 메모리 · #8 컨텍스트 복구. 9커밋, 전부 무회귀(최종 1404 passed) + 테스트 동반. **후속(비차단)**: P3(ASK 강제, 배포 후 shadow 로그), 실 PG/실서버 동시부하 최종검증, b200 config DB host→127.0.0.1, CLI 프롬프트 티어 불일치, hook_manager/deny rule 로딩.
+
+## B200 컨테이너 Bring-up + 전체 스택 e2e 검증 (2026-07-05)
+
+정부 렌탈 NHN B200(180GB) 단일 컨테이너에 Nexus 전체 스택을 co-locate 기동하고, 온프렘 데이터 이관 후 실질의로 끝까지 검증 완료.
+
+### 데이터 이관 (파일 기반, 네트워크 격리 유지)
+- 컨테이너가 온프렘(.39)에 직접 못 닿아, **개발 PC pg_dump → 파일 → SFTP → 컨테이너 pg_restore**로 이관(라이브 터널 미사용 = 격리 경계 준수).
+- 온프렘 nexus DB(PG17.10, 18GB) → 커스텀 덤프 6.1GB → 전송(4.5MB/s, 24분) → 복원.
+- 복원 검증: **tb_knowledge 1,067,978행 / tb_memories 284,685 / tb_symbols 3,065**, 벡터 인덱스 전부 재구축(idx_knowledge_embed ivfflat 8.35GB, idx_memories_embedding hnsw 432MB 등). pg_restore exit=1은 무해 무시 5건(pg_buffercache/pg_prewarm 권한, vector 확장 comment 소유권)뿐.
+
+### 인프라 구성 (모두 detached, localhost)
+- **PG17.10 + pgvector 0.8.4**: /NHNHOME/nexus/pgdata, idino_user로 구동(초기 postgres 소유 권한 이슈 해결), shared_buffers 16GB 등 튜닝, 127.0.0.1:5440.
+- **Redis 7**: 127.0.0.1:6340 인증. 데이터 디렉토리를 `redis`→`redis_data`로 이동(경로가 redis-py를 네임스페이스 shadowing하던 잠복 버그 수정).
+- **config**: b200 템플릿 → config/nexus_config.yaml (host .39→127.0.0.1, tier large). 비번은 .env(NEXUS_PG_PASSWORD/NEXUS_REDIS_PASSWORD)로 주입.
+- **의존성**: venv에 asyncpg/pgvector/redis-py 등 델타 설치(shadow 오탐으로 redis-py 미설치였던 것 발견).
+
+### 모델·서빙
+- **vLLM 0.24.0 + A.X-4.0(skt/A.X-4.0, 72B BF16)** on B200: HF 다운로드 134GB, 127.0.0.1:8001, max_model_len 32768, tool_call_parser=hermes, prefix-caching. 로드 ~150초, GPU 169GB. 아키텍처 Qwen2ForCausalLM 확인.
+  - 추론 검증: 한국어 QA 0.55s, hermes 도구호출 정상(get_weather).
+- **임베딩 e5-large(intfloat/multilingual-e5-large)**: 커스텀 `/v1/embed` pass-through 서버(sentence-transformers, GPU ~3GB), 127.0.0.1:8002, 1024차원. Nexus 계약({"texts"}→{"embeddings","dimension"}) 준수, 접두사는 호출자(passage:/원문)가 처리.
+- **Nexus 웹**: uvicorn 8443, tier=large, scout_available=False, worker_tools=23, web_auth on(테스트키 nexus-b200-test-key-001), SymbolStore pg=connected.
+
+### e2e 검증 (전체 파이프라인)
+- 인증 없음 → 401 정상.
+- 인증 /v1/chat "니체 대표 저서" → `class=KNOWLEDGE → RAG 주입 ~3,857토큰(knowledge_rag=20ms) → A.X-4.0` → 근거 기반 정답(차라투스트라/선악의 저편). 지연 3.23s, input 4,973토큰(RAG 주입 확인). **이관 kowiki를 임베딩+pgvector로 검색해 A.X-4.0이 grounded 응답** = 완전 통합 확인.
+
+### 다음
+- HyperCLOVA SEED-32B 다운로드 → 순차 로드(bake-off 2번째 모델).
+- 3-프로젝트 태스크 배터리(docutil RAG-QA / dynamic_prompt SQL+HTML / 삼진어묵 추출) 채점.
+
+## 분리구조(서비스 PC ↔ B200 백엔드) 전환 + 검증 (2026-07-05)
+
+사용자 결정: bake-off는 A.X-4.0 단독 확정(HyperCLOVA 국가대표 탈락). 이후 요구 — 최종적으로 외부에서 API로 agent 호출·사용, **서비스는 내 PC(추후 다른 서버 가능, 셋업 쉽게), 분리구조로**.
+
+### 아키텍처
+- **서비스 PC(Machine A)**: 오케스트레이터(쿼리루프/도구/권한)+RAG 검색로직+웹+CLI. GPU 불필요.
+- **B200(GPU 백엔드)**: vLLM(A.X-4.0)·임베딩(e5-large)·PostgreSQL(이관 데이터)·Redis 상주.
+- **연결**: SSH 로컬 포워딩(-L)으로 B200 4포트(8001/8002/5440/6340)를 PC localhost로 당김 → 공개 노출 없이 안전. config는 전부 127.0.0.1.
+
+### 구축물 (deploy_pc/)
+- requirements-pc.txt(오케스트레이터 전용 의존성, torch/vllm/sentence-transformers 제외), setup.ps1/.sh, tunnel.ps1/.sh, start_web.ps1/.sh, start_cli.ps1/.sh, README.md.
+- 루트: .env(NEXUS_PG/REDIS_PASSWORD), config/nexus_config.yaml(b200 템플릿 host→127.0.0.1, tier large), config/tenants.yaml(테스트키 nexus-b200-test-key-001).
+- PC venv=.venv_pc(Python 3.11.9). python-multipart 추가 필요했음(업로드 폼).
+
+### 검증 (e2e)
+- PC(Windows) 웹 부트스트랩 성공: vLLM healthy / Redis / PostgreSQL(KnowledgeStore 1,067,978행) / 임베딩 전부 **터널 경유** 연결, tier=large, 23도구.
+- 인증 /v1/chat 니체 질의 → RAG 주입(input 4,973토큰) → A.X-4.0 grounded 응답, 3.9초(터널 오버헤드 ~0.7초). **PC 오케스트레이터 → 터널 → B200 백엔드 전체 왕복 확인.**
+
+### 이전(relocation)
+- 새 서버: 저장소 복사 → setup 실행 → .env·tunnel 키/주소만 수정 → tunnel→start_web. Windows·Linux 스크립트 병행.
+
+### 남은 것
+- 웹 UI는 fetch에 인증 헤더 없음 → 브라우저 채팅 시 401. "UI에 키 주입" 패치 필요(또는 API로 테스트).
+- 외부 agent API: tenants.yaml 테넌트별 api_keys로 이미 가능(격리 세션). 커스텀 agent 정의 확장은 후속.
+- 외부 시연 노출(Bastion 포트매핑/도구 제한/데이터 범위)은 별도 결정 대기.
+
+## 문서 생성 기능(DocumentExport) — docx/pptx/hwpx/md/txt + 웹 다운로드 (2026-07-05)
+
+배경: B200 전환 후 사용자가 업로드 문서 요약을 "docx로 다운로드"하려 했으나 웹이 거절. 원인은 모델 능력이 아니라 배선 부재(생성 도구·다운로드 라우트·UI 없음). 일반 LLM 서비스처럼 문서 생성+다운로드를 Nexus에 추가.
+
+### 사전 검증(에어갭 순수 파이썬)
+- docx=python-docx, pptx=python-pptx(MIT), hwpx=python-hwpx 2.23.0(Apache-2.0, hwpx.builder 고수준 API), md/txt=평문. 5종 실제 파일 생성 스모크 통과(hwpx 유효 OWPML ZIP 확인). 한글 폰트 슬롯 커스터마이즈는 후속.
+
+### 구현
+- 신규 `core/tools/implementations/document_export_tool.py`(DocumentExportTool, BaseTool) + `document_export_renderers.py`(공통 마크다운 파싱→5포맷). 저장은 샌드박스 exports 디렉토리 고정 + uuid 파일명(경로순회 불가) → check_permissions ALLOW.
+- `core/config.py` DocumentExportConfig(exports_dir/formats), `core/bootstrap.py` 웹 TIER_M/L 도구풀 등록(웹 worker 11→12).
+- `web/app.py` `GET /v1/download/{filename}`(FileResponse, 경로순회 차단) + base_options에 exports_dir 주입.
+- **핵심 이슈**: 모델이 결과 URL을 자유 텍스트로 재입력하며 uuid를 오탈(b551ffee→b5551ffee) → 404. 또한 TOOL_RESULT StreamEvent는 orchestrator가 발신하지 않음. → 해결: 턴 종료 후 `engine._messages`의 tool_result 메시지에서 정확한 URL을 서버가 추출해 ChatResponse.downloads(비스트림) + `download` SSE 프레임(스트림)으로 구조화 전달. UI는 그 값으로 다운로드 버튼 생성(dl-link→인증 fetch→blob 저장), 모델 텍스트의 /v1/download 링크는 비클릭 처리.
+- `web/static/index.html` formatContent 링크 렌더 + download 이벤트 수집 + renderDownloadButtons.
+- 의존성: deploy_pc/requirements-pc.txt에 python-pptx/python-hwpx 추가.
+
+### 검증(실물 서버)
+- 단위 테스트 11 passed(포맷 5종 생성+파일유효성, 파일명 정화/경로순회, 파싱). ruff 클린(신규 파일).
+- e2e(PC웹 8600→B200): "hwpx로 만들어줘" → DocumentExport 호출 → /v1/chat downloads 필드 정확한 URL → 실제 hwpx 200/유효. /v1/chat/stream download 프레임 발신 확인. 경로순회 ../ → 404.
+
+### 남은 것
+- CLI 노출은 보류(다운로드 URL이 웹 전용). PDF/한글폰트/표·이미지 고급서식은 후속. config yaml override는 모델 기본값+env로 충분.
+
+### [후속/백로그] TOOL_RESULT 이벤트 노출 리팩터 (2026-07-05 등록)
+
+**공백**: orchestrator/query_loop이 도구 실행 결과를 `StreamEvent(type=TOOL_RESULT, tool_result=...)`로 소비자에게 발신하지 않는다. 그래서 (1) 웹 응답의 `tool_calls[].result`가 항상 None, (2) DocumentExport 다운로드 URL을 이벤트로 못 받아 `web/app.py`에서 `engine._messages`를 사후 스캔 + 결과 본문 정규식(`_extract_download`)으로 뽑는 우회를 넣음.
+
+**정식 수정**:
+1. 도구 결과가 tool_result Message로 만들어지는 지점(core/orchestrator query_loop/executor/stream_handler)에서 `StreamEvent(type=StreamEventType.TOOL_RESULT, tool_result=ToolResultBlock(...))`를 yield. content + **ToolResult.metadata(예: download_url) 함께 전달**.
+2. `web/app.py` 비스트림: TOOL_RESULT 이벤트에서 `info.result`·`downloads` 채우고 `engine._messages[dl_start_idx:]` 스캔 제거.
+3. `web/app.py` 스트림: consume 루프 안에서 이벤트로 바로 `download` 프레임 emit, 사후 스캔 제거.
+4. `_extract_download` 정규식 대신 metadata.download_url 사용(정규식 제거 또는 폴백만 유지).
+
+**대상 파일**: core/message.py(StreamEvent.tool_result·ToolResultBlock 이미 존재), core/orchestrator/*, web/app.py. **정리 대상**: web/app.py의 `dl_start_idx` 스캔 2곳 + `_extract_download`(TODO(nexus) 마커 달아둠).
+
+**검증**: query_loop이 TOOL_RESULT StreamEvent를 yield하는 단위 테스트 + 문서 생성 e2e(downloads 여전히 동작) + 기존 웹 테스트 무회귀. **리스크**: 스트림에 이벤트 추가 → UI가 미지 type 무시하는지 확인(현재 무시함), 중복/이중계수 없게.
+
+### 문서 생성 붕괴(degeneration) 수정 — 프롬프트 지시 추가 (2026-07-05)
+
+증상: "요약한 내용을 보고서로 작성…DOCX로 작성해줘" → 모델이 DocumentExport를 안 부르고 보고서 본문을 인라인 프로즈로 강제 생성하다 반복 루프/기호·키릴 gibberish로 붕괴(사용자 중단).
+
+진단(로그): 라우팅은 무관(도구는 KNOWLEDGE/TOOL 모두 사용 가능 — 12:39 KNOWLEDGE에서도 DocumentExport 호출됨). 샘플링 반복억제(KNOWLEDGE rep_pen=1.15+freq=0.3)는 config→RoutingDecision(routing.py:343)→vLLM까지 정상 전달됨(dead config 아님). 근본 원인은 **모델 선택**: "만들어줘"→도구호출(자연종료), "작성해줘"→인라인 초장문 생성→EOS 못 내고 드리프트. 게다가 worker_system_full.md에 DocumentExport가 아예 없었음(도구 추가 전 작성).
+
+수정: `web/prompts/worker_system_full.md`에 DocumentExport를 도구 목록 + "문서/보고서 생성 요청 시 반드시 DocumentExport 호출, 본문 인라인 금지, 성공 후 1~2문장 확인만" 지시 추가. (라우팅 키워드·샘플링은 안 건드림 — 도구호출이 자연 종료 구조라 붕괴 회피.)
+
+검증(실물 8600): 동일 요청 재현 → DocumentExport 호출, downloads 정확, 붕괴 0건. /v1/chat(37766바이트 유효 docx: 제목+목표+핵심서비스+설계원칙+로드맵) + /v1/chat/stream(download 프레임 1, gibberish 0, text_delta 46=짧은 확인만) 모두 통과.
+
+### 웹 UI 개선 — 마크다운 서식 렌더러 + 문서 미리보기 캔버스 (2026-07-05)
+
+사용자 요청: (1) claude.ai 아티팩트처럼 생성 문서를 우측 캔버스로 미리보기, (2) 응답 마크다운이 들여쓰기·제목까지 정돈되어 표시.
+
+- **백엔드(web/app.py)**: `_collect_downloads()` 헬퍼 신설 — tool_result에서 url/filename 추출 + 대응 DocumentExport tool_use 입력에서 **content(미리보기용 마크다운)·format** 결합. download 이벤트/`downloads[]` 계약을 `{url,filename,content,format}`로 확장. 비스트림·스트림 스캔 2곳을 이 헬퍼로 통일.
+- **프런트(web/static/index.html, frontend-specialist 위임)**: `formatContent` 전면 재작성 + `applyInline()` 분리 — 제목(#/##/###→h2/h3/h4), **중첩 불릿(2/4칸 들여쓰기→실제 중첩 ul)**, 번호목록(1.→ol), 목록/제목 내 굵기·코드·링크, 코드블록 이스케이프, /v1/download 링크 비클릭. 캔버스 패널(`#canvasPanel`, `openCanvas/closeCanvas`) — 우측 42%(모바일 오버레이), 미리보기 버튼(`.preview-btn`)으로 열고 헤더에 파일명·format배지·다운로드(dl-link)·닫기(Esc). 에어갭 준수(외부 라이브러리 0, 순수 바닐라).
+- **검증(실서버 8600)**: GET / 200, 새 요소/함수 전부 존재, <script> 문법 OK(Node), download 이벤트에 content 1257자 실림 확인, formatContent 렌더 출력 검증(h2/h3·중첩ul·ol·strong·code·정상링크·download 라벨화 모두 정상). 브라우저 클릭 상호작용은 사용자 확인 몫.
+
+### 컨텍스트 오버플로우 하드에러 수정 (2026-07-05)
+
+증상: 웹에서 대용량 문서 처리 중 "입력(32257 토큰)이 컨텍스트(24576)를 거의 다 사용하여 응답을 생성할 수 없습니다" 하드에러.
+
+근본원인(로그 확인): `query_loop.py` Phase 1 truncation이 **마지막 메시지 하나만** 잘라, 오버플로우가 *여러 tool_result 누적*에서 오면(마지막 메시지가 excess보다 작음) 조건 미충족으로 **아무것도 안 잘림** → 모델 거부. 로그 `입력 truncate: 26524 → 26524`(안 줄어듦) + emergency_compact도 최근1턴 통째 보존이라 안 줄임.
+
+수정(backend-specialist 위임): `_shrink_text()` + `_truncate_input_for_budget()` 헬퍼 신설. `msg_char_budget = input_limit*3 - (tool_chars+prompt_chars)` 역산 → 메시지 총 글자를 예산 이하로 최신우선 축소. **페어링 보존**(메시지 제거 없이 평문 content만 head+tail 축소, assistant tool_use 구조화 content 불변, tool_use_id/is_error 유지), **히스토리 불변**(팩토리로 새 Message·새 리스트, state.messages 원본 미수정). BF16/config/모델 무변경 — 순수 코드 견고성 수정.
+
+검증: 단위 7 passed + 누적케이스 재현 통과 + **실서버 e2e**(8600→B200): 135,022자(~45k토큰) 입력 → HTTP200 7.3초 정상 3문장 요약, 하드에러 없음. 로그 `입력 truncate: 48927 → 20889 토큰`(정확히 예산).
+
+후속: ① emergency_compact(context_manager.py:218)도 "보존 최근 1턴 내부"는 안 줄이는 동일 결함 클래스 — 2차 안전망 보강 필요(Phase1이 먼저 잡아 현재 도달 안 함). ② 더 큰 단일 컨텍스트가 필요하면 FP8 전환+max_model_len 상향(사용자 결정 대기).
+
+### FP8@65k 전환 — 검증 통과·확정 (2026-07-05)
+
+목적: BF16 32768 창이 대용량 문서엔 좁아, FP8 전환으로 VRAM 확보→창 확대. 품질 민감도 때문에 "검증 후 확정" 방식.
+
+**발견**: A.X-4.0 config는 `max_position_embeddings=131072` 네이티브 → rope override 불필요(첫 시도의 `--rope-scaling`은 vLLM 0.24 미지원 + 애초에 불필요였음). BF16의 32768은 KV 메모리 상한이 이유(GPU 179GB 중 BF16 가중치 175GB 점유, 여유 7.5GB).
+
+**기동**: `/NHNHOME/nexus/run_vllm_fp8.sh` — `--quantization fp8 --max-model-len 65536`(KV는 미지정=BF16 유지, rope 없음). 로딩 ~100초. GPU 172GB(가중치 ~72GB + KV 풀 ~96GB). vLLM 0.24.0.
+
+**검증(실서버 직접 :8001, temp=0)**:
+- 사실/환각 배터리 11문항 BF16 기준값과 비교 → **사실 8/8 완전 동일**(H2O·광복절·베토벤9·1km·에베레스트·17×23·빛속도·서울). 허구 작곡가는 양쪽 동일하게 지어냄(패리티), 2099년·유창성 동일. **near-lossless 실증**.
+- 장문 needle 회수: 50k자(18.5k토큰)·95k자(35.4k토큰)·**160k자(60,122토큰)** 전부 정확 회수(CRIMSON-7492) → 65k 창 전체 + 장문 회수 정상.
+
+**확정 반영**: `config/nexus_config.yaml` max_context_tokens 24576→**49152**(불변식 49152+8192=57344≤65536, 여유 8192), `config/vllm_launch.yaml` axmodel에 `quantization: fp8` + max_model_len 65536. 웹 재기동 후 e2e: 135k자 입력이 truncate 20,889→**41,779**(0.85×49152)로 창 2배 실동작, 정상 응답.
+
+**후속**: ① FP8 런처를 컨테이너 부팅 자동기동에 편입(현재 수동 run_vllm_fp8.sh). ② 필요 시 입력 예산 57344까지 추가 상향 여지. ③ emergency_compact 내부 축소 보강(별건).
+
+### B200 스택 복구 스크립트 배포 (2026-07-05)
+
+배경: 부팅 조사 결과 스택 전체(PG·Redis·임베딩·vLLM·웹 8443)가 수동 기동이며, `/`는 docker overlay(휘발성)이고 `/NHNHOME`만 영구 xfs 볼륨. 즉 재부팅/재생성 시 자동 복구 수단이 없었음.
+
+조치(사용자 선택=옵션2, cron 없이 스크립트만): `/NHNHOME/nexus/start_all.sh` 배포(영구볼륨→생존). 실행 중 프로세스에서 정확한 기동 명령 복원 — PG(`pg_ctl -D pgdata`), Redis(`redis-server redis.conf`), 임베딩(`embed_server.py`), vLLM(`run_vllm_fp8.sh` FP8@65k), 웹(uvicorn :8443). 포트 확인으로 idempotent(가동중이면 skip), vLLM 앞에 nvidia-smi 준비 대기 가드. 검증: 라이브 실행 시 5개 전부 skip(무중단).
+
+**수동 복구 한 줄**: `bash /NHNHOME/nexus/start_all.sh`
+
+자동기동(@reboot cron/systemd)은 미채택 — cron/유닛이 휘발성 `/`에 저장돼 컨테이너 재생성 시 소실(거짓 안심)되고, @reboot는 크래시 재시작 불가 + 부팅 순서/발화 미검증이라, 재생성까지 커버하는 정본은 위 수동 1줄로 둠. (재검토 시 NHN 콘솔 컨테이너 시작커맨드/헬스체크 확인 권장.)
+
+### 웹 UI 중간 활동 표시(도구 실행) 추가 (2026-07-05)
+
+claude처럼 "AI가 지금 무슨 도구를 실행 중인지" 실시간 표시. 표시는 이미 흐르는 StreamEvent를 렌더만 하므로 추가 토큰/GPU 비용 없음.
+
+- **백엔드(web/app.py 스트림 프레임 빌더)**: `event.tool_use`가 있으면 SSE 프레임에 `tool_name` 추가(한 줄). 기존엔 tool_use 이벤트의 `type`만 전달돼 UI가 도구 이름을 못 받았음. 실증: 문서생성 요청 스트림에 `tool_use_start`/`tool_use_stop` + `"tool_name":"DocumentExport"` 도착 확인.
+- **프런트(web/static/index.html, frontend-specialist 위임)**: 활동 영역(`activity-area`/`activityLive`/`activityTrail`) + CSS 스피너. `activityStart/Stop`, 도구명→한글 라벨맵(TOOL_LABELS 12종). tool_use_start→"🔧 라벨·도구명"+스피너, tool_use_stop→트레일에 "✓" 누적, text_delta 시작 시 라이브 감춤, thinking_start→"💭 생각 중". **thinking_delta(text 필드 보유)를 가로채 답변 본문 오염 차단**(부수 버그픽스). 기존 text_delta/download/캔버스/formatContent 무손상.
+- 검증: SSE 실측(tool_name 도착) + GET / 200 + 새 요소·함수 존재 + <script> 문법 OK. 브라우저 시각 확인은 사용자 몫.
+
+### 웹 활동표시 claude화 + 캔버스 자동오픈 (2026-07-05)
+
+실사용 피드백: 같은 도구 반복(DocumentProcess ×10)이 트레일 도배 + 도구 사이 중간 나레이션이 답변에 누적 + 미리보기가 버튼식.
+
+- **(1a) 중복 접기**: `activityStop`에서 직전 트레일 항목과 tool_name 같으면 새 줄 대신 `data-count`+1, `.activity-count` 배지를 `×N`으로 갱신 → `✓ 문서 분석 중 · DocumentProcess ×10`.
+- **(1b) 중간 나레이션 정리**: `resetStreamingBody()` 신설, `tool_use_start` 수신 시 답변 본문(streamingBody textContent) 리셋 → 최종 답변 = 마지막 도구 이후 세그먼트만. 순수 대화(도구 없음)는 리셋 안 됨(회귀 없음). claude식.
+- **(2) 미리보기 자동오픈**: `.preview-btn`(📄 미리보기) 제거, 스트림 종료 후 content 있는 최근 생성문서로 `openCanvas()` 자동 호출(우측 캔버스). 다운로드 버튼(.dl-link)·캔버스 헤더 다운로드는 유지.
+- 보존: text_delta/download/formatContent/스피너/취소·토큰/thinking_delta 가로채기 무변경. 검증: GET / 200 + 새 로직 존재 + preview-btn 0 + <script> 문법 OK.
+
+### ① OpenAI 호환 API 추가 (2026-07-05)
+
+목적: 외부 서비스(AgentHub·LangChain·openai SDK)가 커스텀 코드 없이 Nexus를 드롭인 프로바이더로 사용. (AgentHub 연동에서 드러난 마찰 해소)
+
+- **`POST /v1/chat/completions`**(web/app.py, backend-specialist 위임). OpenAI 형식 `{model, messages[], stream, temperature...}` 수용, `Message.user/assistant` 매핑, system 메시지는 Nexus 기본 프롬프트 뒤에 `[사용자 지시]`로 덧붙임(update_system_prompt). 무상태(요청마다 임시 세션, Redis 복원 안 함 — 클라이언트가 히스토리 소유).
+- 비스트림: `chat.completion` {choices[{message,finish_reason}], usage}. 스트림: `chat.completion.chunk` delta 조각 + `data: [DONE]`. 다운로드는 content 끝에 마크다운 링크 + 비표준 downloads 필드.
+- 신규 Pydantic 모델(OpenAIChatCompletionRequest 등) + 헬퍼(_split_openai_messages/_inject_openai_context/_downloads_markdown). 4-Tier 우회 없음, 기존 /v1/chat·/v1/chat/stream 무손상.
+- 검증: 웹 단위 66 passed + 실서버 e2e(비스트림 chat.completion+system반영+usage / 스트림 delta+role+finish_reason:stop+[DONE]) 통과.
+- 사용법: 클라이언트 base_url=`http://192.168.20.206:8600/v1`, 모델 primary. 한계: temperature/max_tokens는 반향만(엔진 내부 라우팅이 샘플링 관리), 다운로드는 여전히 _messages 사후스캔.
+
+### ③ Speculative decoding — 테스트 후 롤백 (2026-07-05)
+
+FP8@65k에 n-gram speculative(`--speculative-config {method:ngram,num_speculative_tokens:5,prompt_lookup_max:4,min:2}`) 적용해 A/B 측정. 무손실이라 품질 무관, 순수 속도 판단.
+
+측정(temp0, 단일요청): baseline 종합 54.1 tok/s vs spec 52.8 tok/s = **-2%**. 세부: 긴 구조적 출력 +7~13%(171tok 55→59, 204tok 54→61)지만 **짧은 응답은 크게 느려짐**(36tok 0.73s→1.56s = 49→23 tok/s, n-gram 셋업 오버헤드). 채팅 다수가 짧은 응답이라 UX 손해.
+
+결론: 이득 불명확(오히려 단문 지연↑) → **롤백**(run_vllm_fp8.sh no-spec 유지, run_vllm_fp8_spec.sh 삭제). 스펙 디코딩은 저부하 단일유저에서 최선인데도 이득이 미미했고, 프로덕션 동시성에선 더 줄어듦. 향후 생성 극단적 장문/반복 워크로드가 지배적이 되면 재검토.
+
+### ④ RAG MMR 리랭킹 — 구현(기본 OFF) + 실서버 검증 후 "켜지 않음" 결정 (2026-07-05)
+
+목적: 순수 벡터 top_k=5의 중복 청크를 다양성 선별로 대체(컨텍스트 절약+커버리지). 새 모델 없이 기존 임베딩만 사용.
+
+구현(backend-specialist): `knowledge_store.search_by_vector(with_embedding=)` 임베딩 선택반환 + `pgvector_base.parse_vector()` + `knowledge_retriever._mmr_select()`(게이팅 **이후** survivors→top_k, λ=0.7) + config `knowledge_rag.mmr{enabled:false,fetch_k:20,lambda:0.7}` + bootstrap 주입. **기본 OFF=동작 100% 무변경**. 테스트 19+17 passed.
+
+실서버 검증(실 PG+e5): 임베딩 파싱 정상. MMR 개입하나 효과 애매/위험 — "인공지능이란"에서 더 관련높은 `인공일반지능`을 빼고 다양성 위해 `컴퓨터의역사`(덜 관련) 주입 → 사실 QA에서 정답 청크를 밀어낼 위험. "광합성"은 게이팅이 "광"字 오매칭(광섬유/스텔라레이터) 통과시킨 상태라 MMR이 오답끼리 다양화만 함(관련도 못 고침).
+
+결정: **기본 OFF 유지, 프로덕션 미활성**. MMR은 커버리지 중요 워크로드용(연구/요약 테넌트)이고, 환각-민감 사실 QA엔 다양성 우선이 해로울 수 있음. 코드는 무해한 잠재 knob + with_embedding 재사용성으로 보존. 이 워크로드 진짜 품질 레버 = A(크로스인코더 리랭커) 또는 게이팅 개선.
+
+부수 발견(선행 이슈): "광합성" 질의가 "광"字 표면매칭으로 광섬유·스텔라레이터 등 무관 청크를 게이팅 통과 → 향후 게이팅/리랭킹 개선 후보.
