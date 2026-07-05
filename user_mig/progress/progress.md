@@ -2891,3 +2891,16 @@ FP8@65k에 n-gram speculative(`--speculative-config {method:ngram,num_speculativ
 결정: **기본 OFF 유지, 프로덕션 미활성**. MMR은 커버리지 중요 워크로드용(연구/요약 테넌트)이고, 환각-민감 사실 QA엔 다양성 우선이 해로울 수 있음. 코드는 무해한 잠재 knob + with_embedding 재사용성으로 보존. 이 워크로드 진짜 품질 레버 = A(크로스인코더 리랭커) 또는 게이팅 개선.
 
 부수 발견(선행 이슈): "광합성" 질의가 "광"字 표면매칭으로 광섬유·스텔라레이터 등 무관 청크를 게이팅 통과 → 향후 게이팅/리랭킹 개선 후보.
+
+### ④-A 크로스인코더 리랭커 — 구현·검증·활성화 (2026-07-05)
+
+MMR이 관련도를 못 고쳐(광섬유·스텔라레이터 오매칭 잔존) 대신 크로스인코더 리랭커 도입. 사용자 최우선(환각 저감) 직결.
+
+- 모델: dragonkue/bge-reranker-v2-m3-ko(Apache2.0, 0.6B, 한국어). B200 hf_cache 적재(에어갭 반입 준비). GPU 여유 9GB에 fp16(~1.5GB) 수용.
+- 서버: scripts/embed_server.py(8002)에 CrossEncoder 추가 + /v1/rerank. vLLM 별도 인스턴스 대신 임베딩 서버 재사용(메모리 효율). fail-open. start_all.sh 오프라인 플래그로 복구 시 자동 로드.
+- 클라이언트/통합: inference.py rerank() + knowledge_retriever(fetch_k=20·min_sim0.6 리콜→rerank→min_score0.3 게이팅, e5 2단게이팅 대체·엔티티게이팅 유지, 실패 시 fail-safe 폴백, 리랭커>MMR).
+- config: knowledge_rag.rerank(enabled:true). 되돌리기=enabled:false+웹재기동.
+- 검증(실 e2e): 광합성→0주입("모른다"), 인공지능→정제, 바흐→J.S.바흐 rr1.0 교정. 225~491ms. 웹 실사용 경로도 "지식베이스에 없음" 정직 응답 확인.
+- 커밋 1b091e0. 테스트 8+회귀 통과. min_score 캘리브레이션 근거: 관련0.9~1.0/무관0.0/경계0.28.
+
+세션 채택 요약: FP8@65k·OpenAI호환·리랭커 = 채택. speculative·MMR = 검증 후 미채택(이득 없음).
