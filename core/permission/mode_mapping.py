@@ -18,6 +18,24 @@
 Fail-closed 원칙:
   매핑에 없는(알 수 없는) 값이 들어오면 가장 보수적인 DEFAULT로 떨어뜨린다.
   즉 "모르는 모드는 가장 안전한 기본 모드로 취급"한다.
+  이렇게 하면 오타·신규 값·잘못된 문자열이 흘러들어와도 권한이 과도하게
+  풀리는 사고를 막을 수 있다(안전한 쪽으로 실패).
+
+노출 API (이 모듈이 밖으로 제공하는 것):
+  - map_mode_value_to_permission_mode(value): 유일한 공개 함수.
+    세션 모드 → 파이프라인 모드 변환의 단일 진입점.
+  - _MODE_VALUE_TO_PERMISSION_MODE: 내부 매핑 테이블(밑줄 접두사 = 비공개).
+
+의존 모듈:
+  - core.permission.types.PermissionMode  (변환 결과 타입)
+  - core.state.PermissionModeValue        (변환 입력 타입)
+  두 모듈만 참조하며 역방향 의존이나 순환 import는 없다.
+
+사용처 (누가 이 함수를 부르나):
+  권한 파이프라인을 배선하는 지점에서, GlobalState.permission_mode(세션 모드)를
+  PermissionPipeline이 이해하는 PermissionMode로 바꿔 넘길 때 호출한다.
+
+작성자: 이현수 / 작성일: 2026-07-05
 """
 
 from __future__ import annotations
@@ -68,13 +86,26 @@ def map_mode_value_to_permission_mode(
     """
     세션 모드(PermissionModeValue)를 파이프라인 모드(PermissionMode)로 변환한다.
 
+    이 함수가 프로젝트 전체에서 두 enum을 잇는 "유일한 공식 변환점"이다.
+    다른 곳에서 개별적으로 if/elif로 매핑을 흉내내지 말고 반드시 이 함수를 쓴다
+    (매핑 규칙이 한 군데에만 있어야 유지보수·감사가 쉽기 때문).
+
+    처리 흐름(3단계):
+      1) 문자열이 들어오면 PermissionModeValue enum으로 정규화한다.
+         정규화에 실패하면(모르는 문자열) 즉시 DEFAULT로 안전하게 반환.
+      2) 정규화된 enum으로 매핑 테이블을 조회한다.
+      3) 테이블에 없으면(방어적) DEFAULT로 떨어뜨린다.
+
     Args:
         value: PermissionModeValue enum 또는 그 문자열 값("default" 등).
                GlobalState.permission_mode 는 enum이지만, 문자열로 전달되는
                경로(예: ToolUseContext.permission_mode: str)도 있으므로 둘 다 받는다.
+               enum과 문자열을 모두 받아 호출부에서 타입 변환 부담을 없앤다.
 
     Returns:
         대응하는 PermissionMode. 알 수 없는 값이면 fail-closed로 DEFAULT.
+        (예외를 던지지 않고 항상 유효한 PermissionMode를 돌려주므로 호출부에서
+         별도 예외 처리가 필요 없다.)
     """
     # 문자열로 들어오면 PermissionModeValue enum으로 정규화한다.
     # (enum(value)는 값이 유효하지 않으면 ValueError를 던지므로 감싼다.)
