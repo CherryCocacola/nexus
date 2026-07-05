@@ -12,6 +12,23 @@ fail-closed + 실패 격리:
   (v7.1 _warmup_embedding/RAG 초기화의 fire-and-forget + 격리 패턴과 동일).
 
 의존성 방향(P2): core/tools/mcp/ → core/tools/base.py, core/tools/registry.py.
+
+주요 구성:
+  - McpConnectionManager 클래스: 이 파일의 유일한 공개 진입점.
+  - connect_and_register(registry): 부트스트랩에서 호출. enabled 서버를 돌며
+    도구를 발견·등록하고 {서버명: [도구명...]} 요약을 돌려준다.
+  - aclose_all(): 종료 시 호출. 보유 중인 McpClient들을 일괄 정리한다.
+
+협력 모듈:
+  - McpClient(client.py): 실제 LAN HTTP/JSON-RPC 통신(tools/list, tools/call).
+  - McpToolAdapter(adapter.py): 원격 도구 하나를 Nexus BaseTool로 감싸는 래퍼.
+  - ToolRegistry(registry.py): 어댑터를 등록해 도구 풀에 편입시키는 대상.
+
+호출 흐름 요약:
+  bootstrap → connect_and_register() → McpClient.list_tools()
+           → McpToolAdapter로 래핑 → registry.register() → 요약 dict 반환.
+
+작성자: 이현수 / 작성일: 2026-07-05
 """
 
 from __future__ import annotations
@@ -32,15 +49,29 @@ logger = logging.getLogger("nexus.tools.mcp.connection_manager")
 
 class McpConnectionManager:
     """
-    설정된 LAN MCP 서버들에 연결하고 도구를 registry에 등록한다.
+    설정된 LAN MCP 서버들에 연결하고 원격 도구를 ToolRegistry에 등록한다.
 
-    생성한 McpClient들을 보관하여 종료 시 일괄 정리(aclose_all)할 수 있다.
+    이 매니저는 부트스트랩(Phase 2)에서 한 번 생성되어 두 가지 일을 한다:
+      1) connect_and_register(): 서버별로 도구를 발견·등록(실패는 서버 단위 격리).
+      2) aclose_all(): 세션 종료 시 보유 클라이언트를 일괄 정리.
+
+    상태(인스턴스 필드):
+      - self._config           : 이 매니저가 다룰 MCP 설정(전역 enabled + 서버 목록).
+      - self._clients          : 등록에 성공한 서버의 McpClient들. 종료 시 정리 대상.
+      - self.excluded_from_worker : 정책상 Worker 풀 노출에서 제외된 서버→사유 매핑.
+                                    (연결 실패와 구분하기 위해 별도로 보관한다.)
+
+    핵심 원칙은 "실패 격리 + fail-closed"다. 서버 하나가 죽거나 신뢰되지
+    않아도 다른 서버 등록과 본류(채팅)에는 영향을 주지 않는다.
     """
 
     def __init__(self, mcp_config: McpConfig):
         """
+        매니저를 초기화한다. 실제 연결은 여기서 하지 않고, 나중에
+        connect_and_register()가 호출될 때 서버별로 수행한다(지연 연결).
+
         Args:
-            mcp_config: NexusConfig.mcp — 전역 enabled + 서버 목록.
+            mcp_config: NexusConfig.mcp — 전역 enabled 플래그 + 서버 목록.
         """
         self._config = mcp_config
         # 등록에 성공한 서버의 McpClient들 — 종료 시 정리 대상

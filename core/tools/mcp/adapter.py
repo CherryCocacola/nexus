@@ -1,16 +1,31 @@
 """
-McpToolAdapter — 원격 MCP 도구 1개를 Nexus BaseTool로 래핑한다.
+McpToolAdapter — 원격 MCP 도구 1개를 Nexus BaseTool로 래핑하는 어댑터 모듈.
 
-핵심 아이디어:
-  원격 MCP 서버가 보고한 도구 1개를 BaseTool 서브클래스 1개로 감싸면,
-  registry·executor·query_loop은 이 객체를 다른 24개 도구와 완전히 동일하게
-  취급한다. MCP라는 사실을 전혀 모른다(P3 계약 — OpenAI tool_calls만 노출).
+이 파일이 하는 일 (한눈에):
+  MCP(Model Context Protocol) 서버는 자기가 제공하는 "원격 도구" 목록을
+  tools/list로 알려준다. 이 모듈은 그 원격 도구 하나하나를 Nexus 내부의
+  표준 도구 인터페이스(BaseTool)로 옷 입혀(adapter 패턴) 주는 역할을 한다.
 
-경계선:
-  MCP JSON-RPC(tools/call)는 McpClient 내부에만 존재한다. 이 어댑터의 call()은
-  client.call_tool()을 한 번 부를 뿐이며, 결과를 ToolResult로 정규화한다.
+왜 필요한가 (핵심 아이디어):
+  원격 MCP 도구 1개를 BaseTool 서브클래스 1개로 감싸 두면,
+  registry(도구 등록)·executor(실행)·query_loop(에이전트 루프)은 이 객체를
+  나머지 로컬 24개 도구와 "완전히 똑같이" 다룰 수 있다. 즉 상위 계층은
+  이게 원격 MCP 도구라는 사실을 전혀 몰라도 된다.
+  (P3 표준 계약 — 내부에는 OpenAI tool_calls 형식만 노출한다.)
 
-의존성 방향(P2): core/tools/mcp/ → core/tools/base.py (단방향, 역방향 금지).
+경계선 (책임 분리):
+  MCP의 실제 통신 프로토콜인 JSON-RPC(tools/call)는 McpClient 내부에만
+  숨어 있다. 이 어댑터의 call()이 하는 일은 client.call_tool()을 딱 한 번
+  호출하고, 그 응답을 Nexus 표준 결과 타입인 ToolResult로 정규화하는 것뿐이다.
+  (통신은 McpClient가, 표준화·권한·검증 껍데기는 이 어댑터가 담당.)
+
+주요 구성:
+  - McpToolAdapter: 원격 도구 1개 = 이 클래스 인스턴스 1개. BaseTool 상속.
+
+의존성 방향 (P2 규칙): core/tools/mcp/ → core/tools/base.py 로만 흐른다.
+  (단방향만 허용 — base.py가 이 모듈을 거꾸로 import 하면 안 된다.)
+
+작성자: 이현수 / 작성일: 2026-07-05
 """
 
 from __future__ import annotations
@@ -35,11 +50,20 @@ logger = logging.getLogger("nexus.tools.mcp.adapter")
 
 class McpToolAdapter(BaseTool):
     """
-    원격 MCP 서버의 tool 1개를 Nexus BaseTool로 래핑하는 어댑터.
+    원격 MCP 서버의 도구(tool) 1개를 Nexus BaseTool로 래핑하는 어댑터 클래스.
+
+    한 서버가 N개의 원격 도구를 보고하면, 이 클래스 인스턴스도 N개 만들어진다
+    (도구 1개 ↔ 어댑터 1개). 인스턴스는 자기가 감쌀 서버 이름·원격 도구 이름·
+    원격 스키마·통신용 McpClient를 생성 시점에 주입받아 보관한다.
+
+    BaseTool의 생애주기 규약(아래 순서로 상위 executor가 호출):
+      validate_input() → check_permissions() → call() → (결과 매핑)
+    이 클래스는 그중 세 메서드를 오버라이드해 MCP에 맞게 구현한다.
 
     도구 이름 규칙: mcp__{server_name}__{remote_tool_name}
-      → 이 접두사로 PermissionPipeline이 자동으로 ToolCategory.MCP로 분류한다
-        (core/permission/pipeline.py — 이미 존재. 어댑터는 이름만 맞추면 정합).
+      이 "mcp__" 접두사만 맞춰 두면 PermissionPipeline이 이름만 보고 자동으로
+      ToolCategory.MCP로 분류한다(core/permission/pipeline.py에 이미 구현됨).
+      즉 어댑터는 별도 등록 로직 없이 name 규칙만 지키면 권한 분류에 정합된다.
     """
 
     def __init__(
@@ -52,14 +76,24 @@ class McpToolAdapter(BaseTool):
         is_read_only: bool = False,
     ):
         """
+        어댑터 생성자 — 원격 도구 1개를 감싸는 데 필요한 정보를 모두 주입받아
+        내부 필드에 보관한다(이후 프로퍼티/메서드가 이 값들을 참조).
+
+        보통 McpConnectionManager가 서버에 연결한 뒤 tools/list 응답을 돌면서
+        도구마다 이 생성자를 호출해 어댑터를 하나씩 만든다.
+
         Args:
             server_name: MCP 서버 이름 (예: "db", "diag", "docutil", "kowiki").
-            remote_tool_name: 원격 서버가 보고한 원본 도구 이름.
-            remote_schema: tools/list가 준 inputSchema(변환 없이 그대로 노출).
-            client: 이 서버와 통신하는 McpClient.
-            description: 모델에 보여줄 도구 설명.
-            is_read_only: fail-closed 기본 False. 조회 전용 도구만 명시적으로
-                          True로 완화한다(server.trust.read_only 기반).
+                         name 프로퍼티와 group 분류의 기준이 된다.
+            remote_tool_name: 원격 서버가 보고한 원본 도구 이름. call() 시
+                              이 이름 그대로 client.call_tool()에 넘긴다.
+            remote_schema: tools/list가 준 inputSchema. 변환 없이 그대로 노출하며
+                           validate_input()의 검증 기준으로도 쓰인다.
+            client: 이 서버와 실제로 통신하는 McpClient(JSON-RPC 담당).
+            description: 모델(LLM)에 보여줄 도구 설명 문자열.
+            is_read_only: fail-closed 원칙상 기본 False(=쓰기 도구로 간주).
+                          조회 전용 도구만 server.trust.read_only 값을 근거로
+                          명시적으로 True로 완화한다.
         """
         self._server = server_name
         self._remote = remote_tool_name
@@ -72,30 +106,46 @@ class McpToolAdapter(BaseTool):
 
     @property
     def name(self) -> str:
-        """권한 식별 규칙과 정합: mcp__{server}__{tool}."""
+        """
+        도구 고유 이름. 권한 파이프라인의 MCP 식별 규칙과 반드시 정합해야 한다:
+        mcp__{server}__{tool}. 이 이름은 registry 등록 키이자 모델이 호출할 때
+        쓰는 이름이며, "mcp__" 접두사가 곧 ToolCategory.MCP 분류의 트리거다.
+        """
         return f"mcp__{self._server}__{self._remote}"
 
     @property
     def description(self) -> str:
+        """모델에게 보여줄 도구 설명. 생성 시 받은 값을 그대로 돌려준다."""
         return self._description
 
     @property
     def group(self) -> str:
-        """UI 카테고리 — MCP 도구는 서버별로 묶어 보여준다."""
+        """
+        UI/도구 목록에서의 묶음(카테고리) 키. MCP 도구는 서버별로 묶어 보여주기
+        위해 "mcp:{서버명}" 형태를 쓴다(예: 같은 db 서버 도구들은 한 그룹).
+        """
         return f"mcp:{self._server}"
 
     # ═══ Schema ═══
 
     @property
     def input_schema(self) -> dict[str, Any]:
-        """MCP tools/list의 inputSchema를 그대로 노출(변환 없음)."""
+        """
+        도구 입력 JSON Schema. 원격 MCP 서버가 tools/list로 준 inputSchema를
+        가공 없이 그대로 노출한다. 이 스키마가 모델에게 전달되어 어떤 인자를
+        채워야 하는지 알려주고, validate_input()의 검증 기준으로도 재사용된다.
+        """
         return self._schema
 
     # ═══ Behavior Flags ═══
 
     @property
     def is_read_only(self) -> bool:
-        """fail-closed: 기본 False. 조회 전용 서버면 생성 시 True로 완화됨."""
+        """
+        조회 전용 여부. fail-closed 원칙상 기본은 False(쓰기 가능으로 간주)이며,
+        신뢰된 조회 전용 서버의 도구만 생성 시 True로 완화된다. 이 값은 권한
+        판단(모드별 ALLOW/ASK/DENY)과 동시 실행 안전성 판정 등에 영향을 준다.
+        """
         return self._read_only
 
     # ═══ Lifecycle ═══
@@ -195,21 +245,33 @@ class McpToolAdapter(BaseTool):
         context: ToolUseContext,
     ) -> ToolResult:
         """
-        MCP tools/call을 1회 호출하고 결과를 ToolResult로 정규화한다.
+        실제 도구 실행 담당. 원격 MCP 서버의 tools/call을 1회 호출하고,
+        그 응답을 Nexus 표준 결과 타입 ToolResult로 정규화해 돌려준다.
+        (권한·검증을 모두 통과한 뒤 상위 executor가 이 메서드를 호출한다.)
+
+        흐름:
+          1. McpClient.call_tool()에 원격 도구 이름·입력·타임아웃을 넘겨 호출.
+          2. 성공하면 ToolResult.success로 감싸 반환.
+          3. 실패하면 아래 except에서 ToolResult.error로 변환.
 
         에러 처리(anti-pattern #8 — bare except 금지):
-          연결 실패/타임아웃/LAN 검증 실패만 구체적으로 포착해
-          tool_use_error로 래핑한다. 그 외 예상치 못한 예외는 상위 executor의
-          13단계 파이프라인이 일괄 래핑하도록 의도적으로 전파한다.
+          연결 실패/타임아웃/LAN 검증 실패처럼 "예상 가능한" 예외만 구체 타입으로
+          포착해 tool_use_error로 래핑한다. 그 밖의 예상치 못한 예외는 삼키지 않고
+          상위 executor의 13단계 파이프라인이 일괄 래핑하도록 일부러 전파시킨다.
         """
         try:
+            # 원격 서버에 실제 실행 요청. 원본 도구 이름과 입력을 그대로 전달하고,
+            # BaseTool이 제공하는 타임아웃(초)을 함께 넘겨 무한 대기를 방지한다.
             result = await self._client.call_tool(
                 self._remote,
                 input_data,
                 timeout=self.timeout_seconds,
             )
+            # 정상 응답 — 표준 성공 결과로 감싼다.
             return ToolResult.success(result)
         except (TimeoutError, ConnectionError, ValueError) as e:
-            # 원격 MCP 서버 장애는 본류(다른 도구·턴)에 영향 주지 않도록 격리
+            # 원격 MCP 서버 장애(타임아웃/연결 끊김/LAN 검증 실패 등)는
+            # 본류(다른 도구·다음 턴)에 영향을 주지 않도록 여기서 격리한다.
+            # 경고 로그만 남기고, 모델이 이해할 에러 결과로 변환해 반환한다.
             logger.warning("MCP 도구 '%s' 호출 실패: %s", self.name, e)
             return ToolResult.error(f"MCP 서버 '{self._server}' 호출 실패: {e}")
