@@ -399,6 +399,11 @@ async def init_phase2(state: GlobalState) -> dict:
             min_similarity=krag.min_similarity,
             abs_threshold=krag.abs_threshold,
             relevance_margin=krag.relevance_margin,
+            # MMR 리랭킹 (게이팅 이후 다양성 선별). yaml knowledge_rag.mmr에서 주입.
+            # enabled 기본 False라 켜기 전까지 동작은 종전과 100% 동일하다.
+            mmr_enabled=krag.mmr.enabled,
+            mmr_fetch_k=krag.mmr.fetch_k,
+            mmr_lambda=krag.mmr.lambda_,
         )
         components["knowledge_store"] = knowledge_store
         components["knowledge_retriever"] = knowledge_retriever
@@ -955,6 +960,7 @@ def _create_web_tool_registry(tier: Any = None):  # noqa: ANN202
     # 매칭 실패(None/미지 값) 시 아래 블록을 건너뛰어 TIER_S로 폴백 = fail-closed.
     tier_val = getattr(tier, "value", tier)
     if tier_val in (HardwareTier.TIER_M.value, HardwareTier.TIER_L.value):
+        from core.tools.implementations.document_export_tool import DocumentExportTool
         from core.tools.implementations.document_tool import DocumentProcessTool
         from core.tools.implementations.git_tools import GitDiffTool
         from core.tools.implementations.glob_tool import GlobTool
@@ -969,6 +975,7 @@ def _create_web_tool_registry(tier: Any = None):  # noqa: ANN202
                 GrepTool(),  # 내용 정규식 검색
                 LSTool(),  # 디렉토리 목록
                 DocumentProcessTool(),  # 업로드 문서(.pdf/.docx/.xlsx/.hwp/.pptx) 파싱
+                DocumentExportTool(),  # 문서 생성(.docx/.pptx/.hwpx/.md/.txt) + 다운로드
                 GitDiffTool(),  # git 변경 조회(읽기 전용). GitCommit은 제외.
             ]
         )

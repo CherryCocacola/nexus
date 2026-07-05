@@ -47,6 +47,7 @@ from typing import Any
 from core.rag.pgvector_base import PgVectorStore
 from core.rag.pgvector_base import cosine_similarity as _cosine
 from core.rag.pgvector_base import format_vector as _format_vector
+from core.rag.pgvector_base import parse_vector as _parse_vector
 
 logger = logging.getLogger("nexus.rag.knowledge_store")
 
@@ -175,6 +176,7 @@ class KnowledgeStore(PgVectorStore):
         source: str | None = None,
         allowed_sources: list[str] | None = None,
         min_similarity: float = 0.2,
+        with_embedding: bool = False,
     ) -> list[dict[str, Any]]:
         """코사인 유사도 기반 벡터 검색.
 
@@ -186,10 +188,15 @@ class KnowledgeStore(PgVectorStore):
                 DB-level 필터로 cross-tenant 누설을 구조적으로 차단한다.
                 source와 동시 지정 시 allowed_sources가 우선.
             min_similarity: 최소 유사도 (1 - distance). 낮은 품질은 자동 제거.
+            with_embedding: True면 각 결과 dict에 파싱된 임베딩("embedding":
+                list[float], 1024차원)을 함께 담는다. MMR 리랭킹처럼 후보간
+                유사도를 계산해야 할 때만 켠다.
+                기본 False면 SELECT에 embedding을 포함하지 않아 전송/파싱
+                오버헤드가 0이고 반환 dict도 종전과 100% 동일하다(하위 호환).
 
         Returns:
             [{"title", "section", "content", "source", "similarity", "tags"}, ...]
-            유사도 내림차순.
+            유사도 내림차순. with_embedding=True면 각 dict에 "embedding" 키 추가.
         """
         # 단일 source는 allowed_sources의 특수 케이스로 정규화
         if allowed_sources is None and source is not None:
@@ -199,11 +206,16 @@ class KnowledgeStore(PgVectorStore):
             # 인메모리 폴백 — 코사인 유사도 직접 계산
             return _inmemory_search(
                 self._store, embedding, top_k, allowed_sources, min_similarity,
+                with_embedding=with_embedding,
             )
 
         vec_str = _format_vector(embedding)
         # distance < 1 - min_similarity (cosine distance = 1 - cosine similarity)
         max_distance = 1.0 - min_similarity
+
+        # with_embedding일 때만 SELECT에 embedding 컬럼을 추가한다. 기본(False)이면
+        # 종전 컬럼 집합 그대로라 전송량·파싱 비용이 늘지 않는다(하위 호환).
+        embed_col = ", embedding" if with_embedding else ""
 
         params: list[Any] = [vec_str, max_distance, top_k]
         where = "WHERE embedding <=> $1::vector <= $2"
@@ -212,19 +224,20 @@ class KnowledgeStore(PgVectorStore):
             params.append(list(allowed_sources))
 
         query = f"""
-            SELECT source, title, section, content, tags, metadata,
+            SELECT source, title, section, content, tags, metadata{embed_col},
                    (embedding <=> $1::vector) AS distance
             FROM tb_knowledge
             {where}
             ORDER BY distance ASC
             LIMIT $3
-        """  # noqa: S608 — where 절은 whitelist 기반
+        """  # noqa: S608 — where 절/컬럼은 whitelist 기반(embed_col은 내부 bool 분기)
 
         async with self._pg.acquire() as conn:
             rows = await conn.fetch(query, *params)
 
-        return [
-            {
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            item: dict[str, Any] = {
                 "source": r["source"],
                 "title": r["title"],
                 "section": r["section"],
@@ -233,8 +246,12 @@ class KnowledgeStore(PgVectorStore):
                 "similarity": round(1.0 - float(r["distance"]), 4),
                 "metadata": r["metadata"] or {},
             }
-            for r in rows
-        ]
+            if with_embedding:
+                # pgvector는 문자열("[...]")로 오므로 float 리스트로 파싱한다.
+                # 파싱 실패 시 None → 다운스트림(MMR)이 임베딩 없는 후보로 스킵.
+                item["embedding"] = _parse_vector(r["embedding"])
+            out.append(item)
+        return out
 
     async def search_by_text(
         self,
@@ -318,8 +335,13 @@ def _inmemory_search(
     top_k: int,
     allowed_sources: list[str] | None,
     min_similarity: float,
+    with_embedding: bool = False,
 ) -> list[dict[str, Any]]:
-    """인메모리 폴백 벡터 검색 — 작은 데이터셋/테스트 전용."""
+    """인메모리 폴백 벡터 검색 — 작은 데이터셋/테스트 전용.
+
+    with_embedding=True면 DB 경로와 대칭으로 결과 dict에 "embedding"(list[float])을
+    동봉한다(MMR 후보 유사도 계산용). 기본 False면 종전과 동일.
+    """
     allowed = set(allowed_sources) if allowed_sources else None
     scored: list[tuple[float, KnowledgeEntry]] = []
     for e in store.values():
@@ -332,14 +354,17 @@ def _inmemory_search(
             continue
         scored.append((sim, e))
     scored.sort(key=lambda x: x[0], reverse=True)
-    return [
-        {
+    out: list[dict[str, Any]] = []
+    for sim, e in scored[:top_k]:
+        item: dict[str, Any] = {
             "source": e.source, "title": e.title, "section": e.section,
             "content": e.content, "tags": list(e.tags),
             "similarity": round(sim, 4), "metadata": e.metadata,
         }
-        for sim, e in scored[:top_k]
-    ]
+        if with_embedding:
+            item["embedding"] = list(e.embedding)
+        out.append(item)
+    return out
 
 
 # ─────────────────────────────────────────────

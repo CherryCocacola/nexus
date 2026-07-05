@@ -493,9 +493,26 @@ body {
 .model-thinking:hover { max-height: 300px; opacity: 1; }
 .model-thinking::before { content: "thinking... "; font-weight: 500; }
 
-/* ─── 목록 (bullet point) ─── */
-.message-body ul { margin: 4px 0; padding-left: 20px; }
-.message-body li { margin-bottom: 4px; line-height: 1.6; }
+/* ─── 목록 (bullet point / 번호 목록 / 중첩) ─── */
+.message-body ul, .message-body ol,
+.canvas-body ul, .canvas-body ol { margin: 4px 0; padding-left: 22px; }
+.message-body li, .canvas-body li { margin-bottom: 4px; line-height: 1.6; }
+/* 중첩 목록 — 상위 항목 아래로 들여쓰기 시각화 */
+.message-body ul ul, .message-body ul ol,
+.message-body ol ul, .message-body ol ol,
+.canvas-body ul ul, .canvas-body ul ol,
+.canvas-body ol ul, .canvas-body ol ol { margin: 2px 0; }
+.message-body ol, .canvas-body ol { list-style: decimal; }
+.message-body ul, .canvas-body ul { list-style: disc; }
+
+/* ─── 제목 (마크다운 #/##/### → h2/h3/h4) ─── */
+.message-body h2, .canvas-body h2 { font-size: 19px; font-weight: 700; margin: 16px 0 8px; line-height: 1.3; }
+.message-body h3, .canvas-body h3 { font-size: 16px; font-weight: 700; margin: 14px 0 6px; line-height: 1.3; }
+.message-body h4, .canvas-body h4 { font-size: 14px; font-weight: 700; margin: 12px 0 6px; color: var(--text-secondary); }
+.message-body h5, .canvas-body h5 { font-size: 13px; font-weight: 700; margin: 10px 0 4px; color: var(--text-secondary); }
+.message-body h6, .canvas-body h6 { font-size: 12px; font-weight: 700; margin: 10px 0 4px; color: var(--text-muted); }
+.message-body h2:first-child, .message-body h3:first-child, .message-body h4:first-child,
+.canvas-body h2:first-child, .canvas-body h3:first-child, .canvas-body h4:first-child { margin-top: 0; }
 
 .thinking-dots span {
   display: inline-block;
@@ -512,11 +529,208 @@ body {
   40% { opacity: 1; transform: scale(1); }
 }
 
+/* ─── 활동 표시 (Claude 스타일: 지금 어떤 도구를 실행 중인지) ─── */
+/* 스트리밍 메시지 안에 들어가는 "AI가 지금 무슨 일을 하는지" 영역.
+   구성: (1) 완료 단계들의 muted 트레일 + (2) 진행 중 라이브 인디케이터.
+   메시지 본문과 좌측 정렬을 맞추기 위해 padding-left 32px (아바타 폭 보정). */
+.activity-area {
+  padding-left: 32px;
+  margin-bottom: 6px;
+}
+/* 턴이 끝난 뒤 최종 메시지에 남는 트레일은 더 흐리게 */
+.activity-area.activity-final { opacity: 0.6; }
+
+/* 완료 단계 트레일 — 작은 muted 목록 (여러 도구가 누적됨) */
+.activity-trail {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.activity-trail:not(:empty) { margin-bottom: 6px; }
+
+/* 완료된 한 단계, 예: "✓ 문서 생성 · DocumentExport" */
+.activity-step {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+.activity-step .activity-check {
+  color: var(--success);
+  flex-shrink: 0;
+  font-weight: 700;
+}
+/* 반복 접기 카운트 배지 (예: "×10") — 숫자 정렬 고정 */
+.activity-count {
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+  opacity: 0.9;
+  margin-left: 2px;
+}
+
+/* 진행 중 라이브 인디케이터, 예: "🔧 문서 생성 중 · DocumentExport" + 스피너 */
+.activity-live {
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text-secondary);
+  padding: 2px 0;
+}
+.activity-live-text { display: inline-flex; align-items: center; gap: 6px; }
+
+/* 도구명 — 코드 폰트로 살짝 구분, 흐리게 */
+.activity-tool-name {
+  color: var(--text-secondary);
+  opacity: 0.8;
+  font-family: 'Cascadia Code', 'Consolas', monospace;
+  font-size: 11px;
+}
+
+/* CSS 스피너 — 외부 라이브러리 없이 회전 링 (에어갭 준수) */
+.activity-spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--border-light);
+  border-top-color: var(--accent-light);
+  border-radius: 50%;
+  display: inline-block;
+  flex-shrink: 0;
+  animation: activity-spin 0.7s linear infinite;
+}
+@keyframes activity-spin { to { transform: rotate(360deg); } }
+
+/* ─── 다운로드 / 미리보기 버튼 ─── */
+.dl-wrap { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 8px; }
+
+.dl-link {
+  display: inline-block;
+  padding: 8px 14px;
+  background: var(--accent);
+  color: #fff;
+  border-radius: 8px;
+  text-decoration: none;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.dl-link:hover { background: var(--accent-hover); }
+
+/* ─── 문서 미리보기 캔버스 (아티팩트 스타일) ─── */
+.canvas-panel {
+  flex-shrink: 0;
+  width: 0;
+  min-width: 0;
+  overflow: hidden;
+  background: var(--bg-secondary);
+  border-left: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  transition: width 0.28s ease;
+}
+/* 데스크톱: 우측 42% 폭 — .main(flex:1)이 자동으로 줄어든다 */
+.canvas-panel.open { width: 42%; }
+
+.canvas-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.canvas-filename {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 1;
+  min-width: 0;
+}
+
+.canvas-badge {
+  flex-shrink: 0;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: var(--accent-light);
+  background: var(--bg-primary);
+  border: 1px solid var(--border-light);
+  border-radius: 4px;
+  padding: 2px 7px;
+}
+
+.canvas-header-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+
+.canvas-dl {
+  padding: 6px 12px;
+  font-size: 12px;
+}
+
+.canvas-close {
+  background: none;
+  border: 1px solid var(--border-light);
+  color: var(--text-secondary);
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 18px;
+  line-height: 1;
+  transition: all 0.15s;
+}
+.canvas-close:hover { background: var(--bg-hover); color: var(--text-primary); }
+
+.canvas-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 24px 28px;
+  font-size: 14px;
+  line-height: 1.75;
+  color: var(--text-primary);
+  word-wrap: break-word;
+}
+/* 캔버스 본문은 채팅 버블과 동일한 서식 규칙을 재사용 (formatContent) */
+.canvas-body p { margin-bottom: 10px; }
+.canvas-body p:last-child { margin-bottom: 0; }
+.canvas-body pre {
+  background: var(--bg-primary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 16px;
+  overflow-x: auto;
+  margin: 8px 0;
+  font-size: 13px;
+  font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+}
+.canvas-body code {
+  background: var(--bg-hover);
+  padding: 2px 5px;
+  border-radius: 4px;
+  font-size: 13px;
+  font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+}
+.canvas-body pre code { background: none; padding: 0; }
+
 /* ─── 반응형 ─── */
 @media (max-width: 768px) {
   .sidebar { width: 100%; }
   .messages-inner { padding: 0 12px; }
   .input-area { padding: 12px; }
+  /* 좁은 화면: 캔버스는 전체 오버레이 */
+  .canvas-panel {
+    position: absolute;
+    right: 0; top: 0; bottom: 0;
+    border-left: none;
+    z-index: 30;
+  }
+  .canvas-panel.open { width: 100%; }
 }
 </style>
 </head>
@@ -593,9 +807,67 @@ body {
       </div>
     </div>
   </div>
+
+  <!-- 문서 미리보기 캔버스 (기본 숨김: width 0). 문서 생성 시 미리보기 버튼으로 열림 -->
+  <aside class="canvas-panel" id="canvasPanel" aria-hidden="true" aria-label="문서 미리보기">
+    <div class="canvas-header">
+      <span class="canvas-filename" id="canvasFilename">문서</span>
+      <span class="canvas-badge" id="canvasBadge" style="display:none"></span>
+      <div class="canvas-header-actions">
+        <a class="dl-link canvas-dl" id="canvasDownload" href="#">⬇ 다운로드</a>
+        <button class="canvas-close" id="canvasClose" title="닫기" aria-label="미리보기 닫기">&times;</button>
+      </div>
+    </div>
+    <div class="canvas-body" id="canvasBody"></div>
+  </aside>
 </div>
 
 <script>
+// ─── API 키 자동 주입 (분리구조 데모: web_auth 유지한 채 브라우저서 바로 채팅) ───
+// 왜: 이 UI 의 fetch 는 원래 Authorization 헤더를 안 보내서 web_auth 가 켜져 있으면
+//     401 이 난다. 같은 오리진(/v1/..., /health 등) 요청에만 API 키를 자동으로 붙여
+//     인증을 끄지 않고도 브라우저에서 바로 채팅되게 한다.
+(function () {
+  const _origFetch = window.fetch;
+  const API_KEY = 'nexus-b200-test-key-001';  // config/tenants.yaml 의 default 테넌트 키
+  window.fetch = function (input, init) {
+    init = init || {};
+    const url = (typeof input === 'string') ? input : (input && input.url) || '';
+    if (url.startsWith('/')) {  // 외부 URL 로는 키가 새지 않도록 상대경로만
+      const h = new Headers(init.headers || {});
+      if (!h.has('Authorization')) h.set('Authorization', 'Bearer ' + API_KEY);
+      init.headers = h;
+    }
+    return _origFetch(input, init);
+  };
+})();
+
+// ─── 다운로드 링크 처리 ───
+// /v1/download/ 링크는 web_auth 때문에 인증 헤더가 필요하다. 브라우저 기본 이동
+// (<a> href)은 헤더를 안 실으므로 401 이 난다. 그래서 클릭을 가로채 fetch(위의
+// 인증 자동주입 적용)로 blob 을 받아 파일로 저장한다. 인증을 켠 채 다운로드 가능.
+document.addEventListener('click', async (e) => {
+  const a = e.target.closest ? e.target.closest('a.dl-link') : null;
+  if (!a) return;
+  e.preventDefault();
+  const href = a.getAttribute('href');
+  try {
+    const resp = await fetch(href);
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const blob = await resp.blob();
+    const objUrl = URL.createObjectURL(blob);
+    const tmp = document.createElement('a');
+    tmp.href = objUrl;
+    tmp.download = decodeURIComponent(href.split('/').pop());
+    document.body.appendChild(tmp);
+    tmp.click();
+    tmp.remove();
+    URL.revokeObjectURL(objUrl);
+  } catch (err) {
+    alert('다운로드 실패: ' + err.message);
+  }
+});
+
 // ─── 상태 ───
 let sessions = [];
 let currentSessionId = null;
@@ -612,6 +884,15 @@ window.addEventListener('DOMContentLoaded', () => {
   loadServerSessions();
   // 사이드바 클릭 위임 — 인라인 onclick의 escape 취약성 제거 (v0.14.7)
   setupSessionListDelegation();
+  // 문서 미리보기 캔버스 닫기 버튼 + Esc 키
+  const canvasClose = document.getElementById('canvasClose');
+  if (canvasClose) canvasClose.addEventListener('click', closeCanvas);
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      const panel = document.getElementById('canvasPanel');
+      if (panel && panel.classList.contains('open')) closeCanvas();
+    }
+  });
   document.getElementById('userInput').focus();
 });
 
@@ -966,36 +1247,152 @@ function appendMessage(role, content, save = true) {
   return div;
 }
 
-function formatContent(text) {
-  // 코드 블록
-  text = text.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => {
-    return `<pre><code>${escapeHtml(code.trim())}</code></pre>`;
+// 인라인 서식(굵기 / 인라인코드 / 링크)을 "이미 이스케이프된" 텍스트 조각에 적용.
+// 제목·목록 항목·단락 내부 어디서든 재사용되므로 별도 함수로 분리했다.
+// 왜 이스케이프 이후에 적용하나: 사용자/모델 원문의 < > & 를 먼저 무력화(XSS 방지)한
+// 뒤, 우리가 만드는 서식 태그(<strong> 등)만 신뢰해 삽입하기 위함.
+function applyInline(s) {
+  // 1) 인라인 코드( `code` )를 먼저 플레이스홀더로 빼둔다.
+  //    안 그러면 코드 안의 ** 나 [](): 같은 문자가 굵기/링크로 잘못 해석됨.
+  const codes = [];
+  s = s.replace(/`([^`]+)`/g, (_, c) => {
+    codes.push(c);
+    return '' + (codes.length - 1) + '';
   });
-  // 인라인 코드
-  text = text.replace(/`([^`]+)`/g, '<code>$1</code>');
-  // 볼드
-  text = text.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  // 2) 굵기: **텍스트** → <strong>
+  s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  // 3) 링크: [라벨](url) → <a>. 상대경로·http(s)만 허용.
+  //    /v1/download/ 링크는 모델이 파일명(uuid)을 잘못 옮길 수 있으므로 클릭
+  //    링크로 만들지 않고 라벨 텍스트만 남긴다(실제 다운로드는 캔버스/버튼 담당).
+  //    라벨·url 모두 상위에서 이미 이스케이프된 상태다.
+  s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, label, url) => {
+    const u = url.trim();
+    if (u.startsWith('/v1/download/')) return label;
+    if (!/^(\/|https?:\/\/)/.test(u)) return label;
+    return `<a href="${u}">${label}</a>`;
+  });
+  // 4) 인라인 코드 플레이스홀더 복원
+  s = s.replace(/(\d+)/g, (_, i) => `<code>${codes[i]}</code>`);
+  return s;
+}
 
-  // bullet point: "- 항목" 또는 "* 항목" → <ul><li>
+// 채팅 응답/문서 미리보기 공용 마크다운 렌더러.
+// 지원: 펜스 코드블록(```), 인라인코드(`), 굵기(**), 링크([]()),
+//       제목(#/##/### → h2/h3/h4), 순서없는 목록(- / *) + 들여쓰기 중첩,
+//       순서있는 목록(1. 2. …), 빈 줄 단락 분리.
+function formatContent(text) {
+  if (text === null || text === undefined) text = '';
+
+  // 1) 펜스 코드블록을 먼저 추출해 플레이스홀더로 치환한다.
+  //    코드 내부는 마크다운 파싱 대상에서 제외하기 위함(개별로 이스케이프).
+  const codeBlocks = [];
+  text = text.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => {
+    const idx = codeBlocks.length;
+    codeBlocks.push(`<pre><code>${escapeHtml(code.replace(/\n+$/, ''))}</code></pre>`);
+    // 앞뒤 개행으로 감싸 코드블록이 항상 독립된 라인이 되게 한다.
+    return `\n${idx}\n`;
+  });
+
+  // 2) 전체 텍스트를 HTML 이스케이프한다(XSS 방지).
+  //    마크다운 기호(#, *, -, `, [, ])는 이스케이프 대상이 아니라 그대로 남는다.
+  text = escapeHtml(text);
+
+  // 3) 라인 단위 블록 파싱
   const lines = text.split('\n');
-  let result = [];
-  let inList = false;
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (/^[-*]\s+/.test(trimmed)) {
-      if (!inList) { result.push('<ul>'); inList = true; }
-      result.push(`<li>${trimmed.replace(/^[-*]\s+/, '')}</li>`);
-    } else {
-      if (inList) { result.push('</ul>'); inList = false; }
-      result.push(line);
+  let html = '';
+  let para = [];              // 현재 누적 중인 단락 라인들
+  const listTypes = [];      // 열린 목록 타입 스택 ('ul' | 'ol')
+  const listIndents = [];    // 각 목록 레벨의 들여쓰기 폭(공백 수)
+
+  // 누적된 단락을 <p>로 방출
+  function flushPara() {
+    if (para.length) {
+      html += '<p>' + para.map(applyInline).join('<br>') + '</p>';
+      para = [];
     }
   }
-  if (inList) result.push('</ul>');
-  text = result.join('\n');
+  // 열린 목록을 모두 닫는다
+  function flushList() {
+    while (listTypes.length) {
+      html += '</li></' + listTypes.pop() + '>';
+      listIndents.pop();
+    }
+  }
 
-  // 단락
-  text = text.split('\n\n').map(p => `<p>${p.replace(/\n/g, '<br>')}</p>`).join('');
-  return text;
+  const cbLineRe = /^(\d+)$/;   // 코드블록 플레이스홀더 라인
+
+  for (const rawLine of lines) {
+    const line = rawLine.replace(/\s+$/, '');   // 우측 공백 제거(좌측 들여쓰기는 보존)
+    const trimmed = line.trim();
+
+    // 코드블록 플레이스홀더 라인 — 단락/목록을 닫고 그대로 삽입(뒤에서 복원)
+    const cbm = trimmed.match(cbLineRe);
+    if (cbm) {
+      flushPara(); flushList();
+      html += '' + cbm[1] + '';
+      continue;
+    }
+
+    // 빈 줄 → 단락 경계(목록은 유지: 다음 줄이 목록이면 이어서 이어붙는다)
+    if (trimmed === '') {
+      flushPara();
+      continue;
+    }
+
+    // 제목: #/##/### … → h2/h3/h4 …
+    const h = trimmed.match(/^(#{1,6})\s+(.*)$/);
+    if (h) {
+      flushPara(); flushList();
+      const level = Math.min(h[1].length + 1, 6);   // # → h2
+      html += `<h${level}>${applyInline(h[2].trim())}</h${level}>`;
+      continue;
+    }
+
+    // 목록 항목: 순서없음(-, *) 또는 순서있음(1. 2. …)
+    let m = line.match(/^(\s*)[-*]\s+(.*)$/);
+    let type = null, indent = 0, content = '';
+    if (m) { type = 'ul'; indent = m[1].length; content = m[2]; }
+    else {
+      m = line.match(/^(\s*)\d+\.\s+(.*)$/);
+      if (m) { type = 'ol'; indent = m[1].length; content = m[2]; }
+    }
+
+    if (type) {
+      flushPara();
+      const c = applyInline(content.trim());
+      // 현재 들여쓰기보다 깊게 열린 목록은 닫는다
+      while (listTypes.length && indent < listIndents[listIndents.length - 1]) {
+        html += '</li></' + listTypes.pop() + '>';
+        listIndents.pop();
+      }
+      const top = listTypes.length - 1;
+      if (top >= 0 && indent === listIndents[top] && listTypes[top] === type) {
+        // 같은 레벨·같은 종류 → 형제 항목
+        html += '</li><li>' + c;
+      } else if (top >= 0 && indent === listIndents[top] && listTypes[top] !== type) {
+        // 같은 들여쓰기지만 종류가 다름 → 기존 목록 닫고 새 종류로 시작
+        html += '</li></' + listTypes.pop() + '>';
+        listIndents.pop();
+        html += '<' + type + '><li>' + c;
+        listTypes.push(type); listIndents.push(indent);
+      } else {
+        // 더 깊은 들여쓰기(자식) 또는 최초 목록 → 새 목록 시작(부모 <li>는 열린 채 중첩)
+        html += '<' + type + '><li>' + c;
+        listTypes.push(type); listIndents.push(indent);
+      }
+      continue;
+    }
+
+    // 그 밖의 일반 텍스트 → 단락으로 누적(목록은 여기서 닫는다)
+    flushList();
+    para.push(trimmed);
+  }
+  flushPara();
+  flushList();
+
+  // 4) 코드블록 플레이스홀더 복원
+  html = html.replace(/(\d+)/g, (_, i) => codeBlocks[i] || '');
+  return html;
 }
 
 function escapeHtml(str) {
@@ -1073,6 +1470,10 @@ function startStreamingMessage() {
       <img src="/static/images.png" alt="N" class="message-avatar assistant" style="object-fit:cover;">
       <div class="message-sender">Nexus</div>
     </div>
+    <div class="activity-area" id="streamingActivity">
+      <div class="activity-trail" id="activityTrail"></div>
+      <div class="activity-live" id="activityLive" style="display:none"></div>
+    </div>
     <div class="model-thinking" id="streamingThinking" style="display:none"></div>
     <div class="message-body streaming-cursor" id="streamingBody"></div>`;
 
@@ -1134,6 +1535,21 @@ function appendStreamChunk(text) {
   scrollToBottom();
 }
 
+// (1b) 도구 실행이 시작되면 그 시점까지 누적된 답변 본문을 "중간 나레이션"으로 보고
+//      버퍼(streamingBody 표시 + thinking 임시 버퍼)를 비운다. 이렇게 하면 도구가
+//      여러 번 불려도 최종 답변 = "마지막 도구 이후의 텍스트 세그먼트"만 남아 깨끗하다.
+//      (claude에서 중간 단계 텍스트가 접히는 것과 동일한 동작)
+//      도구가 전혀 없는 순수 대화에서는 호출되지 않아 회귀가 없다.
+function resetStreamingBody() {
+  const body = document.getElementById('streamingBody');
+  if (body) body.textContent = '';
+  // 중간 나레이션에 딸린 thinking 임시 상태도 함께 정리
+  _streamThinking = false;
+  _streamThinkBuf = '';
+  const thinkEl = document.getElementById('streamingThinking');
+  if (thinkEl) { thinkEl.textContent = ''; thinkEl.style.display = 'none'; }
+}
+
 function finalizeStreamingMessage() {
   const body = document.getElementById('streamingBody');
   const thinkEl = document.getElementById('streamingThinking');
@@ -1155,11 +1571,171 @@ function finalizeStreamingMessage() {
     }
   }
   if (thinkEl) thinkEl.removeAttribute('id');
+
+  // 활동 영역 정리 — 라이브 인디케이터는 제거하고, 완료 트레일은 흐리게 남긴다.
+  // 트레일이 비어 있으면(도구를 안 쓴 순수 텍스트 응답) 빈 박스를 없앤다.
+  activityHideLive();
+  const act = document.getElementById('streamingActivity');
+  if (act) {
+    const liveEl = document.getElementById('activityLive');
+    if (liveEl) liveEl.remove();
+    const trail = document.getElementById('activityTrail');
+    if (!trail || trail.children.length === 0) {
+      act.remove();   // 남길 게 없으면 활동 영역 자체를 제거
+    } else {
+      // id를 떼어 다음 스트림의 새 활동 영역과 충돌하지 않게 한다
+      act.removeAttribute('id');
+      trail.removeAttribute('id');
+      act.classList.add('activity-final');
+    }
+  }
+
   const msg = document.getElementById('streamingMessage');
   if (msg) msg.removeAttribute('id');
   // 상태 리셋 — 다음 스트림도 기본 "일반 모드"로 시작
   _streamThinking = false;
   _streamThinkBuf = '';
+}
+
+// ─── 활동 표시 (도구/사고 실시간 표시) ───
+// 도구명 → 한글 친화 라벨. 맵에 없으면 도구명을 그대로 쓴다.
+const TOOL_LABELS = {
+  Read: '파일 읽는 중',
+  Grep: '검색 중',
+  Glob: '파일 찾는 중',
+  LS: '디렉터리 확인 중',
+  SymbolSearch: '심볼 찾는 중',
+  DocumentProcess: '문서 분석 중',
+  DocumentExport: '문서 생성 중',
+  Bash: '명령 실행 중',
+  Edit: '파일 편집 중',
+  Write: '파일 작성 중',
+  GitDiff: '변경 확인 중',
+  Agent: '하위 작업 위임 중',
+};
+
+// 도구명 → 라벨. 완료 트레일용으로 "…중" 어미가 그대로 쓰여도 자연스럽다.
+function activityToolLabel(name) {
+  return TOOL_LABELS[name] || name || '작업 중';
+}
+
+// tool_use_start / thinking_start — 진행 중 라이브 인디케이터를 표시/갱신한다.
+// kind: 'tool' | 'thinking'. toolName은 'tool'일 때만 사용.
+function activityStart(kind, toolName) {
+  const live = document.getElementById('activityLive');
+  if (!live) return;
+  if (kind === 'thinking') {
+    live.innerHTML =
+      '<span class="activity-spinner"></span>' +
+      '<span class="activity-live-text">💭 생각 중…</span>';
+  } else {
+    const label = activityToolLabel(toolName);
+    live.innerHTML =
+      '<span class="activity-spinner"></span>' +
+      '<span class="activity-live-text">🔧 ' + escapeHtml(label) +
+      ' · <span class="activity-tool-name">' + escapeHtml(toolName || '') + '</span></span>';
+  }
+  live.style.display = 'flex';
+  scrollToBottom();
+}
+
+// tool_use_stop / thinking_stop — 해당 단계를 완료 처리한다.
+// 도구는 완료 트레일("✓ …")에 누적하고, 사고는 트레일 없이 라이브만 해제.
+function activityStop(kind, toolName) {
+  if (kind === 'tool') {
+    const trail = document.getElementById('activityTrail');
+    if (trail) {
+      const name = toolName || '';
+      const last = trail.lastElementChild;
+      // (1a) 직전 트레일 항목과 같은 도구면 새 줄을 추가하지 않고 카운트만 올린다.
+      //      "✓ 문서 분석 중 · DocumentProcess ×10" 처럼 claude식으로 접어 도배를 막는다.
+      //      (연속으로 같은 도구일 때만 합친다 — 중간에 다른 도구가 끼면 새 줄로 분리)
+      if (last && last.getAttribute('data-tool-name') === name) {
+        const cur = parseInt(last.getAttribute('data-count') || '1', 10) + 1;
+        last.setAttribute('data-count', String(cur));
+        // 카운트 배지(×N)는 textContent로만 갱신 — 숫자라 XSS 위험 없음
+        let countEl = last.querySelector('.activity-count');
+        if (!countEl) {
+          countEl = document.createElement('span');
+          countEl.className = 'activity-count';
+          const textEl = last.querySelector('.activity-step-text');
+          if (textEl) textEl.appendChild(countEl);
+        }
+        countEl.textContent = ' ×' + cur;
+      } else {
+        // 새 도구(또는 트레일 첫 항목) → 새 줄 추가. data-tool-name/data-count로 접기 상태 보관.
+        const label = activityToolLabel(name);
+        const step = document.createElement('div');
+        step.className = 'activity-step';
+        step.setAttribute('data-tool-name', name);
+        step.setAttribute('data-count', '1');
+        step.innerHTML =
+          '<span class="activity-check">✓</span>' +
+          '<span class="activity-step-text">' + escapeHtml(label) +
+          ' · <span class="activity-tool-name">' + escapeHtml(name) + '</span></span>';
+        trail.appendChild(step);
+      }
+    }
+  }
+  activityHideLive();
+  scrollToBottom();
+}
+
+// 라이브 인디케이터를 감춘다. 답변 텍스트가 시작되거나 단계가 끝날 때 호출.
+function activityHideLive() {
+  const live = document.getElementById('activityLive');
+  if (live) {
+    live.style.display = 'none';
+    live.innerHTML = '';
+  }
+}
+
+// 서버가 내려준 정확한 다운로드 링크로 버튼을 만든다. dl-link 클래스라 위의
+// 클릭 핸들러(인증 fetch→blob 저장)가 처리한다. 모델 텍스트의 URL 오탈자와 무관.
+// (2) '📄 미리보기' 버튼은 제거했다 — 문서 미리보기는 스트림 종료 후 우측 캔버스가
+//     claude 아티팩트처럼 자동으로 열린다(아래 sendMessage finalize 참조).
+function renderDownloadButtons(msgEl, downloads) {
+  const body = msgEl.querySelector('.message-body') || msgEl;
+  const wrap = document.createElement('div');
+  wrap.className = 'dl-wrap';
+  for (const d of downloads) {
+    // 다운로드 버튼 (인증 fetch→blob 다운로드는 dl-link 위임 핸들러가 담당)
+    const a = document.createElement('a');
+    a.className = 'dl-link';
+    a.href = d.url;
+    a.textContent = '⬇ ' + decodeURIComponent(d.filename);
+    wrap.appendChild(a);
+  }
+  body.appendChild(wrap);
+}
+
+// ─── 문서 미리보기 캔버스 ───
+// doc = { url, filename, content(마크다운), format }
+function openCanvas(doc) {
+  const panel = document.getElementById('canvasPanel');
+  if (!panel) return;
+  document.getElementById('canvasFilename').textContent =
+    decodeURIComponent(doc.filename || '문서');
+  const badge = document.getElementById('canvasBadge');
+  if (doc.format) {
+    badge.textContent = String(doc.format).toUpperCase();
+    badge.style.display = '';
+  } else {
+    badge.style.display = 'none';
+  }
+  const dl = document.getElementById('canvasDownload');
+  dl.setAttribute('href', doc.url || '#');   // dl-link 위임 핸들러가 인증 다운로드 처리
+  // 개선된 공용 렌더러 재사용 — 제목/목록/중첩까지 문서답게 표시
+  document.getElementById('canvasBody').innerHTML = formatContent(doc.content || '');
+  panel.classList.add('open');
+  panel.setAttribute('aria-hidden', 'false');
+}
+
+function closeCanvas() {
+  const panel = document.getElementById('canvasPanel');
+  if (!panel) return;
+  panel.classList.remove('open');
+  panel.setAttribute('aria-hidden', 'true');
 }
 
 // ─── 전송 ───
@@ -1225,6 +1801,7 @@ async function sendMessage() {
   showThinking();
   let streamStarted = false;
   let userAborted = false;
+  let pendingDownloads = [];  // 서버가 보낸 정확한 다운로드 링크({url, filename})
   _activeAbortController = new AbortController();
 
   try {
@@ -1257,41 +1834,78 @@ async function sendMessage() {
           try {
             const data = JSON.parse(line.substring(6));
 
-            if (data.text && !streamStarted) {
-              streamStarted = true;
-              startStreamingMessage();
-            }
-
-            if (data.text) {
-              appendStreamChunk(data.text);
-            }
-
-            // 토큰 사용량 업데이트
-            if (data.type === 'usage_update' && data.usage) {
-              totalInputTokens = data.usage.input_tokens || totalInputTokens;
-              totalOutputTokens = data.usage.output_tokens || totalOutputTokens;
-              updateTokenDisplay();
-            }
-
-            // message_stop에서도 토큰 확인
-            if (data.type === 'message_stop') {
-              // 출력 토큰을 텍스트 길이로 추정 (서버에서 안 오는 경우)
-              if (totalOutputTokens === 0 && streamStarted) {
-                const body = document.getElementById('streamingBody');
-                if (body) {
-                  totalOutputTokens += Math.ceil(body.textContent.length / 4);
-                  totalInputTokens += Math.ceil(text.length / 4);
-                  updateTokenDisplay();
-                }
-              }
-            }
-
-            if (data.type === 'error' && data.message) {
-              if (!streamStarted) {
+            // ─── 활동(도구/사고) 이벤트 우선 처리 ───
+            // Claude처럼 "지금 무슨 일을 하는지"를 스트리밍 메시지 안에 표시한다.
+            // 도구 이벤트는 답변 텍스트보다 먼저 오므로, 스트리밍 메시지가 아직
+            // 없으면 여기서 먼저 만든다(빈 본문 + 활동 영역만 보이는 상태).
+            if (data.type === 'tool_use_start') {
+              if (!streamStarted) { streamStarted = true; startStreamingMessage(); }
+              // (1b) 도구 시작 시점까지의 답변 본문은 중간 나레이션 → 리셋하여 최종 답변을 깨끗하게
+              resetStreamingBody();
+              activityStart('tool', data.tool_name);
+            } else if (data.type === 'tool_use_stop') {
+              activityStop('tool', data.tool_name);
+            } else if (data.type === 'thinking_start') {
+              if (!streamStarted) { streamStarted = true; startStreamingMessage(); }
+              activityStart('thinking', null);
+            } else if (data.type === 'thinking_stop') {
+              activityStop('thinking', null);
+            } else if (data.type === 'tool_use_delta' || data.type === 'thinking_delta') {
+              // 노이즈(도구 인자 조각 / 사고 조각) — 활동 표시엔 쓰지 않는다.
+              // 특히 thinking_delta는 text 필드를 갖고 있으므로 아래 답변 누적
+              // 경로로 새지 않도록 여기서 확실히 가로챈다.
+            } else {
+              // ─── 기존 처리 (답변 텍스트 / 토큰 / 에러 / 다운로드) ───
+              if (data.text && !streamStarted) {
                 streamStarted = true;
                 startStreamingMessage();
               }
-              appendStreamChunk(`[오류] ${data.message}\n`);
+
+              if (data.text) {
+                // 답변 텍스트가 시작되면 진행 중 인디케이터는 감춘다.
+                // (완료 트레일은 답변 위에 흐리게 그대로 남는다)
+                activityHideLive();
+                appendStreamChunk(data.text);
+              }
+
+              // 토큰 사용량 업데이트
+              if (data.type === 'usage_update' && data.usage) {
+                totalInputTokens = data.usage.input_tokens || totalInputTokens;
+                totalOutputTokens = data.usage.output_tokens || totalOutputTokens;
+                updateTokenDisplay();
+              }
+
+              // message_stop에서도 토큰 확인
+              if (data.type === 'message_stop') {
+                // 출력 토큰을 텍스트 길이로 추정 (서버에서 안 오는 경우)
+                if (totalOutputTokens === 0 && streamStarted) {
+                  const body = document.getElementById('streamingBody');
+                  if (body) {
+                    totalOutputTokens += Math.ceil(body.textContent.length / 4);
+                    totalInputTokens += Math.ceil(text.length / 4);
+                    updateTokenDisplay();
+                  }
+                }
+              }
+
+              if (data.type === 'error' && data.message) {
+                if (!streamStarted) {
+                  streamStarted = true;
+                  startStreamingMessage();
+                }
+                activityHideLive();
+                appendStreamChunk(`[오류] ${data.message}\n`);
+              }
+
+              // 파일 생성 도구의 정확한 다운로드 링크(서버 발신). 스트림 종료 후 버튼 렌더.
+              if (data.type === 'download' && data.url) {
+                pendingDownloads.push({
+                  url: data.url,
+                  filename: data.filename || data.url.split('/').pop(),
+                  content: data.content || '',   // 문서 마크다운 본문(미리보기 캔버스용)
+                  format: data.format || '',     // docx|pptx|hwpx|md|txt (배지 표시용)
+                });
+              }
             }
           } catch (e) { /* JSON 파싱 실패 무시 */ }
         }
@@ -1309,7 +1923,19 @@ async function sendMessage() {
   }
 
   hideThinking();
+  // finalize 가 streamingMessage id를 제거하므로, 그 전에 요소 참조를 잡아둔다.
+  const _streamMsgEl = document.getElementById('streamingMessage');
   if (streamStarted) finalizeStreamingMessage();
+  if (pendingDownloads.length) {
+    const target = _streamMsgEl || appendMessage('assistant', '문서를 생성했습니다.');
+    renderDownloadButtons(target, pendingDownloads);
+    // (2) claude 아티팩트처럼: content(마크다운 본문)를 가진 가장 최근 생성 문서를
+    //     우측 캔버스에 자동으로 연다. 이미 열려 있으면 openCanvas가 내용만 교체한다.
+    const previewable = pendingDownloads.filter(d => d.content);
+    if (previewable.length) {
+      openCanvas(previewable[previewable.length - 1]);
+    }
+  }
   isStreaming = false;
   _activeAbortController = null;
   setSendButtonMode('send');

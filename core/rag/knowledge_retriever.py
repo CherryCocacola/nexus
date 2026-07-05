@@ -20,6 +20,8 @@ import logging
 import re
 from typing import TYPE_CHECKING
 
+from core.rag.pgvector_base import cosine_similarity as _cosine
+
 if TYPE_CHECKING:
     from core.model.inference import ModelProvider
     from core.rag.knowledge_store import KnowledgeStore
@@ -52,12 +54,26 @@ class KnowledgeRetriever:
         abs_threshold: float = 0.0,
         relevance_margin: float = 1.0,
         chars_per_token: int = 3,
+        # ── MMR(Maximal Marginal Relevance) 리랭킹 파라미터 (2026-07-05) ────
+        # 왜 기본값이 "MMR 비활성"인가 (하위 호환):
+        #   순수 벡터 유사도 top_k는 서로 비슷비슷한(중복) 청크를 함께 뽑아
+        #   컨텍스트를 낭비하고 커버리지가 좁다. MMR은 게이팅을 통과한 후보
+        #   중에서 "관련도는 높으면서 서로 다른(다양한)" 청크를 골라 이 문제를
+        #   완화한다. 다만 검증 전 무회귀가 최우선이므로 기본은 꺼둔다.
+        #   mmr_enabled=False면 검색을 종전대로 top_k/임베딩미포함으로 수행하고
+        #   MMR 단계를 통째로 건너뛰어 동작이 현재와 100% 동일하다.
+        #   (게이팅 파라미터가 abs=0.0/margin=1.0 기본으로 무효화되는 것과 동일
+        #    패턴 — 실제 값은 bootstrap이 config.knowledge_rag.mmr에서 주입.)
+        mmr_enabled: bool = False,
+        mmr_fetch_k: int = 20,
+        mmr_lambda: float = 0.7,
     ) -> None:
         """게이팅 임계와 검색 파라미터를 보관한다.
 
         bootstrap이 config.knowledge_rag(yaml 단일 소스)에서 실제 값을 주입한다.
-        인자를 생략하면 게이팅이 무효(전부 통과)라 종전 동작과 100% 동일하다 —
-        위 abs_threshold/relevance_margin 주석의 "하위 호환" 설명 참조.
+        인자를 생략하면 게이팅이 무효(전부 통과)이고 MMR도 비활성이라 종전 동작과
+        100% 동일하다 — 위 abs_threshold/relevance_margin/mmr_enabled 주석의
+        "하위 호환" 설명 참조.
         chars_per_token: 토큰 예산을 글자수로 환산할 때 쓰는 1토큰≈3자 근사값.
         """
         self._store = store
@@ -69,6 +85,13 @@ class KnowledgeRetriever:
         # 상대 마진: top_sim에서 이 폭 이내 결과만 유지(노이즈 청크 절단).
         self._relevance_margin = relevance_margin
         self._chars_per_token = chars_per_token
+        # MMR 리랭킹 설정 (기본 비활성 — 위 주석의 하위 호환 근거 참조).
+        self._mmr_enabled = mmr_enabled
+        # MMR 후보 풀 크기: 이 개수만큼 넉넉히 가져와(top_k보다 크게) 그 안에서
+        # 다양성 선별로 최종 top_k를 고른다. 후보가 많을수록 다양성 여지가 커진다.
+        self._mmr_fetch_k = mmr_fetch_k
+        # 관련도(λ) vs 다양성(1-λ) 균형. 0.7=관련도 우선(약간의 다양성 가미).
+        self._mmr_lambda = mmr_lambda
 
     async def get_context(
         self,
@@ -108,11 +131,16 @@ class KnowledgeRetriever:
             try:
                 vecs = await self._embedding.embed([query])
                 if vecs and vecs[0]:
+                    # MMR 활성 시에만 더 넓은 후보 풀(mmr_fetch_k)을 임베딩과 함께
+                    # 가져온다. 비활성이면 종전대로 top_k만·임베딩 미포함으로
+                    # 가져와 전송/파싱 비용이 늘지 않는다(하위 호환).
+                    fetch_k = self._mmr_fetch_k if self._mmr_enabled else self._top_k
                     results = await self._store.search_by_vector(
                         embedding=vecs[0],
-                        top_k=self._top_k,
+                        top_k=fetch_k,
                         min_similarity=self._min_similarity,
                         allowed_sources=allowed_sources,
+                        with_embedding=self._mmr_enabled,
                     )
                     # 임베딩 생성 + 벡터 검색을 끝까지 마쳤다 → 0건이어도 폴백 불필요
                     vector_search_done = True
@@ -190,6 +218,23 @@ class KnowledgeRetriever:
         if not results:
             return ""
 
+        # ★ MMR(Maximal Marginal Relevance) 다양성 선별 (2026-07-05)
+        #   위치(중요): 모든 게이팅(2단 유사도 + 엔티티) '이후'에 놓인다. 즉
+        #   MMR은 게이팅을 통과한 survivors 중에서만 최종 top_k를 고르는 단계로,
+        #   할루시네이션 게이팅을 훼손하거나 우회하지 않는다.
+        #   왜 필요한가: 순수 벡터 top_k는 서로 비슷한(중복) 청크를 함께 뽑아
+        #   컨텍스트를 낭비하고 커버리지가 좁다. MMR로 "관련도 높으면서 서로 다른"
+        #   청크를 골라 컨텍스트를 절약하고 커버리지를 넓힌다.
+        #   비활성(mmr_enabled=False)이면 이 블록을 통째로 건너뛰어 종전과 동일.
+        #   (임베딩이 없는 폴백 경로 search_by_text에는 embedding 키가 없어
+        #    _mmr_select가 다양성 항을 0으로 처리 → 사실상 관련도 순 유지로 안전.)
+        if self._mmr_enabled:
+            results = self._mmr_select(results)
+            # 임베딩 키는 주입 텍스트 조립 전에 제거한다 — 프롬프트 오염 방지 및
+            # 불필요한 메모리 점유 해소(다운스트림 헤더/예산 로직은 이 키를 안 씀).
+            for r in results:
+                r.pop("embedding", None)
+
         # 3) 토큰 예산 내에서 주입 블록을 조립한다.
         #    게이팅을 통과한 청크를 유사도 높은 순(results는 distance ASC)으로
         #    하나씩 쌓되, max_tokens를 글자수로 환산한 예산(budget_chars)을 넘으면
@@ -229,3 +274,65 @@ class KnowledgeRetriever:
             used,
         )
         return "\n\n".join(lines)
+
+    # ─────────────────────────────────────────────
+    # MMR(Maximal Marginal Relevance) 선별 — 순수 파이썬 구현
+    # ─────────────────────────────────────────────
+    def _mmr_select(self, candidates: list[dict]) -> list[dict]:
+        """게이팅을 통과한 후보 중 MMR로 '관련도+다양성' 상위 top_k를 고른다.
+
+        MMR 점수:
+            score(c) = λ·rel(c) − (1−λ)·max( cos(c, s) for s in selected )
+          - rel(c)   : 질의-후보 유사도 = c["similarity"] (검색 단계에서 이미 계산)
+          - cos(c,s) : 후보끼리의 코사인 유사도(임베딩 정규화 내적, _cosine 사용)
+          - λ(mmr_lambda): 관련도 vs 다양성 균형. 1.0이면 순수 관련도(=종전),
+                           0.0이면 순수 다양성. 0.7=관련도 우선.
+
+        동작:
+          - 후보 수가 top_k 이하이면 선별할 것이 없어 그대로 반환한다(스킵).
+          - 첫 선택은 관련도 최대. candidates는 유사도 내림차순이라 [0]이 최대다
+            (게이팅에서 results[0]=최고 유사도 기준을 그대로 승계).
+          - 이후 매 단계, 남은 후보 중 위 score가 최대인 것을 하나씩 뽑아
+            top_k개까지 채운다.
+          - 임베딩이 없는 후보(폴백 경로 등)는 다양성 항(cos)을 0으로 처리해
+            순수 관련도만으로 다룬다(안전한 열화 — MMR이 오작동하지 않음).
+
+        반환:
+          다운스트림(헤더/토큰예산 조립)이 기대하는 '유사도 내림차순'으로
+          재정렬해 돌려준다. 선택 자체는 다양성 기준이지만, 표시 순서는 관련도순.
+        """
+        k = self._top_k
+        # 후보가 뽑을 개수 이하이면 다양성 선별의 의미가 없다 → 그대로 통과.
+        if len(candidates) <= k:
+            return candidates
+
+        lam = self._mmr_lambda
+        remaining = list(candidates)
+        # 첫 선택: 관련도 최대(= 유사도 내림차순 정렬의 선두).
+        selected: list[dict] = [remaining.pop(0)]
+
+        while remaining and len(selected) < k:
+            best_idx = 0
+            best_score: float | None = None
+            for i, cand in enumerate(remaining):
+                rel = float(cand.get("similarity", 0.0))
+                # 이미 뽑힌 것들과의 최대 유사도(=중복도). 임베딩 없으면 0으로 둔다.
+                max_sim = 0.0
+                emb_c = cand.get("embedding")
+                if emb_c:
+                    for sel in selected:
+                        emb_s = sel.get("embedding")
+                        if emb_s:
+                            s = _cosine(emb_c, emb_s)
+                            if s > max_sim:
+                                max_sim = s
+                # 관련도는 높이고(+λ·rel) 중복도는 낮추도록(−(1−λ)·max_sim) 점수화.
+                score = lam * rel - (1.0 - lam) * max_sim
+                if best_score is None or score > best_score:
+                    best_score = score
+                    best_idx = i
+            selected.append(remaining.pop(best_idx))
+
+        # 표시 순서는 유사도 내림차순으로 통일(헤더 sim 표기·예산 로직 일관성).
+        selected.sort(key=lambda r: r.get("similarity", 0.0), reverse=True)
+        return selected

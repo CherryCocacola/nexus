@@ -42,6 +42,41 @@ def format_vector(vec: list[float] | tuple[float, ...] | None) -> str | None:
     return "[" + ",".join(f"{x:.6f}" for x in vec) + "]"
 
 
+def parse_vector(
+    raw: str | list[float] | tuple[float, ...] | None,
+) -> list[float] | None:
+    """pgvector VECTOR 컬럼 값을 float 리스트로 되돌린다 (format_vector의 역).
+
+    왜 필요한가:
+      asyncpg는 vector 타입 코덱을 따로 등록하지 않으면 pgvector 값을
+      "[0.1,0.2,...]" 형태의 '문자열'로 돌려준다. MMR은 후보 임베딩끼리
+      코사인 유사도를 계산해야 하므로 이 문자열을 float 리스트로 파싱한다.
+
+    입력 관용성:
+      - str  : "[v1,v2,...]" (대괄호 유무 모두 허용) → 파싱
+      - list/tuple : 이미 float 시퀀스면 그대로 list로 변환
+      - None : None 반환 (임베딩 없음)
+      파싱 불가/빈 값이면 None을 반환해 호출자가 안전하게 건너뛰게 한다.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, (list, tuple)):
+        return [float(x) for x in raw]
+    text = raw.strip()
+    if not text:
+        return None
+    # 앞뒤 대괄호를 벗기고 콤마로 분리한다.
+    if text.startswith("[") and text.endswith("]"):
+        text = text[1:-1]
+    if not text:
+        return None
+    try:
+        return [float(part) for part in text.split(",") if part.strip() != ""]
+    except ValueError:
+        # 예기치 못한 포맷이면 조용히 None — MMR은 임베딩 없는 후보를 스킵한다.
+        return None
+
+
 def cosine_similarity(
     a: list[float] | tuple[float, ...],
     b: list[float] | tuple[float, ...],

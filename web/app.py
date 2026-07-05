@@ -9,6 +9,7 @@ SSE 스트리밍, 세션 관리, 도구/모델 조회 등을 제공한다.
 엔드포인트:
   POST /v1/chat          — 비스트리밍 채팅
   POST /v1/chat/stream   — SSE 스트리밍 채팅
+  POST /v1/chat/completions — OpenAI 호환 채팅(비스트림 JSON / stream=true SSE)
   GET  /v1/sessions      — 세션 목록 조회 (title_hint 포함)
   GET  /v1/sessions/{session_id}/messages — 특정 세션 대화 복원 (Ch 16)
   DELETE /v1/sessions/{session_id} — 특정 세션 삭제 (Redis + 트랜스크립트)
@@ -72,7 +73,7 @@ def _sanitize_history_inplace(history: list) -> None:
                 )
 
 
-from fastapi import FastAPI, Header, UploadFile
+from fastapi import FastAPI, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -81,6 +82,65 @@ from pydantic import BaseModel, Field
 from web.middleware import ApiKeyAuthMiddleware, CORSConfig, RequestLoggingMiddleware
 
 logger = logging.getLogger("nexus.web.app")
+
+# DocumentExport 등 파일 생성 도구의 결과에서 다운로드 URL을 뽑는 정규식.
+# 왜: 모델이 URL을 자유 텍스트로 다시 적을 때 uuid 한 글자를 틀리는 등 오탈자가
+# 날 수 있다(실측). 그래서 "도구가 만든 정확한 URL"을 결과 본문에서 서버가 뽑아
+# UI에 구조화(download 이벤트/필드)로 전달한다 — 모델 텍스트에 의존하지 않는다.
+_DOWNLOAD_URL_RE = re.compile(r"/v1/download/[^\s)\]\"']+")
+
+
+def _extract_download(content: str | None) -> dict[str, str] | None:
+    """도구 결과 본문에서 다운로드 URL을 찾아 {url, filename} 으로 돌려준다(없으면 None).
+
+    TODO(nexus): 정식으로는 도구 결과 본문 정규식이 아니라 ToolResult.metadata의
+      download_url을 이벤트로 받아 쓰는 게 맞다(정규식 파싱 제거). TOOL_RESULT
+      StreamEvent 노출 리팩터에서 함께 정리한다.
+    """
+    if not content:
+        return None
+    m = _DOWNLOAD_URL_RE.search(content)
+    if not m:
+        return None
+    url = m.group(0)
+    return {"url": url, "filename": url.rsplit("/", 1)[-1]}
+
+
+# DocumentExport 계열 도구 이름(별칭 포함) — tool_use 입력에서 미리보기 content를 찾을 때 사용.
+_DOC_EXPORT_NAMES = {"DocumentExport", "GenerateDocument", "SaveAs", "ExportDocument"}
+
+
+def _collect_downloads(messages: list) -> list[dict[str, str]]:
+    """
+    이번 턴 메시지에서 생성 문서의 다운로드 정보를 모은다.
+
+    - url/filename: tool_result 메시지에서 정규식으로 정확히 추출(모델 텍스트 오탈자 무관).
+    - content/format: 대응하는 DocumentExport tool_use 입력에서 가져와 UI 미리보기(캔버스)에 쓴다.
+      (tool_use_id로 tool_result ↔ tool_use 를 짝짓는다.)
+    """
+    # 1) tool_use_id → DocumentExport 입력(content/format) 매핑
+    doc_inputs: dict[str, dict] = {}
+    for msg in messages:
+        for tub in getattr(msg, "tool_use_blocks", []):
+            if getattr(tub, "name", "") in _DOC_EXPORT_NAMES:
+                doc_inputs[tub.id] = tub.input or {}
+
+    # 2) tool_result 메시지에서 URL 추출 + 입력에서 미리보기 content 결합
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for msg in messages:
+        role = msg.role if isinstance(msg.role, str) else msg.role.value
+        if role != "tool_result" or not isinstance(msg.content, str):
+            continue
+        dl = _extract_download(msg.content)
+        if not dl or dl["url"] in seen:
+            continue
+        seen.add(dl["url"])
+        inp = doc_inputs.get(getattr(msg, "tool_use_id", None), {})
+        dl["content"] = inp.get("content", "") or ""  # 미리보기용 마크다운 본문
+        dl["format"] = inp.get("format", "") or ""
+        out.append(dl)
+    return out
 
 
 # ─────────────────────────────────────────────
@@ -281,9 +341,10 @@ def _build_web_engine_parts(components: dict, state: Any) -> dict:
         "symbol_store": components.get("symbol_store"),  # Phase 10.0
         # 문서 청크 크기 — 하드코딩 외부화(2026-07-03). DocumentProcess가 읽음.
         # 예산 미제공(None)이면 도구가 CHUNK_SIZE(2500)로 폴백.
-        "document_chunk_size": (
-            _web_budgets.document_chunk_size if _web_budgets else None
-        ),
+        "document_chunk_size": (_web_budgets.document_chunk_size if _web_budgets else None),
+        # 생성 문서 저장 위치 — DocumentExport 도구가 읽는다. 빈 값이면 도구가
+        # {tempdir}/nexus_exports 로 폴백(다운로드 라우트와 동일 경로).
+        "exports_dir": getattr(getattr(state.config, "document_export", None), "exports_dir", ""),
     }
 
     # 시스템 프롬프트는 파일 읽기 + 서브에이전트 가이드 조립이라 비교적 무겁다 →
@@ -458,6 +519,94 @@ class ChatResponse(BaseModel):
         default_factory=list, description="실행된 도구 호출 목록"
     )
     usage: UsageInfo = Field(default_factory=UsageInfo, description="토큰 사용량")
+    # 파일 생성 도구(DocumentExport)의 다운로드 링크 — 서버가 도구 결과에서 뽑은
+    # 정확한 URL. UI는 모델 텍스트가 아니라 이 값으로 다운로드 버튼을 만든다.
+    downloads: list[dict[str, str]] = Field(
+        default_factory=list, description="생성 문서 다운로드 목록({url, filename})"
+    )
+
+
+# ─────────────────────────────────────────────
+# OpenAI 호환 채팅 모델 (POST /v1/chat/completions)
+# ─────────────────────────────────────────────
+# 외부 서비스(AgentHub·.NET·LangChain 등 모든 OpenAI 클라이언트)가 커스텀 코드 없이
+# Nexus를 "드롭인 LLM 프로바이더"로 쓰게 하기 위한 요청/응답 스키마다.
+# OpenAI Chat Completions API 규격(https 규격 문서)의 필드명을 그대로 따른다.
+class OpenAIChatMessage(BaseModel):
+    """OpenAI 형식의 대화 메시지 한 줄.
+
+    role: "system" | "user" | "assistant" | "tool" 등.
+    content: 메시지 본문(멀티모달 배열은 이 에어갭 텍스트 파이프라인에서 미지원 → 문자열만).
+    여분 필드(name, tool_call_id 등)는 무시(extra=ignore)한다.
+    """
+
+    model_config = {"extra": "ignore"}
+
+    role: str = Field(description="메시지 역할 (system/user/assistant 등)")
+    content: str | None = Field(default=None, description="메시지 본문 텍스트")
+
+
+class OpenAIChatCompletionRequest(BaseModel):
+    """OpenAI `POST /v1/chat/completions` 요청 본문.
+
+    - messages: 필수. 전체 대화 히스토리를 매 요청 그대로 담아 보낸다(클라이언트가 소유).
+    - model/stream/temperature/max_tokens/top_p: 받되, 이 파이프라인이 모르는 값은
+      무시하거나 기본값으로 동작한다(엔진이 내부 config로 샘플링을 관리하기 때문).
+    - 알 수 없는 여분 필드(n, stop, presence_penalty 등)는 허용하고 무시한다(extra=ignore).
+    """
+
+    # protected_namespaces=() : `model` 필드가 pydantic의 model_ 예약 네임스페이스
+    # 경고를 내지 않도록 한다. extra="ignore" : 모르는 필드는 조용히 버린다.
+    model_config = {"extra": "ignore", "protected_namespaces": ()}
+
+    messages: list[OpenAIChatMessage] = Field(description="OpenAI 형식 대화 메시지 배열")
+    model: str = Field(default="primary", description="모델 식별자(응답에만 반향)")
+    stream: bool = Field(default=False, description="true면 SSE 스트리밍 응답")
+    # 샘플링 파라미터 — 받되 엔진이 자체 config로 관리하면 무시될 수 있다.
+    temperature: float | None = Field(default=None, description="샘플링 온도(엔진 관리 시 무시)")
+    max_tokens: int | None = Field(default=None, description="최대 생성 토큰(엔진 예산 우선)")
+    top_p: float | None = Field(default=None, description="nucleus 샘플링(엔진 관리 시 무시)")
+    # 멀티테넌시 — body로도 테넌트 지정 가능(헤더/API 키와 동일 우선순위 체계).
+    tenant_id: str | None = Field(default=None, description="테넌트 ID(선택)")
+
+
+class OpenAIResponseMessage(BaseModel):
+    """비스트림 응답의 assistant 메시지."""
+
+    role: str = "assistant"
+    content: str = ""
+
+
+class OpenAIChoice(BaseModel):
+    """비스트림 응답의 choice 한 개."""
+
+    index: int = 0
+    message: OpenAIResponseMessage
+    finish_reason: str = "stop"
+
+
+class OpenAIUsage(BaseModel):
+    """OpenAI 규격 토큰 사용량(prompt/completion/total)."""
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+
+
+class OpenAIChatCompletionResponse(BaseModel):
+    """OpenAI `chat.completion` 비스트림 응답 본문."""
+
+    model_config = {"protected_namespaces": ()}
+
+    id: str
+    object: str = "chat.completion"
+    created: int
+    model: str
+    choices: list[OpenAIChoice]
+    usage: OpenAIUsage = Field(default_factory=OpenAIUsage)
+    # 비표준 확장 필드 — 문서 생성 도구의 다운로드 정보를 표준 클라이언트가 무시해도
+    # 되도록 별도 배열로도 노출한다(표준 클라이언트는 content의 마크다운 링크를 본다).
+    downloads: list[dict[str, str]] = Field(default_factory=list)
 
 
 class ToolInfo(BaseModel):
@@ -782,6 +931,7 @@ async def chat(
     # 같은 tool_use_id를 매칭해 요약/에러를 채운다(한 호출당 ToolCallInfo 하나).
     tool_calls_by_id: dict[str, ToolCallInfo] = {}
     tool_calls_order: list[str] = []
+    downloads: list[dict[str, str]] = []  # 파일 생성 도구 다운로드 링크(정확한 URL)
     # 결과 본문이 과도하게 길면 응답이 비대해지므로 요약 길이를 제한한다(과설계 금지).
     result_summary_max = 500
     response_session_id = session_id
@@ -814,6 +964,10 @@ async def chat(
                 engine._messages.extend(_restore_messages_from_saved(saved, session_id))
             except Exception as e:
                 logger.warning("비스트리밍 세션 복원 실패 (%s): %s", session_id, e)
+
+        # 이 턴에서 새로 추가되는 메시지의 시작 인덱스 — 아래에서 tool_result
+        # 메시지의 다운로드 URL을 정확히 뽑기 위한 기준점(이전 턴 결과 오검출 방지).
+        dl_start_idx = len(engine._messages)
 
         async for event in engine.submit_message(request.message):
             if not isinstance(event, StreamEvent):
@@ -855,6 +1009,14 @@ async def chat(
                 info.result = summary
                 info.is_error = tr.is_error
 
+        # 이 턴에 생성된 문서의 정확한 다운로드 URL을 tool_result 메시지에서 뽑는다.
+        # (TOOL_RESULT StreamEvent는 발신되지 않으므로 메시지에서 직접 추출한다.)
+        # TODO(nexus): orchestrator가 TOOL_RESULT StreamEvent(tool_result 채움 +
+        #   ToolResult.metadata 전달)를 발신하도록 고치면, 이 engine._messages 스캔
+        #   우회를 없애고 이벤트에서 downloads/result를 채울 수 있다. progress.md
+        #   "TOOL_RESULT 이벤트 노출 리팩터" 항목 참조.
+        downloads.extend(_collect_downloads(engine._messages[dl_start_idx:]))
+
         # 응답에 실을 세션 ID는 엔진이 확정한 값을 쓴다(fake 엔진 테스트 호환).
         response_session_id = engine.session_id
 
@@ -866,6 +1028,7 @@ async def chat(
         response="".join(response_text_parts),
         tool_calls=tool_calls_info,
         usage=usage,
+        downloads=downloads,
     )
 
 
@@ -1003,6 +1166,10 @@ async def chat_stream(
         for msg in restored:
             engine._messages.append(msg)
 
+        # 이 턴에서 새로 추가되는 메시지의 시작 인덱스 — 아래(스트림 종료 후)에서
+        # tool_result 메시지의 다운로드 URL을 정확히 뽑기 위한 기준점.
+        dl_start_idx = len(engine._messages)
+
         # ─── 요청 단위 타이밍/관측 로그 ───────────────────
         # 첨부 파일 경로가 메시지에 포함되면 업로드 케이스로 표시
         has_attach = "서버 경로:" in request.message or "[첨부파일:" in request.message
@@ -1077,6 +1244,11 @@ async def chat_stream(
                         sse_data["text"] = event.text
                     if event.message:
                         sse_data["message"] = event.message
+                    # 중간 활동 표시용: 도구 이벤트(TOOL_USE_START/STOP)가 담고 온
+                    # 도구 이름을 프레임에 실어 UI가 "지금 무슨 도구 실행 중"을 렌더할 수
+                    # 있게 한다. (표시는 이미 흐르는 이벤트를 그리는 것 — 추가 토큰/GPU 비용 없음)
+                    if event.tool_use is not None:
+                        sse_data["tool_name"] = event.tool_use.name
                     if event.error_code:
                         sse_data["error_code"] = event.error_code
                     if event.usage:
@@ -1116,6 +1288,13 @@ async def chat_stream(
                     elapsed_total,
                     event_count,
                 )
+
+        # 이 턴에 생성된 문서의 정확한 다운로드 정보(+미리보기 content)를 download
+        # 프레임으로 보낸다 → UI가 모델 텍스트(오탈자 가능) 대신 이걸로 버튼/미리보기 생성.
+        # TODO(nexus): TOOL_RESULT StreamEvent 발신 리팩터 후에는 consume 루프 안에서
+        #   이벤트로 바로 download 프레임을 내보내고 이 사후 스캔을 제거한다.
+        for _dl in _collect_downloads(engine._messages[dl_start_idx:]):
+            yield f"data: {json.dumps({'type': 'download', **_dl}, ensure_ascii=False)}\n\n"
 
         # 이번 턴의 user/assistant 텍스트 메시지만 히스토리에 저장
         # tool_result/tool_use 메시지는 토큰이 크므로 저장하지 않는다
@@ -1171,6 +1350,325 @@ async def chat_stream(
             "X-Session-ID": session_id,
         },
     )
+
+
+# ─────────────────────────────────────────────
+# OpenAI 호환 엔드포인트 (POST /v1/chat/completions)
+# ─────────────────────────────────────────────
+# 왜 필요한가: AgentHub·.NET·LangChain 등 "OpenAI 클라이언트"는 이미 이 규격을 말한다.
+# 이 엔드포인트를 붙이면 그들이 base_url만 Nexus로 바꿔 커스텀 코드 없이 붙을 수 있다.
+# 기존 /v1/chat·/v1/chat/stream 은 그대로 두고(무손상), 4-Tier 체인(submit_message가
+# yield하는 StreamEvent만 소비)도 절대 우회하지 않는다.
+def _split_openai_messages(
+    messages: list[OpenAIChatMessage],
+) -> tuple[str | None, list[Any], str]:
+    """OpenAI messages 배열을 (system_content, prior_messages, last_user_text)로 분해한다.
+
+    - system 메시지: 여러 개면 순서대로 이어붙여 하나의 지시문으로 만든다(없으면 None).
+    - system 을 제외한 user/assistant 는 순서대로 core.Message 로 변환해 히스토리로 쓴다.
+    - 마지막(가장 최근) 메시지는 반드시 user 여야 한다 → submit_message 에 넘길 질문.
+      마지막이 user 가 아니면 400 (OpenAI 관례상 마지막은 사용자 발화).
+
+    반환된 prior_messages 에는 '마지막 user'는 포함하지 않는다(그건 last_user_text).
+    tool 역할 메시지는 이 텍스트 파이프라인에서 재현 불가하므로 건너뛴다.
+    """
+    from core.message import Message
+
+    if not messages:
+        raise HTTPException(status_code=400, detail="messages 배열이 비어 있습니다.")
+
+    # 1) system 지시문 수집(여러 개면 결합).
+    system_parts = [m.content for m in messages if m.role == "system" and m.content]
+    system_content = "\n\n".join(system_parts) if system_parts else None
+
+    # 2) system 을 제외한 대화 흐름.
+    convo = [m for m in messages if m.role != "system"]
+    if not convo or convo[-1].role != "user":
+        raise HTTPException(
+            status_code=400,
+            detail="마지막 메시지는 role='user' 여야 합니다.",
+        )
+    last_user_text = convo[-1].content or ""
+    if not last_user_text.strip():
+        raise HTTPException(status_code=400, detail="마지막 user 메시지 content가 비어 있습니다.")
+
+    # 3) 마지막 user 를 제외한 이전 대화를 core.Message 로 변환.
+    prior_messages: list[Any] = []
+    for m in convo[:-1]:
+        if not m.content:
+            continue
+        if m.role == "user":
+            prior_messages.append(Message.user(m.content))
+        elif m.role == "assistant":
+            prior_messages.append(Message.assistant(m.content))
+        # 그 외 역할(tool 등)은 이 파이프라인에서 재현하지 않는다.
+
+    return system_content, prior_messages, last_user_text
+
+
+def _inject_openai_context(
+    engine: Any,
+    system_content: str | None,
+    prior_messages: list[Any],
+    session_id: str,
+    tenant: Any,
+) -> int:
+    """OpenAI 요청의 system/히스토리를 (세션별 격리) 엔진에 주입하고 다운로드 스캔 기준
+    인덱스(dl_start_idx)를 돌려준다.
+
+    - 소비자 system 지시문은 Nexus 기본 프롬프트를 유지한 채 '뒤에 덧붙인다'. 엔진은
+      요청마다 새로 조립되는 세션 전용 인스턴스라 이 변형은 다른 요청에 영향을 주지 않는다.
+      (base 원본을 먼저 engine.system_prompt 로 보관한 뒤 결합한다.)
+    - OpenAI 클라이언트는 매 요청 전체 히스토리를 보내므로 Redis 세션 복원은 하지 않는다
+      (무상태). clear 후 요청의 이전 user/assistant 만 순서대로 얹는다.
+    """
+    # system 지시문 반영 — 기본 프롬프트 원본을 먼저 보관 후 뒤에 덧붙인다.
+    if system_content:
+        base_prompt = engine.system_prompt
+        engine.update_system_prompt(base_prompt + "\n\n[사용자 지시]\n" + system_content)
+
+    # 세션/tenant/transcript 를 공식 bind_request 로 주입(기존 핸들러와 동일 계약).
+    transcript = _build_transcript(session_id)
+    engine.bind_request(session_id=session_id, tenant=tenant, transcript=transcript)
+
+    # 무상태: 요청이 보낸 히스토리만 그대로 얹는다(Redis 복원 안 함).
+    engine.clear_messages()
+    engine._messages.extend(prior_messages)
+
+    # 이 턴에 새로 생기는 tool_result 메시지에서만 다운로드를 추출하기 위한 기준점.
+    return len(engine._messages)
+
+
+def _downloads_markdown(downloads: list[dict[str, str]]) -> str:
+    """다운로드 목록을 표준 OpenAI 클라이언트도 볼 수 있는 마크다운 링크 블록으로 만든다.
+
+    비표준 downloads 배열 필드를 못 읽는 클라이언트라도 content 안의 링크는 볼 수 있게 한다.
+    """
+    if not downloads:
+        return ""
+    links = "\n".join(
+        f"- [{d.get('filename', 'file')}]({d.get('url', '')})" for d in downloads
+    )
+    return "\n\n---\n**첨부 문서:**\n" + links
+
+
+@app.post("/v1/chat/completions")
+async def chat_completions(
+    request: OpenAIChatCompletionRequest,
+    x_tenant_id: str | None = Header(default=None, alias="X-Tenant-ID"),
+    authorization: str | None = Header(default=None),
+) -> Any:
+    """OpenAI 호환 채팅 완성 엔드포인트.
+
+    외부 OpenAI 클라이언트가 base_url 만 Nexus 로 바꿔 붙을 수 있게 한다.
+    stream=false 면 chat.completion(JSON), stream=true 면 chat.completion.chunk(SSE)를 낸다.
+    4-Tier 체인은 submit_message 이벤트만 소비하여 우회하지 않는다.
+    """
+    tenant = _resolve_tenant(request.tenant_id, x_tenant_id, authorization)
+
+    # 요청 검증/분해는 StreamingResponse 생성 '이전'에 수행해야 400을 정상 반환한다
+    # (제너레이터 안에서 raise 하면 이미 200 스트림이 시작된 뒤라 400이 안 나감).
+    system_content, prior_messages, last_user_text = _split_openai_messages(request.messages)
+
+    # OpenAI 에는 session_id 개념이 없다 → 요청마다 임시 세션으로 무상태 처리.
+    session_id = str(uuid.uuid4())
+    # 응답에 반향할 모델명(요청값 우선, 없으면 기본값).
+    model_name = request.model or "ax-4.0"
+
+    # ── 스트리밍 응답 ──────────────────────────────
+    if request.stream:
+        return StreamingResponse(
+            _openai_stream_generate(
+                session_id=session_id,
+                tenant=tenant,
+                model_name=model_name,
+                system_content=system_content,
+                prior_messages=prior_messages,
+                last_user_text=last_user_text,
+            ),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+            },
+        )
+
+    # ── 비스트림 응답 ─────────────────────────────
+    engine = _acquire_session_engine(session_id, tenant)
+    if engine is None:
+        # 엔진 미초기화(부트스트랩 실패/테스트) — OpenAI 규격의 최소 응답으로 폴백.
+        return OpenAIChatCompletionResponse(
+            id=f"chatcmpl-{uuid.uuid4().hex}",
+            created=int(time.time()),
+            model=model_name,
+            choices=[
+                OpenAIChoice(
+                    message=OpenAIResponseMessage(
+                        content="QueryEngine이 아직 초기화되지 않았습니다.",
+                    ),
+                )
+            ],
+        )
+
+    from core.message import StreamEvent, StreamEventType
+
+    dl_start_idx = _inject_openai_context(
+        engine, system_content, prior_messages, session_id, tenant
+    )
+
+    response_text_parts: list[str] = []
+    usage = OpenAIUsage()
+
+    # 4-Tier 체인 우회 금지: submit_message 가 yield 하는 StreamEvent 만 소비한다.
+    async for event in engine.submit_message(last_user_text):
+        if not isinstance(event, StreamEvent):
+            continue
+        if event.type == StreamEventType.TEXT_DELTA and event.text:
+            response_text_parts.append(event.text)
+        elif event.type == StreamEventType.USAGE_UPDATE and event.usage:
+            usage = OpenAIUsage(
+                prompt_tokens=event.usage.input_tokens,
+                completion_tokens=event.usage.output_tokens,
+                total_tokens=event.usage.total_tokens,
+            )
+        # tool_use/tool_result/thinking 등은 OpenAI 표준 content 에 없으므로 무시한다.
+
+    # 문서 생성 다운로드를 이 턴 메시지에서 추출(기존 헬퍼 재사용).
+    downloads = _collect_downloads(engine._messages[dl_start_idx:])
+
+    content = "".join(response_text_parts)
+    # 표준 클라이언트도 링크를 볼 수 있게 content 끝에 마크다운으로 덧붙인다.
+    content += _downloads_markdown(downloads)
+
+    return OpenAIChatCompletionResponse(
+        id=f"chatcmpl-{uuid.uuid4().hex}",
+        created=int(time.time()),
+        model=model_name,
+        choices=[
+            OpenAIChoice(
+                message=OpenAIResponseMessage(content=content),
+                finish_reason="stop",
+            )
+        ],
+        usage=usage,
+        downloads=downloads,
+    )
+
+
+async def _openai_stream_generate(
+    session_id: str,
+    tenant: Any,
+    model_name: str,
+    system_content: str | None,
+    prior_messages: list[Any],
+    last_user_text: str,
+) -> AsyncGenerator[str, None]:
+    """OpenAI `chat.completion.chunk` SSE 프레임을 생성한다.
+
+    기존 /v1/chat/stream 의 Producer/Queue/Heartbeat 구조를 그대로 참고해 안정적으로
+    스트리밍한다. Nexus text_delta → OpenAI delta.content 로만 매핑하고, tool_use/thinking
+    등 OpenAI 표준에 없는 이벤트는 스트림 content 에 넣지 않는다. 다운로드 링크는 마지막
+    content 청크로 덧붙이고, 종료 시 finish_reason='stop' 프레임 뒤 `data: [DONE]` 를 보낸다.
+    """
+    created = int(time.time())
+    chatcmpl_id = f"chatcmpl-{uuid.uuid4().hex}"
+
+    def _chunk(delta: dict[str, Any], finish: str | None = None) -> str:
+        """OpenAI chunk 한 프레임을 SSE `data: {...}` 문자열로 만든다."""
+        payload = {
+            "id": chatcmpl_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model_name,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+        }
+        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    engine = _acquire_session_engine(session_id, tenant)
+    if engine is None:
+        # 엔진 미초기화 — 관례상 role 프레임 → 안내 content → 종료 순으로 최소 스트림.
+        yield _chunk({"role": "assistant"})
+        yield _chunk({"content": "QueryEngine이 아직 초기화되지 않았습니다."})
+        yield _chunk({}, finish="stop")
+        yield "data: [DONE]\n\n"
+        return
+
+    from core.message import StreamEvent, StreamEventType
+
+    dl_start_idx = _inject_openai_context(
+        engine, system_content, prior_messages, session_id, tenant
+    )
+
+    # OpenAI 관례: 첫 프레임에 delta.role='assistant' 를 실어 스트림 시작을 알린다.
+    yield _chunk({"role": "assistant"})
+
+    # ── Producer/Queue/Heartbeat (기존 /v1/chat/stream 구조 미러링) ──
+    # 이벤트 공백(Scout 호출 등)에 프록시가 끊지 않도록 주기적으로 SSE 주석(`: ping`)을
+    # 보낸다. SSE 주석은 규격상 파서가 무시하므로 OpenAI 클라이언트 파싱에 영향 없음.
+    sse_sentinel: tuple[str, Any] = ("done", None)
+    sse_heartbeat_seconds = 20.0
+    event_queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+
+    async def _producer() -> None:
+        """submit_message 스트림을 큐로 옮긴다(에러 포함)."""
+        try:
+            async for ev in engine.submit_message(last_user_text):
+                await event_queue.put(("event", ev))
+        except BaseException as e:  # noqa: BLE001 — 모든 예외를 에러 프레임/종료로 수렴
+            await event_queue.put(("error", e))
+        finally:
+            await event_queue.put(sse_sentinel)
+
+    producer_task = asyncio.create_task(_producer())
+    stream_abort_error: BaseException | None = None
+    try:
+        while True:
+            try:
+                kind, payload = await asyncio.wait_for(
+                    event_queue.get(), timeout=sse_heartbeat_seconds
+                )
+            except TimeoutError:
+                # 이벤트 공백 → keep-alive 주석 프레임(클라이언트 JSON 파서는 무시).
+                yield ": heartbeat\n\n"
+                continue
+
+            if kind == "done":
+                break
+            if kind == "error":
+                # 스트림 도중 오류 — 표준 content 로 노출하지 않고 종료한다(로그만 남김).
+                stream_abort_error = payload
+                break
+
+            event = payload
+            if isinstance(event, StreamEvent):
+                # 텍스트 조각만 delta.content 로 흘린다. 나머지 이벤트는 무시.
+                if event.type == StreamEventType.TEXT_DELTA and event.text:
+                    yield _chunk({"content": event.text})
+    finally:
+        # 클라이언트가 연결을 끊는 등으로 제너레이터가 닫히면 producer 를 취소한다.
+        if not producer_task.done():
+            producer_task.cancel()
+            try:
+                await producer_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001, S110
+                # 취소 시 예외는 위 error 경로에서 이미 다뤄졌거나 종료 경로다.
+                pass
+        if stream_abort_error is not None:
+            logger.warning(
+                "OpenAI 스트림 중단: session=%s, error=%s",
+                session_id,
+                type(stream_abort_error).__name__,
+            )
+
+    # 이 턴에 생성된 문서 다운로드 링크를 마지막 content 청크로 덧붙인다.
+    downloads = _collect_downloads(engine._messages[dl_start_idx:])
+    dl_md = _downloads_markdown(downloads)
+    if dl_md:
+        yield _chunk({"content": dl_md})
+
+    # 종료 프레임 → OpenAI 관례상 빈 delta + finish_reason='stop', 이어서 [DONE].
+    yield _chunk({}, finish="stop")
+    yield "data: [DONE]\n\n"
 
 
 # ─────────────────────────────────────────────
@@ -1628,6 +2126,37 @@ async def upload_file(file: UploadFile) -> dict[str, Any]:
         "file_name": file.filename,
         "size_bytes": len(content),
     }
+
+
+@app.get("/v1/download/{filename}")
+async def download_file(filename: str):
+    """
+    DocumentExport 도구가 생성한 문서 파일을 다운로드로 내려준다.
+
+    경로 순회 차단(이중 방어):
+      1) Path(filename).name 으로 디렉토리 성분(../, 절대경로 등)을 제거.
+      2) 확정 경로의 부모가 정확히 exports 디렉토리인지 재확인.
+    둘 중 하나라도 어긋나거나 파일이 없으면 404.
+    """
+    from fastapi import HTTPException
+
+    from core.tools.implementations.document_export_renderers import MEDIA_TYPES
+    from core.tools.implementations.document_export_tool import resolve_exports_dir
+
+    config = _app_state.get("config")
+    configured = getattr(getattr(config, "document_export", None), "exports_dir", "")
+    exports_dir = resolve_exports_dir(configured).resolve()
+
+    safe_name = Path(filename).name  # 경로 순회 차단(디렉토리 성분 제거)
+    target = (exports_dir / safe_name).resolve()
+
+    if target.parent != exports_dir or not target.is_file():
+        raise HTTPException(status_code=404, detail="파일을 찾을 수 없습니다.")
+
+    ext = target.suffix.lstrip(".").lower()
+    media = MEDIA_TYPES.get(ext, "application/octet-stream")
+    # attachment + filename 으로 브라우저가 "다운로드"로 처리하게 한다.
+    return FileResponse(str(target), media_type=media, filename=safe_name)
 
 
 # ─────────────────────────────────────────────

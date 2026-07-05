@@ -35,8 +35,23 @@ tenants:
     allowed_knowledge_sources:
       - kowiki
       - sample
-    api_keys: []
+    api_keys: ["nexus-b200-test-key-001"]
     metadata: {}
+
+  # AgentHub(.NET) 외부 연동 — IDINO Nexus 프로바이더 전용 격리 테넌트
+  # 발급 2026-07-05. 이 키를 AgentHub의 AiApiSettings:Nexus:ApiKey 에 입력한다.
+  # (주의: 운영 시 이 파일의 평문 키는 회전/외부주입 대상 — 데모/초기 연동용)
+  - id: agenthub
+    name: AgentHub
+    description: AgentHub(.NET) 에이전트 플랫폼 외부 연동
+    model_override: null
+    allowed_knowledge_sources:
+      - kowiki
+      - sample
+    api_keys: ["sk-agenthub-72041675cc00d0e7aa3b880865f6db92"]
+    metadata:
+      consumer: agenthub-dotnet
+      issued: "2026-07-05"
 
   # 예시: A학교 — 공개 지식 + A학교 전용 교재
   # - id: school-a

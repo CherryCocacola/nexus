@@ -806,6 +806,24 @@ class HwpConfig(BaseModel):
     convert_timeout_sec: float = 120.0
 
 
+class DocumentExportConfig(BaseModel):
+    """
+    문서 생성(DocumentExport 도구) 설정 — 생성물 저장 위치와 허용 포맷.
+
+    왜 설정으로 빼는가 (anti-pattern #4 — 하드코딩 금지):
+      exports_dir 이 개발(Windows)과 배포(에어갭 Linux)에서 다를 수 있다.
+      빈 문자열이면 도구/다운로드 라우트가 {tempdir}/nexus_exports 로 폴백한다
+      (업로드 라우트가 {tempdir}/nexus_uploads 를 쓰는 것과 같은 관례).
+
+    필드 설명:
+      - exports_dir: 생성 파일 저장 디렉토리. 빈 값이면 런타임 폴백.
+      - formats: 노출/허용 포맷 목록(참고·검증용). 실제 렌더러는 RENDERERS 가 관장.
+    """
+
+    exports_dir: str = ""
+    formats: list[str] = Field(default_factory=lambda: ["docx", "pptx", "hwpx", "md", "txt"])
+
+
 class SecurityConfig(BaseModel):
     """
     보안 및 샌드박스 설정.
@@ -879,6 +897,26 @@ class SecurityConfig(BaseModel):
 #   2) relevance_margin(상대 마진): 최상위 유사도(top_sim)에서 이 값만큼만
 #      떨어진 결과까지만 남긴다. top과 크게 벌어진 "끼어든 노이즈 청크"를 잘라
 #      가장 관련 높은 소수의 청크만 모델에 보여준다.
+class MmrConfig(BaseModel):
+    """
+    지식 RAG의 MMR(Maximal Marginal Relevance) 리랭킹 설정.
+
+    왜 기본 OFF인가 (하위 호환):
+      enabled=False면 검색을 종전대로 top_k만 가져와 MMR 단계를 건너뛴다.
+      → 동작이 현재와 100% 동일하다. 검증(실 PG/임베딩 e2e) 후 yaml에서 켠다.
+    """
+
+    # 기본 OFF — 켜기 전 동작 100% 동일(무회귀 보장).
+    enabled: bool = False
+    # MMR 후보 풀 크기. 이 개수만큼 넉넉히 가져와 그 안에서 top_k를 다양성 선별.
+    # 클수록 다양성 여지가 커지지만 임베딩 전송/파싱 비용도 증가한다.
+    fetch_k: int = 20
+    # 관련도(λ) vs 다양성(1−λ) 균형. 0.7=관련도 우선. 1.0이면 순수 관련도(=종전).
+    lambda_: float = Field(default=0.7, alias="lambda")
+
+    model_config = {"populate_by_name": True}
+
+
 class KnowledgeRagConfig(BaseModel):
     """
     지식 베이스(tb_knowledge) RAG 검색·게이팅 설정.
@@ -903,6 +941,11 @@ class KnowledgeRagConfig(BaseModel):
     # 남긴다. e5는 관련 청크들끼리도 유사도가 촘촘해서 0.03(3%p)이면 진짜 핵심
     # 청크 1~몇 개만 통과하고, top과 동떨어진 노이즈 청크는 잘린다.
     relevance_margin: float = 0.03
+    # ── MMR(Maximal Marginal Relevance) 리랭킹 (2026-07-05 추가) ────────────
+    # 게이팅을 통과한 survivors 중에서 "관련도 높으면서 서로 다른(다양한)" 청크를
+    # 골라 컨텍스트 절약 + 커버리지 향상. 게이팅 '이후' 단계라 할루시네이션 저감
+    # 로직은 그대로 유지된다.
+    mmr: MmrConfig = Field(default_factory=lambda: MmrConfig())
 
 
 # ─────────────────────────────────────────────
@@ -957,9 +1000,7 @@ class ContextBudgetConfig(BaseModel):
     # ⑧ 응답이 max_tokens로 잘렸을 때 출력 한도를 점진 상향하는 단계.
     #    query_loop의 OUTPUT_TOKEN_ESCALATION 상수와 동일(현행 [4096,8192,16384]).
     #    list 기본값이므로 mutable 공유를 피하려 default_factory를 쓴다.
-    output_token_escalation: list[int] = Field(
-        default_factory=lambda: [4096, 8192, 16384]
-    )
+    output_token_escalation: list[int] = Field(default_factory=lambda: [4096, 8192, 16384])
 
 
 # ─────────────────────────────────────────────
@@ -1119,6 +1160,9 @@ class NexusConfig(BaseSettings):
 
     # v7.3 단계 9 — 구포맷 .hwp (LibreOffice headless 변환 경유)
     hwp: HwpConfig = Field(default_factory=HwpConfig)
+
+    # 문서 생성(DocumentExport 도구) — docx/pptx/hwpx/md/txt 생성 + 웹 다운로드
+    document_export: DocumentExportConfig = Field(default_factory=DocumentExportConfig)
 
     # v7.0 Part 2.5 쿼리 라우팅 — 지식/도구 질의 분기 (2026-04-21 추가)
     routing: RoutingConfig = Field(default_factory=RoutingConfig)
