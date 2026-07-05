@@ -1,25 +1,40 @@
 """
 쿼리 엔진 — Tier 1 세션 오케스트레이터.
 
-Claude Code의 QueryEngine.ts를 Python으로 재구현한다.
-4-Tier AsyncGenerator 체인의 최상위 레이어로서,
-세션 단위의 대화를 관리하고 query_loop (Tier 2)를 호출한다.
+이 파일은 Nexus 대화 시스템의 "가장 바깥쪽 지휘자"다. 사용자가 메시지 하나를
+보내면, 그 메시지를 받아서 아래 계층(query_loop/모델/도구)이 실제 일을 하도록
+흐름을 열어 주고, 흘러나오는 이벤트를 웹/CLI 쪽으로 그대로 흘려보낸다.
+Claude Code의 QueryEngine.ts를 Python(asyncio)으로 재구현한 것이다.
 
-핵심 역할:
-  1. 대화 히스토리(messages[]) 관리
-  2. 시스템 프롬프트 조립
-  3. 사용자 입력 전처리
-  4. query_loop() 호출 → StreamEvent/Message yield
-  5. 세션 사용량 추적
+4-Tier AsyncGenerator 체인의 최상위(Tier 1) 레이어로서, 세션 단위의 대화를
+관리하고 query_loop(Tier 2)를 호출한다. "세션"이란 한 사용자와의 연속된 대화
+한 묶음을 뜻하며, QueryEngine 인스턴스 하나가 그 한 세션을 책임진다.
 
-4-Tier 체인에서의 위치:
-  Tier 1: QueryEngine.submit_message() ← 여기
-  Tier 2: query_loop()
-  Tier 3: model_provider.stream()
-  Tier 4: httpx 클라이언트
+핵심 역할(이 클래스가 하는 일):
+  1. 대화 히스토리(messages[]) 관리 — 지금까지 오간 메시지를 쌓아 둔다
+  2. 시스템 프롬프트 조립 — PromptAssembler에 위임(RAG/지식/턴상태 주입 포함)
+  3. 사용자 입력 전처리 및 라우팅 결정 — RoutingResolver에 위임
+  4. query_loop()(또는 ModelDispatcher) 호출 → StreamEvent/Message yield
+  5. 세션 사용량(토큰) 추적 및 턴 종료 시 메모리/트랜스크립트 영속화
 
-의존성 방향:
+4-Tier 체인에서의 위치(이벤트는 아래→위로 전파된다):
+  Tier 1: QueryEngine.submit_message() ← 이 파일
+  Tier 2: query_loop()          — while(True) 에이전트 턴 루프
+  Tier 3: model_provider.stream() — SSE 스트림 파싱
+  Tier 4: httpx 클라이언트        — 재시도 + 실제 HTTP 요청
+
+주요 협력 객체(이 엔진이 조율만 하고 세부 로직은 이들이 담당):
+  - RoutingResolver  : 쿼리 분류 + 샘플링 파라미터/모델 선택 결정
+  - PromptAssembler  : 최종 시스템 프롬프트 조립(RAG/지식/턴상태 주입)
+  - query_loop       : 실제 모델 호출 + 도구 실행 루프(폴백 경로)
+  - ModelDispatcher  : Scout→Worker 2단계 멀티모델 경로(주입 시 우선)
+  - MemoryManager    : 턴 종료 시 Redis 단기 저장 + 장기 승격
+  - Transcript       : 턴 종료 시 JSONL 파일에 대화 영구 기록
+
+의존성 방향(단방향 — 순환 import 금지):
   QueryEngine → query_loop, ContextManager, ModelProvider, BaseTool
+
+작성자: 이현수 / 작성일: 2026-07-05
 """
 
 from __future__ import annotations
@@ -59,6 +74,15 @@ class QueryEngine:
     사용자 메시지를 받으면 messages[]에 추가하고,
     query_loop()을 호출하여 모델 응답 → 도구 실행 → 결과 반환의
     전체 흐름을 AsyncGenerator로 yield한다.
+
+    설계 메모(온보딩용):
+      - 이 클래스는 "무엇을 할지"를 직접 계산하지 않는다. 대신 라우팅은
+        RoutingResolver, 프롬프트 조립은 PromptAssembler, 실제 모델/도구
+        실행은 query_loop/ModelDispatcher에게 위임하고 조율만 한다.
+      - AsyncGenerator라서 return이 아니라 yield로 값을 흘려보낸다. 호출자는
+        `async for`로 이벤트를 하나씩 받아 UI에 즉시 반영할 수 있다(스트리밍).
+      - 스레드 세이프하지 않다. 웹 서버는 요청마다 bind_request()로 세션/
+        트랜스크립트를 갈아끼워 재사용한다(하단 bind_request 주석 참조).
 
     사용 예시:
         engine = QueryEngine(
@@ -196,15 +220,23 @@ class QueryEngine:
         """
         사용자 메시지를 제출하고 스트리밍 응답을 반환한다.
 
-        이 메서드가 4-Tier 체인의 진입점이다.
-        사용자 입력을 Message로 변환하여 대화에 추가하고,
-        query_loop()을 호출하여 모델 응답을 yield한다.
+        이 메서드가 4-Tier 체인의 진입점이다. 웹/CLI가 사용자 입력을 받으면
+        이 코루틴을 `async for`로 순회하면서 흘러나오는 이벤트를 화면에 뿌린다.
+
+        전체 처리 흐름(위에서 아래로):
+          1. (턴상태 외부화 시) 기존 messages 비우기
+          2. 사용자 입력을 Message로 변환해 히스토리에 추가
+          3. RoutingResolver로 라우팅 결정(모델/샘플링 파라미터/클래스)
+          4. PromptAssembler로 최종 시스템 프롬프트 조립
+          5. ModelDispatcher(있으면) 또는 query_loop(폴백)로 스트림 시작
+          6. 스트림을 순회하며 이벤트를 그대로 상위로 yield(사용량만 옆에서 추적)
+          7. try/finally로 어떤 경우에도 _finalize_turn을 호출해 영속화 보장
 
         Args:
             user_input: 사용자 입력 텍스트
 
         Yields:
-            StreamEvent: 스트리밍 이벤트 (UI 업데이트용)
+            StreamEvent: 스트리밍 이벤트 (UI 업데이트용 — 텍스트 델타/도구 등)
             Message: assistant/tool_result 메시지 (대화 기록용)
         """
         # TurnStateStore가 있으면 raw messages를 비우고 요약만 시스템 프롬프트에 싣는다
@@ -251,6 +283,11 @@ class QueryEngine:
                 self._turn_state_store.save(self._session_id, turn_state)
 
         # ─── Dispatcher / query_loop 경유 ──────────────────
+        # 두 갈래 중 하나로 스트림을 연다:
+        #  - dispatcher 주입 O → Scout+Worker 멀티모델 경로(route)
+        #  - dispatcher 주입 X → 단일 Worker 폴백 경로(query_loop)
+        # 어느 쪽이든 반환값 stream은 StreamEvent/Message를 내보내는
+        # AsyncGenerator라서, 아래 소비 루프는 경로를 신경 쓰지 않아도 된다.
         if self._model_dispatcher is not None:
             stream = self._model_dispatcher.route(
                 messages=self._messages,

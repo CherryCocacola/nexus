@@ -1,24 +1,35 @@
-"""
-부트스트랩 — 2-Phase 초기화 시스템.
+"""부트스트랩 — Nexus 애플리케이션의 2단계(2-Phase) 초기화 시스템.
 
-Claude Code의 entrypoints/init.ts + setup.ts를 Python으로 재구현한다.
+이 파일은 CLI/웹/SDK 등 "모든 진입점"이 앱을 켤 때 가장 먼저 호출하는
+공통 시동 코드다. Claude Code의 entrypoints/init.ts + setup.ts를
+Python으로 재구현했다. 초기화를 딱 두 단계로 쪼개는 것이 핵심 설계다.
 
-Phase 1 (이 파일): 환경 비의존 초기화
-  - GlobalState 생성
-  - 설정 로딩 + 검증
-  - 로깅 구성
-  - 정상 종료 핸들러 등록
-  - GPU 서버 사전 연결 (fire-and-forget)
-  - 플랫폼 감지
+Phase 1 (init 함수): "환경 비의존" 초기화 — 외부 서비스가 없어도 되는 준비
+  - GlobalState 생성 (세션 전역 상태 싱글톤)
+  - 설정 로딩 + 검증 (YAML → NexusConfig)
+  - 로깅 구성 (콘솔 + 파일)
+  - 정상 종료(graceful shutdown) 핸들러 등록
+  - GPU 서버 사전 연결 (fire-and-forget: 실패해도 진행)
+  - 플랫폼(OS/셸) 감지
 
-Phase 2 (init_phase2): 환경 의존 초기화
-  - ToolRegistry (24개 도구 등록)
-  - MemoryManager (단기+장기 메모리)
-  - QueryEngine (Tier 1 세션 오케스트레이터)
+Phase 2 (init_phase2 함수): "환경 의존" 초기화 — 외부 서비스에 실제로 붙는 단계
+  - ToolRegistry (도구 등록 — 티어에 따라 7개/23개)
+  - MemoryManager (Redis 단기 + PostgreSQL 장기, 실패 시 인메모리 폴백)
+  - RAG/지식/심볼 인덱서, MCP 연결, 권한 파이프라인
+  - QueryEngine (Tier 1 세션 오케스트레이터) 최종 조립
 
-왜 2-Phase인가: Claude Code가 이 패턴을 사용하는 이유는
-Phase 1이 src/ 내부 모듈을 전혀 import하지 않아서
-순환 의존이 원천 차단되기 때문이다 (DAG leaf 격리).
+왜 2단계로 나누는가:
+  Phase 1은 core/ 내부의 다른 모듈을 "전혀 import하지 않는다". 덕분에
+  이 파일이 의존성 그래프(DAG)의 leaf(말단)로 격리되어 순환 import가
+  원천 차단된다. 무거운 모듈은 전부 Phase 2에서 함수 진입 시점에 lazy
+  import 하므로, 시동 초반에는 가볍고 안전하게 뜬다.
+
+주요 공개 함수:
+  - init(): Phase 1 진입점
+  - init_phase2(): Phase 2 진입점, 조립된 컴포넌트 dict 반환
+  - register_cleanup(): 종료 시 실행할 정리 콜백 등록
+
+작성자: 이현수 / 작성일: 2026-07-05
 """
 
 from __future__ import annotations
@@ -32,9 +43,14 @@ import sys
 from pathlib import Path
 from typing import Any
 
+# ── Phase 1에서 허용되는 유일한 core import ──
+# config/state 두 모듈만 끌어온다. 이 둘은 다른 core 모듈에 의존하지 않아
+# leaf 격리(순환 import 방지) 원칙을 깨지 않는다. 나머지 무거운 모듈은
+# 전부 Phase 2 함수 내부에서 lazy import 한다.
 from core.config import load_and_validate_config
 from core.state import GlobalState, get_initial_state
 
+# 이 모듈 전용 로거. 규칙상 "nexus.{모듈}" 네임스페이스를 사용한다.
 logger = logging.getLogger("nexus.bootstrap")
 
 
@@ -45,30 +61,35 @@ async def init(
     config_path: str | None = None,
     cwd: str | None = None,
 ) -> GlobalState:
-    """
-    Phase 1 초기화. CLI, SDK, 웹 서버 등 어떤 진입점이든 이 함수를 먼저 호출한다.
-    bootstrap 모듈만 사용하며, core/ 내부의 다른 모듈은 import하지 않는다.
+    """Phase 1(환경 비의존) 초기화를 수행한다.
+
+    CLI, SDK, 웹 서버 등 어떤 진입점이든 앱 시동 시 이 함수를 "가장 먼저"
+    호출해야 한다. 여기서는 GlobalState 생성, 설정 로드, 로깅, 종료 핸들러
+    등록까지만 하고, DB/모델 등 외부 서비스 연결은 Phase 2로 미룬다.
+    core/ 내부의 무거운 모듈은 import하지 않아 순환 의존을 원천 차단한다.
 
     Args:
-        config_path: 설정 파일 경로. None이면 자동 탐색한다.
-        cwd: 작업 디렉토리. None이면 현재 디렉토리를 사용한다.
+        config_path: 설정 YAML 파일 경로. None이면 config가 자동 탐색한다.
+        cwd: 작업 디렉토리. None이면 현재 프로세스의 디렉토리를 사용한다.
 
     Returns:
-        초기화된 GlobalState 싱글톤
+        초기화된 GlobalState 싱글톤. 이후 init_phase2에 그대로 넘겨준다.
     """
-    # ① GlobalState 초기화
+    # ① GlobalState 초기화 — 세션 ID/작업 디렉토리 등 전역 상태의 시작점.
     state = get_initial_state(cwd=cwd)
     logger.info(f"[Phase 1] GlobalState 초기화 완료: session={state.session_id}")
 
-    # ② 설정 로딩 + 검증
+    # ② 설정 로딩 + 검증 — YAML을 읽어 NexusConfig(Pydantic)로 검증한 뒤
+    #    state에 붙여둔다. 이후 모든 단계가 이 config를 단일 소스로 참조한다.
     config = load_and_validate_config(config_path)
     state.config = config
     logger.info(f"[Phase 1] 설정 로드 완료: gpu_server={config.gpu_server_url}")
 
-    # ③ 로깅 구성
+    # ③ 로깅 구성 — 설정에서 읽은 레벨/파일로 콘솔+파일 핸들러를 세팅한다.
     _configure_logging(config.log_level, config.log_file)
 
-    # ④ 정상 종료 핸들러 등록
+    # ④ 정상 종료 핸들러 등록 — Ctrl+C(SIGINT)/SIGTERM 수신 시 세션 요약을
+    #    남기고 등록된 정리 콜백을 실행하도록 시그널 핸들러를 건다.
     _setup_graceful_shutdown(state)
     logger.info("[Phase 1] 종료 핸들러 등록 완료")
 
@@ -77,7 +98,8 @@ async def init(
     # 첫 추론 요청 전까지 연결이 되면 100-200ms를 절약할 수 있다.
     asyncio.create_task(_preconnect_gpu_server(config.gpu_server_url))
 
-    # ⑥ 플랫폼 감지
+    # ⑥ 플랫폼 감지 — OS/파이썬버전/아키텍처와 사용할 셸 경로를 파악해
+    #    state에 저장한다. Bash 도구가 이 셸 정보를 참조한다.
     state.platform = _detect_platform()
     logger.info(f"[Phase 1] 플랫폼: {state.platform.get('os', 'unknown')}")
 
@@ -88,21 +110,34 @@ async def init(
 # Phase 2: 환경 의존 초기화
 # ─────────────────────────────────────────────
 async def init_phase2(state: GlobalState) -> dict:
-    """
-    Phase 2 초기화. Phase 1(init) 이후 호출한다.
-    core/ 내부 모듈(ToolRegistry, MemoryManager, QueryEngine)을 초기화한다.
+    """Phase 2(환경 의존) 초기화를 수행하고 조립된 컴포넌트 dict를 돌려준다.
+
+    반드시 Phase 1(init)이 끝난 뒤 그 결과 state를 받아 호출한다. 여기서
+    비로소 GPU(모델)/Redis/PostgreSQL/MCP 등 실제 외부 서비스에 연결하고,
+    도구·메모리·RAG·권한 파이프라인을 거쳐 최종적으로 Tier 1 오케스트레이터인
+    QueryEngine까지 조립한다.
+
+    설계 원칙:
+      - 외부 서비스 연결은 전부 "실패 격리"한다. Redis/PG/RAG/MCP 등이 죽어도
+        각 블록이 예외를 삼키고 인메모리 폴백 또는 비활성으로 진행해, 채팅이라는
+        본류 기능은 절대 멈추지 않는다(fail-closed로 부가기능만 끈다).
+      - 무거운 core 모듈은 함수 진입 시점 lazy import로 끌어와 순환 의존을 막는다.
+      - 하드웨어 티어(S/M/L)에 따라 도구 세트·컨텍스트 전략이 자동으로 갈린다.
 
     Args:
-        state: Phase 1에서 생성된 GlobalState
+        state: Phase 1(init)에서 생성·구성된 GlobalState.
 
     Returns:
-        초기화된 컴포넌트 딕셔너리:
-          - tool_registry: ToolRegistry (24개 도구 등록됨)
-          - memory_manager: MemoryManager (인메모리 폴백)
-          - model_provider: LocalModelProvider
-          - query_engine: QueryEngine (Tier 1)
+        조립된 컴포넌트 딕셔너리(components). 진입점이 이 dict에서 필요한
+        객체(query_engine 등)를 꺼내 세션 루프를 구동한다. 주요 키:
+          - model_provider: LocalModelProvider (LLM + 임베딩)
+          - tool_registry: ToolRegistry (메트릭용 풀세트)
+          - memory_manager: MemoryManager (Redis/PG, 없으면 인메모리 폴백)
+          - query_engine: QueryEngine (Tier 1 세션 오케스트레이터)
+          - 그 외 rag/knowledge/symbol/mcp/permission 관련 다수
     """
-    # lazy import — Phase 2 모듈은 Phase 1에서 import하지 않는다
+    # lazy import — Phase 2에서 필요한 무거운 모듈들을 여기서만 끌어온다.
+    # Phase 1(파일 상단)에서는 절대 import하지 않아 leaf 격리를 유지한다.
     from core.memory.long_term import LongTermMemory
     from core.memory.manager import MemoryManager
     from core.memory.short_term import ShortTermMemory
@@ -113,10 +148,13 @@ async def init_phase2(state: GlobalState) -> dict:
     from core.task import TaskManager
     from core.tools.base import ToolUseContext
 
+    # 조립된 컴포넌트를 담아 반환할 그릇. 각 단계가 여기에 키를 채워 넣는다.
     components: dict = {}
 
-    # ① ModelProvider 생성
-    # LLM과 임베딩 서버가 별도 포트/인스턴스이므로 각각 URL을 전달한다
+    # ① ModelProvider 생성 — Machine B(GPU 서버)의 OpenAI 호환 API 클라이언트.
+    #    LLM(추론)과 임베딩 서버가 서로 다른 포트/인스턴스라, 각각의 URL을
+    #    따로 전달한다. 이후 모든 추론/임베딩은 이 provider를 통해서만 나간다
+    #    (규칙: Machine A는 GPU를 직접 호출하지 않는다).
     config = state.config
     provider = LocalModelProvider(
         base_url=config.gpu_server_url,
@@ -133,11 +171,13 @@ async def init_phase2(state: GlobalState) -> dict:
     components["tool_registry"] = registry
     logger.info("[Phase 2] ToolRegistry 초기화: %d개 도구", registry.tool_count)
 
-    # ③ MemoryManager — Redis/PostgreSQL 실 연결 (실패 시 인메모리 폴백)
+    # ③ MemoryManager — 단기(Redis)+장기(PostgreSQL) 메모리를 실제로 연결한다.
+    #    두 연결 헬퍼는 실패 시 None을 돌려주고, 그때는 인메모리 폴백으로 동작해
+    #    테스트/CI나 DB 장애 상황에서도 채팅이 끊기지 않는다.
     redis_client = await _create_redis_client(config)
     pg_pool = await _create_pg_pool(config)
-    stm = ShortTermMemory(redis_client=redis_client)
-    ltm = LongTermMemory(pg_pool=pg_pool)
+    stm = ShortTermMemory(redis_client=redis_client)  # 세션 단기 메모리
+    ltm = LongTermMemory(pg_pool=pg_pool)  # pgvector 기반 장기 메모리
     # tb_memories 스키마·인덱스 멱등 보장 — 새 PG 인스턴스(컨테이너 교체/재해
     # 복구)에서도 자동으로 운영 정의(varchar(12) PK + hnsw 인덱스)를 재현한다.
     # pg_pool=None이면 no-op이므로 인메모리 테스트는 영향 없음.
@@ -162,13 +202,15 @@ async def init_phase2(state: GlobalState) -> dict:
     )
     logger.info("[Phase 2] MemoryManager 초기화: %s", mode)
 
-    # ③-b TaskManager — 비동기 태스크 라이프사이클 관리
+    # ③-b TaskManager — 백그라운드 태스크(에이전트/모니터/워크플로우 등)의
+    #    생성·조회·중단 라이프사이클을 관리한다. Task 계열 도구가 이걸 참조한다.
     task_manager = TaskManager()
     components["task_manager"] = task_manager
     logger.info("[Phase 2] TaskManager 초기화")
 
-    # ④ AgentRegistry 초기화 — v7.0 Phase 9 서브에이전트 시스템
-    # SCOUT_AGENT 등 기본 에이전트가 등록된다.
+    # ④ AgentRegistry — v7.0 Phase 9 서브에이전트 시스템의 정의 저장소.
+    #    SCOUT_AGENT 등 기본 서브에이전트가 여기 등록되며, AgentTool이
+    #    subagent_type 이름으로 정의를 조회하고 시스템 프롬프트에도 반영된다.
     agent_registry = build_default_agent_registry()
     components["agent_registry"] = agent_registry
 
@@ -709,9 +751,14 @@ async def _embedding_keepalive(
 
 
 async def _create_redis_client(config: Any) -> Any:
-    """
-    Redis 비동기 클라이언트를 생성한다.
-    연결 실패 시 None 반환 (인메모리 폴백).
+    """Redis 비동기 클라이언트를 만들고 ping으로 연결을 확인한다.
+
+    단기 메모리(ShortTermMemory)의 백엔드다. redis 패키지가 없거나 서버에
+    붙지 못하면 예외를 삼키고 None을 반환한다 → 호출부는 인메모리 폴백으로
+    진행한다(연결 실패가 앱 시동을 막지 않는다는 원칙).
+
+    Returns:
+        연결된 aioredis.Redis 인스턴스, 또는 실패 시 None.
     """
     try:
         import redis.asyncio as aioredis
@@ -741,9 +788,14 @@ async def _create_redis_client(config: Any) -> Any:
 
 
 async def _create_pg_pool(config: Any) -> Any:
-    """
-    PostgreSQL asyncpg 풀을 생성한다.
-    연결 실패 시 None 반환 (인메모리 폴백).
+    """PostgreSQL 커넥션 풀(asyncpg)을 생성한다.
+
+    장기 메모리(pgvector)·지식/심볼 스토어가 공유하는 DB 풀이다. asyncpg가
+    없거나 서버에 붙지 못하면 예외를 삼키고 None을 반환한다 → 호출부는 각
+    스토어를 인메모리 폴백으로 돌린다(DDL·검색이 no-op이 된다).
+
+    Returns:
+        생성된 asyncpg 풀, 또는 실패 시 None.
     """
     try:
         import asyncpg
@@ -1059,10 +1111,14 @@ def _build_default_system_prompt(agent_registry: Any | None = None) -> str:
 # 로깅 구성
 # ─────────────────────────────────────────────
 def _configure_logging(level: str, log_file: str | None) -> None:
+    """루트 로거를 구성한다 — 콘솔(stderr)과 선택적 파일 핸들러를 함께 건다.
+
+    Args:
+        level: "INFO"/"DEBUG" 등 문자열 레벨. 알 수 없으면 INFO로 폴백한다.
+        log_file: 로그 파일 경로. None이면 콘솔 출력만 사용한다. 경로가 주어지면
+            상위 디렉토리를 미리 만들고 UTF-8로 append 한다.
     """
-    로깅을 구성한다.
-    콘솔(stderr) + 파일(선택) 핸들러를 설정한다.
-    """
+    # 문자열 레벨명을 logging 상수로 변환. 오타/미지 값은 INFO로 안전 폴백.
     log_level = getattr(logging, level.upper(), logging.INFO)
     handlers: list[logging.Handler] = [logging.StreamHandler(sys.stderr)]
 
@@ -1177,9 +1233,11 @@ async def _preconnect_gpu_server(gpu_server_url: str) -> None:
 # 플랫폼 감지
 # ─────────────────────────────────────────────
 def _detect_platform() -> dict:
-    """
-    플랫폼 정보를 감지한다.
-    Claude Code의 setShellIfWindows()에 대응한다.
+    """실행 중인 플랫폼 정보를 수집해 dict로 반환한다.
+
+    OS/버전/파이썬버전/아키텍처와 함께, Bash 도구가 사용할 셸 경로를 고른다.
+    Windows면 git-bash를 우선 찾고 없으면 COMSPEC(cmd), 그 외 OS는 SHELL을
+    사용한다. Claude Code의 setShellIfWindows()에 대응한다.
     """
     info = {
         "os": platform.system(),

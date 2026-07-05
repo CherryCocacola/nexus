@@ -1,13 +1,36 @@
 """
 설정 시스템 — Pydantic v2 기반 설정 로딩 + 검증.
 
+이 파일은 Project Nexus 전체의 "단일 설정 진입점"이다. 흩어진 하드코딩을
+없애고(anti-pattern #4), 모든 운영값을 이 한 곳에서 타입 검증과 함께 받는다.
 Claude Code의 enableConfigs() + applySafeConfigEnvironmentVariables()에 대응한다.
-3단계 우선순위로 설정을 로드한다:
-  1. 기본값 (이 파일에 정의)
-  2. YAML 설정 파일 (config/nexus_config.yaml)
-  3. 환경변수 (NEXUS_ 접두사)
 
-에어갭 검증: GPU 서버 URL이 로컬/LAN 주소인지 자동으로 확인한다.
+3단계 우선순위로 설정을 로드한다(뒤로 갈수록 우선):
+  1. 기본값 (이 파일의 각 *Config 클래스에 정의)
+  2. YAML 설정 파일 (config/nexus_config.yaml 등)
+  3. 환경변수 (NEXUS_ 접두사, 중첩은 __ 구분자)
+
+주요 구성(모두 NexusConfig 아래에 중첩된 하위 설정 모델):
+  - GPUServerConfig / RedisConfig / PostgreSQLConfig — 인프라 접속 정보
+  - ModelConfig / RoutingConfig / ScoutConfig — 모델 선택·질의 라우팅
+  - McpConfig / TenantRegistry / WebAuthConfig — MCP·멀티테넌시·웹 인증
+  - Ocr/Hwp/DocumentExportConfig — 문서 수집(ingest)·생성 파서 경로
+  - Knowledge/Mmr/RerankConfig — 지식 RAG 검색·게이팅·리랭킹
+  - Security/PermissionEnforcement/Audit/CommandFilterConfig — 보안·권한·감사
+  - ContextBudgetConfig — 티어별 컨텍스트 예산(하드코딩 외부화)
+
+핵심 클래스/함수:
+  - NexusConfig(BaseSettings): 위 모든 설정을 묶는 최상위 모델.
+  - load_and_validate_config(): 파일 탐색 → 로드 → 비밀번호 주입 →
+    테넌트 병합까지 수행하는 공식 로더. 애플리케이션 기동 시 이걸 호출한다.
+
+호출/의존 관계: cli/·web/ 진입점과 core 전반이 이 모듈을 읽는다. 반대로 이
+모듈은 core.security.network_guard(LAN 판정)와 training.adapter_naming(지연
+임포트)에만 의존한다 — 의존성 방향(P2: config → security 허용)을 지킨다.
+
+에어갭 검증: GPU 서버 URL이 로컬/LAN 주소인지 자동으로 확인한다(외부면 경고).
+
+작성자: 이현수 / 작성일: 2026-07-05
 """
 
 from __future__ import annotations

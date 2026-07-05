@@ -1,10 +1,16 @@
 """
 시스템 프롬프트 조립기 (2026-04-21 리팩토링).
 
-`QueryEngine.submit_message()`에 뭉쳐 있던 "effective_system_prompt 조립" 로직을
-분리한다. 조립 순서와 규칙이 한곳에 모여 있어 디버깅과 유지가 쉽다.
+[이 파일이 하는 일]
+LLM에게 매 턴 전달할 "시스템 프롬프트"를 완성해서 돌려주는 전용 조립기다.
+원래는 `QueryEngine.submit_message()` 안에 이 조립 로직이 뒤섞여 있었는데,
+조립 순서·규칙을 한곳으로 모아 디버깅과 유지보수를 쉽게 하려고 분리했다.
 
-조립 순서 (누적):
+시스템 프롬프트는 "기본 지침(base) + 이전 대화 맥락 + 관련 파일 + 지식베이스"를
+필요에 따라 차곡차곡 이어 붙여 만든다. 이렇게 하면 모델이 현재 상황에 필요한
+배경 정보를 미리 갖고 답변을 시작할 수 있다.
+
+[조립 순서 — 앞에서부터 누적으로 이어 붙임]
   1. base_system_prompt              (상시)
   2. TurnState 이전 턴 요약           (turn_state_store가 있을 때)
   3. RAG 관련 파일 청크               (rag_retriever가 있을 때, 모든 질의)
@@ -12,7 +18,23 @@
      + tenant.allowed_knowledge_sources 필터 자동 적용
      + CHAT/TOOL 질의는 자동 스킵 (Part 2.5.9 v0.14.6)
 
-각 단계는 실패해도 조용히 폴백 — 어떤 보조 모듈이 죽어도 본류 응답은 생성된다.
+[핵심 설계 원칙 — Fail-open 폴백]
+각 단계(2~4)는 실패해도 예외를 밖으로 던지지 않고 조용히 원본 프롬프트를
+그대로 돌려준다. 즉 TurnState·RAG·지식베이스 같은 "보조" 모듈이 죽어도
+본류 응답 생성은 절대 막히지 않는다. 보조 정보는 있으면 좋고 없으면 마는 것.
+
+[주요 구성]
+  - PromptAssembler         : 조립 전체를 캡슐화한 클래스
+  - PromptAssembler.assemble: 외부에서 호출하는 유일한 진입점(매 턴 1회)
+  - _attach_turn_state / _attach_project_rag / _attach_knowledge_base
+                            : 순서대로 실행되는 내부 조립 스텝 3개
+
+[의존 관계]
+  - RoutingDecision(core.orchestrator.routing) : 질의 분류 결과. 어떤 RAG를
+    주입할지, 어떤 지식 소스를 허용할지 결정하는 근거로 쓴다.
+  - 호출자는 QueryEngine.submit_message() 하나뿐.
+
+작성자: 이현수 / 작성일: 2026-07-05
 """
 
 from __future__ import annotations
@@ -36,9 +58,17 @@ _DEFAULT_KNOWLEDGE_RAG_TOKENS = 1000  # 지식베이스 RAG 주입 상한(현행
 
 
 class PromptAssembler:
-    """system_prompt 조립을 한 객체로 캡슐화.
+    """system_prompt 조립을 한 객체로 캡슐화한 클래스.
 
-    주입 가능한 보조 의존성은 전부 `None` 허용 — 테스트·경량 환경에서도 동작.
+    생성 시점에 세 종류의 "보조 조회기(retriever/store)"와 각 단계의
+    토큰 예산을 주입받고, 이후 매 턴 `assemble()`이 호출될 때마다
+    그 의존성들을 사용해 프롬프트를 만들어 준다.
+
+    [설계 포인트]
+    주입 가능한 보조 의존성(turn_state_store / rag_retriever /
+    knowledge_retriever)은 전부 `None`을 허용한다. 그래서 단위 테스트나
+    보조 서비스가 없는 경량 환경에서도 이 객체를 그대로 만들어 쓸 수 있다.
+    (None으로 들어온 스텝은 실행 시 조용히 건너뛴다.)
     """
 
     def __init__(
@@ -53,10 +83,29 @@ class PromptAssembler:
         project_rag_tokens: int | None = None,
         knowledge_rag_tokens: int | None = None,
     ) -> None:
+        """조립기를 초기화하며 보조 의존성과 토큰 예산을 확정한다.
+
+        매개변수:
+          turn_state_store    : 이전 턴 요약을 보관·조회하는 저장소.
+                                None이면 ① 스텝을 건너뜀.
+          rag_retriever       : 질의와 관련된 프로젝트 파일 청크를 찾아오는
+                                검색기. None이면 ② 스텝을 건너뜀.
+          knowledge_retriever : 지식베이스(위키 등) 청크를 찾아오는 검색기.
+                                None이면 ③ 스텝을 건너뜀.
+          turn_state_tokens / project_rag_tokens / knowledge_rag_tokens :
+                                각 스텝이 프롬프트에 주입할 최대 토큰 예산.
+                                None이면 파일 상단의 현행 상수로 폴백한다
+                                (아래 "무회귀" 설명 참조).
+
+        운영 경로에서는 bootstrap→QueryEngine을 거쳐 config.context_budgets의
+        값이 예산으로 주입된다. 테스트에서는 예산을 생략해도 상수 폴백으로
+        기존과 똑같이 동작한다.
+        """
         self._turn_state_store = turn_state_store
         self._rag_retriever = rag_retriever
         self._knowledge_retriever = knowledge_retriever
-        # 예산 확정 — 주입값 우선, 미주입 시 현행 상수 폴백(무회귀).
+        # 예산 확정 — 주입값이 있으면 그걸 쓰고, 없으면(None) 현행 상수로 폴백.
+        # 이렇게 해야 예산 인자를 넘기지 않는 기존 호출부·테스트가 동작 불변(무회귀).
         self._turn_state_tokens = (
             turn_state_tokens if turn_state_tokens is not None
             else _DEFAULT_TURN_STATE_TOKENS
@@ -115,13 +164,26 @@ class PromptAssembler:
 
     # ─── 내부 스텝 ───────────────────────────────────
     def _attach_turn_state(self, prompt: str, session_id: str) -> str:
+        """① 이전 턴 요약(TurnState)을 프롬프트 뒤에 이어 붙인다.
+
+        같은 세션의 앞선 대화 맥락을 모델에게 다시 상기시켜, 여러 턴에 걸친
+        대화의 연속성을 유지하기 위한 단계다.
+
+        흐름:
+          - 저장소가 주입되지 않았으면(None) 아무 것도 안 하고 원본 반환.
+          - 저장소 조회가 실패하면 경고만 남기고 원본 반환(fail-open).
+          - 요약이 비어 있으면(첫 턴 등) 그대로 원본 반환.
+          - 요약이 있으면 'Previous context' 구분선과 함께 덧붙여 반환.
+        """
         if self._turn_state_store is None:
             return prompt
         try:
+            # 세션별 이전 맥락을 예산(max_tokens) 안에서 가져온다.
             prev = self._turn_state_store.get_context(
                 session_id, max_tokens=self._turn_state_tokens
             )
         except Exception as e:
+            # 보조 저장소 장애가 본류 응답을 막지 않도록 조용히 폴백.
             logger.debug("TurnState 조회 실패 (무시): %s", e)
             return prompt
         if not prev:
@@ -133,13 +195,27 @@ class PromptAssembler:
         )
 
     async def _attach_project_rag(self, prompt: str, user_input: str) -> str:
+        """② 질의와 관련된 프로젝트 파일 청크(RAG)를 프롬프트에 이어 붙인다.
+
+        사용자의 이번 입력(user_input)과 의미적으로 관련 있는 파일 조각을
+        검색해 주입한다. 질의 타입과 무관하게(모든 질의에서) 시도한다.
+        비동기 검색이 필요하므로 async 메서드다.
+
+        흐름:
+          - 검색기가 없으면(None) 원본 반환.
+          - 검색 실패 시 경고만 남기고 원본 반환(fail-open).
+          - 결과가 비면 원본 반환.
+          - 결과가 있으면 'Relevant files' 블록으로 감싸 덧붙여 반환.
+        """
         if self._rag_retriever is None:
             return prompt
         try:
+            # 사용자 입력을 질의로 삼아 관련 파일 청크를 예산 안에서 검색.
             ctx = await self._rag_retriever.get_context(
                 user_input, max_tokens=self._project_rag_tokens
             )
         except Exception as e:
+            # 검색 장애가 본류 응답을 막지 않도록 조용히 폴백.
             logger.debug("RAG 검색 실패 (무시): %s", e)
             return prompt
         if not ctx:
@@ -157,6 +233,21 @@ class PromptAssembler:
         user_input: str,
         decision: RoutingDecision,
     ) -> str:
+        """③ 지식베이스(위키 등) 청크를 KNOWLEDGE 질의에 한해 주입한다.
+
+        라우팅 결과(decision)를 보고 "지식 검색이 필요한 질의"일 때만 지식베이스를
+        조회해 주입한다. 인사·잡담(CHAT)이나 도구 실행(TOOL) 질의에는 넣지 않는다.
+
+        이 단계는 할루시네이션 저감 로직의 핵심이라 분기가 세 갈래로 나뉜다:
+          (a) 검색기 없음/게이팅 스킵/검색 실패 → 원본 그대로 반환.
+          (b) 검색 결과가 비었음 → "관련 자료 없음" 마커를 명시 주입(★2).
+              → 모델이 근거 없이 사실을 지어내지 않고 "모른다"고 답하게 유도.
+          (c) 검색 결과가 있음 → 지식베이스 블록 + grounding 지침을 함께 주입(★1).
+
+        매개변수:
+          decision : 질의 분류 결과. inject_knowledge_rag(주입 여부)와
+                     allowed_knowledge_sources(테넌트별 허용 소스 필터)를 제공.
+        """
         if self._knowledge_retriever is None:
             return prompt
         # CHAT/TOOL 질의는 KB 단계 자체를 스킵 (Part 2.5.9 v0.14.6).
@@ -164,12 +255,15 @@ class PromptAssembler:
         if not decision.inject_knowledge_rag:
             return prompt
         try:
+            # 지식베이스 조회 — 예산(max_tokens)과 테넌트 허용 소스 필터를 함께 전달.
+            # allowed_sources로 이 테넌트가 볼 수 있는 지식 소스만 걸러 검색한다.
             kb_ctx = await self._knowledge_retriever.get_context(
                 user_input,
                 max_tokens=self._knowledge_rag_tokens,
                 allowed_sources=decision.allowed_knowledge_sources,
             )
         except Exception as e:
+            # 지식 검색 장애가 본류 응답을 막지 않도록 조용히 폴백.
             logger.debug("지식 RAG 주입 실패 (무시): %s", e)
             return prompt
         if not kb_ctx:

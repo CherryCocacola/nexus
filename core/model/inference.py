@@ -1,15 +1,31 @@
 """
 추론 엔진 — ModelProvider ABC + LocalModelProvider 구현.
 
-Claude Code의 ApiClient를 Python ABC로 재구현한다.
-LocalModelProvider는 vLLM의 OpenAI 호환 API와 SSE 스트리밍으로 통신한다.
+이 파일은 Nexus에서 "실제로 LLM에게 말을 거는" 유일한 통로다. 상위 계층
+(query_loop, QueryEngine, 도구 시스템)은 여기 정의된 ModelProvider 인터페이스만
+바라보므로, 뒤에 어떤 모델(Qwen/ExaOne/OpenAI)이 붙든 상위 코드는 바뀌지 않는다.
 
-핵심 흐름:
-  Nexus Message[] → OpenAI messages[] → SSE chunks → StreamEvent yield
+구성 요소:
+  - ModelConfig       : 모델 1개의 런타임 설정(컨텍스트 상한, 출력 상한 등) 데이터클래스
+  - ModelProvider(ABC): 모든 모델 백엔드가 구현해야 하는 추상 인터페이스
+                        (stream / embed / rerank / health_check / count_tokens / get_config)
+  - LocalModelProvider: 에어갭용 구현체. LAN 안의 vLLM(OpenAI 호환 API)과 통신한다.
 
-이 모듈은 4-Tier 체인의 Tier 3~4에 해당한다:
-  Tier 3: stream() — SSE 스트림 파싱
-  Tier 4: httpx 클라이언트 (재시도는 별도 with_retry에서 처리)
+핵심 흐름(가장 중요한 stream() 기준):
+  Nexus Message[] → OpenAI messages[] → HTTP POST(SSE) → SSE chunk 파싱 → StreamEvent yield
+
+즉 상위 계층이 쓰는 도메인 타입(Message)을 vLLM이 이해하는 OpenAI 형식으로 바꿔
+요청하고, 서버가 조각조각 흘려보내는 SSE 응답을 다시 Nexus의 StreamEvent로 되돌려
+상위로 실시간 전달한다.
+
+이 모듈은 4-Tier AsyncGenerator 체인에서 Tier 3~4에 해당한다:
+  Tier 3: stream() — SSE 스트림 파싱 및 StreamEvent 변환
+  Tier 4: httpx 클라이언트로의 실제 HTTP 왕복 (재시도 정책은 별도 with_retry가 담당)
+
+의존 방향: 이 파일은 core.message의 도메인 타입만 의존하며, 외부로는 httpx로 LAN의
+vLLM 서버에만 접근한다(에어갭 규칙 준수 — 외부 인터넷 호출 없음).
+
+작성자: 이현수 / 작성일: 2026-07-05
 """
 
 from __future__ import annotations

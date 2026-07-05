@@ -21,6 +21,27 @@ Claude Code의 query.ts (1,729줄)를 Python으로 완전 재구현한다.
   5. stop_hook_blocking: Hook이 종료를 차단 → 강제 다음 턴
   6. token_budget_continuation: 토큰 예산 부족 → 계속
   7. next_turn: 도구 실행 후 정상 다음 턴
+
+────────────────────────────────────────────
+이 파일에 들어 있는 것 (온보딩용 지도):
+  - ContinueReason (Enum): 루프가 "왜 다음 턴으로 가는가"를 나타내는 7가지 이유.
+  - LoopState (dataclass): 턴 카운트·토큰 누적·각종 재시도 카운터를 담은 루프 상태.
+  - 상수들(MAX_TURNS 등): 무한 루프 방지·재시도 한도·출력 토큰 에스컬레이션 단계.
+  - _shrink_text / _truncate_input_for_budget: 입력이 컨텍스트를 초과할 때
+    메시지 content를 "예산(budget)" 안으로 줄이는 순수 헬퍼(원본 비훼손·페어링 보존).
+  - _RecoveryOutcome / _error_event_to_recovery_text / _try_recover_from_model_error:
+    모델 에러(컨텍스트 초과·prompt-too-long·GPU OOM)를 판정해 압축/축소로 복구하는 헬퍼.
+    예외 경로와 ERROR 이벤트 경로 두 곳에서 재사용한다(감사 Critical #8 대응).
+  - query_loop (핵심 함수): 위 요소를 엮은 while(True) 턴 루프. 이 파일의 심장부.
+
+호출·의존 관계 (4-Tier 체인 안에서의 위치):
+  - 상위(Tier 1): QueryEngine.submit_message()가 query_loop을 호출한다.
+  - 하위(Tier 3): query_loop이 model_provider.stream()을 호출한다(Phase 2).
+  - 협력 모듈: StopResolver(종료 판정), StreamingToolExecutor(도구 병렬 실행),
+    ContextManager(압축, 선택), HookManager(종료 훅, 선택), stream_watchdog(무응답 감지).
+  - 데이터 계약: 내부는 항상 OpenAI tool_calls 형식만 다룬다(XML은 보지 않음).
+
+작성자: 이현수 / 작성일: 2026-07-05
 """
 
 from __future__ import annotations

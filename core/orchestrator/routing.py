@@ -1,16 +1,42 @@
 """
 쿼리 라우팅 결정 로직 — v7.0 Part 2.5 + 멀티테넌시 통합 (2026-04-21 리팩토링).
 
-`QueryEngine.submit_message()`에서 한 덩어리로 섞여있던 라우팅 로직을 독립
-모듈로 분리한다. 기존 동작을 100% 유지하면서 다음을 제공한다:
+[이 파일이 하는 일]
+사용자가 보낸 질의 한 건을 보고 "이 질의를 어떤 성격으로 처리할지"를 정하는
+모듈이다. 성격은 세 가지 라벨로 나뉜다.
+  - KNOWLEDGE : 일반 지식 질문 → 지식베이스(KB) RAG를 붙여 답변
+  - TOOL      : 도구 호출·프로젝트 작업 → 도구 실행 경로로 흐름
+  - CHAT      : 인사·잡담 → KB를 붙이지 않고 가볍게 응답
+이 라벨에 더해, 어떤 모델을 쓸지(model_override)·온도·최대 토큰·샘플링
+파라미터까지 한 번에 묶어 결정한다. 그 결과 묶음이 `RoutingDecision`이다.
+
+[왜 별도 모듈인가]
+원래 `QueryEngine.submit_message()` 안에 라우팅 로직이 한 덩어리로 섞여
+있었다. 그걸 이 모듈로 떼어내 테스트하기 쉽고 읽기 쉽게 만들었다. 기존
+동작은 100% 그대로 유지하면서 아래 두 축을 제공한다:
 
   - `RoutingDecision` (frozen dataclass) — 라우팅 결과의 불변 객체
-  - `RoutingResolver` — classify + 프로필 선택 + 테넌트 override 통합
+  - `RoutingResolver` — 분류(classify) + 프로필 선택 + 테넌트 override 통합
+
+[주요 구성 요소]
+  - QueryClassifier / HeuristicClassifier : 질의 → 라벨 분류 (전략 패턴)
+  - build_classifier() : 설정값(classifier_type)에 맞는 분류기 생성
+  - RoutingDecision : Tier 2 이하로 넘길 라우팅 파라미터 묶음
+  - RoutingResolver : 위 전부를 조립해 최종 결정을 내리는 집결 지점
+  - classify_query() / _resolve_profile() : 구버전 호환용 모듈 함수
+
+[호출 관계]
+`QueryEngine.submit_message()`가 RoutingResolver.resolve()를 호출하고,
+반환된 RoutingDecision을 dispatcher/query_loop에 전달한다. 여기서 정한
+샘플링 파라미터는 query_loop → model_dispatcher → inference.stream()을
+거쳐 최종 vLLM payload까지 그대로 흘러간다(passthrough).
 
 설계 원칙:
   - 순수 함수/클래스 — 네트워크·DB 호출 없음, 단위 테스트 용이
   - Pydantic·Config 외부 의존 최소화
   - 기존 `classify_query()` / `_resolve_profile()`는 그대로 유지(하위 호환)
+
+작성자: 이현수 / 작성일: 2026-07-05
 """
 
 from __future__ import annotations
@@ -270,6 +296,19 @@ class RoutingResolver:
     ) -> RoutingDecision:
         """
         사용자 입력 + (선택) 테넌트를 받아 최종 RoutingDecision을 반환한다.
+
+        [전체 흐름]
+          1) 라우팅이 꺼져 있으면(enabled=False) 곧바로 기본값 결정 반환
+          2) 분류기로 질의 라벨(KNOWLEDGE/TOOL/CHAT) 결정
+          3) 라벨에 맞는 RoutingProfile 선택(모델·온도·샘플링 묶음)
+          4) 테넌트가 있으면 model_override / allowed_sources 덮어쓰기
+          5) 위 값을 모두 담아 RoutingDecision 생성
+
+        매개변수:
+          - user_input : 사용자가 보낸 원문 질의 텍스트
+          - tenant     : 멀티테넌시 컨텍스트(없으면 단일 테넌트로 동작)
+        반환:
+          - RoutingDecision : Tier 2 이하로 넘길 라우팅 파라미터 묶음
 
         `routing.enabled=False`면 프로필 치환 없이 프로바이더 기본 설정을 쓴다
         (model_override=None, temperature=0.7 기본, allowed_sources=None).
