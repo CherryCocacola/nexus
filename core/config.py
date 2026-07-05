@@ -917,6 +917,41 @@ class MmrConfig(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class RerankConfig(BaseModel):
+    """
+    지식 RAG의 크로스인코더 리랭커 설정 (B200 임베딩 서버 /v1/rerank 경유).
+
+    왜 기본 OFF인가 (하위 호환):
+      enabled=False면 벡터검색 인자·게이팅·조립이 종전과 100% 동일하고 리랭커를
+      호출하지 않는다 → 동작이 현재와 완전히 같다. 검증(실 PG/임베딩 e2e) 후 켠다.
+
+    캘리브레이션 근거 (B200 실측):
+      관련 청크 0.9~1.0, 무관 0.0, 경계 ~0.28. 따라서 min_score 0.3이 적정
+      (무관/약관련 배제). min_score 미만이면 전체 드롭 → "관련 자료 없음".
+
+    게이팅 대체 관계:
+      리랭커 ON이면 e5 코사인 분포용 2단 유사도 게이팅(abs_threshold/
+      relevance_margin)은 건너뛰고 rerank 점수 게이팅(min_score)이 이를 대체한다.
+      (e5 임계는 rerank 점수 분포에 부적합.) 엔티티(식별자) 게이팅은 그대로 유지.
+    """
+
+    # 기본 OFF — 켜기 전 동작 100% 동일(무회귀 보장).
+    enabled: bool = False
+    # 리랭커 모델 식별자(서버 측에서 로드하는 체크포인트, 문서/운영 참고용).
+    model: str = "dragonkue/bge-reranker-v2-m3-ko"
+    # 리랭킹 후보 풀 크기. 벡터검색을 이 개수만큼 넉넉히(리콜 그물 완화) 가져와
+    # 크로스인코더로 재정렬한다. 클수록 재현율↑ 이지만 서버 부하도 증가.
+    fetch_k: int = 20
+    # 재정렬·게이팅 후 최종적으로 프롬프트에 넣을 청크 개수.
+    top_k: int = 5
+    # rerank 점수 절대 게이팅: 최고 점수가 이 값 미만이면 전체 드롭(관련 자료 없음).
+    # 실측 경계(~0.28) 위인 0.3으로 둬 무관/약관련을 배제한다.
+    min_score: float = 0.3
+    # 리랭킹용 벡터검색 1차 컷오프. 리콜 그물을 넓히려 기존 min_similarity(0.75)보다
+    # 완화한 0.6을 쓴다 — 크로스인코더가 그 위에서 정밀 재정렬하므로 1차는 느슨해도 된다.
+    min_similarity: float = 0.6
+
+
 class KnowledgeRagConfig(BaseModel):
     """
     지식 베이스(tb_knowledge) RAG 검색·게이팅 설정.
@@ -946,6 +981,12 @@ class KnowledgeRagConfig(BaseModel):
     # 골라 컨텍스트 절약 + 커버리지 향상. 게이팅 '이후' 단계라 할루시네이션 저감
     # 로직은 그대로 유지된다.
     mmr: MmrConfig = Field(default_factory=lambda: MmrConfig())
+    # ── 크로스인코더 리랭커 (2026-07-05 추가) ──────────────────────────────
+    # B200 임베딩 서버 /v1/rerank로 (질의, 각 청크) 관련도를 직접 점수화해 재정렬.
+    # enabled=True면 e5 2단 유사도 게이팅을 rerank 점수 게이팅(min_score)이 대체한다
+    # (엔티티 게이팅은 유지). 기본 OFF라 켜기 전까지 동작은 종전과 100% 동일하다.
+    # MMR과 동시 활성 시 리랭커 우선(관련도 자체를 다루므로 MMR 스킵).
+    rerank: RerankConfig = Field(default_factory=lambda: RerankConfig())
 
 
 # ─────────────────────────────────────────────

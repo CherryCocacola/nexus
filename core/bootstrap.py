@@ -404,6 +404,13 @@ async def init_phase2(state: GlobalState) -> dict:
             mmr_enabled=krag.mmr.enabled,
             mmr_fetch_k=krag.mmr.fetch_k,
             mmr_lambda=krag.mmr.lambda_,
+            # 크로스인코더 리랭커 (게이팅 대체 + 재정렬). yaml knowledge_rag.rerank에서 주입.
+            # enabled 기본 False라 켜기 전까지 동작은 종전과 100% 동일하다.
+            rerank_enabled=krag.rerank.enabled,
+            rerank_fetch_k=krag.rerank.fetch_k,
+            rerank_top_k=krag.rerank.top_k,
+            rerank_min_score=krag.rerank.min_score,
+            rerank_min_similarity=krag.rerank.min_similarity,
         )
         components["knowledge_store"] = knowledge_store
         components["knowledge_retriever"] = knowledge_retriever

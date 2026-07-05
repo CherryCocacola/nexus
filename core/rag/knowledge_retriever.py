@@ -67,6 +67,21 @@ class KnowledgeRetriever:
         mmr_enabled: bool = False,
         mmr_fetch_k: int = 20,
         mmr_lambda: float = 0.7,
+        # ── 크로스인코더 리랭커 파라미터 (2026-07-05) ─────────────────────────
+        # 왜 기본값이 "리랭커 비활성"인가 (하위 호환):
+        #   rerank_enabled=False면 벡터검색 인자·게이팅·조립이 종전과 100% 동일하고
+        #   리랭커를 호출하지 않는다 → 동작이 현재와 완전히 같다(회귀 0).
+        #   B200 임베딩 서버 /v1/rerank로 (질의, 각 청크) 관련도를 직접 점수화(0~1)해
+        #   재정렬한다. 켜지면 e5 코사인 분포용 2단 유사도 게이팅
+        #   (abs_threshold/relevance_margin)은 rerank 점수 게이팅(min_score)이
+        #   대체하고, 엔티티(식별자) 게이팅은 그대로 유지된다.
+        #   (게이팅/MMR 기본값이 무효화되는 것과 동일 패턴 — 실제 값은 bootstrap이
+        #    config.knowledge_rag.rerank에서 주입.)
+        rerank_enabled: bool = False,
+        rerank_fetch_k: int = 20,
+        rerank_top_k: int = 5,
+        rerank_min_score: float = 0.3,
+        rerank_min_similarity: float = 0.6,
     ) -> None:
         """게이팅 임계와 검색 파라미터를 보관한다.
 
@@ -92,6 +107,17 @@ class KnowledgeRetriever:
         self._mmr_fetch_k = mmr_fetch_k
         # 관련도(λ) vs 다양성(1-λ) 균형. 0.7=관련도 우선(약간의 다양성 가미).
         self._mmr_lambda = mmr_lambda
+        # 크로스인코더 리랭커 설정 (기본 비활성 — 위 주석의 하위 호환 근거 참조).
+        self._rerank_enabled = rerank_enabled
+        # 리랭킹 후보 풀: 벡터검색을 이 개수만큼 넉넉히(리콜 그물 완화) 가져와
+        # 크로스인코더로 재정렬한다. top_k보다 크게 둘수록 재현율이 오른다.
+        self._rerank_fetch_k = rerank_fetch_k
+        # 재정렬·게이팅 후 최종적으로 프롬프트에 넣을 청크 개수.
+        self._rerank_top_k = rerank_top_k
+        # rerank 점수 절대 게이팅: 최고 점수가 이 값 미만이면 전체 드롭(관련 자료 없음).
+        self._rerank_min_score = rerank_min_score
+        # 리랭킹용 벡터검색 1차 컷오프(리콜 그물을 넓히려 기존 min_similarity보다 완화).
+        self._rerank_min_similarity = rerank_min_similarity
 
     async def get_context(
         self,
@@ -131,16 +157,32 @@ class KnowledgeRetriever:
             try:
                 vecs = await self._embedding.embed([query])
                 if vecs and vecs[0]:
-                    # MMR 활성 시에만 더 넓은 후보 풀(mmr_fetch_k)을 임베딩과 함께
-                    # 가져온다. 비활성이면 종전대로 top_k만·임베딩 미포함으로
-                    # 가져와 전송/파싱 비용이 늘지 않는다(하위 호환).
-                    fetch_k = self._mmr_fetch_k if self._mmr_enabled else self._top_k
+                    # 검색 파라미터 선택 — 우선순위: 리랭커 > MMR > 종전(하위 호환).
+                    #   - 리랭커 활성: 리콜 그물을 넓게(rerank_fetch_k) + 완화된 1차
+                    #     컷오프(rerank_min_similarity)로 가져온다. 크로스인코더가 그
+                    #     위에서 정밀 재정렬하므로 1차는 느슨해도 된다. 임베딩은 서버가
+                    #     직접 점수화하므로 되받을 필요 없음(with_embedding=False).
+                    #   - MMR 활성(리랭커 비활성): 넓은 후보 풀(mmr_fetch_k)을 임베딩과
+                    #     함께 가져와 다양성 선별한다.
+                    #   - 둘 다 비활성: 종전대로 top_k만·임베딩 미포함(전송/파싱 비용 무증가).
+                    if self._rerank_enabled:
+                        fetch_k = self._rerank_fetch_k
+                        min_sim = self._rerank_min_similarity
+                        with_emb = False
+                    elif self._mmr_enabled:
+                        fetch_k = self._mmr_fetch_k
+                        min_sim = self._min_similarity
+                        with_emb = True
+                    else:
+                        fetch_k = self._top_k
+                        min_sim = self._min_similarity
+                        with_emb = False
                     results = await self._store.search_by_vector(
                         embedding=vecs[0],
                         top_k=fetch_k,
-                        min_similarity=self._min_similarity,
+                        min_similarity=min_sim,
                         allowed_sources=allowed_sources,
-                        with_embedding=self._mmr_enabled,
+                        with_embedding=with_emb,
                     )
                     # 임베딩 생성 + 벡터 검색을 끝까지 마쳤다 → 0건이어도 폴백 불필요
                     vector_search_done = True
@@ -165,7 +207,58 @@ class KnowledgeRetriever:
                 logger.debug("KnowledgeRetriever 텍스트 검색 실패: %s", e)
                 return ""
 
+        # ★ 크로스인코더 리랭킹 (2026-07-05) — 임베딩 성공 경로에서만.
+        #   왜 여기(게이팅 앞)인가:
+        #     리랭커는 (질의, 각 청크)의 관련도를 크로스인코더로 직접 점수화(0~1)한다.
+        #     e5 코사인 유사도보다 관련/무관을 훨씬 선명하게 가른다(실측: 관련 0.9~1.0,
+        #     무관 0.0, 경계 ~0.28). 그래서 리랭커가 켜지면 아래 e5 2단 유사도 게이팅
+        #     (abs_threshold/relevance_margin — e5 분포 전용 임계)은 '건너뛰고',
+        #     rerank 점수 게이팅(min_score)이 그 역할을 대체한다. 단, 엔티티(식별자)
+        #     게이팅은 rerank와 무관한 별개 안전장치이므로 아래에서 그대로 유지한다.
+        #   적용 조건(하위 호환·fail-safe):
+        #     - rerank_enabled일 때만. 비활성이면 이 블록 전체를 건너뛰어 종전과 동일.
+        #     - vector_search_done(임베딩 성공 경로)일 때만. 임베딩 실패→ILIKE 폴백
+        #       경로에서는 리랭킹을 스킵하고 기존 게이팅으로 처리한다.
+        #     - rerank 호출이 예외를 던지면(서버 미로드/네트워크) 리랭킹을 통째로
+        #       건너뛰고(rerank_applied=False) 기존 벡터순+기존 게이팅으로 폴백한다
+        #       (fail-safe, warning 로깅).
+        rerank_applied = False
+        if self._rerank_enabled and vector_search_done and results:
+            try:
+                contents = [(r.get("content") or "") for r in results]
+                scores = await self._embedding.rerank(query, contents)
+                # 서버 계약: documents와 동일 길이·순서. 어긋나면 정렬이 오정렬되므로
+                # 예외로 처리해 아래 except의 fail-safe 폴백으로 넘긴다.
+                if len(scores) != len(results):
+                    raise ValueError(
+                        f"rerank 점수 개수 불일치: {len(scores)} != {len(results)}"
+                    )
+                # 각 후보에 rerank 점수 부착 후 내림차순 재정렬.
+                for r, s in zip(results, scores, strict=True):
+                    r["rerank_score"] = float(s)
+                results.sort(
+                    key=lambda r: r.get("rerank_score", 0.0), reverse=True
+                )
+                # rerank 절대 게이팅: 최고 점수조차 min_score 미만이면 전체 드롭
+                # (→ "" 반환 → "관련 자료 없음"). 그 외 min_score 이상만 유지한다.
+                if results[0].get("rerank_score", 0.0) < self._rerank_min_score:
+                    results = []
+                else:
+                    results = [
+                        r
+                        for r in results
+                        if r.get("rerank_score", 0.0) >= self._rerank_min_score
+                    ]
+                rerank_applied = True
+            except Exception as e:
+                # fail-safe: 리랭킹 실패 시 기존 벡터순+기존 게이팅으로 폴백한다.
+                logger.warning(
+                    "KnowledgeRetriever 리랭킹 실패 — 벡터순+기존 게이팅 폴백: %s", e
+                )
+
         # ★ 유사도 2단 게이팅 (2026-06-18) — 무관 청크 주입 차단.
+        #   (리랭커 적용 시 rerank_applied=True → 이 블록을 건너뛴다. rerank 점수
+        #    게이팅이 e5 분포 전용인 abs_threshold/relevance_margin을 대체하기 때문.)
         #   왜 절대+상대 2단인가 (e5-large 분포 특성):
         #     실측상 e5-large 코사인 유사도는 "무관한 문서끼리"도 0.78~0.83에
         #     몰린다. 즉 절대 유사도 하나만으로는 관련/무관을 깔끔히 가를 수 없다.
@@ -182,7 +275,7 @@ class KnowledgeRetriever:
         #   유사도 값은 각 결과 dict의 "similarity" 키에 들어 있다.
         #   (기본값 abs_threshold=0.0 / relevance_margin=1.0이면 이 블록은
         #    아무것도 거르지 않으므로 하위 호환이 보장된다.)
-        if results:
+        if results and not rerank_applied:
             top_sim = results[0].get("similarity", 0.0)
             if top_sim < self._abs_threshold:
                 # 최상위조차 무관 → 전체 드롭 (아래에서 빈 문자열 반환)
@@ -218,6 +311,11 @@ class KnowledgeRetriever:
         if not results:
             return ""
 
+        # ★ 리랭커 적용 시 최종 top_k 컷 — 재정렬·게이팅·엔티티게이팅을 통과한
+        #   상위 rerank_top_k개만 남겨 토큰예산 조립부로 넘긴다(조립 로직은 재사용).
+        if rerank_applied:
+            results = results[: self._rerank_top_k]
+
         # ★ MMR(Maximal Marginal Relevance) 다양성 선별 (2026-07-05)
         #   위치(중요): 모든 게이팅(2단 유사도 + 엔티티) '이후'에 놓인다. 즉
         #   MMR은 게이팅을 통과한 survivors 중에서만 최종 top_k를 고르는 단계로,
@@ -228,7 +326,9 @@ class KnowledgeRetriever:
         #   비활성(mmr_enabled=False)이면 이 블록을 통째로 건너뛰어 종전과 동일.
         #   (임베딩이 없는 폴백 경로 search_by_text에는 embedding 키가 없어
         #    _mmr_select가 다양성 항을 0으로 처리 → 사실상 관련도 순 유지로 안전.)
-        if self._mmr_enabled:
+        #   ── 리랭커와 동시 활성이면 리랭커 우선(MMR 스킵): 리랭커가 관련도 자체를
+        #      크로스인코더로 직접 다루므로, 그 위에 MMR을 겹쳐 재정렬하지 않는다.
+        if self._mmr_enabled and not rerank_applied:
             results = self._mmr_select(results)
             # 임베딩 키는 주입 텍스트 조립 전에 제거한다 — 프롬프트 오염 방지 및
             # 불필요한 메모리 점유 해소(다운스트림 헤더/예산 로직은 이 키를 안 씀).
@@ -253,7 +353,11 @@ class KnowledgeRetriever:
             if not content:
                 continue
             section_part = f" · {section}" if section else ""
-            header = f"[{source} · {title}{section_part} · sim={sim:.2f}]"
+            # 리랭킹된 청크는 헤더에 rerank 점수(rr=)를 표기한다. 그 외에는 종전대로
+            # e5 코사인 유사도(sim=)를 쓴다(리랭킹 안 된 경로는 rerank_score 키 없음).
+            rr = r.get("rerank_score")
+            score_part = f"rr={rr:.2f}" if rr is not None else f"sim={sim:.2f}"
+            header = f"[{source} · {title}{section_part} · {score_part}]"
             block = f"{header}\n{content}"
             if used + len(block) > budget_chars:
                 # 잘라서라도 하나 더 넣을지 — 여유 있으면 자르고 중단

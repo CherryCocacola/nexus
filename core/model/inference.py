@@ -127,6 +127,17 @@ class ModelProvider(ABC):
         """텍스트 임베딩을 생성한다."""
         ...
 
+    async def rerank(self, query: str, documents: list[str]) -> list[float]:
+        """(query, 각 document) 쌍의 관련도 점수(0~1)를 documents와 같은 순서로 반환한다.
+
+        왜 @abstractmethod가 아니라 기본 구현(NotImplementedError)인가:
+          기존 ModelProvider 하위 구현체(테스트용 Mock 등)가 rerank를 몰라도
+          인스턴스화가 깨지지 않게 하려는 하위 호환 조치다. 리랭킹을 지원하지
+          않는 백엔드에서 호출되면 예외가 나고, 호출자(KnowledgeRetriever)는
+          이를 fail-safe로 받아 기존 벡터순 경로로 폴백한다.
+        """
+        raise NotImplementedError("이 ModelProvider는 rerank를 지원하지 않습니다.")
+
     @abstractmethod
     async def health_check(self) -> bool:
         """모델 서버 가용성을 확인한다."""
@@ -585,6 +596,37 @@ class LocalModelProvider(ModelProvider):
             return data["embeddings"]
         except Exception as e:
             logger.error(f"임베딩 실패: {e}")
+            raise
+
+    # ─── rerank() ───
+
+    async def rerank(self, query: str, documents: list[str]) -> list[float]:
+        """
+        임베딩 서버의 /v1/rerank 엔드포인트를 호출해 크로스인코더 리랭킹 점수를 받는다.
+
+        임베딩 서버 API (embed()와 동일한 base_url·인증 패턴):
+          요청: POST /v1/rerank {"query": "질의", "documents": ["청크1", "청크2", ...]}
+          응답: {"scores": [0.97, 0.00, ...]}  — documents와 동일 순서, 0~1(sigmoid)
+
+        반환: documents와 같은 순서의 관련도 점수 리스트.
+        빈 documents면 서버를 호출하지 않고 빈 리스트를 반환한다.
+        실패/미로드 시 예외를 그대로 올린다 — 호출자(KnowledgeRetriever)가 이를
+        fail-safe로 받아 기존 벡터순 경로로 폴백한다.
+        """
+        # 빈 입력은 서버 왕복 없이 즉시 반환(불필요한 네트워크 호출 회피).
+        if not documents:
+            return []
+        try:
+            response = await self._client.post(
+                f"{self._embedding_base_url}/v1/rerank",
+                json={"query": query, "documents": documents},
+                headers={"Authorization": f"Bearer {self.api_key}"},
+            )
+            response.raise_for_status()
+            data = response.json()
+            return data["scores"]
+        except Exception as e:
+            logger.error(f"리랭킹 실패: {e}")
             raise
 
     # ─── health_check() ───
