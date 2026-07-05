@@ -15,6 +15,7 @@ build/
 # 가상환경 (Virtual Environment)
 # ===========================
 .venv/
+.venv_pc/
 venv/
 env/
 

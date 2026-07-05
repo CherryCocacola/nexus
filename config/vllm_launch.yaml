@@ -42,11 +42,13 @@ profiles:
   axmodel:
     model: "skt/A.X-4.0"                     # HF repo id → HF_HOME 캐시에 받아 재사용
     served_model_name: "ax-4.0"              # OpenAI API에 노출되는 모델 이름
-    dtype: "bfloat16"                        # 양자화 없음(B200은 VRAM 여유)
-    # 단일 B200(180GB): 가중치 144GB + util 0.92(=166GB) → KV 예산 ~22GB.
-    # Qwen2.5-72B KV ~320KB/token 기준 약 6.8만 토큰. bake-off 평가엔 32K가 안전.
-    # (2×B200 프로덕션 확정 시 이 값을 65536+ 로 상향)
-    max_model_len: 32768
+    dtype: "bfloat16"                        # 계산 dtype(quantization=fp8와 병용: bf16 로드→FP8 양자화)
+    quantization: "fp8"                      # 2026-07-05 FP8 전환(B200 네이티브, near-lossless 검증됨)
+    # FP8: 가중치 ~144GB→~72GB, util 0.92(=~168GB) → KV 풀 ~96GB로 대폭 확대.
+    # A.X-4.0은 max_position_embeddings=131072 네이티브라 rope override 없이 65536 지원.
+    # (검증: 사실 배터리 BF16 8/8 동일 + needle 60k토큰 회수 통과. 실기동 런처는
+    #  /NHNHOME/nexus/run_vllm_fp8.sh — vLLM 0.24는 --rope-scaling 미지원, --hf-overrides 사용.)
+    max_model_len: 65536
     gpu_memory_utilization: 0.92
     port: 8001
     tool_call_parser: "hermes"               # A.X-4.0 모델 카드 기준(조사). 기동 후 검증

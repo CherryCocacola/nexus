@@ -34,6 +34,7 @@ from typing import Any
 
 from core.message import (
     Message,
+    Role,
     StopReason,
     StreamEvent,
     StreamEventType,
@@ -122,6 +123,152 @@ MAX_COLLAPSE_DRAIN = 1  # 긴급 압축 최대 횟수
 # 출력 토큰 에스컬레이션 단계
 # max_tokens를 점진적으로 증가시킨다 (4K → 8K → 16K)
 OUTPUT_TOKEN_ESCALATION = [4096, 8192, 16384]
+
+
+# ─────────────────────────────────────────────
+# Phase 1 입력 예산 truncation 헬퍼
+# ─────────────────────────────────────────────
+#
+# 배경(왜 이 헬퍼가 필요한가):
+#   예전 Phase 1 코드는 입력이 너무 길 때 "마지막 메시지 하나"만 잘랐다.
+#   그러나 실제 오버플로우는 대개 '여러 tool_result가 누적'되며 발생하는데,
+#   이 경우 마지막 메시지 하나는 초과분(excess)보다 작아서
+#   `if len(content) > excess + 200` 조건이 False → 아무것도 못 자르고
+#   그대로 모델에 전송 → 모델이 예산 초과로 거부 → 하드에러가 났다.
+#   (증거 로그: "입력 truncate: 26524 → 26524 토큰" — 전혀 안 줄어듦)
+#
+#   그래서 접근을 '예산(budget) 방식'으로 바꾼다. 고정 오버헤드(도구 스키마 +
+#   시스템 프롬프트)는 못 줄이므로, "메시지 content가 통틀어 써도 되는 글자 예산"을
+#   역산한 뒤, 입력이 어디에 몰려 있든 그 예산 이하로 확실히 낮춘다.
+
+
+def _shrink_text(text: str, max_chars: int) -> str:
+    """
+    평문 문자열 하나를 max_chars 글자 이하로 줄인다.
+
+    왜 앞+뒤를 남기고 가운데를 생략하는가:
+      - tool_result/사용자 입력은 보통 앞부분(무엇에 대한 결과인지)과
+        뒷부분(결론/요약)이 가장 중요하고, 가운데 본문이 길이를 폭발시킨다.
+        그래서 head(앞)와 tail(뒤)을 남기고 가운데만 생략 표시로 대체한다.
+      - 반환 길이는 반드시 max_chars 이하임을 마지막에 강제 clamp로 보장한다
+        (예산 초과를 절대 만들지 않기 위해).
+    """
+    if len(text) <= max_chars:
+        return text
+    # 몇 글자를 생략하는지 안내 문구(marker). 길이는 대략적이어도 무방하다.
+    omitted = len(text) - max_chars
+    marker = f"\n…[중략: 약 {omitted}자 생략]…\n"
+    # head/tail에 실제로 나눠 쓸 예산 = 전체 예산에서 marker 길이를 뺀 값
+    body_budget = max_chars - len(marker)
+    if body_budget <= 0:
+        # 예산이 marker보다도 작은 극단적 경우: 표식만 남기고 강제로 자른다.
+        return marker.strip()[:max_chars]
+    # 앞부분을 더 많이(2/3) 남긴다 — 맥락 파악에 앞부분이 더 유용하기 때문.
+    head_budget = (body_budget * 2) // 3
+    tail_budget = body_budget - head_budget
+    head = text[:head_budget]
+    tail = text[len(text) - tail_budget :] if tail_budget > 0 else ""
+    result = head + marker + tail
+    # 안전장치: 반올림/marker 길이 오차로 혹시라도 넘치면 강제로 자른다.
+    if len(result) > max_chars:
+        result = result[:max_chars]
+    return result
+
+
+def _truncate_input_for_budget(
+    api_messages: list[Message],
+    msg_char_budget: int,
+) -> tuple[list[Message], int, int]:
+    """
+    입력 메시지들의 content 총 글자수를 msg_char_budget 이하로 낮춘 '새 리스트'를 만든다.
+
+    핵심 원칙(정확성 제약):
+      1. 원본(state.messages)을 절대 훼손하지 않는다.
+         줄여야 하는 메시지는 in-place로 고치지 않고, 팩토리(Message.user/
+         tool_result/system)로 '새 Message'를 만들어 새 리스트에 담는다.
+         변경이 필요 없는 메시지는 원본 객체를 그대로 참조로 재사용한다.
+      2. tool_use ↔ tool_result 페어링을 절대 깨지 않는다.
+         - 메시지를 '제거'하지 않는다 (제거하면 짝이 깨진다). 오직 content 문자열만 줄인다.
+         - assistant의 구조화 content(list — tool_use 블록 포함)는 건드리지 않는다.
+           평문 str content(user/tool_result/system)만 줄인다.
+         - tool_result는 팩토리로 재생성할 때 tool_use_id/is_error를 그대로 넘겨
+           짝 tool_use와의 연결을 유지한다.
+      3. 오래된 것부터 줄이고 최근 메시지는 최대한 온전히 남긴다.
+         최신 평문 메시지부터 예산을 채워주고, 예산이 소진되면 오래된 메시지가
+         먼저 짧아지도록 배분한다.
+
+    Args:
+        api_messages: 이번 API 호출에 쓸 메시지 리스트 (state.messages 또는 그 파생)
+        msg_char_budget: 메시지 content가 통틀어 쓸 수 있는 글자 예산
+
+    Returns:
+        (새 메시지 리스트, 원래 메시지 총 글자수, 줄인 뒤 메시지 총 글자수)
+    """
+    if msg_char_budget < 0:
+        msg_char_budget = 0
+
+    # 줄일 수 있는(평문 str content) 메시지의 인덱스 집합.
+    # content가 list(assistant tool_use 등)인 메시지는 건드리지 않는다 → 페어링 보존.
+    shrinkable_idx = [
+        i for i, m in enumerate(api_messages) if isinstance(m.content, str)
+    ]
+    shrinkable_set = set(shrinkable_idx)
+
+    # 줄일 수 없는 메시지들이 이미 차지한 고정 글자수.
+    fixed_chars = sum(
+        len(str(m.content))
+        for i, m in enumerate(api_messages)
+        if i not in shrinkable_set
+    )
+
+    # 평문 메시지들이 '합쳐서' 써도 되는 글자 예산.
+    # 고정분이 예산을 이미 초과하면 평문은 최소로 줄일 수밖에 없다(available=0).
+    available = max(0, msg_char_budget - fixed_chars)
+
+    # ── 최신 우선 배분 ──
+    # 최신 평문 메시지부터 필요한 만큼 예산을 채워주고, 남는 예산이 없으면
+    # 오래된 메시지는 0(=최소 표식)까지 줄어든다. 이렇게 하면 가장 최근 턴이
+    # 최대한 온전히 남는다.
+    alloc: dict[int, int] = {}
+    remaining = available
+    for i in reversed(shrinkable_idx):  # 최신 → 오래된 순
+        cur = len(str(api_messages[i].content))
+        give = min(cur, remaining)
+        alloc[i] = give
+        remaining -= give
+
+    # 새 리스트 구성 — 원본은 그대로 두고, 줄일 메시지만 팩토리로 새로 만든다.
+    new_messages: list[Message] = []
+    before_chars = 0
+    after_chars = 0
+    for i, m in enumerate(api_messages):
+        cur = len(str(m.content))
+        before_chars += cur
+        # 배분된 예산보다 길면 줄인다. (평문 메시지만 alloc에 존재)
+        if i in alloc and cur > alloc[i]:
+            shrunk = _shrink_text(str(m.content), alloc[i])
+            if m.role == Role.USER:
+                nm = Message.user(shrunk)
+            elif m.role == Role.TOOL_RESULT:
+                # tool_use_id/is_error를 보존해 짝 tool_use와의 연결을 유지한다.
+                nm = Message.tool_result(
+                    tool_use_id=m.tool_use_id or "",
+                    content=shrunk,
+                    is_error=bool(m.is_error),
+                )
+            elif m.role == Role.SYSTEM:
+                nm = Message.system(shrunk)
+            else:
+                # 예상 못한 역할은 안전하게 원본 유지(페어링 훼손 방지).
+                nm = m
+            new_messages.append(nm)
+            after_chars += len(str(nm.content))
+        else:
+            # 변경 없는 메시지는 원본 참조를 그대로 재사용한다.
+            new_messages.append(m)
+            after_chars += cur
+
+    return new_messages, before_chars, after_chars
 
 
 # ─────────────────────────────────────────────
@@ -418,31 +565,40 @@ async def query_loop(
             # 왜 85%: 최소 출력 512토큰 + 버퍼 확보
             input_limit = int(max_context * 0.85)
             if estimated_input > input_limit and len(api_messages) >= 1:
-                # 가장 최근 메시지의 내용을 자른다 (대화 맥락 유지)
-                # 왜 마지막 메시지인가: 보통 길이를 폭발시키는 건 방금 붙은
-                # 사용자 입력/도구 결과이고, 앞쪽 대화 맥락은 살려야 하기 때문이다.
-                last_msg = api_messages[-1]
-                content_str = str(last_msg.content)
-                # 토큰 추정이 /3이었으므로, 줄여야 할 토큰을 다시 ×3 해서
-                # 잘라낼 문자 수(excess_chars)로 환산한다.
-                excess_chars = (estimated_input - input_limit) * 3
-                # excess_chars + 200 보다 길 때만 자른다 — 안내 문구를 붙일
-                # 최소 여유(약 200자)를 남겨 내용이 통째로 사라지는 것을 막는다.
-                if len(content_str) > excess_chars + 200:
-                    truncated = content_str[: len(content_str) - excess_chars]
-                    truncated += "\n\n[내용이 길어서 일부가 잘렸습니다. 핵심 부분만 분석합니다.]"
-                    last_msg.content = truncated
-                    # 자른 뒤 입력 토큰을 다시 추정해 이후 max_tokens 계산에 반영한다
-                    msg_chars = sum(len(str(m.content)) for m in api_messages)
-                    total_chars = tool_chars + msg_chars + prompt_chars
-                    estimated_input = total_chars // 3
+                # ── 예산(budget) 방식 truncation ──
+                # 왜 마지막 메시지 하나만 자르면 안 되는가:
+                #   오버플로우가 '여러 tool_result 누적'에서 오면 마지막 메시지
+                #   하나는 초과분보다 작아 아무것도 못 자르고 그대로 전송 → 하드에러.
+                # 그래서 "메시지 content가 통틀어 써도 되는 글자 예산"을 역산해,
+                # 입력이 어디에 몰려 있든 그 예산 이하로 확실히 낮춘다.
+                #
+                # estimated_input = (tool_chars + msg_chars + prompt_chars) // 3 이므로,
+                # 목표 estimated_input <= input_limit 을 만족시키려면
+                #   tool_chars + msg_chars + prompt_chars <= input_limit * 3
+                # 이어야 한다. 고정 오버헤드(tool_chars=도구 스키마,
+                # prompt_chars=시스템 프롬프트)는 줄일 수 없으므로, 메시지가 쓸 수 있는
+                # 글자 예산만 역산한다:
+                #   msg_char_budget = input_limit*3 - (tool_chars + prompt_chars)
+                msg_char_budget = input_limit * 3 - (tool_chars + prompt_chars)
 
-                orig_chars = tool_chars + prompt_chars + sum(
-                    len(str(m.content)) for m in state.messages
+                # 헬퍼가 원본을 훼손하지 않고 '이번 호출용 사본 리스트'를 돌려준다.
+                # (줄일 메시지는 팩토리로 새로 만들고, 나머지는 원본 참조 재사용)
+                api_messages, before_msg_chars, after_msg_chars = (
+                    _truncate_input_for_budget(api_messages, msg_char_budget)
                 )
+
+                # 자른 뒤 입력 토큰을 '실제로' 다시 추정한다.
+                # (예전의 오해를 주는 26524 → 26524 로그를 진짜 before→after로 교정)
+                before_input = (tool_chars + before_msg_chars + prompt_chars) // 3
+                msg_chars = after_msg_chars
+                total_chars = tool_chars + msg_chars + prompt_chars
+                estimated_input = total_chars // 3
+
                 logger.info(
-                    "입력 truncate: %d → %d 토큰 (컨텍스트 %d의 85%%)",
-                    orig_chars // 3, estimated_input, max_context,
+                    "입력 truncate: %d → %d 토큰 "
+                    "(컨텍스트 %d의 85%%=%d, 메시지 글자 %d → %d)",
+                    before_input, estimated_input, max_context, input_limit,
+                    before_msg_chars, after_msg_chars,
                 )
 
             # 최대 컨텍스트에서 입력을 빼고 200 토큰 버퍼를 둔다
