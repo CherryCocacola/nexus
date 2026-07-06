@@ -45,7 +45,7 @@ from collections.abc import AsyncGenerator
 from pathlib import Path
 from typing import Any
 
-from core.message import Message, StreamEvent, StreamEventType
+from core.message import Message, StreamEvent, StreamEventType, ToolResultBlock
 from core.tools.base import (
     BaseTool,
     ToolUseContext,
@@ -53,6 +53,49 @@ from core.tools.base import (
 
 # 모듈 전용 로거. 프로젝트 규칙상 "nexus.{모듈경로}" 네임스페이스를 사용한다.
 logger = logging.getLogger("nexus.tools.executor")
+
+
+async def _emit_tool_result(
+    tool_use_id: str,
+    content: str,
+    is_error: bool = False,
+) -> AsyncGenerator[StreamEvent | Message, None]:
+    """
+    하나의 도구 결과를 "표시용 StreamEvent"와 "히스토리용 Message" 두 형태로 함께 내보낸다.
+
+    왜 두 개를 yield하는가 (핵심):
+      - StreamEvent(TOOL_RESULT): UI(웹/CLI)가 "접힌 활동라인 + 접힌 요약(펼치면 원문)"
+        을 실시간으로 그리기 위한 표시용 프레임이다. 결과 본문은 tool_result 필드
+        (ToolResultBlock)에 담는다. 이 이벤트는 4-Tier 체인의 정상 이벤트 흐름을 타고
+        상위(query_loop → QueryEngine → web)로 그대로 전파된다. (체인 우회 아님)
+      - Message(tool_result): 다음 턴에서 "모델"이 읽어야 하는 대화 히스토리용 결과다.
+        query_loop은 흐르는 값 중 Message만 골라 state.messages에 누적하고,
+        StreamEvent는 표시용이라 히스토리에 넣지 않는다(중복 저장 방지).
+
+    두 값은 같은 tool_use_id/content/is_error를 공유하므로, 사용자가 보는 UI 요약과
+    모델이 보는 히스토리가 항상 일치한다. 기존 계약(Message.tool_result)은 그대로 두고,
+    표시용 StreamEvent만 "추가"하는 것이라 하위 호환이 유지된다.
+
+    Args:
+        tool_use_id: 이 결과가 어떤 도구 호출(ToolUseBlock.id)에 대한 것인지.
+        content: 도구 결과 문자열(성공 결과 또는 <tool_use_error> 오류 메시지).
+        is_error: 실패 여부. UI는 이 값으로 에러 색상/아이콘을, 모델은 오류 인지를 한다.
+
+    Yields:
+        StreamEvent(TOOL_RESULT): 표시용 프레임(먼저).
+        Message(tool_result): 히스토리용 결과(다음).
+    """
+    # 1) 표시용 이벤트 — UI가 접힌 요약/펼침 원문을 그릴 수 있도록 먼저 흘려보낸다.
+    yield StreamEvent(
+        type=StreamEventType.TOOL_RESULT,
+        tool_result=ToolResultBlock(
+            tool_use_id=tool_use_id,
+            content=content,
+            is_error=is_error,
+        ),
+    )
+    # 2) 히스토리용 메시지 — 모델이 다음 턴에 읽도록 query_loop이 이 값만 누적한다.
+    yield Message.tool_result(tool_use_id, content, is_error=is_error)
 
 # 대형 도구 결과를 파일로 떨어뜨릴 디렉토리.
 # 사용자 홈 아래 ~/.nexus/tool_results 에 저장한다(11단계에서 사용).
@@ -116,12 +159,13 @@ async def run_tool_use(
 
     # 세 방법 모두 실패하면 "알 수 없는 도구" 오류를 내고 중단한다(사용 가능 목록을 함께 안내).
     if tool is None:
-        yield Message.tool_result(
+        async for _ev in _emit_tool_result(
             tool_use_id,
             f"<tool_use_error>알 수 없는 도구: '{tool_name}'. "
             f"사용 가능: {', '.join(t.name for t in tools)}</tool_use_error>",
             is_error=True,
-        )
+        ):
+            yield _ev
         return
 
     # ═══ Step 2: abort 확인 ═══
@@ -130,11 +174,12 @@ async def run_tool_use(
     # 시그널이 없거나 is_set 속성이 없으면(오리 타이핑) 이 검사를 안전하게 건너뛴다.
     if context.abort_signal and hasattr(context.abort_signal, "is_set"):
         if context.abort_signal.is_set():
-            yield Message.tool_result(
+            async for _ev in _emit_tool_result(
                 tool_use_id,
                 "<tool_use_error>사용자에 의해 실행이 취소되었습니다</tool_use_error>",
                 is_error=True,
-            )
+            ):
+                yield _ev
             return
 
     # ═══ Step 3: JSON Schema 검증 ═══
@@ -142,11 +187,12 @@ async def run_tool_use(
     # 형식 수준의 오류를 여기서 먼저 걸러 실제 실행에 잘못된 입력이 들어가지 않게 한다.
     schema_error = _validate_json_schema(tool, tool_input)
     if schema_error:
-        yield Message.tool_result(
+        async for _ev in _emit_tool_result(
             tool_use_id,
             f"<tool_use_error>InputValidationError: {schema_error}</tool_use_error>",
             is_error=True,
-        )
+        ):
+            yield _ev
         return
 
     # ═══ Step 4: 도메인 검증 ═══
@@ -154,11 +200,12 @@ async def run_tool_use(
     # end_line보다 작아야 한다" 같은 규칙. 각 BaseTool이 validate_input()으로 구현한다.
     domain_error = tool.validate_input(tool_input)
     if domain_error:
-        yield Message.tool_result(
+        async for _ev in _emit_tool_result(
             tool_use_id,
             f"<tool_use_error>DomainValidationError: {domain_error}</tool_use_error>",
             is_error=True,
-        )
+        ):
+            yield _ev
         return
 
     # ═══ Step 5: 보안 분류 (Bash 전용, 비동기) ═══
@@ -211,11 +258,12 @@ async def run_tool_use(
                 logger.info(
                     "[permission enforce] 도구=%s 차단: %s", tool.name, reason
                 )
-                yield Message.tool_result(
+                async for _ev in _emit_tool_result(
                     tool_use_id,
                     f"<tool_use_error>권한 거부: {reason}</tool_use_error>",
                     is_error=True,
-                )
+                ):
+                    yield _ev
                 return
 
             logger.debug(
@@ -239,21 +287,23 @@ async def run_tool_use(
         perm_result = await tool.check_permissions(tool_input, context)
         # behavior가 "deny"면 권한 거부 → 오류 결과를 내고 중단.
         if perm_result.behavior.value == "deny":
-            yield Message.tool_result(
+            async for _ev in _emit_tool_result(
                 tool_use_id,
                 f"<tool_use_error>권한 거부: {perm_result.message}</tool_use_error>",
                 is_error=True,
-            )
+            ):
+                yield _ev
             return
     except Exception as e:
         # 권한 확인 자체가 예외로 실패하면 fail-closed 원칙에 따라 실행을 막는다.
         # (안전 판단을 못 했으니 통과시키지 않는다.)
         logger.error(f"권한 확인 실패: {e}")
-        yield Message.tool_result(
+        async for _ev in _emit_tool_result(
             tool_use_id,
             f"<tool_use_error>권한 확인 에러: {e}</tool_use_error>",
             is_error=True,
-        )
+        ):
+            yield _ev
         return
 
     # Step 5 결과 확인 (비동기 보안 검사)
@@ -263,11 +313,12 @@ async def run_tool_use(
         try:
             sec_result = await security_task
             if not sec_result["safe"]:
-                yield Message.tool_result(
+                async for _ev in _emit_tool_result(
                     tool_use_id,
                     f"<tool_use_error>보안 검사 실패: {sec_result['reason']}</tool_use_error>",
                     is_error=True,
-                )
+                ):
+                    yield _ev
                 return
         except Exception as e:
             # 보안 검사 로직 자체의 오류는 도구 차단이 아니라 경고만 남기고 통과시킨다.
@@ -304,22 +355,24 @@ async def run_tool_use(
         )
     except TimeoutError:
         elapsed = time.monotonic() - start_time
-        yield Message.tool_result(
+        async for _ev in _emit_tool_result(
             tool_use_id,
             f"<tool_use_error>도구 '{tool.name}' 타임아웃: "
             f"{tool.timeout_seconds}초 (경과: {elapsed:.1f}초)</tool_use_error>",
             is_error=True,
-        )
+        ):
+            yield _ev
         return
     except Exception as e:
         # 도구 내부에서 난 예외를 삼키지 않고 로그(스택트레이스 포함)로 남긴 뒤,
         # 모델이 이해할 수 있게 예외 타입/메시지를 tool_use_error로 감싸 돌려준다.
         logger.error(f"도구 실행 에러: {tool.name}: {e}", exc_info=True)
-        yield Message.tool_result(
+        async for _ev in _emit_tool_result(
             tool_use_id,
             f"<tool_use_error>{type(e).__name__}: {e}</tool_use_error>",
             is_error=True,
-        )
+        ):
+            yield _ev
         return
 
     # ═══ Step 10: 결과 직렬화 ═══
@@ -349,11 +402,14 @@ async def run_tool_use(
     elapsed = time.monotonic() - start_time
     logger.info(f"도구 '{tool.name}' 완료: {elapsed:.2f}초")
 
-    yield Message.tool_result(
+    # 표시용 TOOL_RESULT StreamEvent + 히스토리용 tool_result Message를 함께 내보낸다.
+    # (같은 content/is_error를 공유 → UI 요약과 모델 히스토리가 일치)
+    async for _ev in _emit_tool_result(
         tool_use_id,
         content,
         is_error=result.is_error,
-    )
+    ):
+        yield _ev
 
 
 # ─────────────────────────────────────────────

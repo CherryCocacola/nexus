@@ -537,8 +537,9 @@ body {
   padding-left: 32px;
   margin-bottom: 6px;
 }
-/* 턴이 끝난 뒤 최종 메시지에 남는 트레일은 더 흐리게 */
-.activity-area.activity-final { opacity: 0.6; }
+/* 턴이 끝난 뒤 최종 메시지에 남는 완료 트레일은 더 흐리게.
+   (접힌 도구결과 블록 activity-results는 클릭해 펼쳐 읽는 대상이라 흐리게 하지 않는다) */
+.activity-area.activity-final .activity-trail { opacity: 0.6; }
 
 /* 완료 단계 트레일 — 작은 muted 목록 (여러 도구가 누적됨) */
 .activity-trail {
@@ -600,6 +601,103 @@ body {
   animation: activity-spin 0.7s linear infinite;
 }
 @keyframes activity-spin { to { transform: rotate(360deg); } }
+
+/* ─── 도구 / 서브에이전트 결과 — 접힌 상세 블록 (Claude 스타일) ─── */
+/* tool_result 프레임이 오면 여기(activity-results)에 <details> 박스를 하나씩 쌓는다.
+   기본은 "접힘" 상태로, 요약 한 줄만 보이고 클릭하면 전체 원문이 펼쳐진다.
+   메인 답변 말풍선(streamingBody)과 분리돼 있어, 도구 원문이 답변에 섞이지 않는다. */
+.activity-results {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.activity-results:not(:empty) { margin: 4px 0 6px; }
+
+/* 접힌 결과 박스 — 옅은 회색 카드 */
+.tool-result {
+  border: 1px solid var(--border-light);
+  border-radius: 8px;
+  background: var(--bg-secondary);
+  overflow: hidden;
+  font-size: 12px;
+}
+
+/* 요약 줄(summary): "▸ scout: 문서 분석 · 3개 문단 요약" 형태. 클릭 시 펼침 토글. */
+.tool-result > summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  cursor: pointer;
+  list-style: none;                 /* 브라우저 기본 삼각형 마커 제거(직접 ▸ 사용) */
+  color: var(--text-secondary);
+  user-select: none;
+}
+.tool-result > summary::-webkit-details-marker { display: none; }  /* Safari/Chrome 기본 마커 제거 */
+.tool-result > summary::marker { content: ''; }                    /* Firefox 기본 마커 제거 */
+.tool-result > summary:hover { background: var(--bg-hover); }
+/* 키보드 포커스 시 접근성용 외곽선 */
+.tool-result > summary:focus-visible { outline: 2px solid var(--accent-light); outline-offset: -2px; }
+
+/* ▸ 캐럿 — 펼치면 90도 회전해 ▾ 처럼 보이게 한다 */
+.tool-result .tr-caret {
+  flex-shrink: 0;
+  color: var(--text-muted);
+  display: inline-block;
+  transition: transform 0.15s ease;
+}
+.tool-result[open] > summary .tr-caret { transform: rotate(90deg); }
+
+/* 도구/서브에이전트 라벨 — 모노폰트로 살짝 구분 */
+.tool-result .tr-label {
+  font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+  color: var(--text-primary);
+  flex-shrink: 0;
+}
+.tool-result .tr-sep { color: var(--text-muted); flex-shrink: 0; }
+/* 한 줄 미리보기 — 넘치면 말줄임 */
+.tool-result .tr-preview {
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+/* 펼쳤을 때 나오는 전체 원문 영역 — formatContent()가 렌더한 HTML이 들어간다 */
+.tool-result .tool-result-body {
+  padding: 8px 12px 10px;
+  border-top: 1px solid var(--border-light);
+  max-height: 360px;
+  overflow: auto;
+  font-size: 13px;
+  color: var(--text-secondary);
+  line-height: 1.6;
+}
+/* 본문 내부 요소는 .message-body 규칙이 닿지 않으므로 최소한의 가독성 스타일을 직접 준다 */
+.tool-result-body p { margin: 4px 0; }
+.tool-result-body ul, .tool-result-body ol { padding-left: 18px; margin: 4px 0; }
+.tool-result-body h2, .tool-result-body h3, .tool-result-body h4 { margin: 8px 0 4px; font-size: 13px; }
+.tool-result-body pre {
+  background: var(--bg-primary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  overflow-x: auto;              /* 긴 코드는 박스 안에서만 가로 스크롤 */
+  margin: 6px 0;
+  font-size: 12px;
+  font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+}
+.tool-result-body code {
+  font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+  font-size: 12px;
+}
+.tool-result-body pre code { background: none; padding: 0; }
+
+/* 오류 결과 — 붉은 톤으로 강조 */
+.tool-result.is-error { border-color: var(--error); }
+.tool-result.is-error > summary { color: var(--error); }
+.tool-result.is-error .tr-label { color: var(--error); }
 
 /* ─── 다운로드 / 미리보기 버튼 ─── */
 .dl-wrap { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 8px; }
@@ -1472,6 +1570,7 @@ function startStreamingMessage() {
     </div>
     <div class="activity-area" id="streamingActivity">
       <div class="activity-trail" id="activityTrail"></div>
+      <div class="activity-results" id="activityResults"></div>
       <div class="activity-live" id="activityLive" style="display:none"></div>
     </div>
     <div class="model-thinking" id="streamingThinking" style="display:none"></div>
@@ -1580,12 +1679,16 @@ function finalizeStreamingMessage() {
     const liveEl = document.getElementById('activityLive');
     if (liveEl) liveEl.remove();
     const trail = document.getElementById('activityTrail');
-    if (!trail || trail.children.length === 0) {
-      act.remove();   // 남길 게 없으면 활동 영역 자체를 제거
+    const results = document.getElementById('activityResults');
+    const hasTrail = trail && trail.children.length > 0;
+    const hasResults = results && results.children.length > 0;   // 접힌 도구결과 블록이 하나라도 있으면 유지
+    if (!hasTrail && !hasResults) {
+      act.remove();   // 남길 게 없으면(순수 텍스트 응답) 활동 영역 자체를 제거
     } else {
       // id를 떼어 다음 스트림의 새 활동 영역과 충돌하지 않게 한다
       act.removeAttribute('id');
-      trail.removeAttribute('id');
+      if (trail) trail.removeAttribute('id');
+      if (results) results.removeAttribute('id');
       act.classList.add('activity-final');
     }
   }
@@ -1620,8 +1723,10 @@ function activityToolLabel(name) {
 }
 
 // tool_use_start / thinking_start — 진행 중 라이브 인디케이터를 표시/갱신한다.
-// kind: 'tool' | 'thinking'. toolName은 'tool'일 때만 사용.
-function activityStart(kind, toolName) {
+// kind: 'tool' | 'thinking'. toolName/toolDesc는 'tool'일 때만 사용.
+// toolDesc: 백엔드가 내려주는 사람이 읽는 라벨(예 "scout: 문서 분석"). 있으면 우선 표시,
+//           없으면 기존 activityToolLabel(toolName) 폴백.
+function activityStart(kind, toolName, toolDesc) {
   const live = document.getElementById('activityLive');
   if (!live) return;
   if (kind === 'thinking') {
@@ -1629,7 +1734,8 @@ function activityStart(kind, toolName) {
       '<span class="activity-spinner"></span>' +
       '<span class="activity-live-text">💭 생각 중…</span>';
   } else {
-    const label = activityToolLabel(toolName);
+    // tool_desc 우선, 없으면 도구명 기반 한글 라벨
+    const label = (toolDesc && toolDesc.trim()) ? toolDesc : activityToolLabel(toolName);
     live.innerHTML =
       '<span class="activity-spinner"></span>' +
       '<span class="activity-live-text">🔧 ' + escapeHtml(label) +
@@ -1641,16 +1747,22 @@ function activityStart(kind, toolName) {
 
 // tool_use_stop / thinking_stop — 해당 단계를 완료 처리한다.
 // 도구는 완료 트레일("✓ …")에 누적하고, 사고는 트레일 없이 라이브만 해제.
-function activityStop(kind, toolName) {
+// toolDesc: 있으면 라벨로 우선 사용(activityStart와 동일 규칙).
+function activityStop(kind, toolName, toolDesc) {
   if (kind === 'tool') {
     const trail = document.getElementById('activityTrail');
     if (trail) {
       const name = toolName || '';
+      // 표시 라벨은 tool_desc 우선, 없으면 도구명 기반 한글 라벨
+      const label = (toolDesc && toolDesc.trim()) ? toolDesc : activityToolLabel(name);
+      // 접기(×N) 판정 키 — 화면에 찍히는 라벨 기준으로 잡는다. 이렇게 하면 같은 도구라도
+      // tool_desc가 다르면(예 "scout: 문서 분석" vs "scout: 코드 검색") 서로 다른 줄로 분리된다.
+      const key = label + ' ' + name;
       const last = trail.lastElementChild;
-      // (1a) 직전 트레일 항목과 같은 도구면 새 줄을 추가하지 않고 카운트만 올린다.
+      // (1a) 직전 트레일 항목과 같은 라벨이면 새 줄을 추가하지 않고 카운트만 올린다.
       //      "✓ 문서 분석 중 · DocumentProcess ×10" 처럼 claude식으로 접어 도배를 막는다.
-      //      (연속으로 같은 도구일 때만 합친다 — 중간에 다른 도구가 끼면 새 줄로 분리)
-      if (last && last.getAttribute('data-tool-name') === name) {
+      //      (연속으로 같은 라벨일 때만 합친다 — 중간에 다른 도구가 끼면 새 줄로 분리)
+      if (last && last.getAttribute('data-activity-key') === key) {
         const cur = parseInt(last.getAttribute('data-count') || '1', 10) + 1;
         last.setAttribute('data-count', String(cur));
         // 카운트 배지(×N)는 textContent로만 갱신 — 숫자라 XSS 위험 없음
@@ -1663,11 +1775,10 @@ function activityStop(kind, toolName) {
         }
         countEl.textContent = ' ×' + cur;
       } else {
-        // 새 도구(또는 트레일 첫 항목) → 새 줄 추가. data-tool-name/data-count로 접기 상태 보관.
-        const label = activityToolLabel(name);
+        // 새 도구(또는 트레일 첫 항목) → 새 줄 추가. data-activity-key/data-count로 접기 상태 보관.
         const step = document.createElement('div');
         step.className = 'activity-step';
-        step.setAttribute('data-tool-name', name);
+        step.setAttribute('data-activity-key', key);
         step.setAttribute('data-count', '1');
         step.innerHTML =
           '<span class="activity-check">✓</span>' +
@@ -1678,6 +1789,44 @@ function activityStop(kind, toolName) {
     }
   }
   activityHideLive();
+  scrollToBottom();
+}
+
+// 신규 tool_result 프레임 — 도구/서브에이전트의 실행 결과를 "접힌 상세 블록"으로 쌓는다.
+// data = { type:'tool_result', session_id, tool_use_id, name, tool_desc?, is_error, preview, content }
+//   - preview: 짧은 한 줄 요약(summary에 표시)
+//   - content: 전체 원문(마크다운/텍스트, 최대 16k자) → 펼치면 formatContent로 렌더
+// 메인 답변 말풍선(streamingBody)이 아니라 activity-results 영역에 넣어, 도구 원문이
+// 최종 답변에 섞이지 않게 한다(#3). 기본은 접힘 상태.
+function renderToolResult(data) {
+  const results = document.getElementById('activityResults');
+  if (!results) return;
+
+  const name = data.name || '';
+  // 라벨은 tool_desc 우선, 없으면 도구명 기반 한글 라벨(활동라인과 동일 규칙)
+  const label = (data.tool_desc && data.tool_desc.trim()) ? data.tool_desc : activityToolLabel(name);
+  const preview = data.preview || '';
+  const content = data.content || '';
+
+  const box = document.createElement('details');
+  box.className = 'tool-result' + (data.is_error ? ' is-error' : '');
+
+  // 요약 줄 — 모든 사용자/모델 문자열은 escapeHtml 경유(XSS 방지)
+  const summary = document.createElement('summary');
+  summary.innerHTML =
+    '<span class="tr-caret">▸</span>' +
+    '<span class="tr-label">' + escapeHtml(label) + '</span>' +
+    (preview ? '<span class="tr-sep">·</span>' +
+               '<span class="tr-preview">' + escapeHtml(preview) + '</span>' : '');
+  box.appendChild(summary);
+
+  // 펼침 본문 — 공용 마크다운 렌더러 재사용(내부에서 escape 처리됨)
+  const bodyEl = document.createElement('div');
+  bodyEl.className = 'tool-result-body';
+  bodyEl.innerHTML = formatContent(content);
+  box.appendChild(bodyEl);
+
+  results.appendChild(box);
   scrollToBottom();
 }
 
@@ -1891,9 +2040,15 @@ async function sendMessage() {
               // 도구를 쓰기 직전까지 흘러나온 본문은 대개 "이제 ~를 해볼게요" 같은 중간 나레이션이다.
               // 최종 답변을 깨끗하게 남기려고 그 부분을 리셋한다.
               resetStreamingBody();
-              activityStart('tool', data.tool_name);   // 활동영역에 "○○ 도구 실행 중" 표시 시작
+              // tool_desc(있으면)를 넘겨 "🔧 scout: 문서 분석"처럼 사람이 읽는 라벨로 표시
+              activityStart('tool', data.tool_name, data.tool_desc);   // 활동영역에 "○○ 도구 실행 중" 표시 시작
             } else if (data.type === 'tool_use_stop') {
-              activityStop('tool', data.tool_name);     // 해당 도구 실행 완료 처리(중복은 ×N 으로 접힘)
+              activityStop('tool', data.tool_name, data.tool_desc);    // 해당 도구 실행 완료 처리(중복은 ×N 으로 접힘)
+            } else if (data.type === 'tool_result') {
+              // 신규 tool_result — 도구/서브에이전트 결과를 접힌 상세 블록으로 활동영역에 쌓는다.
+              // 답변 말풍선에 원문이 새어들지 않도록 여기(활동영역)에서만 처리하고 아래 (B)로 넘기지 않는다.
+              if (!streamStarted) { streamStarted = true; startStreamingMessage(); }
+              renderToolResult(data);
             } else if (data.type === 'thinking_start') {
               if (!streamStarted) { streamStarted = true; startStreamingMessage(); }
               activityStart('thinking', null);          // "생각하는 중" 표시 시작

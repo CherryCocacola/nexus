@@ -167,6 +167,53 @@ def _collect_downloads(messages: list) -> list[dict[str, str]]:
 
 
 # ─────────────────────────────────────────────
+# 도구 활동 표시(접힌 활동라인 + 접힌 요약) 헬퍼 — 웹 UX 개선
+# ─────────────────────────────────────────────
+# 프론트가 "지금 무슨 작업 중"(활동라인)과 "결과 요약(펼치면 원문)"을 그리기 위한
+# 값들을 백엔드가 계산해 SSE 프레임에 실어 보낸다. 아래 두 상한은 큰 결과가
+# 프레임을 폭파시키는 것을 막는 방어값이다.
+_TOOL_PREVIEW_MAX = 160  # 접힌 라인용 요약 최대 글자수(초과 시 "…")
+_TOOL_CONTENT_MAX = 16000  # 펼침용 전체 텍스트 최대 글자수(초과 시 "…(truncated)")
+
+
+def _compute_tool_desc(tool_use: Any) -> str | None:
+    """
+    사람이 읽는 도구 라벨(tool_desc)을 계산한다. 없으면 None(프론트는 tool_name으로 폴백).
+
+    규칙:
+      - Agent 도구(서브에이전트 호출)면 입력의 subagent_type/description으로 라벨을 만든다.
+        · description이 있으면 "{subagent_type}: {description}" (예: "scout: 문서 분석")
+        · description이 없으면 "{subagent_type}"만.
+        · subagent_type도 없으면(ad-hoc description만 있는 경우) description을 그대로 쓴다.
+      - 그 외 도구는 None을 반환한다 → 프론트가 tool_name으로 폴백 표시.
+
+    왜 백엔드에서 계산하나: subagent_type/description은 도구 입력(dict)에 들어 있어
+    프론트가 알기 어렵고, "무슨 서브에이전트가 무슨 일을 하는지"를 일관되게 보여주려면
+    이벤트가 흐르는 이 지점에서 라벨을 확정해 실어 보내는 것이 가장 정확하다.
+
+    Args:
+        tool_use: ToolUseBlock (name, input을 가진 도구 호출 정보).
+
+    Returns:
+        표시용 라벨 문자열, 또는 라벨을 만들 수 없으면 None.
+    """
+    name = getattr(tool_use, "name", "") or ""
+    if name != "Agent":
+        return None
+    inp = getattr(tool_use, "input", None) or {}
+    subagent_type = (inp.get("subagent_type") or "").strip()
+    description = (inp.get("description") or "").strip()
+    if subagent_type and description:
+        return f"{subagent_type}: {description}"
+    if subagent_type:
+        return subagent_type
+    if description:
+        # subagent_type 없이 ad-hoc description만 준 하위 호환 경로.
+        return description
+    return None
+
+
+# ─────────────────────────────────────────────
 # 멀티테넌시 해석 헬퍼 (Part 5 Ch 15, 2026-04-21)
 # ─────────────────────────────────────────────
 # 우선순위: body.tenant_id > X-Tenant-ID 헤더 > Authorization Bearer(API 키)
@@ -1262,6 +1309,11 @@ async def chat_stream(
         event_count = 0
         stream_abort_error: BaseException | None = None
 
+        # tool_use_id → 표시용 메타(name, tool_desc). TOOL_USE_START/STOP에서 채우고,
+        # 뒤이어 오는 TOOL_RESULT 프레임에서 조회해 "접힌 활동라인 + 접힌 요약"의
+        # 라벨(누가/무슨 작업)을 결과 라인과 일치시킨다.
+        tool_meta: dict[str, dict[str, str]] = {}
+
         logger.info(
             "SSE 시작: session=%s, message_len=%d, has_attach=%s",
             session_id,
@@ -1321,8 +1373,11 @@ async def chat_stream(
 
                 event = payload
                 if isinstance(event, StreamEvent):
+                    # 이벤트 타입 문자열(enum/문자열 양쪽 정규화). 아래 tool_result
+                    # 분기 판정과 프레임 type 필드에 함께 쓴다.
+                    etype = event.type if isinstance(event.type, str) else event.type.value
                     sse_data: dict[str, Any] = {
-                        "type": event.type if isinstance(event.type, str) else event.type.value,
+                        "type": etype,
                         "session_id": engine.session_id,
                     }
                     if event.text:
@@ -1330,10 +1385,47 @@ async def chat_stream(
                     if event.message:
                         sse_data["message"] = event.message
                     # 중간 활동 표시용: 도구 이벤트(TOOL_USE_START/STOP)가 담고 온
-                    # 도구 이름을 프레임에 실어 UI가 "지금 무슨 도구 실행 중"을 렌더할 수
+                    # 도구 이름 + 사람이 읽는 라벨(tool_desc)을 프레임에 실어, UI가
+                    # "지금 무슨 작업(누가) 중"을 클로드처럼 접힌 활동라인으로 렌더할 수
                     # 있게 한다. (표시는 이미 흐르는 이벤트를 그리는 것 — 추가 토큰/GPU 비용 없음)
                     if event.tool_use is not None:
-                        sse_data["tool_name"] = event.tool_use.name
+                        tu = event.tool_use
+                        sse_data["tool_name"] = tu.name
+                        # tool_use_id → 표시 메타를 등록/갱신해, 뒤이어 오는 TOOL_RESULT
+                        # 프레임이 같은 이름/라벨로 결과 라인을 그릴 수 있게 한다.
+                        _meta = tool_meta.setdefault(tu.id, {"name": tu.name})
+                        _meta["name"] = tu.name
+                        # Agent(서브에이전트) 호출이면 "{subagent_type}: {description}"
+                        # 라벨을 만든다. 그 외 도구는 None → 프론트가 tool_name으로 폴백.
+                        _desc = _compute_tool_desc(tu)
+                        if _desc:
+                            sse_data["tool_desc"] = _desc
+                            _meta["tool_desc"] = _desc
+                    # ─── 신규 tool_result 프레임 ───
+                    # 도구/서브에이전트 실행 결과를 "접힌 요약(preview) + 펼침 원문(content)"
+                    # 으로 내려보낸다. 프론트는 이 프레임으로 결과를 접힌 채 보여주고,
+                    # 펼치면 원문을 노출한다(메인 답변에 원문 재출력 방지).
+                    if etype == "tool_result" and event.tool_result is not None:
+                        tr = event.tool_result
+                        _rmeta = tool_meta.get(tr.tool_use_id, {})
+                        _raw = tr.content or ""
+                        # preview: 접힌 라인용 — 개행을 공백으로 치환한 첫 N글자(넘으면 "…").
+                        _preview = (
+                            _raw.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+                        )
+                        if len(_preview) > _TOOL_PREVIEW_MAX:
+                            _preview = _preview[:_TOOL_PREVIEW_MAX] + "…"
+                        # content: 펼침용 전체 텍스트 — 상한 초과 시 말미에 절단 표식(큰 결과 방어).
+                        _content = _raw
+                        if len(_content) > _TOOL_CONTENT_MAX:
+                            _content = _content[:_TOOL_CONTENT_MAX] + "…(truncated)"
+                        sse_data["tool_use_id"] = tr.tool_use_id
+                        sse_data["name"] = _rmeta.get("name", "")
+                        if _rmeta.get("tool_desc"):
+                            sse_data["tool_desc"] = _rmeta["tool_desc"]
+                        sse_data["is_error"] = bool(tr.is_error)
+                        sse_data["preview"] = _preview
+                        sse_data["content"] = _content
                     if event.error_code:
                         sse_data["error_code"] = event.error_code
                     if event.usage:
