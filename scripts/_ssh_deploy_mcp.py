@@ -32,6 +32,31 @@ MCP 서버를 DB 서버(192.168.10.39)에 배포하는 스크립트.
 anti-pattern #8(bare except 금지):
   원격 명령/SFTP 실패는 구체 예외로 포착해 사유와 함께 보고한다. 한 단계 실패가
   전체 배포 흐름을 모호하게 삼키지 않도록 한다.
+
+전체 흐름(엔트리포인트 main 기준, 위→아래 순서):
+  1) build_parser() 로 CLI 인자를 파싱한다(--servers/--dry-run/--host 등).
+  2) dry-run 이면 SSH 접속조차 생략하고 "무엇을 할지"만 출력한다.
+  3) 실제 모드면 paramiko 로 .39 에 접속한 뒤 아래 단계를 차례로 수행한다.
+     - 코드 배포: deploy_code_upload(SFTP) 또는 deploy_code_pull(git pull)
+     - 의존성 확인: check_dependencies (import 되는지 점검, 설치는 안 함)
+     - 서버별 기동+검증: start_server(nohup) → health_check(curl /health)
+
+주요 함수 지도(처음 읽는 사람용):
+  · run_remote          — 모든 원격 명령의 단일 통로(dry-run 분기·예외 포착 담당)
+  · _iter_local_files   — 업로드할 로컬 파일 목록을 걸러서 순회
+  · _sftp_mkdirs        — SFTP 에 없는 mkdir -p 를 재귀 생성으로 대체
+  · deploy_code_upload  — mcp_servers/core/config 를 SFTP put
+  · deploy_code_pull    — 원격 레포에서 git pull(레포가 이미 있을 때만)
+  · check_dependencies  — 원격 파이썬에 필수 패키지가 있는지 확인
+  · start_server        — MCP 서버 1개를 nohup 백그라운드로 기동
+  · health_check        — 기동된 서버의 /health 응답 확인
+  · main                — 위 함수들을 순서대로 엮는 오케스트레이터
+
+의존 모듈:
+  paramiko(SSH/SFTP), 표준 라이브러리(argparse/posixpath/os). 이 스크립트 자체는
+  Nexus core 를 import 하지 않는다 — 배포 도구이므로 레포 코드에 의존하지 않게 둔다.
+
+작성자: 이현수 / 작성일: 2026-07-05
 """
 
 from __future__ import annotations
@@ -86,12 +111,27 @@ EXCLUDE_SUFFIXES = (".pyc", ".pyo", ".log")
 # 출력/명령 헬퍼
 # ─────────────────────────────────────────────
 def _print_header(title: str) -> None:
-    """단계 구분용 헤더를 출력한다."""
+    """
+    각 배포 단계의 시작을 눈에 띄게 구분해 주는 헤더 한 줄을 출력한다.
+
+    로그를 눈으로 훑을 때 "지금 어느 단계인지"를 바로 알 수 있도록 앞에 빈 줄과
+    === 표시를 붙인다. 순수 출력 헬퍼라 반환값은 없다.
+    """
     print(f"\n=== {title} ===")
 
 
 def _should_skip(name: str) -> bool:
-    """업로드 시 건너뛸 파일/디렉토리인지 판정한다(캐시/숨김/바이트코드 제외)."""
+    """
+    업로드할 때 건너뛸 파일/디렉토리 이름인지 판정한다.
+
+    두 가지 기준으로 거른다:
+      1) 이름이 EXCLUDE_NAMES 에 있으면(예: __pycache__, .git, .venv) 제외.
+      2) 확장자가 EXCLUDE_SUFFIXES(.pyc/.pyo/.log)로 끝나면 제외.
+    캐시·바이트코드·로그처럼 원격에 올릴 필요 없는 파일을 걸러 용량을 줄인다.
+
+    Returns:
+        건너뛰어야 하면 True, 올려야 하면 False.
+    """
     if name in EXCLUDE_NAMES:
         return True
     return any(name.endswith(suffix) for suffix in EXCLUDE_SUFFIXES)
@@ -334,7 +374,13 @@ def health_check(ssh: paramiko.SSHClient, name: str, *, dry_run: bool) -> None:
 # 엔트리포인트
 # ─────────────────────────────────────────────
 def _local_repo_root() -> str:
-    """이 스크립트(scripts/_ssh_deploy_mcp.py)의 상위 = 레포 루트를 추정한다."""
+    """
+    이 스크립트 파일 위치를 기준으로 레포 루트 경로를 추정해 돌려준다.
+
+    이 파일은 <레포루트>/scripts/_ssh_deploy_mcp.py 에 있으므로, __file__ 의
+    부모(scripts)의 다시 부모가 레포 루트다. dirname 을 두 번 적용해 구한다.
+    업로드 모드에서 mcp_servers/core/config 를 찾을 기준 경로로 쓰인다.
+    """
     import os
 
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

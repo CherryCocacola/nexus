@@ -38,6 +38,21 @@ PostgreSQL(:5440)은 모두 LAN 주소이므로 에어갭을 준수한다.
   - `--dry-run`: 파싱/청킹까지만 수행하고 임베딩·DB 쓰기 생략.
   - `--limit N`: 상위 N개 파일만 처리(스모크 테스트).
   - 적재는 UPSERT(KnowledgeEntry.id = SHA-256)이므로 재실행해도 중복 없음.
+
+주요 구성요소(이 파일 안):
+  - _gpu_available()        : CUDA GPU 유무를 fail-soft 로 판정(스택 자동 선택용).
+  - _build_parser_registry(): 포맷별 파서를 우선순위와 함께 ParserRegistry 에 등록.
+  - iter_input_files()      : 입력 디렉토리를 재귀 순회하며 대상 파일 목록 확보.
+  - _build_model_provider() : 임베딩 전용 LocalModelProvider 조립.
+  - _create_pg_pool()       : asyncpg 커넥션 풀 생성(실패 시 인메모리 폴백).
+  - run_ingest()            : 실제 배치 적재 메인 흐름(파일별 격리 + 진행 로그).
+  - run_build_index()       : 적재 후 ivfflat 벡터 인덱스 재빌드.
+  - main()                  : argparse 진입점 — 서브명령(적재/인덱스) 분기.
+
+외부 의존(core/*): DocumentIngestPipeline, ParserRegistry, LocalModelProvider,
+KnowledgeStore, load_and_validate_config — docingest MCP 서버와 동일한 조립을 재사용.
+
+작성자: 이현수 / 작성일: 2026-07-05
 """
 
 from __future__ import annotations
@@ -226,7 +241,27 @@ async def _create_pg_pool(config: Any, dsn: str | None) -> Any | None:
 # 메인 배치 적재 흐름
 # ─────────────────────────────────────────────
 async def run_ingest(args: argparse.Namespace) -> int:
-    """디렉토리 재귀 순회 → 파일별 ingest_file → 진행 로그."""
+    """
+    배치 적재 메인 흐름 — 디렉토리 재귀 순회 → 파일별 ingest_file → 진행 로그.
+
+    전체 단계:
+      1) 입력 디렉토리 유효성 검사(디렉토리가 아니면 즉시 종료).
+      2) 스택 결정(명시값 우선, "auto" 면 GPU 감지로 light/high 선택).
+      3) 파서 레지스트리 구성 → 등록된 확장자 기준으로 처리 대상 확장자 확정
+         (--formats 가 있으면 교집합만).
+      4) 처리 대상 파일 목록 수집(--limit 로 상위 N개만 자를 수 있음).
+      5) 임베딩 프로바이더 + PG 풀 구성(dry-run 이면 PG 풀 생략).
+      6) KnowledgeStore 스키마 보장 → DocumentIngestPipeline 조립.
+      7) 파일별로 ingest_file 을 try/except 로 격리 호출하며 누적 카운터 갱신,
+         주기적으로(_PROGRESS_EVERY) 진행 로그 출력.
+      8) finally 에서 httpx 클라이언트/PG 풀을 항상 정리.
+
+    Args:
+        args: argparse 결과. input/formats/embed_url/pg/stack/dry_run/limit 사용.
+
+    Returns:
+        종료 코드 — 0(정상/처리대상 없음), 1(입력 디렉토리 오류/처리 확장자 없음).
+    """
     from core.config import load_and_validate_config
     from core.ingest.pipeline import DocumentIngestPipeline
     from core.rag.knowledge_store import KnowledgeStore
@@ -370,7 +405,24 @@ async def run_ingest(args: argparse.Namespace) -> int:
 
 
 async def run_build_index(args: argparse.Namespace) -> int:
-    """대량 적재 후 벡터 검색 인덱스(ivfflat)를 만든다(prepare_kowiki 방식)."""
+    """
+    대량 적재 후 벡터 검색 인덱스(ivfflat)를 만든다(prepare_kowiki 방식).
+
+    ivfflat 는 미리 만들어두면 대량 삽입이 느려지므로, 적재를 모두 끝낸 뒤
+    한 번에 빌드하는 것이 정석이다. --build-index 서브명령이 이 함수를 호출한다.
+
+    흐름:
+      1) PG 풀 생성 — 실패하면 인덱스를 만들 수 없으므로 종료 코드 1.
+      2) KnowledgeStore 스키마 보장(테이블/컬럼 존재 확인).
+      3) build_vector_index() 로 ivfflat 인덱스 생성.
+      4) 풀을 닫고 종료 코드 0 반환.
+
+    Args:
+        args: argparse 결과. pg(DSN)만 사용.
+
+    Returns:
+        종료 코드 — 0(빌드 성공), 1(PG 연결 실패).
+    """
     from core.config import load_and_validate_config
     from core.rag.knowledge_store import KnowledgeStore
 
@@ -389,6 +441,18 @@ async def run_build_index(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
+    """
+    CLI 진입점 — 로깅 설정 후 argparse 로 인자를 파싱하고 서브명령을 분기한다.
+
+    분기 규칙:
+      - --build-index 가 주어지면 run_build_index 만 실행하고 끝낸다(적재 없음).
+      - 그 외에는 --input 이 반드시 필요하며(없으면 parser.error 로 사용법 출력),
+        run_ingest 로 실제 배치 적재를 수행한다.
+    두 경로 모두 asyncio.run 으로 async 함수를 돌려 그 종료 코드를 그대로 반환한다.
+
+    Returns:
+        하위 실행(run_ingest / run_build_index)의 종료 코드.
+    """
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
