@@ -2943,3 +2943,15 @@ QA #43(깨진 Bash 명령을 못 고치고 14회·62초 반복)의 근본 방어
 - **구현(query_loop.py 1파일)**: 서명(도구+정규화입력)별 '연속 실패 턴 수'를 지역 dict로 추적. Phase 4에서 tool_result의 is_error를 tool_use_id로 수집 → `_update_tool_failure_streak`로 갱신. `REPEATED_TOOL_FAILURE_WARN=3`턴 → user역할 "반복 중단" 피드백 1회 주입, `ABORT=5`턴 → 루프 강제 종료. 순수 헬퍼로 분리해 단위 테스트.
 - **code-reviewer 별도 레인 검토(자기승인 금지)** → 실결함 3건 확증·수정: (HIGH) stale 서명 미evict로 WARN 매턴 무한주입 → 이번 턴 등장 서명만 카운트+evict. (MED) 병렬 동일호출 턴당 다중증가 → 서명별 턴당 +1 dedup. (LOW) `==`→`>=`+warned_sigs 1회주입 보장. 리뷰가 메시지순서·ABORT return·StreamEvent 계약은 무결성 확인.
 - **검증**: 단위 10개(증가·리셋·독립·stale evict·병렬 dedup·임계·직렬화폴백) + 기존 query_loop 7개 통과. 포맷터 직접확인(tool_result 뒤 user 주입 정상). 라이브 회귀(계산 506628·일반대화) 정상, 가드 미발동.
+
+### 포인트 4 — 최신 LLM 기능격차 4종 (설계 Fable5 + 구현, 2026-07-08~09)
+
+격차 분석 후 4기능을 Fable5로 병렬 설계(user_mig/design/point4_*.md) → executor(opus) 구현 → 성역 검토 + 실 B200 e2e → 커밋. 전부 기본 OFF/additive라 무회귀.
+
+- **1. 구조화 출력(bdc6ca4)**: vLLM response_format(json_schema) 강제. Phase0 실측=response_format만 강제됨(guided_json 무시). tools 상호배타·thinking off. web /v1/chat/completions가 response_format 조용히 버리던 결함 수정. e2e 순수JSON·미지원type 400. 유닛10+전체1087.
+- **2. RAG 출처인용(8d74907)**: 본문 [출처N] + 서버진실 sources 필드. KnowledgeCitation frozen + KNOWLEDGE_SOURCES 이벤트. 기본 OFF. e2e 바흐5·광합성3 출처. 유닛127+전체1117.
+- **4. TodoWrite 체크리스트(0914448)**: 기존 깨진 TodoRead/Write를 사양(체크리스트)대로 복구. core/todo_store.py leaf. 권한 READONLY(PLAN 허용). e2e SSE todo_update revision. 유닛34+전체1147.
+- **3. 자기일관성(870014f)**: KNOWLEDGE 사실형에 n=3 합의(기본 OFF, 3중게이트). n=1 바이트동일 무회귀. B200 벤치=발동·"교차검증중(3표본)"·2~5초. 서술형/일관된오답은 못잡음(정직). 유닛23+전체1129.
+- **인용 회귀 수정(92dd581)**: OFF인데 정적 프롬프트가 [출처N] 지시→모델이 근거없는 마커 날조. 정적 지시 제거, 게이팅 trailer로 일원화. OFF=마커0 복원, ON=정상.
+
+**다음**: 포인트 3(사양 재감사, 웹도구·포인트4는 의도적 이탈로 제외). 이후 [[project_multicorpus_rag]] 파이프라인 준비.
