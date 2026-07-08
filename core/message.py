@@ -117,6 +117,14 @@ class StreamEventType(str, Enum):
     # 기존 소비자에는 하위 호환(신규 type 추가일 뿐 기존 이벤트 수정 아님).
     KNOWLEDGE_SOURCES = "knowledge_sources"  # 지식 RAG 출처 목록(knowledge_sources 필드)
 
+    # 자기일관성(Self-Consistency) 표본 후보 (Point 4-3, 2026-07-09)
+    # vLLM n>1 요청에서 얻은 개별 표본 텍스트 1건을 Tier 3(inference.stream)가
+    # Tier 2(query_loop)로 올려보내는 전용 이벤트. text에 후보 원문, sample_index에
+    # 표본 번호(0..n-1)를 담는다. query_loop이 이 이벤트들을 버퍼링해 다수결 합의를
+    # 낸 뒤 승자만 TEXT_DELTA로 의사-스트림하므로, UI로는 흘려보내지 않는다(버퍼 전용).
+    # 미지 타입을 무시하는 기존 소비자에는 하위 호환(신규 type 추가일 뿐 기존 수정 아님).
+    SC_CANDIDATE = "sc_candidate"  # SC 표본 후보 텍스트(text + sample_index 필드)
+
     # 사용량
     USAGE_UPDATE = "usage_update"  # 토큰 사용량 갱신
 
@@ -316,6 +324,10 @@ class StreamEvent(BaseModel):
 
     # KNOWLEDGE_SOURCES — 지식 RAG 출처 목록(주입된 청크의 출처 메타). Point 4-2.
     knowledge_sources: list[KnowledgeCitation] | None = None
+
+    # SC_CANDIDATE — 자기일관성 표본 번호(0..n-1). Point 4-3. SC_CANDIDATE 이벤트에서만
+    # 유효하며, 나머지 이벤트에서는 None(하위 호환 — 기존 소비자는 이 필드를 모른다).
+    sample_index: int | None = None
 
     # 메타데이터
     model_id: str | None = None  # 이 이벤트를 만든 모델 식별자

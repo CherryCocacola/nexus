@@ -493,6 +493,48 @@ class RoutingProfile(BaseModel):
     presence_penalty: float = 0.0
 
 
+class SelfConsistencyConfig(BaseModel):
+    """
+    자기일관성(Self-Consistency) 사실 검증 설정 — 기본 비활성(fail-closed, P6).
+
+    같은 KNOWLEDGE 질의를 vLLM n>1로 한 요청에 N번 샘플링해 다수결로 답을
+    확정한다(설계 Point 4.3). 수치 깨짐·고유명사 혼동 같은 디코딩 노이즈 오답을
+    "오답은 흩어지고 정답은 수렴한다"는 원리로 상쇄한다.
+
+    ★기본 off 근거(정직한 판단, 설계 §4.4)★:
+      상시 3배 출력은 5090 토큰 예산에서 정당화 불가하고, 버퍼링으로 TTFT가
+      10초+로 늘어 대화형 UX에 치명적이다. 평가/데모/고정밀 KB QA 시나리오에서만
+      명시적으로 켠다. 켜더라도 아래 3중 게이트(설정·KNOWLEDGE 한정·사실형 패턴)를
+      모두 통과해야 발동한다.
+
+    단일 소스는 config/nexus_config.yaml#routing.self_consistency 이며, 아래
+    기본값은 yaml 누락 시(테스트/경량 실행) 폴백으로만 쓰인다(안티패턴 #4 회피).
+    """
+
+    # 마스터 스위치(G1 게이트). 기본 False = SC 경로 진입 자체를 차단(무회귀).
+    enabled: bool = False
+    # 표본 수. 2는 동률 불가피, 5는 비용 과다 → 3 고정 권장. ge/le로 예산 보호.
+    n: int = Field(default=3, ge=2, le=5)
+    # SC 전용 온도. knowledge_mode의 0.2로는 3표본이 사실상 동일해 투표가 무의미하므로
+    # 다양성 확보를 위해 0.7로 올린다(설계 §3.5 — 개별 표본 품질↓, 투표가 상쇄).
+    temperature: float = 0.7
+    top_p: float = 0.95
+    # 표본당 출력 캡 — 비용 분석(§4.1)의 전제. le로 과대 소비 방어.
+    max_tokens: int = Field(default=512, le=2048)
+    # 적용 질의 클래스(G2 게이트). TOOL/CHAT은 원리적으로 부적합하므로 제외.
+    apply_classes: list[str] = Field(default_factory=lambda: ["KNOWLEDGE"])
+    # 사실형 패턴 게이트(G3) on/off. 서술형은 majority 합의가 어려워(§3.3) 기본 차단.
+    factual_gate: bool = True
+    # 질문 길이 상한 — 초과 시 서술형 가능성이 높아 SC 제외(G3 병행 조건).
+    factual_max_question_chars: int = 120
+    # 이 글자수 이하면 정규화 exact majority, 초과 시 임베딩 클러스터(폴백)로 분기.
+    short_answer_max_chars: int = 80
+    # 최소 합의 표 수(N=3의 과반). 미달 시 후보 0번 채택 + 합의 실패 로그(§3.4).
+    min_agreement: int = 2
+    # 서술형 임베딩 클러스터 임계(폴백 경로에서만 사용).
+    similarity_threshold: float = 0.90
+
+
 class RoutingConfig(BaseModel):
     """
     질의 타입별 라우팅 설정.
@@ -585,6 +627,12 @@ class RoutingConfig(BaseModel):
             frequency_penalty=0.2,
             presence_penalty=0.0,
         )
+    )
+    # 자기일관성(Self-Consistency) 사실 검증 설정 — 기본 비활성(Point 4.3).
+    # yaml#routing.self_consistency가 단일 소스. 미지정 시 기본 SelfConsistencyConfig()
+    # (enabled=False)로 폴백해 기존 동작이 1비트도 바뀌지 않는다(무회귀).
+    self_consistency: SelfConsistencyConfig = Field(
+        default_factory=SelfConsistencyConfig
     )
 
 

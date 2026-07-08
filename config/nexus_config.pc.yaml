@@ -260,6 +260,20 @@ routing:
     presence_penalty: 0.0
     description: "인사·잡담 — RAG 미주입, 짧은 응답"
 
+  # 자기일관성(self-consistency) 사실 검증 — N표본 합의 (Point 4-3)
+  self_consistency:
+    enabled: false            # 기본 비활성 (fail-closed P6). B200 벤치 완료(짧은사실형 2~5초·표본3배)
+    n: 3                      # 표본 수(2=동률, 5=비용 과다 → 3 권장, 허용 2~5)
+    temperature: 0.7          # SC 전용 온도(knowledge 0.2로는 표본 다양성 없음)
+    top_p: 0.95
+    max_tokens: 512           # 표본당 출력 캡 — 비용 분석(§4.1)의 전제
+    apply_classes: ["KNOWLEDGE"]   # 적용 질의 클래스(TOOL/CHAT 금지)
+    factual_gate: true        # G3 사실형 패턴 게이트 on/off
+    factual_max_question_chars: 120
+    short_answer_max_chars: 80     # 이 이하면 exact majority, 초과 시 임베딩 클러스터
+    min_agreement: 2               # 최소 합의 표(N=3의 과반)
+    similarity_threshold: 0.90     # 서술형 임베딩 클러스터 임계(폴백 경로)
+
 # 세션 설정 (base 유지)
 session:
   sessions_dir: ".nexus/sessions"  # JSONL 트랜스크립트 저장 디렉토리

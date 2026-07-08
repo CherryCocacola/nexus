@@ -47,9 +47,24 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from core.config import RoutingConfig, TenantConfig
+    from core.config import RoutingConfig, SelfConsistencyConfig, TenantConfig
 
 logger = logging.getLogger("nexus.orchestrator.routing")
+
+
+# ─────────────────────────────────────────────
+# 자기일관성(Self-Consistency) G3 사실형 패턴 게이트 (Point 4.3)
+# ─────────────────────────────────────────────
+# "짧은 사실 답"을 기대하는 질문 패턴을 사전 컴파일 정규식으로 판정한다
+# (HeuristicClassifier와 동일한 방식). 서술형 질문은 majority 합의가 본질적으로
+# 어려우므로(설계 §3.3), 이 패턴에 매치되고 길이가 짧을 때만 SC를 태운다.
+# 이 게이트가 실질적 비용 방어선이다 — 오탐 시 토큰만 3배 쓰고 이득이 없다.
+_SC_FACTUAL_PATTERN = re.compile(
+    r"언제|몇\s*(?:년|명|개|살|km|%|위|번|시|월|일)"
+    r"|누구|어디|얼마|무슨\s*(?:년도|색)|수도는|이름은"
+    r"|when|who|where|how\s+many|how\s+much",
+    re.IGNORECASE,
+)
 
 
 # ─────────────────────────────────────────────
@@ -252,6 +267,14 @@ class RoutingDecision:
     repetition_penalty: float = 1.0
     frequency_penalty: float = 0.0
     presence_penalty: float = 0.0
+    # ── 자기일관성(Self-Consistency) 파라미터 (Point 4.3) ──────────────────
+    # 기본값은 전부 "비활성"(sc_n=1). 3중 게이트(G1~G3)를 모두 통과할 때만
+    # RoutingResolver.resolve()가 sc_n=config.n으로 채운다. sc_n<=1이면 Tier2/Tier3가
+    # SC 로직을 통째로 우회하므로 기존 동작이 1비트도 바뀌지 않는다(무회귀).
+    sc_n: int = 1                          # 1 = SC 비활성(하위 호환 기본값)
+    sc_min_agreement: int = 2              # 최소 합의 표(N=3의 과반)
+    sc_short_answer_max_chars: int = 80    # 이 이하면 exact majority, 초과 시 임베딩 클러스터
+    sc_similarity_threshold: float = 0.90  # 서술형 임베딩 클러스터 임계(폴백 경로)
 
     @property
     def routing_enabled(self) -> bool:
@@ -262,6 +285,15 @@ class RoutingDecision:
     def inject_knowledge_rag(self) -> bool:
         """KB RAG 주입 여부 — KNOWLEDGE만 True, CHAT/TOOL은 False (Part 2.5.9)."""
         return self.query_class == "KNOWLEDGE"
+
+    @property
+    def self_consistency_active(self) -> bool:
+        """이번 턴에 자기일관성(SC) 다중표본 경로가 발동하는지 (Point 4.3).
+
+        sc_n>1일 때만 True — Tier 2(query_loop)가 이 값으로 SC 버퍼링/합의를 켠다.
+        기본 sc_n=1(비활성)이면 항상 False라 기존 단일 경로 그대로다(무회귀).
+        """
+        return self.sc_n > 1
 
 
 # ─────────────────────────────────────────────
@@ -365,11 +397,36 @@ class RoutingResolver:
             src = getattr(tenant, "allowed_knowledge_sources", None) or []
             allowed_sources = list(src) if src else None
 
+        # ── 자기일관성(SC) 게이팅 판정 (Point 4.3, G1~G3) ──────────────────
+        # 기본 샘플링 값은 선택된 프로필 값. 3중 게이트를 모두 통과하면 SC 전용
+        # 온도/top_p/max_tokens로 치환하고 sc_n을 config.n으로 채운다(설계 §5.3).
+        temperature = profile.temperature
+        top_p = profile.top_p
+        max_tokens_cap: int | None = profile.max_tokens
+        sc_n = 1
+        sc_min_agreement = 2
+        sc_short = 80
+        sc_sim = 0.90
+        sc = self._resolve_sc_gate(user_input, query_class)
+        if sc is not None:
+            # 게이트 통과 — SC 발동. 샘플링을 SC 전용값으로 치환(표본 다양성 확보).
+            sc_n = sc.n
+            temperature = sc.temperature
+            top_p = sc.top_p
+            max_tokens_cap = sc.max_tokens
+            sc_min_agreement = sc.min_agreement
+            sc_short = sc.short_answer_max_chars
+            sc_sim = sc.similarity_threshold
+            logger.info(
+                "라우팅(SC): class=%s → n=%d, temp=%.2f, max_tokens=%d (사실 교차검증)",
+                query_class, sc_n, temperature, max_tokens_cap,
+            )
+
         return RoutingDecision(
             query_class=query_class,
             model_override=model,
-            temperature=profile.temperature,
-            max_tokens_cap=profile.max_tokens,
+            temperature=temperature,
+            max_tokens_cap=max_tokens_cap,
             enable_thinking=profile.enable_thinking,
             allowed_knowledge_sources=allowed_sources,
             tenant_id=tenant.id if tenant else None,
@@ -377,11 +434,46 @@ class RoutingResolver:
             # 선택된 프로필의 샘플링 파라미터를 그대로 실어 보낸다.
             # 여기서부터 query_loop → model_dispatcher → inference.stream()까지
             # passthrough로 흘러가 최종 vLLM payload에 반영된다(degeneration 방지).
-            top_p=profile.top_p,
+            top_p=top_p,
             repetition_penalty=profile.repetition_penalty,
             frequency_penalty=profile.frequency_penalty,
             presence_penalty=profile.presence_penalty,
+            # SC 파라미터 — 게이트 미통과 시 sc_n=1(비활성)이라 무회귀.
+            sc_n=sc_n,
+            sc_min_agreement=sc_min_agreement,
+            sc_short_answer_max_chars=sc_short,
+            sc_similarity_threshold=sc_sim,
         )
+
+    def _resolve_sc_gate(
+        self, user_input: str, query_class: str
+    ) -> SelfConsistencyConfig | None:
+        """자기일관성 3중 게이트(G1~G3)를 검사해 통과 시 SC 설정을, 아니면 None 반환.
+
+        게이트(설계 §1.2 — 모두 통과해야 SC 경로 진입):
+          G1. 설정      : config.self_consistency.enabled == True (기본 False)
+          G2. 질의 클래스 : query_class ∈ apply_classes (기본 ["KNOWLEDGE"])
+          G3. 사실형 패턴 : factual_gate on이면, 질문 길이 상한 이하 + 사실형 정규식 매치
+
+        구버전 RoutingConfig 객체에 self_consistency 필드가 없을 수 있어 getattr로
+        안전하게 폴백한다(없으면 SC 미발동 — fail-closed).
+        """
+        sc = getattr(self._routing, "self_consistency", None)
+        # G1: 마스터 스위치 — 미설정/비활성이면 즉시 미발동(fail-closed).
+        if sc is None or not sc.enabled:
+            return None
+        # G2: 질의 클래스 제한 — TOOL/CHAT은 원리적으로 부적합해 제외.
+        if query_class not in sc.apply_classes:
+            return None
+        # G3: 사실형 패턴 게이트(선택). 서술형은 majority 합의가 어려워 차단한다.
+        if sc.factual_gate:
+            # 긴 복합 질문은 서술형 가능성이 높아 길이 상한으로 먼저 거른다.
+            if len(user_input) > sc.factual_max_question_chars:
+                return None
+            # 짧은 사실 답을 기대하는 패턴이 아니면 SC 미발동(비용 방어선).
+            if not _SC_FACTUAL_PATTERN.search(user_input):
+                return None
+        return sc
 
 
 # ─────────────────────────────────────────────

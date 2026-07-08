@@ -63,11 +63,24 @@ from core.message import (
     TokenUsage,
 )
 from core.model.inference import ModelProvider, StructuredOutputSpec
+from core.orchestrator.self_consistency import resolve_consensus
 from core.orchestrator.stop_resolver import StopResolver, _seems_truncated
 from core.orchestrator.stream_handler import StreamingToolExecutor
 from core.tools.base import BaseTool, ToolUseContext
 
 logger = logging.getLogger("nexus.orchestrator.query_loop")
+
+
+def _chunk_text(text: str, size: int) -> list[str]:
+    """텍스트를 size 글자 단위로 잘라 리스트로 돌려준다(SC 승자 의사-스트림용).
+
+    합의로 확정한 승자 텍스트를 한 번에 던지지 않고 조각내어 TEXT_DELTA로
+    연속 yield하면, 상위 소비자(웹 SSE/CLI Rich)가 일반 턴과 구분 없이 자연스럽게
+    렌더링한다(설계 §6.2). size 이하이거나 빈 문자열이면 통째로 담는다.
+    """
+    if not text:
+        return []
+    return [text[i : i + size] for i in range(0, len(text), size)]
 
 
 # ─────────────────────────────────────────────
@@ -529,6 +542,15 @@ async def query_loop(
     # 구조화 출력(guided decoding) 스펙. None이면 일반 에이전트 턴(무회귀).
     # 지정되면 도구를 노출하지 않고(1차 방어) Tier 3로 그대로 전달한다.
     structured_output: StructuredOutputSpec | None = None,
+    # 자기일관성(Self-Consistency) 파라미터 (Point 4.3). sc_n=1(기본)이면 SC 로직을
+    # 통째로 우회하므로 기존 동작이 1비트도 바뀌지 않는다(무회귀). sc_n>1이면
+    # Tier 3에 n=sc_n을 전달해 표본 N개를 받고, 합의(다수결/임베딩 클러스터)로 승자를
+    # 확정한 뒤 승자만 의사-스트림한다. structured_output이 지정되면 SC는 비활성이다
+    # (guided decoding과 상호 배타 — 구조화 응답에 다중표본 합의는 부적합).
+    sc_n: int = 1,
+    sc_min_agreement: int = 2,
+    sc_short_answer_max_chars: int = 80,
+    sc_similarity_threshold: float = 0.90,
 ) -> AsyncGenerator[StreamEvent | Message, None]:
     """
     핵심 에이전트 턴 루프.
@@ -580,6 +602,12 @@ async def query_loop(
     # stop_resolver: 매 턴 끝에서 "도구 호출이 남았는지"를 판정해 계속/종료를 결정한다.
     state = LoopState(messages=messages)
     stop_resolver = StopResolver()
+
+    # ── 자기일관성(SC) 활성 여부 (Point 4.3) ──────────────────────────────
+    # sc_n>1이고 구조화 출력이 아닐 때만 SC 경로를 켠다. structured_output과는
+    # 상호 배타(둘 다 응답 본문 문법을 다투므로). sc_active=False면 아래 SC 분기는
+    # 전부 죽은 코드가 되어 기존 단일 경로와 완전히 동일하게 동작한다(무회귀).
+    sc_active = structured_output is None and sc_n > 1
 
     # 출력 토큰 에스컬레이션 단계 확정 — 주입값 우선, 미주입 시 모듈 상수 폴백.
     # (하드코딩 외부화 무회귀: config 미주입 경로/기존 테스트는 상수 그대로 사용)
@@ -724,11 +752,25 @@ async def query_loop(
         turn_usage = TokenUsage()  # 이번 턴의 토큰 사용량
         stop_reason: StopReason | None = None  # 모델 종료 이유
         model_error: str | None = None  # 모델 에러 메시지
+        # SC 표본 후보 버퍼(표본 index → 완성 텍스트). sc_active일 때만 채워진다.
+        # Tier 3가 SC_CANDIDATE 이벤트로 올려보낸 후보들을 여기 모아, 스트림 종료 후
+        # 다수결/임베딩 클러스터 합의를 낸다(§3, §6.2).
+        sc_candidates: dict[int, str] = {}
         # ERROR 이벤트 기반 복구가 발동했는지 표시하는 플래그(감사 Critical #8).
         # Tier 3가 예외 대신 ERROR StreamEvent로 컨텍스트 초과를 내려보낸 경우,
         # Phase 2 안에서 헬퍼로 복구한 뒤 이 플래그를 세워, except/Phase 3를 건너뛰고
         # 곧장 다음 턴으로 재시도(continue)하게 한다.
         error_event_recovered = False
+
+        # ── SC 활동 표시 (Point 4.3, §6.2) ──
+        # SC 모드는 전 표본을 버퍼링한 뒤 합의를 내므로, 합의 전까지 출력이 없다
+        # (무출력 구간). 이때 사용자가 hang으로 오인하지 않도록 SYSTEM_INFO를 즉시
+        # 흘려보내 "사실 교차 검증 중"임을 알린다. 신규 이벤트 타입 불필요(재사용).
+        if sc_active:
+            yield StreamEvent(
+                type=StreamEventType.SYSTEM_INFO,
+                message=f"사실 교차 검증 중 ({sc_n}표본)",
+            )
 
         # StreamingToolExecutor 생성 — 스트리밍 중 도구를 병렬 실행
         # 모델이 응답을 다 만들 때까지 기다리지 않고, tool_use가 완성되는 즉시
@@ -765,18 +807,29 @@ async def query_loop(
                 presence_penalty=presence_penalty,
                 # 구조화 출력 스펙을 Tier 3로 전달(passthrough) — None이면 일반 생성.
                 structured_output=structured_output,
+                # SC 표본 수 — sc_active일 때만 n>1, 아니면 1(기존 단일 경로, 무회귀).
+                n=sc_n if sc_active else 1,
             )
             async for event in stream_with_watchdog(
                 _raw_stream,
                 idle_timeout=30.0,
                 total_timeout=300.0,
             ):
-                # 이벤트를 UI로 전파 (먼저 상위 Tier로 흘려보낸 뒤 내부 처리)
-                yield event
-
                 # 이벤트 처리 — type이 enum이거나 문자열일 수 있음
                 # 프로바이더 구현에 따라 둘 중 무엇이 와도 동작하도록 .value로 정규화한다.
                 event_type = event.type if isinstance(event.type, str) else event.type.value
+
+                # ── SC 후보 버퍼링 (Point 4.3, §6.2) ──
+                # SC 모드의 표본 후보(SC_CANDIDATE)는 UI로 흘리지 않고 모아둔다.
+                # 합의 후 승자만 TEXT_DELTA로 의사-스트림하기 때문이다. 원문 후보 N개가
+                # 그대로 노출되면 혼란스러우므로 Tier 2에서 확실히 가로챈다(yield 안 함).
+                if sc_active and event_type == StreamEventType.SC_CANDIDATE.value:
+                    if event.sample_index is not None:
+                        sc_candidates[event.sample_index] = event.text or ""
+                    continue
+
+                # 이벤트를 UI로 전파 (먼저 상위 Tier로 흘려보낸 뒤 내부 처리)
+                yield event
 
                 if event_type == StreamEventType.TEXT_DELTA.value:
                     # 텍스트 조각 누적
@@ -951,6 +1004,56 @@ async def query_loop(
                     ),
                 )
                 return
+
+        # ─── 자기일관성(SC) 합의 + 승자 의사-스트림 (Point 4.3, §3·§6.2) ───
+        # SC 모드에서 표본 후보가 모였고, tool_calls 폴백도 아니고, 모델 에러도 아니면
+        # 합의를 낸다. 표본에 tool_calls가 섞이면(tool_use_blocks 있음) Tier 3가 이미
+        # 단일 스트림으로 폴백했으므로 여기선 SC를 건너뛰고 일반 도구 실행 턴으로 간다.
+        if sc_active and sc_candidates and not tool_use_blocks and not model_error:
+            # 표본을 index 순서대로 정렬해 후보 리스트를 만든다.
+            candidates = [sc_candidates[i] for i in sorted(sc_candidates)]
+            embeddings: list[list[float]] | None = None
+            # 서술형(긴 답)이 하나라도 있으면 임베딩 클러스터 폴백을 위해 임베딩을 만든다.
+            # (짧은 사실형만 있으면 임베딩 없이 순수 다수결 — 임베딩 서버 왕복 절약)
+            if any(len(c) > sc_short_answer_max_chars for c in candidates):
+                try:
+                    embeddings = await model_provider.embed(candidates)
+                except Exception as e:
+                    # 임베딩 서버 실패는 치명적이지 않다 — 다수결로 폴백(정직히 로그).
+                    logger.warning("SC 임베딩 실패 — 다수결로 폴백: %s", e)
+                    embeddings = None
+            # 순수 함수 합의 모듈 호출(모델 호출 없음 — 체인 밖 헬퍼).
+            result = resolve_consensus(
+                candidates,
+                min_agreement=sc_min_agreement,
+                short_answer_max_chars=sc_short_answer_max_chars,
+                embeddings=embeddings,
+                similarity_threshold=sc_similarity_threshold,
+            )
+            if not result.consensus_reached:
+                # 합의 실패(3표가 전부 다름 등) — 후보 0번 채택 + 관측 로그(§3.4).
+                # 재샘플링(N 추가)은 하지 않는다(토큰 예산 원칙).
+                logger.warning(
+                    "SC 합의 실패 (%d/%d표) — 첫 표본 채택: %.80s",
+                    result.agreement, result.total, result.winner,
+                )
+                yield StreamEvent(
+                    type=StreamEventType.SYSTEM_WARNING,
+                    message=(
+                        f"[사실 교차검증] {result.total}표본 중 합의 실패 "
+                        f"({result.agreement}표) — 첫 표본을 사용합니다."
+                    ),
+                )
+            else:
+                logger.info(
+                    "SC 합의 성공 (%s, %d/%d표)",
+                    result.method, result.agreement, result.total,
+                )
+            # 승자를 40자씩 잘라 TEXT_DELTA로 의사-스트림(일반 턴과 동일 렌더링, §6.2).
+            for _chunk in _chunk_text(result.winner, 40):
+                yield StreamEvent(type=StreamEventType.TEXT_DELTA, text=_chunk)
+            # assistant 메시지 본문을 승자로 확정한다(아래 join이 이 값을 집는다).
+            assistant_text_parts = [result.winner]
 
         # assistant 메시지 기록
         # 스트림으로 조각조각 받은 텍스트를 하나로 합치고, 이번 턴에 모델이 요청한

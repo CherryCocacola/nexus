@@ -55,6 +55,7 @@ class ScriptedProvider(ModelProvider):
         # Tier2→Tier3 전달(passthrough) 및 도구 비노출 분기를 테스트에서 검증한다.
         self.last_structured_output: Any = None
         self.last_tools: list[dict[str, Any]] | None = None
+        self.last_n: int = 1
 
     async def stream(
         self,
@@ -71,10 +72,12 @@ class ScriptedProvider(ModelProvider):
         frequency_penalty: float = 0.0,
         presence_penalty: float = 0.0,
         structured_output: Any = None,
+        n: int = 1,
     ) -> AsyncGenerator[StreamEvent, None]:
         # 전파 검증용 기록 — 실제 동작은 흉내내지 않는다.
         self.last_structured_output = structured_output
         self.last_tools = tools
+        self.last_n = n
         idx = min(self.call_count, len(self._script) - 1)
         action = self._script[idx]
         self.call_count += 1

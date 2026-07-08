@@ -67,6 +67,7 @@ class MockModelProvider(ModelProvider):
         frequency_penalty: float = 0.0,
         presence_penalty: float = 0.0,
         structured_output: Any = None,
+        n: int = 1,
     ) -> AsyncGenerator[StreamEvent, None]:
         """미리 설정된 텍스트를 StreamEvent로 yield한다."""
         # 응답 텍스트 선택 (호출 순서대로)

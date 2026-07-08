@@ -333,6 +333,11 @@ class QueryEngine:
                 output_token_escalation=self._output_token_escalation,
                 # 구조화 출력 스펙(호출 단위 인자). None이면 일반 경로.
                 structured_output=structured_output,
+                # 자기일관성(SC) 파라미터 — 게이트 미통과 시 sc_n=1(비활성, 무회귀).
+                sc_n=decision.sc_n,
+                sc_min_agreement=decision.sc_min_agreement,
+                sc_short_answer_max_chars=decision.sc_short_answer_max_chars,
+                sc_similarity_threshold=decision.sc_similarity_threshold,
             )
         else:
             # 폴백 — dispatcher 주입이 없는 경우 기존 단일 Worker 경로
@@ -358,6 +363,11 @@ class QueryEngine:
                 output_token_escalation=self._output_token_escalation,
                 # 구조화 출력 스펙(호출 단위 인자). None이면 일반 경로.
                 structured_output=structured_output,
+                # 자기일관성(SC) 파라미터 — 게이트 미통과 시 sc_n=1(비활성, 무회귀).
+                sc_n=decision.sc_n,
+                sc_min_agreement=decision.sc_min_agreement,
+                sc_short_answer_max_chars=decision.sc_short_answer_max_chars,
+                sc_similarity_threshold=decision.sc_similarity_threshold,
             )
 
         # ─── 스트림 소비 ─────────────────────────────────

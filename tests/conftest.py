@@ -219,6 +219,7 @@ class EnhancedMockModelProvider(ModelProvider):
         frequency_penalty: float = 0.0,
         presence_penalty: float = 0.0,
         structured_output: Any = None,
+        n: int = 1,
     ) -> AsyncGeneratorType[StreamEvent, None]:
         """
         MockResponse에 따라 StreamEvent를 yield한다.
@@ -245,6 +246,8 @@ class EnhancedMockModelProvider(ModelProvider):
         self._last_presence_penalty = presence_penalty
         # 구조화 출력 스펙도 마지막 값을 기록 — 전파 검증용(Mock은 동작을 흉내내지 않음)
         self._last_structured_output = structured_output
+        # SC 표본 수도 마지막 값을 기록 — 전파 검증용(Mock은 다중표본을 흉내내지 않음)
+        self._last_n = n
         # 현재 턴에 해당하는 응답을 선택 (마지막 응답은 반복 사용)
         idx = min(self._call_count, len(self._responses) - 1)
         response = self._responses[idx]

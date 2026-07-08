@@ -150,6 +150,7 @@ class ScoutModelProvider(LocalModelProvider):
         frequency_penalty: float = 0.0,
         presence_penalty: float = 0.0,
         structured_output: StructuredOutputSpec | None = None,
+        n: int = 1,
     ) -> AsyncGenerator[StreamEvent, None]:
         """
         Scout 전용 stream — enable_thinking을 None으로 강제한다.
@@ -197,6 +198,8 @@ class ScoutModelProvider(LocalModelProvider):
             presence_penalty=presence_penalty,
             # Scout는 구조화 출력 대상이 아니지만 시그니처 정합을 위해 그대로 전달.
             structured_output=structured_output,
+            # SC 표본 수도 시그니처 정합을 위해 그대로 전달(Scout는 SC 대상 아님 — 통상 1).
+            n=n,
         ):
             yield ev
 

@@ -142,11 +142,19 @@ class ModelProvider(ABC):
         frequency_penalty: float = 0.0,
         presence_penalty: float = 0.0,
         structured_output: StructuredOutputSpec | None = None,
+        n: int = 1,
     ) -> AsyncGenerator[StreamEvent, None]:
         """
         모델에 스트리밍 요청을 보낸다.
 
         Args:
+            n: 자기일관성(Self-Consistency)용 표본 수(Point 4.3). 기본 1이면 기존
+                단일 경로 그대로다(무회귀). n>1이면 vLLM `n` 파라미터로 한 요청 안에서
+                프롬프트 KV cache를 공유하며 N개 시퀀스를 생성하고(prefill 1회 +
+                디코드만 N배), 라이브 TEXT_DELTA 대신 표본별 완성 텍스트를 SC_CANDIDATE
+                이벤트(text + sample_index)로 올려보낸다. 상위(query_loop)가 이를
+                버퍼링해 다수결 합의를 낸다. 어떤 표본에 tool_calls가 섞이면 SC를
+                포기하고 choice 0만으로 기존 단일 스트림처럼 폴백한다(설계 §2.3).
             model_override: 호출 시점에 기본 model_id를 덮어쓴다.
                 v7.0 Part 2.5 쿼리 라우팅에서 LoRA ON/OFF를 런타임 전환하기 위해 사용.
                 None이면 프로바이더의 model_id를 그대로 쓴다.
@@ -316,12 +324,18 @@ class LocalModelProvider(ModelProvider):
         frequency_penalty: float = 0.0,
         presence_penalty: float = 0.0,
         structured_output: StructuredOutputSpec | None = None,
+        n: int = 1,
     ) -> AsyncGenerator[StreamEvent, None]:
         """
         vLLM /v1/chat/completions SSE 스트리밍.
 
         변환 흐름:
           Nexus Message[] → OpenAI messages[] → SSE chunks → StreamEvent yield
+
+        n>1(자기일관성, Point 4.3)이면 payload에 "n"을 실어 한 요청으로 N개 시퀀스를
+        생성하고, choices[i].index로 표본을 디멀티플렉스한다. 이 경우 라이브 TEXT_DELTA는
+        내보내지 않고 표본별 완성 텍스트를 SC_CANDIDATE 이벤트로 올려보낸다(설계 §2.3).
+        n=1(기본)이면 아래 코드 경로가 기존과 완전히 동일하다(무회귀).
 
         model_override/enable_thinking은 v7.0 Part 2.5 쿼리 라우팅에서 LoRA
         ON/OFF 및 thinking 모드를 런타임 전환하기 위해 사용된다.
@@ -376,6 +390,14 @@ class LocalModelProvider(ModelProvider):
         if enable_thinking is not None:
             # bool(True/False)일 때만 명시적으로 주입 — None이면 완전 생략
             payload["chat_template_kwargs"] = {"enable_thinking": enable_thinking}
+
+        # ── 자기일관성(Self-Consistency) 표본 수 (Point 4.3) ─────────────────
+        # n>1일 때만 "n"을 주입한다. n=1이면 vLLM 기본값과 같아 굳이 넣지 않아
+        # payload가 기존과 바이트 단위로 동일하게 유지된다(무회귀). n개 시퀀스는
+        # 프롬프트 KV cache를 공유하므로 prefill은 1회, 디코드만 N배 든다(설계 §2.1).
+        sc_mode = n > 1
+        if sc_mode:
+            payload["n"] = n
 
         if stop_sequences:
             payload["stop"] = stop_sequences
@@ -445,6 +467,14 @@ class LocalModelProvider(ModelProvider):
             # vLLM은 finish_reason 청크 → usage 청크 → [DONE] 순으로 전송한다.
             pending_stop: StopReason | None = None
 
+            # ── 자기일관성(SC) 전용 상태 (n>1일 때만 사용) ──────────────────
+            # 표본(choice) 인덱스별 텍스트 조각을 버퍼링한다. 라이브 TEXT_DELTA는
+            # 내보내지 않고(§2.3), [DONE] 시점에 SC_CANDIDATE로 한꺼번에 올려보낸다.
+            # 어떤 표본이든 tool_calls가 나오면 sc_tool_seen을 세워 SC를 포기하고
+            # choice 0만으로 단일 스트림처럼 폴백한다(설계 §2.3).
+            sc_candidate_texts: dict[int, list[str]] = {}
+            sc_tool_seen = False
+
             try:
                 async with self._client.stream(
                     "POST",
@@ -510,6 +540,17 @@ class LocalModelProvider(ModelProvider):
                         # "data: " (6글자) 이후가 실제 페이로드
                         data_str = line[6:].strip()
                         if data_str == "[DONE]":
+                            if sc_mode:
+                                # ── SC 종료 처리 (§2.3) ──
+                                for _evt in self._finalize_sc_stream(
+                                    sc_candidate_texts,
+                                    sc_tool_seen,
+                                    accumulated_tool_calls,
+                                    pending_stop,
+                                    total_usage,
+                                ):
+                                    yield _evt
+                                return
                             # pending_stop이 없으면 (finish_reason 없이 [DONE] 도달)
                             # 폴백으로 END_TURN 사용
                             if pending_stop is None:
@@ -540,6 +581,48 @@ class LocalModelProvider(ModelProvider):
 
                         # usage 전용 청크는 choices가 비어 있을 수 있으므로 건너뛴다
                         if not data.get("choices"):
+                            continue
+
+                        # ── SC 모드(n>1): 표본을 index로 디멀티플렉스 ──────────────
+                        # vLLM은 청크마다 choices[i].index로 시퀀스를 구분해 보낸다.
+                        # 표본별 텍스트를 버퍼링만 하고(라이브 TEXT_DELTA 억제), tool_calls는
+                        # choice 0에 대해서만 라이브로 흘려 단일 폴백을 준비한다(§2.3).
+                        if sc_mode:
+                            for _sc_choice in data["choices"]:
+                                ci = _sc_choice.get("index", 0)
+                                sc_delta = _sc_choice.get("delta", {})
+                                sc_finish = _sc_choice.get("finish_reason")
+                                # 본문 텍스트 조각을 표본 버퍼에 누적(표출은 합의 후).
+                                if sc_delta.get("content"):
+                                    sc_candidate_texts.setdefault(ci, []).append(
+                                        sc_delta["content"]
+                                    )
+                                # reasoning_content를 본문으로 합치는 프로바이더(Scout 등)면
+                                # 그 조각도 같은 버퍼에 담는다(내용 유실 방지).
+                                sc_reasoning = sc_delta.get("reasoning_content")
+                                if sc_reasoning and getattr(
+                                    self, "_include_reasoning_as_text", False
+                                ):
+                                    sc_candidate_texts.setdefault(ci, []).append(
+                                        sc_reasoning
+                                    )
+                                # tool_calls가 어떤 표본에든 나오면 SC 포기 신호. 실제
+                                # 누적/이벤트는 choice 0에 대해서만 수행(단일 폴백 대상).
+                                if "tool_calls" in sc_delta:
+                                    sc_tool_seen = True
+                                    if ci == 0:
+                                        for _tc in sc_delta["tool_calls"]:
+                                            for _evt in self._accumulate_tool_call(
+                                                accumulated_tool_calls, _tc
+                                            ):
+                                                yield _evt
+                                # choice 0의 finish_reason만 단일 폴백의 종료 이유로 쓴다.
+                                if sc_finish and ci == 0:
+                                    pending_stop = {
+                                        "stop": StopReason.END_TURN,
+                                        "length": StopReason.MAX_TOKENS,
+                                        "tool_calls": StopReason.TOOL_USE,
+                                    }.get(sc_finish, StopReason.END_TURN)
                             continue
 
                         # 스트리밍에서는 한 청크당 choice 1개. delta에 이번 조각이 담긴다.
@@ -991,6 +1074,66 @@ class LocalModelProvider(ModelProvider):
                         ),
                     )
                 )
+        return events
+
+    # ─── 내부: 자기일관성(SC) 스트림 종료 처리 ───
+
+    def _finalize_sc_stream(
+        self,
+        candidate_texts: dict[int, list[str]],
+        tool_seen: bool,
+        accumulated_tool_calls: dict[int, dict[str, Any]],
+        pending_stop: StopReason | None,
+        total_usage: TokenUsage,
+    ) -> list[StreamEvent]:
+        """
+        SC 모드([DONE] 시점)의 종료 이벤트 목록을 만든다(설계 §2.3).
+
+        두 갈래:
+          (1) tool_seen=True → SC 포기, choice 0만으로 단일 스트림처럼 폴백.
+              choice 0 버퍼 텍스트를 TEXT_DELTA로, 누적된 tool_calls를 TOOL_USE_STOP으로
+              내보내고 MESSAGE_STOP으로 닫는다. 상위(query_loop)는 tool_use가 있으므로
+              SC 합의를 건너뛰고 일반 도구 실행 턴으로 진행한다.
+          (2) tool_seen=False → 표본별 완성 텍스트를 SC_CANDIDATE(text + sample_index)로
+              index 순서대로 1건씩 올려보낸 뒤 MESSAGE_STOP으로 닫는다. 상위가 이
+              후보들을 버퍼링해 다수결 합의를 낸다. usage는 표본 합산이 이미 반영된
+              vLLM 값을 그대로 정직 보고한다(과소 계상 금지, §6.2).
+        """
+        events: list[StreamEvent] = []
+        if tool_seen:
+            # choice 0의 버퍼 텍스트를 단일 스트림처럼 흘려보낸다.
+            text0 = "".join(candidate_texts.get(0, []))
+            if text0:
+                events.append(
+                    StreamEvent(type=StreamEventType.TEXT_DELTA, text=text0)
+                )
+            # 누적된 choice 0 tool_calls를 완성 이벤트로 닫는다.
+            events.extend(self._finalize_tool_calls(accumulated_tool_calls))
+            events.append(
+                StreamEvent(
+                    type=StreamEventType.MESSAGE_STOP,
+                    stop_reason=pending_stop or StopReason.END_TURN,
+                    usage=total_usage,
+                )
+            )
+            return events
+
+        # 순수 SC — 표본을 SC_CANDIDATE로 index 순서대로 올려보낸다.
+        for ci in sorted(candidate_texts.keys()):
+            events.append(
+                StreamEvent(
+                    type=StreamEventType.SC_CANDIDATE,
+                    text="".join(candidate_texts[ci]),
+                    sample_index=ci,
+                )
+            )
+        events.append(
+            StreamEvent(
+                type=StreamEventType.MESSAGE_STOP,
+                stop_reason=pending_stop or StopReason.END_TURN,
+                usage=total_usage,
+            )
+        )
         return events
 
     # ─── 통계 ───

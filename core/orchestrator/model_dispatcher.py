@@ -165,6 +165,13 @@ class ModelDispatcher:
         # 구조화 출력 스펙(guided decoding). None이면 일반 경로(무회귀). 라우팅
         # 판단과 무관하게 query_loop으로 그대로 통과시킨다(passthrough).
         structured_output: StructuredOutputSpec | None = None,
+        # 자기일관성(Self-Consistency) 파라미터(Point 4.3). sc_n=1(기본)이면 SC 비활성
+        # 이라 query_loop이 기존 단일 경로로 동작한다(무회귀). QueryEngine이 라우팅
+        # 결정(RoutingDecision.sc_*)을 넘겨주며, route()는 판단 없이 통과만 시킨다.
+        sc_n: int = 1,
+        sc_min_agreement: int = 2,
+        sc_short_answer_max_chars: int = 80,
+        sc_similarity_threshold: float = 0.90,
     ) -> AsyncGenerator[StreamEvent | Message, None]:
         """
         Worker query_loop으로 직행하는 비동기 제너레이터 (passthrough).
@@ -226,6 +233,11 @@ class ModelDispatcher:
             output_token_escalation=output_token_escalation,
             # 구조화 출력 스펙 passthrough (None이면 일반 경로).
             structured_output=structured_output,
+            # SC 파라미터 passthrough — sc_n=1이면 query_loop이 SC를 우회한다(무회귀).
+            sc_n=sc_n,
+            sc_min_agreement=sc_min_agreement,
+            sc_short_answer_max_chars=sc_short_answer_max_chars,
+            sc_similarity_threshold=sc_similarity_threshold,
         ):
             yield event
 
