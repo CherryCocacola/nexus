@@ -165,6 +165,9 @@ async def init_phase2(state: GlobalState) -> dict:
         max_context_tokens=config.model.max_context_tokens,
         max_output_tokens=config.model.default_max_tokens,
         embedding_base_url=config.gpu_server.embedding_url,
+        # 구조화 출력 payload 주입 형태를 config에서 주입(하드코딩 회피, 안티패턴 #4).
+        # 기본 "response_format"은 Phase 0 B200 실측으로 확정된 값이다.
+        structured_output_injection_mode=config.structured_output.injection_mode,
     )
     components["model_provider"] = provider
     logger.info("[Phase 2] ModelProvider 초기화: %s", config.gpu_server_url)

@@ -51,7 +51,7 @@ from core.message import (
     StreamEventType,
     TokenUsage,
 )
-from core.model.inference import ModelProvider
+from core.model.inference import ModelProvider, StructuredOutputSpec
 from core.orchestrator.context_manager import ContextManager
 from core.orchestrator.prompt_assembler import PromptAssembler
 from core.orchestrator.query_loop import query_loop
@@ -215,7 +215,9 @@ class QueryEngine:
         )
 
     async def submit_message(
-        self, user_input: str
+        self,
+        user_input: str,
+        structured_output: StructuredOutputSpec | None = None,
     ) -> AsyncGenerator[StreamEvent | Message, None]:
         """
         사용자 메시지를 제출하고 스트리밍 응답을 반환한다.
@@ -234,6 +236,11 @@ class QueryEngine:
 
         Args:
             user_input: 사용자 입력 텍스트
+            structured_output: 구조화 출력(guided decoding) 스펙(선택). 지정되면
+                이번 호출의 응답이 지정 JSON Schema를 강제로 따른다. 세션 상태가
+                아니라 "호출 단위 인자"로 받는다 — 세션에 붙이면 다음 턴까지 스키마가
+                잔류해 일반 대화가 오염되기 때문이다(리스크 R8). dispatcher/폴백
+                query_loop 양쪽 경로로 그대로 전달한다.
 
         Yields:
             StreamEvent: 스트리밍 이벤트 (UI 업데이트용 — 텍스트 델타/도구 등)
@@ -304,6 +311,8 @@ class QueryEngine:
                 presence_penalty=decision.presence_penalty,
                 # 출력 토큰 에스컬레이션 단계(config 값, None이면 상수 폴백).
                 output_token_escalation=self._output_token_escalation,
+                # 구조화 출력 스펙(호출 단위 인자). None이면 일반 경로.
+                structured_output=structured_output,
             )
         else:
             # 폴백 — dispatcher 주입이 없는 경우 기존 단일 Worker 경로
@@ -327,6 +336,8 @@ class QueryEngine:
                 presence_penalty=decision.presence_penalty,
                 # 출력 토큰 에스컬레이션 단계(config 값, None이면 상수 폴백).
                 output_token_escalation=self._output_token_escalation,
+                # 구조화 출력 스펙(호출 단위 인자). None이면 일반 경로.
+                structured_output=structured_output,
             )
 
         # ─── 스트림 소비 ─────────────────────────────────

@@ -1020,6 +1020,33 @@ class KnowledgeRagConfig(BaseModel):
 
 
 # ─────────────────────────────────────────────
+# 구조화 출력 설정 (vLLM guided decoding) — 2026-07-08 Point 4.1
+# ─────────────────────────────────────────────
+class StructuredOutputConfig(BaseModel):
+    """
+    구조화 출력(guided decoding) 동작 설정.
+
+    단일 소스는 config/nexus_config.yaml#structured_output 이며, 이 기본값은
+    yaml 누락 시(테스트/경량 실행) 폴백으로만 쓰인다. 스키마 자체는 여기 두지
+    않는다 — JSON Schema는 요청별 가변 데이터(AgentHub가 보내는 값)라 "설정"이
+    아니기 때문이다(안티패턴 #4는 "설정값 하드코딩 금지"이지 "모든 데이터의
+    YAML화"가 아니다). 여기서는 "기능 동작 방식"만 설정한다.
+    """
+
+    # 마스터 스위치. False면 web 핸들러가 response_format 요청을 400으로 거부한다.
+    enabled: bool = True
+    # vLLM payload 주입 형태:
+    #   "response_format"    — OpenAI 표준 (권장, 기본. Phase 0 B200 실측으로 확정)
+    #   "structured_outputs" — vLLM 신형 확장 (표준형 미지원 티어의 폴백, 미실측)
+    injection_mode: str = "response_format"
+    # 스키마 직렬화 크기 상한(바이트). 초과 시 요청을 거부한다. 거대/재귀 스키마의
+    # xgrammar 문법 컴파일 지연(스트림 워치독 idle 30초와 충돌 위험)을 사전 차단한다.
+    max_schema_bytes: int = 65536
+    # json_schema.strict 기본값 (스키마 완전 준수 강제).
+    strict: bool = True
+
+
+# ─────────────────────────────────────────────
 # 컨텍스트 예산 설정 — 하드코딩 외부화 (2026-07-03, B200 티어 준비 Phase 1)
 # ─────────────────────────────────────────────
 class ContextBudgetConfig(BaseModel):
@@ -1241,6 +1268,13 @@ class NexusConfig(BaseSettings):
     # 지식 베이스 RAG 게이팅 — 무관 청크 주입 차단 (2026-06-18 추가)
     # 임계값을 코드가 아닌 yaml에서 받아 운영 중 튜닝 가능하게 한다.
     knowledge_rag: KnowledgeRagConfig = Field(default_factory=KnowledgeRagConfig)
+
+    # 구조화 출력 (vLLM guided decoding) — 외부 OpenAI 클라이언트의 response_format
+    # 수용 및 내부 구조화 생성 동작 설정 (2026-07-08 Point 4.1). 기본값=현행 동작
+    # 유지(response_format 표준형). 스키마는 항상 요청 단위로 지정한다(전역 스키마 없음).
+    structured_output: StructuredOutputConfig = Field(
+        default_factory=StructuredOutputConfig
+    )
 
     # 멀티테넌시 (Part 5 Ch 15, 2026-04-21)
     tenants: TenantRegistry = Field(default_factory=TenantRegistry)

@@ -62,7 +62,7 @@ from core.message import (
     StreamEventType,
     TokenUsage,
 )
-from core.model.inference import ModelProvider
+from core.model.inference import ModelProvider, StructuredOutputSpec
 from core.orchestrator.stop_resolver import StopResolver, _seems_truncated
 from core.orchestrator.stream_handler import StreamingToolExecutor
 from core.tools.base import BaseTool, ToolUseContext
@@ -526,6 +526,9 @@ async def query_loop(
     # 포함)는 [4096,8192,16384] 그대로 사용해 동작 불변(무회귀). config 값은
     # bootstrap→QueryEngine→(dispatcher.route/폴백 query_loop) 경로로 주입된다.
     output_token_escalation: list[int] | None = None,
+    # 구조화 출력(guided decoding) 스펙. None이면 일반 에이전트 턴(무회귀).
+    # 지정되면 도구를 노출하지 않고(1차 방어) Tier 3로 그대로 전달한다.
+    structured_output: StructuredOutputSpec | None = None,
 ) -> AsyncGenerator[StreamEvent | Message, None]:
     """
     핵심 에이전트 턴 루프.
@@ -562,6 +565,11 @@ async def query_loop(
             (degeneration)을 억제하기 위해 추가됨.
         frequency_penalty: 빈도 페널티 (기본 0.0=비활성).
         presence_penalty: 등장 페널티 (기본 0.0=비활성).
+        structured_output: 구조화 출력(guided decoding) 스펙 (기본 None). 지정되면
+            (1) 이번 루프에서 도구 스키마를 모델에 노출하지 않고(1차 방어 —
+            Tier 3의 tools 상호배타 ValueError를 애초에 유발하지 않음),
+            (2) model_provider.stream()에 그대로 전달해 응답 JSON 문법을 강제한다.
+            AgentHub 단발 호출·내부 추출 파이프라인 같은 "구조화 응답 전용" 경로용.
 
     Yields:
         StreamEvent: 스트리밍 이벤트 (UI 업데이트용)
@@ -617,7 +625,12 @@ async def query_loop(
                 # 압축 실패 시 원본 사용
 
         # 1b. 도구 스키마 준비 (이름순 정렬 — prompt cache 안정성)
-        tool_schemas = [t.to_schema() for t in tools]
+        # 구조화 출력 모드에서는 도구를 아예 노출하지 않는다(1차 방어).
+        # 왜: response_format(guided decoding)과 tools는 vLLM에서 상호 배타이며,
+        # Tier 3(stream)가 둘 다 오면 ValueError를 던진다. 여기서 도구 스키마를
+        # 비우면 그 예외를 애초에 유발하지 않고, 도구 스키마가 프롬프트 앞부분에
+        # 들어가지 않아 구조화 응답 전용 라인이 깔끔하게 유지된다.
+        tool_schemas = [] if structured_output is not None else [t.to_schema() for t in tools]
 
         # 1c. max_output_tokens 동적 결정
         # 도구 스키마 + 시스템 프롬프트 + 메시지가 차지하는 토큰을 추정하고,
@@ -737,7 +750,9 @@ async def query_loop(
             _raw_stream = model_provider.stream(
                 messages=api_messages,
                 system_prompt=system_prompt,
-                tools=tool_schemas if tools else None,
+                # tool_schemas는 구조화 출력 모드에서 []로 비워지므로 tools=None이 된다
+                # (Tier 3의 tools 상호배타 ValueError를 애초에 유발하지 않음).
+                tools=tool_schemas if tool_schemas else None,
                 temperature=temperature,
                 max_tokens=max_tokens,
                 model_override=model_override,
@@ -748,6 +763,8 @@ async def query_loop(
                 repetition_penalty=repetition_penalty,
                 frequency_penalty=frequency_penalty,
                 presence_penalty=presence_penalty,
+                # 구조화 출력 스펙을 Tier 3로 전달(passthrough) — None이면 일반 생성.
+                structured_output=structured_output,
             )
             async for event in stream_with_watchdog(
                 _raw_stream,

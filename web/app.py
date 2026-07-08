@@ -658,6 +658,15 @@ class OpenAIChatCompletionRequest(BaseModel):
     top_p: float | None = Field(default=None, description="nucleus 샘플링(엔진 관리 시 무시)")
     # 멀티테넌시 — body로도 테넌트 지정 가능(헤더/API 키와 동일 우선순위 체계).
     tenant_id: str | None = Field(default=None, description="테넌트 ID(선택)")
+    # OpenAI 표준 response_format — 구조화 출력(guided decoding) 요청.
+    #   {"type": "json_schema", "json_schema": {"name": ..., "schema": {...}, "strict": ...}}
+    #   또는 {"type": "json_object"}(스키마 없는 JSON 강제).
+    # 지정 시 엔진이 vLLM guided decoding으로 응답 JSON 문법을 강제한다. 과거에는
+    # extra="ignore"로 이 필드가 조용히 버려졌는데(드롭인 프로바이더 규격 위반),
+    # 이제 명시 필드로 받아 핸들러에서 StructuredOutputSpec으로 변환한다.
+    response_format: dict[str, Any] | None = Field(
+        default=None, description="구조화 출력 스펙(OpenAI response_format)"
+    )
 
 
 class OpenAIResponseMessage(BaseModel):
@@ -1629,6 +1638,74 @@ def _downloads_markdown(downloads: list[dict[str, str]]) -> str:
     return "\n\n---\n**첨부 문서:**\n" + links
 
 
+def _build_structured_output_spec(response_format: dict[str, Any] | None) -> Any:
+    """OpenAI response_format 필드를 내부 StructuredOutputSpec으로 변환한다(fail-closed).
+
+    None이면 None을 돌려주어 일반 생성 경로를 유지한다(무회귀). 값이 있으면 아래
+    규칙으로 검증하며, 어긋나면 조용히 무시하지 않고 400을 던진다(과거 extra=ignore가
+    바로 이 결함이었다 — 드롭인 프로바이더 규격 위반).
+
+      - structured_output.enabled=false            → 400 (기능 자체가 꺼짐)
+      - type == "json_schema": json_schema.schema(객체) 필수. name/strict 반영.
+      - type == "json_object": 스키마 없는 JSON 강제 → {"type": "object"}로 정규화.
+      - 그 외 type                                 → 400 (미지원)
+      - 직렬화 크기 > max_schema_bytes             → 400 (xgrammar 컴파일 지연 차단)
+
+    반환된 스펙은 호출 단위 인자로 submit_message에 넘긴다(세션 오염 방지, R8).
+    """
+    if response_format is None:
+        return None
+
+    from core.model.inference import StructuredOutputSpec
+
+    # config 접근 — 부트스트랩 전/테스트에서는 None일 수 있어 기본값으로 폴백한다.
+    cfg = _app_state.get("config")
+    so_cfg = getattr(cfg, "structured_output", None) if cfg else None
+
+    # 마스터 스위치 — 꺼져 있으면 조용히 무시하지 않고 명시적으로 거부한다.
+    if so_cfg is not None and not so_cfg.enabled:
+        raise HTTPException(
+            status_code=400,
+            detail="구조화 출력이 비활성화되어 있습니다(structured_output.enabled=false).",
+        )
+
+    default_strict = so_cfg.strict if so_cfg is not None else True
+    max_bytes = so_cfg.max_schema_bytes if so_cfg is not None else 65536
+
+    rf_type = response_format.get("type")
+    if rf_type == "json_schema":
+        js = response_format.get("json_schema") or {}
+        schema = js.get("schema")
+        if not isinstance(schema, dict):
+            raise HTTPException(
+                status_code=400,
+                detail="response_format.json_schema.schema(객체)가 필요합니다.",
+            )
+        name = js.get("name", "nexus_structured")
+        strict = js.get("strict", default_strict)
+    elif rf_type == "json_object":
+        # 스키마 없는 JSON 강제 — 최소 object 스키마로 정규화한다.
+        schema = {"type": "object"}
+        name = "nexus_structured"
+        strict = default_strict
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail=f"지원하지 않는 response_format.type: {rf_type!r} "
+            "('json_schema' 또는 'json_object'만 허용)",
+        )
+
+    # 스키마 크기 상한 검사 — 거대/재귀 스키마의 문법 컴파일 지연을 사전 차단한다.
+    schema_bytes = len(json.dumps(schema, ensure_ascii=False).encode("utf-8"))
+    if schema_bytes > max_bytes:
+        raise HTTPException(
+            status_code=400,
+            detail=f"스키마 크기({schema_bytes}B)가 상한({max_bytes}B)을 초과했습니다.",
+        )
+
+    return StructuredOutputSpec(json_schema=schema, name=name, strict=strict)
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(
     request: OpenAIChatCompletionRequest,
@@ -1647,6 +1724,10 @@ async def chat_completions(
     # (제너레이터 안에서 raise 하면 이미 200 스트림이 시작된 뒤라 400이 안 나감).
     system_content, prior_messages, last_user_text = _split_openai_messages(request.messages)
 
+    # 구조화 출력 스펙 변환 — StreamingResponse '이전'에 수행해야 400을 정상 반환한다
+    # (제너레이터 안에서 raise하면 이미 200 스트림이 시작된 뒤라 400이 안 나감).
+    structured_output = _build_structured_output_spec(request.response_format)
+
     # OpenAI 에는 session_id 개념이 없다 → 요청마다 임시 세션으로 무상태 처리.
     session_id = str(uuid.uuid4())
     # 응답에 반향할 모델명(요청값 우선, 없으면 기본값).
@@ -1662,6 +1743,7 @@ async def chat_completions(
                 system_content=system_content,
                 prior_messages=prior_messages,
                 last_user_text=last_user_text,
+                structured_output=structured_output,
             ),
             media_type="text/event-stream",
             headers={
@@ -1697,7 +1779,9 @@ async def chat_completions(
     usage = OpenAIUsage()
 
     # 4-Tier 체인 우회 금지: submit_message 가 yield 하는 StreamEvent 만 소비한다.
-    async for event in engine.submit_message(last_user_text):
+    async for event in engine.submit_message(
+        last_user_text, structured_output=structured_output
+    ):
         if not isinstance(event, StreamEvent):
             continue
         if event.type == StreamEventType.TEXT_DELTA and event.text:
@@ -1739,6 +1823,7 @@ async def _openai_stream_generate(
     system_content: str | None,
     prior_messages: list[Any],
     last_user_text: str,
+    structured_output: Any = None,
 ) -> AsyncGenerator[str, None]:
     """OpenAI `chat.completion.chunk` SSE 프레임을 생성한다.
 
@@ -1789,7 +1874,9 @@ async def _openai_stream_generate(
     async def _producer() -> None:
         """submit_message 스트림을 큐로 옮긴다(에러 포함)."""
         try:
-            async for ev in engine.submit_message(last_user_text):
+            async for ev in engine.submit_message(
+                last_user_text, structured_output=structured_output
+            ):
                 await event_queue.put(("event", ev))
         except BaseException as e:  # noqa: BLE001 — 모든 예외를 에러 프레임/종료로 수렴
             await event_queue.put(("error", e))

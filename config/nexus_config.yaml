@@ -404,6 +404,20 @@ context_budgets:
   #   base의 16384 단계는 제거했다(24576+16384=40960 > 32768 이라 불변식 위반).
   output_token_escalation: [4096, 8192]
 
+# =============================================================================
+# 구조화 출력 (vLLM guided decoding) — Point 4.1 (2026-07-08)
+# 외부 OpenAI 클라이언트(AgentHub 등)의 response_format 수용 및 내부 구조화 생성에
+# 사용. 스키마는 항상 요청 단위로 지정한다(전역 스키마 없음).
+# =============================================================================
+structured_output:
+  enabled: true                       # 마스터 스위치. false면 response_format을 400으로 거부
+  injection_mode: "response_format"   # vLLM payload 주입 형태:
+                                      #   "response_format"    — OpenAI 표준 (권장, 기본)
+                                      #   "structured_outputs" — vLLM 신형 확장 (표준형 미지원 시)
+                                      # Phase 0 B200 실측 결과 response_format으로 확정(순수 JSON 강제 성공).
+  max_schema_bytes: 65536             # 스키마 직렬화 크기 상한 — 초과 시 요청 거부(워치독 충돌 방지)
+  strict: true                        # json_schema.strict 기본값
+
 # 운영 설정 (base 유지)
 log_level: "INFO"      # 로그 레벨 (DEBUG/INFO/WARNING/ERROR)
 log_file: null         # 파일 로그 경로 — null이면 콘솔(stderr)만 사용

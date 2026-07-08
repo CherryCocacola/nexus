@@ -57,7 +57,7 @@ from typing import Any
 
 from core.message import Message, StreamEvent
 from core.model.hardware_tier import HardwareTier
-from core.model.inference import ModelProvider
+from core.model.inference import ModelProvider, StructuredOutputSpec
 from core.orchestrator.query_loop import query_loop
 from core.tools.base import BaseTool, ToolUseContext
 
@@ -162,6 +162,9 @@ class ModelDispatcher:
         # 출력 토큰 에스컬레이션 단계(하드코딩 외부화). None이면 query_loop이
         # 모듈 상수로 폴백 → 무회귀. QueryEngine이 config 값을 넘겨준다.
         output_token_escalation: list[int] | None = None,
+        # 구조화 출력 스펙(guided decoding). None이면 일반 경로(무회귀). 라우팅
+        # 판단과 무관하게 query_loop으로 그대로 통과시킨다(passthrough).
+        structured_output: StructuredOutputSpec | None = None,
     ) -> AsyncGenerator[StreamEvent | Message, None]:
         """
         Worker query_loop으로 직행하는 비동기 제너레이터 (passthrough).
@@ -195,6 +198,8 @@ class ModelDispatcher:
                 샘플링 세부 파라미터. QueryEngine이 정한 값을 그대로 통과시킨다.
             output_token_escalation: 출력 토큰 에스컬레이션 단계 리스트(선택).
                 None이면 query_loop이 모듈 상수로 폴백하므로 기존 동작과 동일하다.
+            structured_output: 구조화 출력 스펙(선택). None이면 일반 경로. Dispatcher는
+                이 값을 만들지 않고 query_loop으로 그대로 통과시킨다.
 
         Yields:
             StreamEvent | Message: query_loop이 산출하는 스트리밍 이벤트/메시지.
@@ -219,6 +224,8 @@ class ModelDispatcher:
             presence_penalty=presence_penalty,
             # 출력 토큰 에스컬레이션 단계 passthrough (None이면 상수 폴백).
             output_token_escalation=output_token_escalation,
+            # 구조화 출력 스펙 passthrough (None이면 일반 경로).
+            structured_output=structured_output,
         ):
             yield event
 

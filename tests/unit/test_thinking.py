@@ -60,6 +60,13 @@ class MockModelProvider(ModelProvider):
         temperature: float = 0.7,
         max_tokens: int = 4096,
         stop_sequences: list[str] | None = None,
+        model_override: str | None = None,
+        enable_thinking: bool | None = False,
+        top_p: float = 1.0,
+        repetition_penalty: float = 1.0,
+        frequency_penalty: float = 0.0,
+        presence_penalty: float = 0.0,
+        structured_output: Any = None,
     ) -> AsyncGenerator[StreamEvent, None]:
         """미리 설정된 텍스트를 StreamEvent로 yield한다."""
         # 응답 텍스트 선택 (호출 순서대로)

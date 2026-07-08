@@ -47,7 +47,7 @@ from core.message import Message, StreamEvent
 
 # Scout는 별도 백엔드가 아니라 LocalModelProvider를 상속해 재사용한다.
 # (llama.cpp도 OpenAI 호환 API를 제공하므로 통신·SSE 파싱 로직이 완전히 동일)
-from core.model.inference import LocalModelProvider
+from core.model.inference import LocalModelProvider, StructuredOutputSpec
 
 # 모듈 전용 로거. 규칙상 "nexus.{모듈경로}" 네임스페이스를 쓴다.
 
@@ -149,6 +149,7 @@ class ScoutModelProvider(LocalModelProvider):
         repetition_penalty: float = 1.0,
         frequency_penalty: float = 0.0,
         presence_penalty: float = 0.0,
+        structured_output: StructuredOutputSpec | None = None,
     ) -> AsyncGenerator[StreamEvent, None]:
         """
         Scout 전용 stream — enable_thinking을 None으로 강제한다.
@@ -169,6 +170,9 @@ class ScoutModelProvider(LocalModelProvider):
             temperature~presence_penalty: 샘플링 파라미터. 여기서는 손대지
                 않고 부모로 그대로 넘긴다(passthrough).
             enable_thinking: 무시됨 — 항상 None으로 덮어써 전달한다.
+            structured_output: Scout(4B/llama.cpp) 경로에서는 미사용. 상위
+                오케스트레이터가 프로바이더 종류를 구분하지 않도록 시그니처
+                정합성만 맞추고, 값은 그대로 부모에 passthrough한다.
         Yields:
             StreamEvent: 부모가 만들어 흘려보내는 스트림 이벤트를 그대로 중계.
         """
@@ -191,6 +195,8 @@ class ScoutModelProvider(LocalModelProvider):
             repetition_penalty=repetition_penalty,
             frequency_penalty=frequency_penalty,
             presence_penalty=presence_penalty,
+            # Scout는 구조화 출력 대상이 아니지만 시그니처 정합을 위해 그대로 전달.
+            structured_output=structured_output,
         ):
             yield ev
 

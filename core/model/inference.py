@@ -42,6 +42,10 @@ from typing import Any
 # 외부 라이브러리 — vLLM 서버와 HTTP/SSE로 통신하는 비동기 클라이언트
 import httpx
 
+# Pydantic v2 — 구조화 출력 스펙(StructuredOutputSpec)을 불변(frozen) 모델로 정의한다.
+# (프로젝트 규칙 P5: 데이터 구조는 Pydantic BaseModel 또는 frozen dataclass)
+from pydantic import BaseModel, ConfigDict
+
 # 내부 도메인 모델 — 4-Tier 체인 전체에서 공유하는 데이터 타입
 # (StreamEvent/StopReason 등은 frozen이므로 생성 후 수정하지 않는다)
 from core.message import (
@@ -82,6 +86,32 @@ class ModelConfig:
 
 
 # ─────────────────────────────────────────────
+# 구조화 출력 스펙 (vLLM guided decoding)
+# ─────────────────────────────────────────────
+class StructuredOutputSpec(BaseModel):
+    """
+    구조화 출력(guided decoding) 요청 스펙 — 불변(frozen) 객체.
+
+    stream() 호출자가 이 객체를 넘기면 Tier 3(LocalModelProvider.stream)가
+    vLLM payload에 response_format(json_schema) 형태로 주입해, 모델이 지정한
+    JSON Schema를 "토큰 생성 단계에서" 강제로 따르게 한다(사후 검증이 아니라
+    디코딩 시점 예방). 용도: (a) 외부 OpenAI 클라이언트(AgentHub)의
+    response_format 수용, (c) 사실 필드 형식 안정화.
+
+    왜 dict가 아니라 Pydantic 모델인가:
+      스키마 dict만 넘기면 이름(name)·strict 여부를 별도 인자로 또 늘려야 한다.
+      스펙 객체 하나로 세 정보를 함께 운반하면 시그니처가 단순해지고(P5 준수),
+      frozen이라 생성 후 변형될 수 없어 호출 간 오염 위험도 없다.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    json_schema: dict[str, Any]  # JSON Schema (draft 2020-12 부분집합)
+    name: str = "nexus_structured"  # OpenAI json_schema.name 필드
+    strict: bool = True  # vLLM strict 모드 (스키마 완전 준수 강제)
+
+
+# ─────────────────────────────────────────────
 # ModelProvider ABC (추상 인터페이스)
 # ─────────────────────────────────────────────
 class ModelProvider(ABC):
@@ -111,6 +141,7 @@ class ModelProvider(ABC):
         repetition_penalty: float = 1.0,
         frequency_penalty: float = 0.0,
         presence_penalty: float = 0.0,
+        structured_output: StructuredOutputSpec | None = None,
     ) -> AsyncGenerator[StreamEvent, None]:
         """
         모델에 스트리밍 요청을 보낸다.
@@ -124,6 +155,10 @@ class ModelProvider(ABC):
                 동일 문장 무한 반복(degeneration)을 억제한다.
             frequency_penalty: 빈도 페널티. 0.0이면 비활성.
             presence_penalty: 등장 페널티. 0.0이면 비활성.
+            structured_output: 구조화 출력(guided decoding) 스펙. None이면 일반
+                생성(무회귀). 지정되면 payload에 response_format을 주입해 모델이
+                JSON Schema를 강제로 따르게 한다. tools와는 상호 배타(구현체에서
+                ValueError). 자세한 규칙은 LocalModelProvider.stream() 참조.
             enable_thinking: Qwen3.5 chat_template_kwargs.enable_thinking 인자.
                 - False(기본): 빈 <think></think> 블록 주입 — Worker(27B)에서 내부 독백이
                   답변을 잡아먹는 현상 회피 목적.
@@ -200,6 +235,7 @@ class LocalModelProvider(ModelProvider):
         embedding_base_url: str | None = None,
         connect_timeout: float = 10.0,
         read_timeout: float = 300.0,
+        structured_output_injection_mode: str = "response_format",
     ):
         """
         vLLM 서버 연결 정보와 httpx 클라이언트를 준비한다.
@@ -212,6 +248,11 @@ class LocalModelProvider(ModelProvider):
                 채팅과 동일한 base_url을 재사용한다.
             connect_timeout: 연결 수립 제한 시간(초)
             read_timeout: 응답 본문 읽기 제한 시간(초). GPU 추론이 길 수 있어 넉넉히 둔다.
+            structured_output_injection_mode: 구조화 출력 payload 주입 형태.
+                "response_format"(기본, OpenAI 표준 — Phase 0 B200 실측으로 확정) 또는
+                "structured_outputs"(vLLM 신형 확장, 표준형 미지원 시 폴백). 값 자체는
+                config/nexus_config.yaml#structured_output.injection_mode가 단일
+                소스이며, bootstrap이 그 값을 여기로 주입한다(안티패턴 #4 하드코딩 회피).
         """
         # 끝의 슬래시를 제거해 "{base_url}/v1/..." 조합 시 // 가 생기지 않게 한다
         self.base_url = base_url.rstrip("/")
@@ -223,6 +264,11 @@ class LocalModelProvider(ModelProvider):
         self._embedding_base_url = (
             embedding_base_url.rstrip("/") if embedding_base_url else self.base_url
         )
+        # 구조화 출력 주입 형태 — _build_response_format()이 참조한다.
+        # 기본 "response_format"은 Phase 0 실측(B200 vLLM 0.24)으로 확정된 값이며,
+        # 실측에서 표준형이 거부되는 티어를 만나면 config로 "structured_outputs"로
+        # 전환한다(코드 무수정 대응, 리스크 R1).
+        self._structured_output_injection_mode = structured_output_injection_mode
 
         self._config = ModelConfig(
             model_id=model_id,
@@ -269,6 +315,7 @@ class LocalModelProvider(ModelProvider):
         repetition_penalty: float = 1.0,
         frequency_penalty: float = 0.0,
         presence_penalty: float = 0.0,
+        structured_output: StructuredOutputSpec | None = None,
     ) -> AsyncGenerator[StreamEvent, None]:
         """
         vLLM /v1/chat/completions SSE 스트리밍.
@@ -337,6 +384,33 @@ class LocalModelProvider(ModelProvider):
         if tools:
             payload["tools"] = [self._convert_tool_schema(t) for t in tools]
             payload["tool_choice"] = "auto"
+
+        # ── 구조화 출력 (guided decoding) 주입 ──────────────────────────────
+        # 왜 도구 블록 '직후'인가: tools와 response_format의 동시 사용은 vLLM에서
+        # 의미가 충돌한다(도구 호출 문법 vs 응답 본문 문법). 같은 자리에서 상호
+        # 배타를 검사해 fail-closed로 즉시 거부하면 조용한 오동작을 막는다.
+        # 왜 top-level 주입인가: 이 코드는 openai SDK가 아니라 httpx raw
+        # POST(json=payload)라, vLLM 확장/OpenAI 표준 필드 모두 extra_body 래핑
+        # 없이 payload 최상위에 넣어야 서버가 인식한다(repetition_penalty와 동일 규칙).
+        if structured_output is not None:
+            if tools:
+                raise ValueError(
+                    "structured_output과 tools는 동시에 사용할 수 없습니다 "
+                    "(guided decoding은 응답 본문 문법을 강제하므로 tool_calls "
+                    "생성과 충돌). 호출자가 둘 중 하나만 지정해야 합니다."
+                )
+            # 주입 형태에 따라 top-level 키가 다르므로(표준=response_format,
+            # 폴백=structured_outputs) 헬퍼가 만든 payload 조각을 통째로 병합한다.
+            payload.update(self._build_response_format(structured_output))
+            # thinking 블록(<think>…</think>)은 JSON 문법을 위반하므로, 구조화 출력
+            # 모드에서는 호출자가 넘긴 enable_thinking 값을 무시하고 무조건 끈다.
+            # (위에서 이미 세팅됐을 수 있는 chat_template_kwargs를 여기서 덮어쓴다.)
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
+            logger.debug(
+                "구조화 출력 활성 — enable_thinking을 False로 강제 (mode=%s, name=%s)",
+                self._structured_output_injection_mode,
+                structured_output.name,
+            )
 
         # vLLM 인증 헤더 — api_key가 서버 --api-key와 일치해야 401을 피한다
         headers = {
@@ -741,6 +815,51 @@ class LocalModelProvider(ModelProvider):
                 oai.append(entry)
 
         return oai
+
+    # ─── 내부: 구조화 출력 payload 조립 ───
+
+    def _build_response_format(
+        self, spec: StructuredOutputSpec
+    ) -> dict[str, Any]:
+        """
+        StructuredOutputSpec을 vLLM payload에 병합할 조각(dict)으로 변환한다.
+
+        반환값은 payload.update()로 최상위에 병합된다. injection_mode에 따라
+        최상위 키 자체가 달라지므로(표준=response_format, 폴백=structured_outputs)
+        키를 포함한 완성된 조각을 돌려준다.
+
+        injection_mode(생성자 주입, 단일 소스는 config)에 따라 형태가 갈린다:
+          - "response_format"  : OpenAI 표준
+              {"response_format": {"type": "json_schema",
+                "json_schema": {"name": ..., "schema": {...}, "strict": true}}}
+            Phase 0 실측(B200 vLLM 0.24)에서 순수 JSON 강제 성공을 확인한 값이라
+            기본값으로 둔다.
+          - "structured_outputs": vLLM 신형 확장(설계 2.2)
+              {"structured_outputs": {"json": {...}}}
+            ※ 미실측 폴백 — 표준형이 거부되는 티어를 만났을 때만 config로 전환한다.
+              strict/name은 이 형태에 대응 필드가 없어 스키마만 전달한다.
+
+        알 수 없는 injection_mode는 fail-closed로 ValueError를 던진다(조용한 오동작 방지).
+        """
+        mode = self._structured_output_injection_mode
+        if mode == "response_format":
+            return {
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": spec.name,
+                        "schema": spec.json_schema,
+                        "strict": spec.strict,
+                    },
+                }
+            }
+        if mode == "structured_outputs":
+            # 미실측 폴백 형태 — Phase 0에서 검증되지 않았다.
+            return {"structured_outputs": {"json": spec.json_schema}}
+        raise ValueError(
+            f"알 수 없는 structured_output injection_mode: {mode!r} "
+            "('response_format' 또는 'structured_outputs'만 허용)"
+        )
 
     # ─── 내부: 도구 스키마 변환 ───
 

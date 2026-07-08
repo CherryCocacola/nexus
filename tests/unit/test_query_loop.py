@@ -51,6 +51,10 @@ class ScriptedProvider(ModelProvider):
     def __init__(self, script: list[dict[str, Any]]) -> None:
         self._script = script
         self.call_count = 0
+        # 마지막 stream() 호출에서 받은 tools/structured_output을 기록해 두어
+        # Tier2→Tier3 전달(passthrough) 및 도구 비노출 분기를 테스트에서 검증한다.
+        self.last_structured_output: Any = None
+        self.last_tools: list[dict[str, Any]] | None = None
 
     async def stream(
         self,
@@ -66,7 +70,11 @@ class ScriptedProvider(ModelProvider):
         repetition_penalty: float = 1.0,
         frequency_penalty: float = 0.0,
         presence_penalty: float = 0.0,
+        structured_output: Any = None,
     ) -> AsyncGenerator[StreamEvent, None]:
+        # 전파 검증용 기록 — 실제 동작은 흉내내지 않는다.
+        self.last_structured_output = structured_output
+        self.last_tools = tools
         idx = min(self.call_count, len(self._script) - 1)
         action = self._script[idx]
         self.call_count += 1
