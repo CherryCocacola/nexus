@@ -123,6 +123,8 @@ class KnowledgeRetriever:
         rerank_top_k: int = 5,
         rerank_min_score: float = 0.3,
         rerank_min_similarity: float = 0.6,
+        # ivfflat 재현율 튜닝 — search_by_vector에 probes로 전달.
+        ivfflat_probes: int = 40,
     ) -> None:
         """게이팅 임계와 검색 파라미터를 보관한다.
 
@@ -136,6 +138,9 @@ class KnowledgeRetriever:
         self._embedding = embedding_provider
         self._top_k = top_k
         self._min_similarity = min_similarity
+        # ivfflat.probes — 벡터검색 재현율(search_by_vector에 전달). lists=1000 인덱스에서
+        # 기본 probes=1은 정답 청크를 후보에서 놓치므로 config에서 상향(기본 40).
+        self._ivfflat_probes = ivfflat_probes
         # 절대 임계: 최상위 결과조차 이 값 미만이면 "관련 자료 없음"으로 전체 드롭.
         self._abs_threshold = abs_threshold
         # 상대 마진: top_sim에서 이 폭 이내 결과만 유지(노이즈 청크 절단).
@@ -238,6 +243,7 @@ class KnowledgeRetriever:
                         min_similarity=min_sim,
                         allowed_sources=allowed_sources,
                         with_embedding=with_emb,
+                        probes=self._ivfflat_probes,
                     )
                     # 임베딩 생성 + 벡터 검색을 끝까지 마쳤다 → 0건이어도 폴백 불필요
                     vector_search_done = True

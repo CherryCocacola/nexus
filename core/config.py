@@ -999,6 +999,13 @@ class KnowledgeRagConfig(BaseModel):
     # 남긴다. e5는 관련 청크들끼리도 유사도가 촘촘해서 0.03(3%p)이면 진짜 핵심
     # 청크 1~몇 개만 통과하고, top과 동떨어진 노이즈 청크는 잘린다.
     relevance_margin: float = 0.03
+    # ivfflat 근사검색이 스캔할 리스트 개수(pgvector ivfflat.probes). tb_knowledge
+    # 인덱스는 lists=1000이라 기본값 probes=1이면 1000개 중 1개(0.1%)만 스캔 →
+    # 재현율 급락으로 정답 문서를 후보에서 통째로 놓친다(칸트/베토벤 등 실측 확인).
+    # lists=1000엔 40(≈4%)이 recall/latency 균형점. search_by_vector가 SET LOCAL로
+    # 세션 트랜잭션에 적용한다. (2026-07-08: B200 이관 시 DB 레벨 튜닝이 누락돼
+    # 발생 — 값을 코드/설정에 두어 배포 간 이식성을 확보한다.)
+    ivfflat_probes: int = 40
     # ── MMR(Maximal Marginal Relevance) 리랭킹 (2026-07-05 추가) ────────────
     # 게이팅을 통과한 survivors 중에서 "관련도 높으면서 서로 다른(다양한)" 청크를
     # 골라 컨텍스트 절약 + 커버리지 향상. 게이팅 '이후' 단계라 할루시네이션 저감

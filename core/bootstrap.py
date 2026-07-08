@@ -453,6 +453,9 @@ async def init_phase2(state: GlobalState) -> dict:
             rerank_top_k=krag.rerank.top_k,
             rerank_min_score=krag.rerank.min_score,
             rerank_min_similarity=krag.rerank.min_similarity,
+            # ivfflat 재현율(probes) — search_by_vector가 SET LOCAL로 적용. lists=1000
+            # 인덱스에서 기본 probes=1은 정답 문서를 놓쳐 그라운딩 실패를 유발한다.
+            ivfflat_probes=krag.ivfflat_probes,
         )
         components["knowledge_store"] = knowledge_store
         components["knowledge_retriever"] = knowledge_retriever

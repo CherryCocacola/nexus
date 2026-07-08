@@ -243,6 +243,7 @@ class KnowledgeStore(PgVectorStore):
         allowed_sources: list[str] | None = None,
         min_similarity: float = 0.2,
         with_embedding: bool = False,
+        probes: int | None = None,
     ) -> list[dict[str, Any]]:
         """코사인 유사도 기반 벡터 검색.
 
@@ -305,7 +306,15 @@ class KnowledgeStore(PgVectorStore):
 
         # 커넥션 풀에서 연결 하나를 빌려(acquire) 쿼리를 실행하고 자동 반납한다.
         async with self._pg.acquire() as conn:
-            rows = await conn.fetch(query, *params)
+            if probes is not None:
+                # ivfflat 근사검색 재현율 — SET LOCAL로 이 트랜잭션에만 probes를 적용한다
+                # (풀의 다른 쿼리에 영향 없음). probes가 낮으면(기본 1) 스캔 리스트가
+                # 적어 정답 청크를 후보에서 놓친다. int 캐스팅으로 SQL 인젝션 차단.
+                async with conn.transaction():
+                    await conn.execute(f"SET LOCAL ivfflat.probes = {int(probes)}")
+                    rows = await conn.fetch(query, *params)
+            else:
+                rows = await conn.fetch(query, *params)
 
         # DB 행(Record)들을 호출자가 다루기 쉬운 평범한 dict 리스트로 변환한다.
         out: list[dict[str, Any]] = []

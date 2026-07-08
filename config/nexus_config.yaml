@@ -314,6 +314,7 @@ knowledge_rag:
   min_similarity: 0.75      # DB 벡터 검색 1차 컷오프
   abs_threshold: 0.84       # 최상위조차 이 값 미만이면 전부 드롭 (무관 분포 상한 바로 위)
   relevance_margin: 0.03    # top_sim에서 이 폭 이내 결과만 유지 (노이즈 청크 절단)
+  ivfflat_probes: 40        # ivfflat 스캔 리스트 수(lists=1000). 기본 1이면 재현율 급락 → 40(≈4%)
   # MMR(Maximal Marginal Relevance) 리랭킹 — 게이팅 통과 survivors 중에서
   # "관련도 높으면서 서로 다른(다양한)" 청크를 골라 컨텍스트 절약 + 커버리지 향상.
   # 게이팅 '이후' 단계라 할루시네이션 저감 로직은 그대로 유지된다.
