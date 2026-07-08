@@ -22,9 +22,13 @@ if (Test-Path "$Root\.env") {
 $env:PYTHONIOENCODING = "utf-8"
 
 # 포트 8600 사용(8443 은 Docker Desktop 등 기존 서비스와 충돌하므로 회피).
-# 접속은 반드시 http://127.0.0.1:8600 (localhost 는 IPv6(::1)로 풀려 다른 서비스로 갈 수 있음).
+# 바인딩 0.0.0.0 — 같은 게이트웨이(LAN)의 다른 PC에서도 접속 가능하게 연다.
+#   · 로컬:  http://127.0.0.1:8600
+#   · LAN :  http://192.168.20.206:8600  (이 PC = Machine A)
+#   · 보호:  web_auth 활성(Bearer API 키 필수) + 방화벽 규칙 "Nexus Web 8600 (LAN)"
+#            (TCP/8600, Domain·Private 프로필 — 신뢰 LAN에서만 허용).
 # PC 전용 설정 사용 — 터널 로컬 포트(18001/18002/15440/16340)를 가리키는 사본.
 # 이렇게 분리해야 B200 co-located용 공용 config(127.0.0.1:8001…)를 훼손하지 않는다.
 $env:NEXUS_CONFIG = "config\nexus_config.pc.yaml"
-Write-Host "[웹] 오케스트레이터 기동: http://127.0.0.1:8600  (백엔드=B200 터널, config=nexus_config.pc.yaml)" -ForegroundColor Cyan
-& $Venv -m uvicorn web.app:app --host 127.0.0.1 --port 8600 --log-level info
+Write-Host "[웹] 오케스트레이터 기동: http://192.168.20.206:8600 (LAN) / http://127.0.0.1:8600 (로컬)  (백엔드=B200 터널)" -ForegroundColor Cyan
+& $Venv -m uvicorn web.app:app --host 0.0.0.0 --port 8600 --log-level info
