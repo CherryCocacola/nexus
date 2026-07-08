@@ -55,6 +55,9 @@ logger = logging.getLogger("nexus.orchestrator.prompt_assembler")
 _DEFAULT_TURN_STATE_TOKENS = 1000  # 이전 턴 요약 주입 상한(현행)
 _DEFAULT_PROJECT_RAG_TOKENS = 1500  # 프로젝트 RAG 주입 상한(현행)
 _DEFAULT_KNOWLEDGE_RAG_TOKENS = 1000  # 지식베이스 RAG 주입 상한(현행)
+# 계획 체크리스트(TodoWrite) 주입 상한. TIER_S(8K) 토큰 압박을 고려해 작게 잡는다.
+# 초과 시 completed 항목은 개수로 축약한다(아래 _attach_todo_checklist 참조).
+_DEFAULT_TODO_TOKENS = 300
 
 
 def _citation_trailer(label: str) -> str:
@@ -98,12 +101,14 @@ class PromptAssembler:
         turn_state_store: Any | None = None,
         rag_retriever: Any | None = None,
         knowledge_retriever: Any | None = None,
+        todo_store: Any | None = None,
         # ── 컨텍스트 예산 주입 (하드코딩 외부화, 2026-07-03) ──
         # None이면 현행 상수로 폴백 → 기존 호출부(테스트 포함)는 동작 불변(무회귀).
         # bootstrap→QueryEngine 경로에서 config.context_budgets 값이 주입된다.
         turn_state_tokens: int | None = None,
         project_rag_tokens: int | None = None,
         knowledge_rag_tokens: int | None = None,
+        todo_tokens: int | None = None,
     ) -> None:
         """조립기를 초기화하며 보조 의존성과 토큰 예산을 확정한다.
 
@@ -126,6 +131,8 @@ class PromptAssembler:
         self._turn_state_store = turn_state_store
         self._rag_retriever = rag_retriever
         self._knowledge_retriever = knowledge_retriever
+        # 계획 체크리스트 저장소(TodoWrite). None이면 ①.5 스텝을 건너뛴다.
+        self._todo_store = todo_store
         # 예산 확정 — 주입값이 있으면 그걸 쓰고, 없으면(None) 현행 상수로 폴백.
         # 이렇게 해야 예산 인자를 넘기지 않는 기존 호출부·테스트가 동작 불변(무회귀).
         self._turn_state_tokens = (
@@ -139,6 +146,9 @@ class PromptAssembler:
         self._knowledge_rag_tokens = (
             knowledge_rag_tokens if knowledge_rag_tokens is not None
             else _DEFAULT_KNOWLEDGE_RAG_TOKENS
+        )
+        self._todo_tokens = (
+            todo_tokens if todo_tokens is not None else _DEFAULT_TODO_TOKENS
         )
         # 출처 인용(Point 4-2) — 이번 assemble()에서 KB에 '실제로 주입된' 청크의
         # 출처 목록. _attach_knowledge_base가 채우고(citation 활성 시), assemble()
@@ -171,6 +181,9 @@ class PromptAssembler:
         t0 = time.perf_counter()
         prompt = self._attach_turn_state(prompt, session_id)
         ms_turn_state = (time.perf_counter() - t0) * 1000
+
+        # ①.5 계획 체크리스트(TodoWrite) — compact 이후에도 계획을 유지시킨다.
+        prompt = self._attach_todo_checklist(prompt, session_id)
 
         # ② 프로젝트 RAG — 관련 파일 청크 (질의 타입 무관)
         t0 = time.perf_counter()
@@ -222,6 +235,52 @@ class PromptAssembler:
             prompt
             + "\n\n--- Previous context ---\n"
             + prev
+        )
+
+    def _attach_todo_checklist(self, prompt: str, session_id: str) -> str:
+        """①.5 현재 계획 체크리스트(TodoWrite)를 프롬프트 뒤에 이어 붙인다.
+
+        모델이 다단계 작업의 원래 계획을 잊지 않도록, 매 턴 최신 체크리스트를
+        시스템 프롬프트에 재주입한다. 특히 TIER_S(8K)에서 compact 이후에도 계획
+        맥락이 유지된다.
+
+        흐름:
+          - 저장소가 주입되지 않았으면(None) 원본 반환.
+          - 조회 실패 시 경고만 남기고 원본 반환(fail-open — 보조 정보라 본류를 막지 않음).
+          - 목록이 비어 있으면 그대로 원본 반환.
+          - 있으면 토큰 예산(_todo_tokens) 안에서 축약해 '## 현재 작업 체크리스트'
+            섹션으로 덧붙인다. 예산 초과 시 completed 항목은 개수로만 요약한다.
+        """
+        if self._todo_store is None:
+            return prompt
+        try:
+            # 메인 에이전트(agent_id=None) 목록만 주입한다(서브에이전트 목록은 격리).
+            state = self._todo_store.get(session_id, None)
+        except Exception as e:
+            # 보조 저장소 장애가 본류 응답을 막지 않도록 조용히 폴백.
+            logger.debug("체크리스트 조회 실패 (무시): %s", e)
+            return prompt
+        items = getattr(state, "items", ())
+        if not items:
+            return prompt
+
+        # 렌더 — core.todo_store.render_checklist는 순수 함수라 여기서 재사용한다.
+        from core.todo_store import TodoStatus, render_checklist
+
+        section = render_checklist(items)
+        # 토큰 예산 초과 시 completed 항목을 개수로 축약한다(estimated: 문자수//3).
+        if len(section) // 3 > self._todo_tokens:
+            done = sum(1 for i in items if getattr(i, "status", None) == TodoStatus.COMPLETED)
+            active = tuple(
+                i for i in items if getattr(i, "status", None) != TodoStatus.COMPLETED
+            )
+            section = render_checklist(active)
+            if done:
+                section += f"\n(완료 {done}개 생략)"
+        return (
+            prompt
+            + "\n\n## 현재 작업 체크리스트\n"
+            + section
         )
 
     async def _attach_project_rag(self, prompt: str, user_input: str) -> str:

@@ -224,6 +224,51 @@ class OutputFormatter:
             expand=False,
         )
 
+    # ─── 계획 체크리스트 (TodoWrite/TodoRead) ───
+
+    @staticmethod
+    def _looks_like_checklist(content: str) -> bool:
+        """도구 결과 본문이 계획 체크리스트인지 판별한다(TodoWrite/TodoRead 결과 감지).
+
+        TOOL_RESULT StreamEvent에는 도구명·metadata가 실리지 않으므로, 렌더된 본문의
+        서명(체크박스 마커 또는 갱신 요약 머리말)으로 판별한다.
+        """
+        if content.startswith(("체크리스트 갱신됨", "(체크리스트가 비어")):
+            return True
+        # 마커 줄([x]/[~]/[ ])이 하나라도 있으면 체크리스트로 본다.
+        return any(
+            line.startswith(("[x] ", "[~] ", "[ ] ")) for line in content.split("\n")
+        )
+
+    def format_todo_list(self, content: str) -> Panel:
+        """계획 체크리스트 본문을 색상 있는 Rich Panel로 렌더한다.
+
+        [x] 완료(취소선/흐림), [~] 진행 중(강조), [ ] 대기 로 아이콘·색을 입힌다.
+        요약 머리말(체크리스트 갱신됨 …)이나 경고 줄은 그대로 통과시킨다.
+        """
+        rendered = Text()
+        for i, line in enumerate(content.split("\n")):
+            if i:
+                rendered.append("\n")
+            if line.startswith("[x] "):
+                rendered.append("✔ ", style="green")
+                rendered.append(line[4:], style="dim strike")
+            elif line.startswith("[~] "):
+                rendered.append("◐ ", style="yellow")
+                rendered.append(line[4:], style="bold")
+            elif line.startswith("[ ] "):
+                rendered.append("○ ", style="dim")
+                rendered.append(line[4:])
+            else:
+                # 요약 머리말·경고·빈 목록 안내 등은 흐리게 그대로 표시.
+                rendered.append(line, style="dim")
+        return Panel(
+            rendered,
+            title="[bold cyan]체크리스트[/bold cyan]",
+            border_style="cyan",
+            expand=False,
+        )
+
     # ─── 사고(Thinking) ───
 
     def format_thinking(self, text: str) -> Panel:
@@ -345,8 +390,13 @@ class OutputFormatter:
 
         # 도구 결과 — 도구가 실제로 실행되고 나온 결과를 표시한다.
         if event_type == StreamEventType.TOOL_RESULT and event.tool_result:
+            content = event.tool_result.content
+            # 계획 체크리스트(TodoWrite/TodoRead) 결과는 전용 체크박스 패널로 표시한다
+            # (일반 결과 패널 대신 — 진행 상황을 한눈에 보이게).
+            if not event.tool_result.is_error and self._looks_like_checklist(content):
+                return self.format_todo_list(content)
             return self.format_tool_result(
-                content=event.tool_result.content,
+                content=content,
                 is_error=event.tool_result.is_error,
             )
 

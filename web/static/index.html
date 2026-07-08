@@ -541,6 +541,26 @@ body {
    (접힌 도구결과 블록 activity-results는 클릭해 펼쳐 읽는 대상이라 흐리게 하지 않는다) */
 .activity-area.activity-final .activity-trail { opacity: 0.6; }
 
+/* 계획 체크리스트 패널 (TodoWrite) — 활동영역 상단 고정. 스트림 종료 후에도 유지. */
+.todo-panel {
+  border: 1px solid var(--border, #333);
+  border-radius: 8px;
+  padding: 8px 12px;
+  margin-bottom: 8px;
+  background: rgba(127, 127, 127, 0.06);
+  font-size: 0.88em;
+}
+.todo-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; }
+.todo-title { font-weight: 600; opacity: 0.85; }
+.todo-count { font-variant-numeric: tabular-nums; opacity: 0.6; font-size: 0.9em; }
+.todo-list { display: flex; flex-direction: column; gap: 2px; }
+.todo-item { display: flex; align-items: baseline; gap: 6px; line-height: 1.5; }
+.todo-mark { width: 1em; flex: none; text-align: center; }
+.todo-completed { opacity: 0.55; }
+.todo-completed .todo-text { text-decoration: line-through; }
+.todo-in_progress { font-weight: 600; }
+.todo-active { opacity: 0.75; font-weight: 400; font-size: 0.9em; }
+
 /* 완료 단계 트레일 — 작은 muted 목록 (여러 도구가 누적됨) */
 .activity-trail {
   display: flex;
@@ -1555,6 +1575,9 @@ function hideThinking() {
 // ─── 스트리밍 메시지 ───
 function startStreamingMessage() {
   hideThinking();
+  // 새 스트리밍 메시지 시작 — 체크리스트 패널이 새로 그려지므로 revision 가드도 리셋한다
+  // (턴/세션이 바뀌어 revision이 낮아져도 이번 턴의 첫 todo_update를 반드시 표시).
+  lastTodoRevision = -1;
   const welcome = document.getElementById('welcome');
   if (welcome) welcome.remove();
 
@@ -1569,6 +1592,7 @@ function startStreamingMessage() {
       <div class="message-sender">Nexus</div>
     </div>
     <div class="activity-area" id="streamingActivity">
+      <div class="todo-panel" id="todoPanel" style="display:none"></div>
       <div class="activity-trail" id="activityTrail"></div>
       <div class="activity-results" id="activityResults"></div>
       <div class="activity-live" id="activityLive" style="display:none"></div>
@@ -1830,6 +1854,50 @@ function renderToolResult(data) {
   scrollToBottom();
 }
 
+// 계획 체크리스트(TodoWrite) 패널을 전체 교체한다.
+// data = { type:'todo_update', session_id, revision, stats, todos:[{content,status,active_form}] }
+//   - [x] 완료(취소선) / [~] 진행 중(active_form 강조) / [ ] 대기
+//   - revision으로 중복·역순 프레임을 무시한다(전체 교체라 diff 불필요).
+//   - 스트리밍 종료 후에도 패널은 유지한다(최종 계획 상태를 계속 보여줌).
+let lastTodoRevision = -1;
+function renderTodoUpdate(data) {
+  const panel = document.getElementById('todoPanel');
+  if (!panel) return;
+  const rev = (typeof data.revision === 'number') ? data.revision : 0;
+  // 오래된(또는 중복) 프레임은 무시한다.
+  if (rev <= lastTodoRevision) return;
+  lastTodoRevision = rev;
+
+  const todos = Array.isArray(data.todos) ? data.todos : [];
+  if (todos.length === 0) { panel.style.display = 'none'; panel.innerHTML = ''; return; }
+
+  const st = data.stats || {};
+  const total = st.total != null ? st.total : todos.length;
+  const done = st.completed != null ? st.completed : 0;
+
+  const icon = { completed: '✔', in_progress: '◐', pending: '○' };
+  let rows = '';
+  for (const t of todos) {
+    const status = t.status || 'pending';
+    const cls = 'todo-item todo-' + status;
+    const mark = icon[status] || '○';
+    // 진행 중이면 active_form(있으면)을 꼬리표로 강조한다.
+    let tail = '';
+    if (status === 'in_progress') {
+      const af = (t.active_form && t.active_form.trim()) ? t.active_form : '진행 중';
+      tail = '<span class="todo-active"> ← ' + escapeHtml(af) + '</span>';
+    }
+    rows += '<div class="' + cls + '"><span class="todo-mark">' + mark + '</span>' +
+            '<span class="todo-text">' + escapeHtml(t.content || '') + '</span>' + tail + '</div>';
+  }
+  panel.innerHTML =
+    '<div class="todo-head"><span class="todo-title">작업 체크리스트</span>' +
+    '<span class="todo-count">' + done + '/' + total + '</span></div>' +
+    '<div class="todo-list">' + rows + '</div>';
+  panel.style.display = 'block';
+  scrollToBottom();
+}
+
 // 라이브 인디케이터를 감춘다. 답변 텍스트가 시작되거나 단계가 끝날 때 호출.
 function activityHideLive() {
   const live = document.getElementById('activityLive');
@@ -2049,6 +2117,11 @@ async function sendMessage() {
               // 답변 말풍선에 원문이 새어들지 않도록 여기(활동영역)에서만 처리하고 아래 (B)로 넘기지 않는다.
               if (!streamStarted) { streamStarted = true; startStreamingMessage(); }
               renderToolResult(data);
+            } else if (data.type === 'todo_update') {
+              // 계획 체크리스트(TodoWrite) 갱신 — 서버가 TodoStore에서 뽑은 구조화 목록.
+              // 활동영역 상단의 고정 패널을 전체 교체한다(revision으로 중복/역순 프레임 무시).
+              if (!streamStarted) { streamStarted = true; startStreamingMessage(); }
+              renderTodoUpdate(data);
             } else if (data.type === 'thinking_start') {
               if (!streamStarted) { streamStarted = true; startStreamingMessage(); }
               activityStart('thinking', null);          // "생각하는 중" 표시 시작

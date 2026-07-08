@@ -253,6 +253,16 @@ class PermissionPipeline:
             "tail",
             "taskget",
             "tasklist",
+            # TodoRead/TodoWrite: 세션 내부의 계획 메타데이터만 갱신하며
+            # 파일·프로세스·네트워크 등 외부 부작용이 전혀 없다.
+            # PLAN 모드에서도 계획 수립 자체는 허용되어야 하므로 READONLY로 취급한다
+            # (READONLY 열은 MODE_BEHAVIOR_MAP에서 항상 ALLOW). 도구 자체의
+            # is_read_only 플래그는 정직하게 유지된다(TodoWrite=False) — executor의
+            # 동시성 파티셔닝은 플래그를, 권한 카테고리는 이 집합을 본다.
+            # Layer 1(deny rule)·Layer 4(hook)는 그대로 적용되므로 운영자가
+            # permission_rules.yaml에서 여전히 차단할 수 있다(anti-pattern #11 준수).
+            "todoread",
+            "todowrite",
         }
         file_write_tools = {"write", "edit", "notebookedit"}
         bash_tools = {"bash"}

@@ -171,6 +171,44 @@ def _collect_downloads(messages: list) -> list[dict[str, str]]:
     return out
 
 
+def _build_todo_update_frame(engine: Any, session_id: str) -> dict[str, Any] | None:
+    """
+    TodoStore에서 현재 (메인 에이전트) 계획 체크리스트를 읽어 todo_update 프레임을 만든다.
+
+    서버가 진실(TodoStore)에서 직접 구조화 목록을 뽑으므로 모델 텍스트 파싱이
+    필요 없다(DocumentExport URL 추출과 동일 원칙). 목록이 비었거나 저장소가
+    없으면 None을 돌려 프레임을 내보내지 않는다.
+
+    프레임 형식(웹 전용 — StreamEvent 아님):
+      {type: "todo_update", session_id, revision, stats, todos: [...]}
+    프론트는 revision으로 중복/역순 프레임을 무시하고 #todoPanel을 전체 교체한다.
+    """
+    ctx = getattr(engine, "_context", None)
+    options = getattr(ctx, "options", None)
+    store = options.get("todo_store") if isinstance(options, dict) else None
+    if store is None:
+        return None
+    try:
+        # 메인 에이전트(agent_id=None) 목록만 UI에 노출한다(서브에이전트 격리).
+        state = store.get(session_id, None)
+    except Exception as e:  # noqa: BLE001 — 보조 UI 정보라 본류를 막지 않는다
+        logger.debug("todo_update 조회 실패 (무시): %s", e)
+        return None
+    items = list(getattr(state, "items", ()))
+    if not items:
+        return None
+    todos = [i.model_dump(mode="json") for i in items]
+    completed = sum(1 for t in todos if t.get("status") == "completed")
+    in_progress = sum(1 for t in todos if t.get("status") == "in_progress")
+    return {
+        "type": "todo_update",
+        "session_id": session_id,
+        "revision": getattr(state, "revision", 0),
+        "stats": {"total": len(todos), "completed": completed, "in_progress": in_progress},
+        "todos": todos,
+    }
+
+
 # ─────────────────────────────────────────────
 # 도구 활동 표시(접힌 활동라인 + 접힌 요약) 헬퍼 — 웹 UX 개선
 # ─────────────────────────────────────────────
@@ -409,6 +447,10 @@ def _build_web_engine_parts(components: dict, state: Any) -> dict:
     base_options = {
         "memory_manager": components.get("memory_manager"),
         "task_manager": components.get("task_manager"),
+        # 계획 체크리스트 저장소 — 웹 TodoWrite/TodoRead 도구와 todo_update 프레임이
+        # 같은 (세션 격리) 저장소를 공유하도록 주입한다. 미주입 시 도구는 모듈 전역
+        # 폴백을 쓰지만, 그러면 _build_todo_update_frame이 읽지 못해 UI 갱신이 끊긴다.
+        "todo_store": components.get("todo_store"),
         "agent_registry": components.get("agent_registry"),
         "model_provider": components["model_provider"],
         "scout_provider": components.get("scout_provider"),
@@ -830,6 +872,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         _app_state["tool_registry"] = components.get("tool_registry")
         _app_state["model_provider"] = components.get("model_provider")
         _app_state["memory_manager"] = components.get("memory_manager")  # Ch 16
+        _app_state["todo_store"] = components.get("todo_store")  # 계획 체크리스트 저장소
         _app_state["tenant_registry"] = state.config.tenants  # M2 — 헤더 해석용
         # v0.14.8: 임베딩 keepalive task — 종료 시 cancel하기 위해 보관
         _app_state["embedding_keepalive_task"] = components.get("embedding_keepalive_task")
@@ -1493,6 +1536,20 @@ async def chat_stream(
                         )
                     yield f"data: {json.dumps(sse_data, ensure_ascii=False)}\n\n"
                     event_count += 1
+
+                    # ─── todo_update 프레임 (계획 체크리스트 가시화) ───
+                    # TodoWrite/TodoRead 결과가 왔으면, 서버가 TodoStore에서 최신
+                    # 목록을 직접 읽어 웹 전용 todo_update 프레임을 추가로 내보낸다.
+                    # (모델 텍스트 파싱이 아니라 서버 진실 — DocumentExport URL 추출과
+                    # 동일 원칙.) StreamEvent를 새로 만들지 않는다(4-Tier 체인 불변).
+                    if etype == "tool_result" and sse_data.get("name") in (
+                        "TodoWrite",
+                        "TodoRead",
+                    ):
+                        todo_frame = _build_todo_update_frame(engine, session_id)
+                        if todo_frame is not None:
+                            yield f"data: {json.dumps(todo_frame, ensure_ascii=False)}\n\n"
+                            event_count += 1
         finally:
             # producer가 아직 살아 있으면 취소 (클라이언트가 연결을 끊은 경우 등)
             if not producer_task.done():
@@ -2192,6 +2249,14 @@ async def delete_session(session_id: str) -> dict[str, Any]:
         except Exception as e:
             # Redis 장애는 치명적 아님 — 디스크 삭제는 독립적으로 시도
             logger.warning("Redis 세션 삭제 실패 (%s): %s", session_id, e)
+
+    # 1-b) 계획 체크리스트(TodoStore) — 세션 삭제 시 함께 정리(메모리 누수 방지).
+    todo_store = _app_state.get("todo_store")
+    if todo_store is not None:
+        try:
+            todo_store.clear_session(session_id)
+        except Exception as e:  # noqa: BLE001 — 보조 정리라 삭제 응답을 막지 않는다
+            logger.warning("체크리스트 세션 삭제 실패 (%s): %s", session_id, e)
 
     # 2) 디스크 — 트랜스크립트 디렉토리 통째로 제거
     from core.memory.transcript import delete_transcript_session

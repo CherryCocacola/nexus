@@ -1,14 +1,20 @@
 """
-Task 도구 모음 — 에이전트가 "할 일(태스크)"을 관리할 때 쓰는 도구 3종.
+Task 도구 — 에이전트가 백그라운드 "태스크"를 관리할 때 쓰는 종합 도구.
 
-이 파일은 LLM(모델)이 자기 작업을 스스로 계획/추적할 수 있도록,
-태스크를 만들고·수정하고·조회하고·중지하는 BaseTool 구현들을 담는다.
-Nexus의 도구 레지스트리에 등록되어 모델의 tool_calls로 호출된다.
+이 파일은 LLM(모델)이 백그라운드 실행체(asyncio.Task — 로컬/원격 에이전트,
+Bash, 모니터, 학습 등)를 생성·수정·조회·중지할 수 있도록, 그 라이프사이클을
+제어하는 BaseTool 구현을 담는다. Nexus의 도구 레지스트리에 등록되어 모델의
+tool_calls로 호출된다.
 
 제공하는 도구(클래스):
-  - TodoReadTool  ("TodoRead") : 태스크 목록 조회 (읽기 전용, 병렬 안전)
-  - TodoWriteTool ("TodoWrite"): 태스크 생성/업데이트 (쓰기, 확인 필요)
-  - TaskTool      ("Task")     : 종합 관리 — create/update/list/get/stop
+  - TaskTool ("Task") : 종합 관리 — create/update/list/get/stop
+
+[변경 이력 — 2026-07-08]
+예전에는 이 파일에 TodoReadTool/TodoWriteTool도 있었으나, 이들은 이름만 Todo일
+뿐 TaskManager 단건 CRUD로 Task 도구와 기능이 중복이었다. 계획 체크리스트
+시맨틱(전체 목록 원자 교체 + pending/in_progress/completed)으로 사양(v6.1의
+"task list")을 복구하며 두 도구를 core/tools/implementations/todo_tools.py로
+분리·재구현했다. 백그라운드 태스크 제어는 이 Task 도구로 일원화했다.
 
 동작 방식(중요):
   - 실제 태스크 저장/실행은 core.task.TaskManager가 담당한다.
@@ -155,307 +161,6 @@ def _format_task(task: dict[str, Any]) -> str:
 
 
 # ─────────────────────────────────────────────
-# TodoReadTool — 태스크 목록 조회
-# ─────────────────────────────────────────────
-class TodoReadTool(BaseTool):
-    """
-    태스크 "목록"을 조회하는 읽기 전용 도구("TodoRead").
-
-    전체 태스크를 보여주거나, status_filter로 특정 상태만 걸러서 보여준다.
-    데이터를 바꾸지 않는 순수 조회라서 is_read_only=True,
-    is_concurrency_safe=True로 두어 다른 도구와 병렬 실행해도 안전하다.
-
-    BaseTool의 수명주기 중 여기서 재정의하는 것:
-      - name/description/group : 도구 식별/설명(모델에 노출됨)
-      - input_schema           : 입력 JSON 스키마
-      - is_read_only 등 플래그  : 동작 특성
-      - check_permissions/call : 권한 판정 및 실제 실행
-    """
-
-    # ═══ 1. Identity ═══
-
-    @property
-    def name(self) -> str:
-        return "TodoRead"
-
-    @property
-    def description(self) -> str:
-        return "태스크 목록을 조회합니다. 전체 또는 상태별로 필터링할 수 있습니다."
-
-    @property
-    def group(self) -> str:
-        return "task"
-
-    # ═══ 2. Schema ═══
-
-    @property
-    def input_schema(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "status_filter": {
-                    "type": "string",
-                    "description": "상태 필터 (pending/running/completed/failed/killed)",
-                    "enum": ["pending", "running", "completed", "failed", "killed"],
-                },
-            },
-            "required": [],
-        }
-
-    # ═══ 3. Behavior Flags ═══
-
-    @property
-    def is_read_only(self) -> bool:
-        return True
-
-    @property
-    def is_concurrency_safe(self) -> bool:
-        return True
-
-    # ═══ 5. Lifecycle ═══
-
-    async def check_permissions(
-        self, input_data: dict[str, Any], context: ToolUseContext
-    ) -> PermissionResult:
-        """조회는 부작용이 없으므로 사용자 확인 없이 항상 ALLOW로 허용한다."""
-        return PermissionResult(behavior=PermissionBehavior.ALLOW)
-
-    async def call(self, input_data: dict[str, Any], context: ToolUseContext) -> ToolResult:
-        """
-        태스크 목록을 조회해 사람이 읽기 좋은 텍스트로 돌려준다.
-
-        처리 순서:
-          1. TaskManager가 있으면 그걸로, 없으면 인메모리 폴백에서 목록 확보
-          2. status_filter가 주어졌으면 해당 상태만 남김(선택)
-          3. 비었으면 "없음" 메시지, 아니면 최신순 정렬 후 한 줄씩 포맷
-
-        반환:
-          ToolResult.success — count 메타데이터에 태스크 개수를 함께 담는다.
-        """
-        manager = _get_task_manager(context)
-        status_filter = input_data.get("status_filter")
-
-        if manager is not None:
-            # TaskManager 경로: 전체 TaskState를 받아 dict 포맷으로 변환.
-            all_tasks = manager.get_all()
-            tasks = [_task_state_to_dict(t) for t in all_tasks]
-            if status_filter:
-                # 상태 필터가 있으면 일치하는 것만 남긴다.
-                tasks = [t for t in tasks if t["status"] == status_filter]
-        else:
-            # 폴백 경로: 전역 인메모리 저장소의 값들을 그대로 목록화.
-            tasks = list(_fallback_tasks.values())
-            if status_filter:
-                tasks = [t for t in tasks if t["status"] == status_filter]
-
-        if not tasks:
-            # 결과가 없을 때: 필터가 있었으면 그 조건도 안내에 덧붙인다.
-            filter_msg = f" (상태: {status_filter})" if status_filter else ""
-            return ToolResult.success(f"태스크가 없습니다{filter_msg}.", count=0)
-
-        # 생성 시간(created_at) 기준 내림차순 — 최신 태스크가 위로 오게 정렬.
-        tasks.sort(key=lambda t: t.get("created_at", 0), reverse=True)
-        # 각 태스크를 한 줄 문자열로 만들고 줄바꿈으로 이어붙인다.
-        lines = [_format_task(t) for t in tasks]
-        result_text = "\n".join(lines)
-
-        logger.debug("TodoRead: %d tasks found", len(tasks))
-        return ToolResult.success(result_text, count=len(tasks))
-
-    # ═══ 7. UI Hints ═══
-
-    def get_progress_label(self, input_data: dict[str, Any]) -> str:
-        # 실행 중 UI에 표시할 진행 라벨(사용자에게 보이는 짧은 상태 문구).
-        return "Loading tasks..."
-
-
-# ─────────────────────────────────────────────
-# TodoWriteTool — 태스크 생성/업데이트
-# ─────────────────────────────────────────────
-class TodoWriteTool(BaseTool):
-    """
-    태스크를 생성하거나 업데이트하는 쓰기 도구("TodoWrite").
-
-    입력의 task_id 유무로 동작이 갈린다:
-      - task_id 있음 → 그 태스크를 찾아 필드(설명/상태/우선순위) 업데이트
-      - task_id 없음 → 새 태스크를 생성
-
-    쓰기 도구이므로 BaseTool의 fail-closed 기본값(읽기전용 아님, 병렬 불가)을
-    그대로 두고, check_permissions에서 사용자 확인(ASK)을 받도록 한다.
-    """
-
-    # ═══ 1. Identity ═══
-
-    @property
-    def name(self) -> str:
-        return "TodoWrite"
-
-    @property
-    def description(self) -> str:
-        return (
-            "태스크를 생성하거나 업데이트합니다. "
-            "task_id가 주어지면 기존 태스크를 업데이트하고, "
-            "없으면 새 태스크를 생성합니다."
-        )
-
-    @property
-    def group(self) -> str:
-        return "task"
-
-    # ═══ 2. Schema ═══
-
-    @property
-    def input_schema(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "task_id": {
-                    "type": "string",
-                    "description": "업데이트할 태스크 ID (생략 시 새로 생성)",
-                },
-                "description": {
-                    "type": "string",
-                    "description": "태스크 설명",
-                },
-                "status": {
-                    "type": "string",
-                    "description": "태스크 상태",
-                    "enum": ["pending", "in_progress", "running", "completed", "failed", "killed"],
-                },
-                "priority": {
-                    "type": "string",
-                    "description": "우선순위 (기본: medium)",
-                    "enum": ["low", "medium", "high"],
-                    "default": "medium",
-                },
-            },
-            "required": [],
-        }
-
-    # ═══ 3. Behavior Flags ═══
-    # 쓰기 도구 — 기본 fail-closed 유지
-
-    # ═══ 5. Lifecycle ═══
-
-    def validate_input(self, input_data: dict[str, Any]) -> str | None:
-        """
-        입력값 사전 검증(권한/실행 전에 호출됨).
-
-        새 태스크 생성(task_id 없음)일 때는 description이 반드시 있어야 한다.
-        문제가 있으면 에러 메시지 문자열을, 정상이면 None을 반환한다.
-        """
-        task_id = input_data.get("task_id")
-        if not task_id and not input_data.get("description"):
-            return "새 태스크 생성 시 description은 필수입니다."
-        return None
-
-    async def check_permissions(
-        self, input_data: dict[str, Any], context: ToolUseContext
-    ) -> PermissionResult:
-        """
-        태스크 쓰기(생성/수정)는 사용자 확인(ASK)을 받는다.
-
-        업데이트인지 생성인지에 따라 사용자에게 보여줄 확인 메시지를 다르게 만든다.
-        생성 시 설명이 길 수 있어 앞 50자만 잘라서 보여준다.
-        """
-        task_id = input_data.get("task_id")
-        if task_id:
-            msg = f"태스크 #{task_id} 업데이트"
-        else:
-            desc = input_data.get("description", "")[:50]
-            msg = f"새 태스크 생성: {desc}"
-        return PermissionResult(
-            behavior=PermissionBehavior.ASK,
-            message=msg,
-        )
-
-    async def call(self, input_data: dict[str, Any], context: ToolUseContext) -> ToolResult:
-        """
-        실제로 태스크를 생성하거나 업데이트한다.
-
-        처리 순서:
-          1. task_id 유무로 "업데이트 / 생성" 두 갈래로 분기
-          2. 각 갈래 안에서 다시 TaskManager 경로 / 인메모리 폴백 경로로 분기
-          3. 대상 태스크를 dict로 만들어 포맷 후 결과 반환
-
-        반환:
-          성공 시 ToolResult.success(대상 task_id 포함),
-          대상을 못 찾으면 ToolResult.error.
-        """
-        manager = _get_task_manager(context)
-        task_id = input_data.get("task_id")
-
-        if task_id:
-            # ── 기존 태스크 업데이트 ──
-            if manager is not None:
-                # TaskManager 경로: id로 TaskState를 찾아 필드를 직접 수정.
-                task_state = manager.tasks.get(task_id)
-                if not task_state:
-                    return ToolResult.error(f"태스크 #{task_id}을(를) 찾을 수 없습니다.")
-
-                # 입력에 들어온 필드만 골라서 갱신한다(부분 업데이트).
-                if "description" in input_data:
-                    task_state.description = input_data["description"]
-                if "status" in input_data:
-                    # 문자열을 TaskStatus enum으로 변환. 잘못된 값이면
-                    # ValueError가 나는데, 상태 변경을 조용히 건너뛴다.
-                    try:
-                        task_state.status = TaskStatus(input_data["status"])
-                    except ValueError:
-                        pass
-                task = _task_state_to_dict(task_state)
-            else:
-                # 인메모리 폴백 경로: 전역 저장소의 dict를 직접 수정.
-                task = _fallback_tasks.get(task_id)
-                if not task:
-                    return ToolResult.error(f"태스크 #{task_id}을(를) 찾을 수 없습니다.")
-
-                if "description" in input_data:
-                    task["description"] = input_data["description"]
-                if "status" in input_data:
-                    task["status"] = input_data["status"]
-                if "priority" in input_data:
-                    task["priority"] = input_data["priority"]
-                # 수정이 일어났으니 갱신 시각을 현재 시각으로 찍는다.
-                task["updated_at"] = time.time()
-
-            logger.info("TodoWrite: updated task #%s", task_id)
-            return ToolResult.success(
-                f"태스크 #{task_id}을(를) 업데이트했습니다.\n{_format_task(task)}",
-                task_id=task_id,
-            )
-        else:
-            # ── 새 태스크 생성 ──
-            # validate_input을 통과했으므로 description은 존재한다고 본다.
-            description = input_data["description"]
-            priority = input_data.get("priority", "medium")
-
-            if manager is not None:
-                # TaskManager로 생성 — 타입은 로컬 워크플로우("local_workflow")로 고정.
-                tid = manager.create("local_workflow", description)
-                task_state = manager.tasks[tid]
-                task = _task_state_to_dict(task_state)
-                task["priority"] = priority  # priority는 포맷 표시용
-            else:
-                # 폴백 경로: 인메모리에 바로 생성.
-                task = _create_fallback_task(description=description, priority=priority)
-
-            logger.info("TodoWrite: created task #%s", task["id"])
-            return ToolResult.success(
-                f"태스크를 생성했습니다.\n{_format_task(task)}",
-                task_id=task["id"],
-            )
-
-    # ═══ 7. UI Hints ═══
-
-    def get_progress_label(self, input_data: dict[str, Any]) -> str:
-        # 업데이트인지 생성인지에 따라 UI 진행 문구를 다르게 보여준다.
-        if input_data.get("task_id"):
-            return "Updating task..."
-        return "Creating task..."
-
-
-# ─────────────────────────────────────────────
 # TaskTool — 종합 태스크 관리
 # ─────────────────────────────────────────────
 class TaskTool(BaseTool):
@@ -464,7 +169,8 @@ class TaskTool(BaseTool):
 
     입력의 action 값에 따라 다섯 가지 작업을 한 도구에서 처리한다:
       create(생성) / update(수정) / list(목록) / get(상세) / stop(중지).
-    TodoRead/TodoWrite보다 세분화돼 있고, stop처럼 실행 제어(중지)까지 포함한다.
+    stop처럼 백그라운드 실행체의 제어(중지)까지 포함한다. 계획 체크리스트는
+    별도 도구(TodoWrite/TodoRead)가 담당한다.
 
     권한 정책:
       list/get 같은 읽기 작업은 바로 ALLOW,
@@ -648,7 +354,6 @@ class TaskTool(BaseTool):
 
         입력에 들어온 필드만 부분 수정한다. TaskManager 경로에서는
         progress도 받을 수 있어 update_progress()로 진행률을 갱신한다.
-        (TodoWrite와 달리 progress 갱신을 지원하는 점이 다르다.)
         대상을 못 찾으면 에러를 반환한다.
         """
         task_id = input_data["task_id"]
@@ -693,7 +398,7 @@ class TaskTool(BaseTool):
 
     def _handle_list(self, input_data: dict[str, Any], context: ToolUseContext) -> ToolResult:
         """
-        action="list" 처리 — TodoRead와 동일한 방식의 목록 조회.
+        action="list" 처리 — 백그라운드 태스크 목록 조회.
 
         status_filter로 상태를 걸러낼 수 있고, 최신순으로 정렬해 반환한다.
         """

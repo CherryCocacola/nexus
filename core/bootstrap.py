@@ -214,6 +214,16 @@ async def init_phase2(state: GlobalState) -> dict:
     components["task_manager"] = task_manager
     logger.info("[Phase 2] TaskManager 초기화")
 
+    # ③-c TodoStore — 계획 체크리스트(TodoWrite) 상태 저장소.
+    #    TurnStateStore와 동일한 세션·에이전트 키 인메모리 저장소로, TodoWrite/
+    #    TodoRead 도구가 context.options["todo_store"]로 참조한다(아래 ④-b).
+    #    prompt_assembler가 매 턴 이 체크리스트를 시스템 프롬프트로 재주입한다.
+    from core.todo_store import TodoStore
+
+    todo_store = TodoStore()
+    components["todo_store"] = todo_store
+    logger.info("[Phase 2] TodoStore 초기화 (계획 체크리스트)")
+
     # ④ AgentRegistry — v7.0 Phase 9 서브에이전트 시스템의 정의 저장소.
     #    SCOUT_AGENT 등 기본 서브에이전트가 여기 등록되며, AgentTool이
     #    subagent_type 이름으로 정의를 조회하고 시스템 프롬프트에도 반영된다.
@@ -305,6 +315,9 @@ async def init_phase2(state: GlobalState) -> dict:
         options={
             "memory_manager": memory_manager,
             "task_manager": task_manager,
+            # 계획 체크리스트 저장소 — TodoWrite/TodoRead 도구가 여기서 꺼내 쓴다.
+            # 미주입 시 도구가 모듈 전역 폴백 TodoStore로 동작한다(무회귀).
+            "todo_store": todo_store,
             "agent_registry": agent_registry,
             "model_provider": provider,
             # 문서 청크 크기 — 하드코딩 외부화(2026-07-03). DocumentProcess 도구가
@@ -667,6 +680,7 @@ async def init_phase2(state: GlobalState) -> dict:
         context_manager=context_manager,  # Ch 6: 티어별 전략
         max_turns=200,
         turn_state_store=turn_state_store,
+        todo_store=todo_store,  # 계획 체크리스트 — 매 턴 시스템 프롬프트에 재주입
         rag_retriever=rag_retriever,
         model_dispatcher=dispatcher,
         routing_config=config.routing,  # v7.0 Part 2.5 — 지식/도구 분기
@@ -864,7 +878,8 @@ def _create_tool_registry():  # noqa: ANN202 — ToolRegistry는 함수 내부�
     from core.tools.implementations.multi_edit_tool import MultiEditTool
     from core.tools.implementations.notebook_tools import NotebookEditTool, NotebookReadTool
     from core.tools.implementations.read_tool import ReadTool
-    from core.tools.implementations.task_tools import TaskTool, TodoReadTool, TodoWriteTool
+    from core.tools.implementations.task_tools import TaskTool
+    from core.tools.implementations.todo_tools import TodoReadTool, TodoWriteTool
     from core.tools.implementations.write_tool import WriteTool
     from core.tools.registry import ToolRegistry
 
@@ -1019,11 +1034,15 @@ def _create_web_tool_registry(tier: Any = None):  # noqa: ANN202
     from core.tools.implementations.bash_tool import BashTool
     from core.tools.implementations.edit_tool import EditTool
     from core.tools.implementations.symbol_search_tool import SymbolSearchTool
+    from core.tools.implementations.todo_tools import TodoReadTool, TodoWriteTool
     from core.tools.implementations.write_tool import WriteTool
     from core.tools.registry import ToolRegistry
 
     registry = ToolRegistry()
-    # TIER_S(기본) — 실행 전용 5개. 모든 티어의 공통 하위집합.
+    # TIER_S(기본) — 실행 + 계획 체크리스트. 모든 티어의 공통 하위집합.
+    # TodoWrite/TodoRead: 계획 메타데이터만 갱신(외부 부작용 없음). 웹 사용자에게
+    # "지금 몇 번째 단계"를 가시화하고, compact 후에도 계획을 유지하기 위해 웹
+    # Worker 풀에도 포함한다(파일 탐색 도구와 달리 세션 격리 cwd와 무관하게 유효).
     registry.register_many(
         [
             EditTool(),  # 편집 (~325 토큰)
@@ -1031,6 +1050,8 @@ def _create_web_tool_registry(tier: Any = None):  # noqa: ANN202
             BashTool(),  # 실행 (~275 토큰)
             AgentTool(),  # 서브에이전트 호출 (~300 토큰)
             SymbolSearchTool(),  # Phase 10.0 심볼 검색 (~200 토큰)
+            TodoWriteTool(),  # 계획 체크리스트 갱신 (전체 목록 원자 교체)
+            TodoReadTool(),  # 계획 체크리스트 조회 (읽기 전용)
         ]
     )
 

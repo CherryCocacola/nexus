@@ -317,31 +317,54 @@ _TOOL_USE_TEMPLATES: list[dict[str, Any]] = [
         "tool": "TodoRead",
         "input": {},
     },
-    # ── TodoWrite 도구 ──
+    # ── TodoWrite 도구 (계획 체크리스트 — 전체 목록 원자 교체) ──
+    # 주의: TodoWrite는 항상 todos 배열 "전체"를 보내 기존 목록을 통째로 교체한다.
+    # 단건 add/complete(구 스키마)가 아니라, 매번 완성된 계획을 다시 보낸다.
     {
-        "instruction": "할일을 추가해줘: query_loop 단위 테스트 작성",
+        "instruction": "query_loop 단위 테스트 작성 작업 계획을 세워줘.",
         "tool": "TodoWrite",
-        "input": {"action": "add", "content": "query_loop 단위 테스트 작성"},
+        "input": {
+            "todos": [
+                {
+                    "content": "query_loop 단위 테스트 작성",
+                    "status": "in_progress",
+                    "active_form": "query_loop 단위 테스트 작성 중",
+                },
+                {
+                    "content": "Read 도구 권한 검증 로직 추가",
+                    "status": "pending",
+                    "active_form": "Read 도구 권한 검증 로직 추가 중",
+                },
+                {
+                    "content": "SSE 스트리밍 파서 에러 핸들링 개선",
+                    "status": "pending",
+                    "active_form": "SSE 스트리밍 파서 에러 핸들링 개선 중",
+                },
+            ]
+        },
     },
     {
-        "instruction": "할일을 추가해줘: Read 도구 권한 검증 로직 추가",
+        "instruction": "첫 번째 항목을 끝냈어. 다음 항목으로 진행해줘.",
         "tool": "TodoWrite",
-        "input": {"action": "add", "content": "Read 도구 권한 검증 로직 추가"},
-    },
-    {
-        "instruction": "할일을 추가해줘: SSE 스트리밍 파서 에러 핸들링 개선",
-        "tool": "TodoWrite",
-        "input": {"action": "add", "content": "SSE 스트리밍 파서 에러 핸들링 개선"},
-    },
-    {
-        "instruction": "1번 할일을 완료 처리해줘.",
-        "tool": "TodoWrite",
-        "input": {"action": "complete", "task_id": "1"},
-    },
-    {
-        "instruction": "3번 할일을 완료 처리해줘.",
-        "tool": "TodoWrite",
-        "input": {"action": "complete", "task_id": "3"},
+        "input": {
+            "todos": [
+                {
+                    "content": "query_loop 단위 테스트 작성",
+                    "status": "completed",
+                    "active_form": "query_loop 단위 테스트 작성 중",
+                },
+                {
+                    "content": "Read 도구 권한 검증 로직 추가",
+                    "status": "in_progress",
+                    "active_form": "Read 도구 권한 검증 로직 추가 중",
+                },
+                {
+                    "content": "SSE 스트리밍 파서 에러 핸들링 개선",
+                    "status": "pending",
+                    "active_form": "SSE 스트리밍 파서 에러 핸들링 개선 중",
+                },
+            ]
+        },
     },
     # ── Task 도구 ──
     {

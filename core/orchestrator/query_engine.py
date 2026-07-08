@@ -106,6 +106,7 @@ class QueryEngine:
         max_turns: int = 200,
         hook_manager: Any | None = None,
         turn_state_store: Any | None = None,
+        todo_store: Any | None = None,
         rag_retriever: Any | None = None,
         model_dispatcher: Any | None = None,
         routing_config: RoutingConfig | None = None,
@@ -148,6 +149,9 @@ class QueryEngine:
         # v7.0: 턴 상태 외부화 저장소
         self._turn_state_store = turn_state_store
 
+        # 계획 체크리스트 저장소(TodoWrite) — PromptAssembler가 매 턴 재주입한다.
+        self._todo_store = todo_store
+
         # RAG: 관련 문서 청크 자동 검색
         self._rag_retriever = rag_retriever
 
@@ -167,6 +171,7 @@ class QueryEngine:
         # PromptAssembler 내부 기본 상수(현행값)로 폴백시킨다.
         self._prompt_assembler = PromptAssembler(
             turn_state_store=turn_state_store,
+            todo_store=todo_store,
             rag_retriever=rag_retriever,
             knowledge_retriever=None,  # 아래 setattr 이후 바인딩
             turn_state_tokens=(

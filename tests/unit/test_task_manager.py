@@ -372,15 +372,19 @@ class TestTaskToolsWithManager:
         )
 
     @pytest.mark.asyncio
-    async def test_todo_write_create_uses_manager(self):
-        """TodoWriteTool의 create가 TaskManager를 사용해야 한다."""
-        from core.tools.implementations.task_tools import TodoWriteTool
+    async def test_task_tool_create_uses_manager(self):
+        """TaskTool의 create가 TaskManager를 사용해야 한다.
+
+        (구 TodoWriteTool 단건 생성 테스트를 TaskTool 기반으로 이전 —
+        TodoWrite는 계획 체크리스트 시맨틱으로 바뀌었다.)
+        """
+        from core.tools.implementations.task_tools import TaskTool
 
         mgr = TaskManager()
         ctx = self._make_context_with_manager(mgr)
-        tool = TodoWriteTool()
+        tool = TaskTool()
 
-        result = await tool.call({"description": "manager task"}, ctx)
+        result = await tool.call({"action": "create", "description": "manager task"}, ctx)
 
         assert not result.is_error
         assert "태스크를 생성했습니다" in result.data
@@ -388,18 +392,21 @@ class TestTaskToolsWithManager:
         assert len(mgr.tasks) == 1
 
     @pytest.mark.asyncio
-    async def test_todo_read_uses_manager(self):
-        """TodoReadTool이 TaskManager에서 태스크를 조회해야 한다."""
-        from core.tools.implementations.task_tools import TodoReadTool
+    async def test_task_tool_list_uses_manager(self):
+        """TaskTool의 list가 TaskManager에서 태스크를 조회해야 한다.
+
+        (구 TodoReadTool 목록 조회 테스트를 TaskTool 기반으로 이전.)
+        """
+        from core.tools.implementations.task_tools import TaskTool
 
         mgr = TaskManager()
         mgr.create(TaskType.WORKFLOW, "task A")
         mgr.create(TaskType.WORKFLOW, "task B")
 
         ctx = self._make_context_with_manager(mgr)
-        tool = TodoReadTool()
+        tool = TaskTool()
 
-        result = await tool.call({}, ctx)
+        result = await tool.call({"action": "list"}, ctx)
 
         assert not result.is_error
         assert "task A" in result.data

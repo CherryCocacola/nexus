@@ -71,7 +71,10 @@ tool_configuration:
       enabled: true
       require_permission: true
 
-    # ── 태스크 관리 (3개) ──
+    # ── 계획 체크리스트 + 태스크 관리 (3개) ──
+    # TodoRead/TodoWrite: 계획 체크리스트(전체 목록 원자 교체 + pending/in_progress/
+    #   completed). 백그라운드 태스크 제어가 아니라 모델의 계획 추적·사용자 가시성용.
+    # Task: 백그라운드 실행체(create/update/list/get/stop) 라이프사이클 제어.
     - name: "TodoRead"
       enabled: true
     - name: "TodoWrite"
