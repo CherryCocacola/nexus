@@ -81,6 +81,9 @@ async def init(
 
     # ② 설정 로딩 + 검증 — YAML을 읽어 NexusConfig(Pydantic)로 검증한 뒤
     #    state에 붙여둔다. 이후 모든 단계가 이 config를 단일 소스로 참조한다.
+    # NEXUS_CONFIG 환경변수로 설정 파일 경로를 지정할 수 있다(config 헤더에 문서화된 방식).
+    # 우선순위: 인자로 넘긴 config_path > NEXUS_CONFIG env > 자동 탐색(None).
+    config_path = config_path or os.environ.get("NEXUS_CONFIG")
     config = load_and_validate_config(config_path)
     state.config = config
     logger.info(f"[Phase 1] 설정 로드 완료: gpu_server={config.gpu_server_url}")

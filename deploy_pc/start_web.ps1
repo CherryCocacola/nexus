@@ -23,5 +23,8 @@ $env:PYTHONIOENCODING = "utf-8"
 
 # 포트 8600 사용(8443 은 Docker Desktop 등 기존 서비스와 충돌하므로 회피).
 # 접속은 반드시 http://127.0.0.1:8600 (localhost 는 IPv6(::1)로 풀려 다른 서비스로 갈 수 있음).
-Write-Host "[웹] 오케스트레이터 기동: http://127.0.0.1:8600  (백엔드=B200 터널)" -ForegroundColor Cyan
+# PC 전용 설정 사용 — 터널 로컬 포트(18001/18002/15440/16340)를 가리키는 사본.
+# 이렇게 분리해야 B200 co-located용 공용 config(127.0.0.1:8001…)를 훼손하지 않는다.
+$env:NEXUS_CONFIG = "config\nexus_config.pc.yaml"
+Write-Host "[웹] 오케스트레이터 기동: http://127.0.0.1:8600  (백엔드=B200 터널, config=nexus_config.pc.yaml)" -ForegroundColor Cyan
 & $Venv -m uvicorn web.app:app --host 127.0.0.1 --port 8600 --log-level info
