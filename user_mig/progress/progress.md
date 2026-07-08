@@ -2935,3 +2935,11 @@ QA 잔존 사실오류(#38 칸트/#8 베토벤/#34 조선왕)의 원인 규명. 
 - **원인 배경**: 메모리의 "probes 10" 튜닝은 구 docutil DB 것이고, B200 이관 nexus DB엔 DB레벨 설정이 안 따라옴. `ALTER DATABASE`는 오토모드가 공유DB 영속변경으로 차단 → **코드 주입**이 정공법(배포 간 이식성).
 - **수정(5파일)**: config.py `KnowledgeRagConfig.ivfflat_probes:int=40` 추가 / knowledge_store.py `search_by_vector(probes=)`에서 트랜잭션+`SET LOCAL ivfflat.probes` / knowledge_retriever.py `__init__(ivfflat_probes)` + search_by_vector 호출에 전달 / bootstrap.py 리트리버 생성에 `ivfflat_probes=krag.ivfflat_probes` / nexus_config.yaml·pc.yaml `knowledge_rag.ivfflat_probes:40`. ruff 통과, knowledge/retriever/store 테스트 57 passed. 재기동 후 칸트 3대 비판서 정확 회복.
 - **잔존(별개 이슈)**: 긴 서술형 답변에서 **간헐적 숫자 깨짐**(1781→1887, 1988→19988). 검증: rep_pen 1.15/1.0 무관, 연도 복사·짧은 recall은 정확, FP8은 기검증(BF16 동일). → 긴 생성 디코딩 아티팩트로 추정, 모델레벨. 실용대응=핵심 사실 RAG 주입 복사. 완전근절은 후속 심층과제.
+
+### 코드 견고성 — 반복 실패 도구 호출 가드 (2026-07-08)
+
+QA #43(깨진 Bash 명령을 못 고치고 14회·62초 반복)의 근본 방어. MAX_TURNS=200은 이런 짧은 반복 루프를 잡기엔 너무 큼.
+
+- **구현(query_loop.py 1파일)**: 서명(도구+정규화입력)별 '연속 실패 턴 수'를 지역 dict로 추적. Phase 4에서 tool_result의 is_error를 tool_use_id로 수집 → `_update_tool_failure_streak`로 갱신. `REPEATED_TOOL_FAILURE_WARN=3`턴 → user역할 "반복 중단" 피드백 1회 주입, `ABORT=5`턴 → 루프 강제 종료. 순수 헬퍼로 분리해 단위 테스트.
+- **code-reviewer 별도 레인 검토(자기승인 금지)** → 실결함 3건 확증·수정: (HIGH) stale 서명 미evict로 WARN 매턴 무한주입 → 이번 턴 등장 서명만 카운트+evict. (MED) 병렬 동일호출 턴당 다중증가 → 서명별 턴당 +1 dedup. (LOW) `==`→`>=`+warned_sigs 1회주입 보장. 리뷰가 메시지순서·ABORT return·StreamEvent 계약은 무결성 확인.
+- **검증**: 단위 10개(증가·리셋·독립·stale evict·병렬 dedup·임계·직렬화폴백) + 기존 query_loop 7개 통과. 포맷터 직접확인(tool_result 뒤 user 주입 정상). 라이브 회귀(계산 506628·일반대화) 정상, 가드 미발동.

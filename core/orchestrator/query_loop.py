@@ -46,6 +46,7 @@ Claude Code의 query.ts (1,729줄)를 Python으로 완전 재구현한다.
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from collections.abc import AsyncGenerator
@@ -140,10 +141,70 @@ MAX_TOOL_PARSE_RETRY = 2  # 도구 JSON 파싱 재시도 횟수
 MAX_MODEL_ERROR_RETRY = 3  # 모델 에러 재시도 횟수
 MAX_COMPACT_RETRY = 2  # prompt-too-long 압축 재시도 횟수
 MAX_COLLAPSE_DRAIN = 1  # 긴급 압축 최대 횟수
+# 반복 실패 도구 호출 가드 — 모델이 같은 도구를 같은 입력으로 계속 호출하는데
+# 매번 실패하는(예: 깨진 Bash 명령을 못 고치고 반복하는) 상황을 조기에 끊는다.
+# MAX_TURNS(200)는 이런 짧은 반복 루프를 잡기엔 너무 커서 별도 임계를 둔다.
+REPEATED_TOOL_FAILURE_WARN = 3  # 이 횟수 연속 실패 시 "반복 중단" 피드백 1회 주입
+REPEATED_TOOL_FAILURE_ABORT = 5  # 이 횟수 연속 실패 시 턴 루프 강제 종료(백스톱)
 
 # 출력 토큰 에스컬레이션 단계
 # max_tokens를 점진적으로 증가시킨다 (4K → 8K → 16K)
 OUTPUT_TOKEN_ESCALATION = [4096, 8192, 16384]
+
+
+def _tool_call_signature(name: str, tool_input: Any) -> str:
+    """도구 호출을 '이름 + 정규화된 입력'으로 서명한다.
+
+    같은 명령의 반복을 식별하기 위한 키다. 입력 dict를 키 정렬 JSON으로
+    직렬화해, 키 순서만 다른 동일 입력도 같은 서명이 되게 한다. 직렬화가
+    불가능한 입력은 str()로 폴백한다(서명은 완벽할 필요 없이 안정적이면 된다).
+    """
+    try:
+        norm = json.dumps(tool_input, sort_keys=True, ensure_ascii=False)
+    except (TypeError, ValueError):
+        norm = str(tool_input)
+    return f"{name}::{norm}"
+
+
+def _update_tool_failure_streak(
+    tool_use_blocks: list[dict[str, Any]],
+    id_to_error: dict[str, bool],
+    streak: dict[str, int],
+) -> int:
+    """이번 턴 도구 호출들의 '연속 실패 턴 수'를 갱신하고 최댓값을 돌려준다.
+
+    카운터의 의미는 "그 서명이 연속으로 실패한 '턴' 수"다. 이를 지키기 위해:
+    - 같은 서명이 한 턴에 병렬로 여러 번 호출돼도(list[dict] 병렬 호출) 카운터는
+      턴당 최대 +1만 오른다(턴 내 중복이 ABORT를 앞당기지 못하게).
+    - 실패한 서명: +1. 성공(또는 결과 없음)한 서명: 리셋(더는 '반복 실패' 아님).
+    - 이번 턴에 아예 등장하지 않은 과거 서명: '연속'이 끊긴 것이므로 제거한다.
+      그래야 모델이 다른 명령으로 넘어가면 낡은 실패 카운트가 판정을 오염시키지
+      않는다(안 그러면 max()가 과거 서명에 영영 지배당함).
+
+    반환값은 '이번 턴에 등장한' 서명들의 최고 연속 실패 횟수 — 호출부가 이 값으로
+    경고 주입(WARN)/강제 종료(ABORT)를 판단한다. streak dict는 query_loop
+    1회 호출 동안만 유지되는 지역 상태라 세션/서브에이전트 간 격리된다.
+    """
+    # 1) 이번 턴 서명별 실패 여부를 OR로 집계(병렬 중복 호출을 턴당 1회로 합침).
+    errored_this_turn: dict[str, bool] = {}
+    for tu in tool_use_blocks:
+        sig = _tool_call_signature(tu.get("name", ""), tu.get("input"))
+        errored = id_to_error.get(tu.get("id", ""), False)
+        errored_this_turn[sig] = errored_this_turn.get(sig, False) or errored
+
+    # 2) 이번 턴에 등장하지 않은 과거 서명은 연속이 끊긴 것 → 제거.
+    for stale_sig in [s for s in streak if s not in errored_this_turn]:
+        streak.pop(stale_sig, None)
+
+    # 3) 이번 턴 서명별로 +1(실패) 또는 리셋(성공).
+    for sig, errored in errored_this_turn.items():
+        if errored:
+            streak[sig] = streak.get(sig, 0) + 1
+        else:
+            streak.pop(sig, None)
+
+    # 4) 남은 건 이번 턴에 실패한 서명뿐 → 그 최댓값이 최고 연속 실패 턴 수.
+    return max(streak.values(), default=0)
 
 
 # ─────────────────────────────────────────────
@@ -515,6 +576,12 @@ async def query_loop(
     # 출력 토큰 에스컬레이션 단계 확정 — 주입값 우선, 미주입 시 모듈 상수 폴백.
     # (하드코딩 외부화 무회귀: config 미주입 경로/기존 테스트는 상수 그대로 사용)
     escalation_steps = output_token_escalation or OUTPUT_TOKEN_ESCALATION
+
+    # 반복 실패 도구 호출 추적 — 서명(도구+입력)별 연속 실패 턴 수.
+    # query_loop 1회 호출 동안만 유지되는 지역 상태다(서브에이전트/세션 간 격리).
+    tool_failure_streak: dict[str, int] = {}
+    # WARN 피드백을 이미 준 서명 집합 — 같은 실패에 매 턴 중복 경고를 막는다.
+    warned_sigs: set[str] = set()
 
     # ── while(True) 에이전트 턴 루프 (Tier 2의 심장부) ──
     # 모델이 도구 사용을 멈추거나(정상 종료), 7가지 Continue Transition 중 하나로
@@ -1025,11 +1092,62 @@ async def query_loop(
 
         # 스트리밍 중 미처 끝나지 않은 도구를 모두 완료시키고 결과를 흘려보낸다.
         # 도구 결과(tool_result Message)는 다음 턴에서 모델이 읽도록 히스토리에 넣는다.
+        # 이번 턴 도구 결과의 에러 여부를 tool_use_id로 수집(반복 실패 가드용).
+        this_turn_errors: dict[str, bool] = {}
         async for event in streaming_executor.drain_remaining():
             yield event
             # Message 이벤트(tool_result)는 대화 히스토리에 추가
             if isinstance(event, Message):
                 state.messages.append(event)
+                if getattr(event, "tool_use_id", None):
+                    this_turn_errors[event.tool_use_id] = bool(
+                        getattr(event, "is_error", False)
+                    )
+
+        # ─── 반복 실패 도구 호출 가드 (무한 재시도 루프 방지) ───
+        # 같은 도구를 같은 입력으로 계속 호출하며 매번 실패하면(예: 깨진 Bash
+        # 명령을 못 고치고 반복) 시간만 태운다. 연속 실패가 WARN 임계에 닿으면
+        # 모델에 "반복하지 말라"는 피드백을 1회 주입하고, ABORT를 넘으면 강제
+        # 종료한다. 성공한 호출은 헬퍼가 서명별로 카운터를 리셋한다.
+        worst_streak = _update_tool_failure_streak(
+            tool_use_blocks, this_turn_errors, tool_failure_streak
+        )
+        # 리셋/제거된 서명은 경고 이력에서도 지워, 같은 명령이 나중에 재발하면
+        # 다시 한 번 경고할 수 있게 한다(살아있는 streak 서명과 동기화).
+        warned_sigs.intersection_update(tool_failure_streak.keys())
+        if worst_streak >= REPEATED_TOOL_FAILURE_ABORT:
+            logger.warning(
+                "동일 도구 호출이 %d턴 연속 실패 — 턴 루프 강제 종료", worst_streak
+            )
+            yield StreamEvent(
+                type=StreamEventType.SYSTEM_WARNING,
+                message=(
+                    f"[반복 실패 중단] 동일한 도구 호출이 {worst_streak}턴 연속 "
+                    "실패하여 중단합니다. 다른 방법으로 다시 시도해 주세요."
+                ),
+            )
+            return
+        # WARN 임계를 '처음' 넘은 서명에만 1회 피드백을 주입한다(warned_sigs로
+        # 중복 주입 차단 — 같은 실패에 매 턴 경고가 반복되지 않게). user 역할로
+        # 넣어 모델이 다음 턴에 확실히 읽고 반복을 멈추도록 유도한다.
+        newly_warned = [
+            sig
+            for sig, cnt in tool_failure_streak.items()
+            if cnt >= REPEATED_TOOL_FAILURE_WARN and sig not in warned_sigs
+        ]
+        if newly_warned:
+            warned_sigs.update(newly_warned)
+            yield StreamEvent(
+                type=StreamEventType.SYSTEM_WARNING,
+                message=f"[반복 실패 경고] 동일 도구 호출 {worst_streak}턴 연속 실패",
+            )
+            state.messages.append(
+                Message.user(
+                    "[시스템] 방금 같은 도구 호출이 여러 번 연속 실패했습니다. "
+                    "똑같은 명령을 그대로 반복하지 마세요. 명령이나 입력을 바꾸거나, "
+                    "도구 없이 지금까지의 정보로 답변을 완성하세요."
+                )
+            )
 
         # ─── Transition 7: next_turn ───
         # 도구 실행 완료 → 정상적으로 다음 턴 진행
