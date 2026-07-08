@@ -985,9 +985,15 @@ def _create_web_tool_registry(tier: Any = None):  # noqa: ANN202
     Agent(subagent_type="scout")로 위임한다. 8K 컨텍스트에 큰 데이터가 직접
     적재되는 상황을 구조적으로 차단하기 위함이다.
 
-    ── TIER_M/L (80GB+ , 32K/128K ctx) — 탐색·문서 도구 추가 ──
-    컨텍스트가 넉넉하므로 Worker가 직접 탐색할 수 있게 다음 6개를 추가한다:
-    Read / Glob / Grep / LS / DocumentProcess / GitDiff.
+    ── TIER_M/L (80GB+ , 32K/128K ctx) — 문서 도구만 추가 ──
+    컨텍스트가 넉넉하므로 문서 처리·생성 도구 3개를 추가한다:
+    DocumentProcess / DocumentExport / GitDiff.
+    ★ 파일탐색(Read/Glob/Grep/LS)은 웹 표면에서 **의도적으로 제외**한다(2026-07-08 결정).
+      사양서 v7.0 Part 2.5는 "상위 티어 Worker는 직접 탐색"을 규정하지만, 그 규정은
+      로컬 파일시스템을 가진 CLI/에이전트 Worker를 전제한 것이다. 웹 채팅 사용자는
+      뒤질 파일시스템이 없어(세션 cwd 격리) Glob/Grep/LS/Read가 항상 빈손을 반환해
+      혼란만 준다. 웹 사용자의 "파일"은 업로드 문서(DocumentProcess) + 지식 RAG(자동
+      주입)이므로 그쪽으로만 노출한다. 코드 심볼 위치는 SymbolSearch(TIER_S 공통)가 담당.
     GitCommit은 웹 정책상 **계속 제외**한다(일반 사용자 UI에서 커밋 금지).
 
     fail-closed: tier가 None이거나 알 수 없는 값이면 TIER_S(5개)로 유지한다.
@@ -1025,20 +1031,13 @@ def _create_web_tool_registry(tier: Any = None):  # noqa: ANN202
         from core.tools.implementations.document_export_tool import DocumentExportTool
         from core.tools.implementations.document_tool import DocumentProcessTool
         from core.tools.implementations.git_tools import GitDiffTool
-        from core.tools.implementations.glob_tool import GlobTool
-        from core.tools.implementations.grep_tool import GrepTool
-        from core.tools.implementations.ls_tool import LSTool
-        from core.tools.implementations.read_tool import ReadTool
 
         registry.register_many(
             [
-                ReadTool(),  # 파일 읽기
-                GlobTool(),  # 파일명 패턴 검색
-                GrepTool(),  # 내용 정규식 검색
-                LSTool(),  # 디렉토리 목록
                 DocumentProcessTool(),  # 업로드 문서(.pdf/.docx/.xlsx/.hwp/.pptx) 파싱
                 DocumentExportTool(),  # 문서 생성(.docx/.pptx/.hwpx/.md/.txt) + 다운로드
                 GitDiffTool(),  # git 변경 조회(읽기 전용). GitCommit은 제외.
+                # ※ Read/Glob/Grep/LS는 웹 표면에서 제외 — 위 docstring 근거 참조.
             ]
         )
 
