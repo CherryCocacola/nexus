@@ -110,6 +110,13 @@ class StreamEventType(str, Enum):
     STREAM_REQUEST_START = "stream_request_start"  # 모델 요청 시작 마커
     STREAM_REQUEST_END = "stream_request_end"  # 모델 요청 종료 마커
 
+    # 지식 RAG 출처 인용 (Point 4-2, 2026-07-08)
+    # KNOWLEDGE 질의에서 주입된 지식 청크의 출처 메타데이터를 상위(웹/CLI)로 1회 전달.
+    # Tier 1(QueryEngine.submit_message)이 프롬프트 조립 직후 yield하며, 웹은 이를
+    # ChatResponse.sources(비스트림)/SSE(스트림)로 노출한다. 미지 타입을 무시하는
+    # 기존 소비자에는 하위 호환(신규 type 추가일 뿐 기존 이벤트 수정 아님).
+    KNOWLEDGE_SOURCES = "knowledge_sources"  # 지식 RAG 출처 목록(knowledge_sources 필드)
+
     # 사용량
     USAGE_UPDATE = "usage_update"  # 토큰 사용량 갱신
 
@@ -224,6 +231,43 @@ class TokenUsage(BaseModel):
 
 
 # ─────────────────────────────────────────────
+# 지식 RAG 출처 인용 (Point 4-2, 2026-07-08)
+# ─────────────────────────────────────────────
+class KnowledgeCitation(BaseModel):
+    """주입된 지식 청크 1건의 출처 메타데이터 — 답변 인용·UI 노출용.
+
+    KNOWLEDGE 질의에서 knowledge_retriever가 "실제로 프롬프트에 주입한" 청크
+    하나마다 만들어지는 불변(frozen) 레코드다. 본문의 `[출처N]` 마커가 가리키는
+    실체(제목/source/섹션/점수)를 담아, 모델이 아니라 "서버가 아는 진실"로 출처를
+    노출한다(downloads 필드와 동일 원칙 — 모델 텍스트를 신뢰하지 않는다).
+
+    이 모델을 core/message.py에 두는 이유(의존성 방향 P2):
+      StreamEvent가 이 타입을 필드로 참조해야 하는데, StreamEvent는 core/message에
+      있다. rag가 message를 import하는 것은 순방향(core/rag → core/message)이므로,
+      모델을 여기 두고 rag가 가져다 쓴다(역방향 import 회피).
+
+    필드:
+      index    : 1부터 시작하는 출처 번호([출처N]의 N). 조립 시점의 '실제 주입
+                 순서'로 부여 → 토큰 예산에서 잘려 주입 안 된 청크에는 번호가
+                 없다("번호는 있는데 본문이 없는" 불일치 원천 차단).
+      source   : 출처 계열('kowiki', 'docingest' 등).
+      title    : 문서 제목.
+      section  : 섹션명(없으면 None).
+      score    : 신뢰도 — rerank_score 우선, 없으면 similarity.
+      chunk_id : tb_knowledge.id(감사·추적용, 선택 — 없으면 None).
+    """
+
+    model_config = {"frozen": True}
+
+    index: int
+    source: str
+    title: str
+    section: str | None = None
+    score: float = 0.0
+    chunk_id: str | None = None
+
+
+# ─────────────────────────────────────────────
 # 스트리밍 이벤트
 # ─────────────────────────────────────────────
 class StreamEvent(BaseModel):
@@ -269,6 +313,9 @@ class StreamEvent(BaseModel):
 
     # THINKING
     thinking_text: str | None = None  # 사고(thinking) 텍스트 조각
+
+    # KNOWLEDGE_SOURCES — 지식 RAG 출처 목록(주입된 청크의 출처 메타). Point 4-2.
+    knowledge_sources: list[KnowledgeCitation] | None = None
 
     # 메타데이터
     model_id: str | None = None  # 이 이벤트를 만든 모델 식별자

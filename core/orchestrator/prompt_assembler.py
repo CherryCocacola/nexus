@@ -57,6 +57,28 @@ _DEFAULT_PROJECT_RAG_TOKENS = 1500  # 프로젝트 RAG 주입 상한(현행)
 _DEFAULT_KNOWLEDGE_RAG_TOKENS = 1000  # 지식베이스 RAG 주입 상한(현행)
 
 
+def _citation_trailer(label: str) -> str:
+    """출처 인용 지시문(Point 4-2 §5.1)을 만든다 — KB 블록 뒤 grounding trailer 뒤에 붙는다.
+
+    citation 활성 + 실제 주입 청크가 있을 때만 사용한다. 라벨(기본 "출처")은
+    config에서 오며, 헤더의 `[출처N | ...]`과 같은 값이라 본문 마커와 정합한다.
+    나머지 지시는 모델 지시 효율을 위해 기존 trailer들처럼 영어로 둔다(라벨만 한글).
+    """
+    return (
+        f"Citation rule ({label} 표기): Each snippet above is labeled [{label}N].\n"
+        f"- When you state a fact taken from a snippet, append its label like "
+        f"[{label}1] at the end of that sentence. Multiple labels are allowed: "
+        f"[{label}1][{label}3].\n"
+        f"- Use ONLY the labels that actually appear above. Never invent labels "
+        f"or numbers.\n"
+        f"- Do NOT restate snippet titles or metadata in the body — the label "
+        f"alone is enough.\n"
+        f"- Statements from your own general knowledge get NO label; if a "
+        f"verifiable fact has no supporting snippet and you are not confident, "
+        f"say you are not sure (Grounding rule)."
+    )
+
+
 class PromptAssembler:
     """system_prompt 조립을 한 객체로 캡슐화한 클래스.
 
@@ -118,6 +140,11 @@ class PromptAssembler:
             knowledge_rag_tokens if knowledge_rag_tokens is not None
             else _DEFAULT_KNOWLEDGE_RAG_TOKENS
         )
+        # 출처 인용(Point 4-2) — 이번 assemble()에서 KB에 '실제로 주입된' 청크의
+        # 출처 목록. _attach_knowledge_base가 채우고(citation 활성 시), assemble()
+        # 시작마다 ()로 리셋한다. Tier 1(QueryEngine)이 이 값을 읽어
+        # KNOWLEDGE_SOURCES StreamEvent로 상위(웹/CLI)에 1회 전달한다.
+        self.last_knowledge_citations: tuple = ()
 
     async def assemble(
         self,
@@ -136,6 +163,9 @@ class PromptAssembler:
         """
         prompt = base_prompt
         t_start = time.perf_counter()
+        # 출처 인용 — 이번 조립의 citations를 매번 초기화한다(이전 턴 값 누수 차단).
+        # KB 주입이 없거나 인용 비활성이면 ()로 남아 Tier 1이 이벤트를 내지 않는다.
+        self.last_knowledge_citations = ()
 
         # ① TurnState — 이전 턴 요약
         t0 = time.perf_counter()
@@ -257,7 +287,9 @@ class PromptAssembler:
         try:
             # 지식베이스 조회 — 예산(max_tokens)과 테넌트 허용 소스 필터를 함께 전달.
             # allowed_sources로 이 테넌트가 볼 수 있는 지식 소스만 걸러 검색한다.
-            kb_ctx = await self._knowledge_retriever.get_context(
+            # get_context_with_citations는 (주입 텍스트 + 출처 목록)을 함께 돌려준다
+            # (출처 인용 Point 4-2). citation 비활성이면 citations는 () — 무회귀.
+            kb = await self._knowledge_retriever.get_context_with_citations(
                 user_input,
                 max_tokens=self._knowledge_rag_tokens,
                 allowed_sources=decision.allowed_knowledge_sources,
@@ -266,6 +298,7 @@ class PromptAssembler:
             # 지식 검색 장애가 본류 응답을 막지 않도록 조용히 폴백.
             logger.debug("지식 RAG 주입 실패 (무시): %s", e)
             return prompt
+        kb_ctx = kb.text
         if not kb_ctx:
             # ★2 게이팅 — KNOWLEDGE 질의인데 관련 자료를 못 찾은 경우.
             # 예전엔 그냥 prompt를 반환해 KB 블록 없이 모델이 자유 생성했고,
@@ -286,20 +319,35 @@ class PromptAssembler:
                 "available and you cannot verify it (예: '제공된 자료에는 없고 "
                 "정확히 확인하기 어렵습니다')."
             )
-        logger.info("지식 RAG 주입: ~%d자", len(kb_ctx))
+        # 출처 인용(Point 4-2) — 실제 주입된 청크의 출처 목록을 보관한다.
+        # Tier 1(QueryEngine)이 이 값을 읽어 KNOWLEDGE_SOURCES 이벤트로 노출한다.
+        # citation 비활성이거나 주입 청크가 없으면 kb.citations는 ()라 무영향.
+        self.last_knowledge_citations = kb.citations
+        logger.info(
+            "지식 RAG 주입: ~%d자 (citations=%d)", len(kb_ctx), len(kb.citations)
+        )
         # 검색 결과가 질의와 무관할 때 모델이 무리하게 활용하지 않도록 명시.
         # kowiki 100만 청크 환경에서 어떤 질의든 코사인 유사도로 무언가가 잡히지만
         # 의미적으로 관련이 없을 수 있다. "주어진 컨텍스트 = 정답 재료"로 오인하지
         # 말 것 + 검증 가능한 사실은 근거 없으면 단정 금지(★1 grounding)를 명시.
-        return (
-            prompt
-            + "\n\n--- Knowledge base ---\n"
-            + kb_ctx
-            + "\n--- End of knowledge base ---\n"
-            + "Use the information above ONLY when it is clearly relevant to the "
+        trailer = (
+            "Use the information above ONLY when it is clearly relevant to the "
             "user's question. If the snippets are off-topic or irrelevant, do not "
             "force-fit them. For verifiable facts (catalog numbers, names, dates, "
             "figures), state them as certain ONLY if supported above or by "
             "well-established common knowledge; otherwise say you are not sure "
             "rather than guessing."
+        )
+        # 인용 활성 + 실제 주입 청크가 있을 때(=citations 비어있지 않음)만 인용 지시를
+        # grounding trailer 뒤에 덧붙인다. "자료 없음" 분기(b)에는 인용 대상이 없어
+        # 넣지 않는다(위에서 이미 return). 라벨은 retriever와 같은 값으로 맞춘다.
+        if kb.citations:
+            label = getattr(self._knowledge_retriever, "citation_label", "출처")
+            trailer = trailer + "\n\n" + _citation_trailer(label)
+        return (
+            prompt
+            + "\n\n--- Knowledge base ---\n"
+            + kb_ctx
+            + "\n--- End of knowledge base ---\n"
+            + trailer
         )

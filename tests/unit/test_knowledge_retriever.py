@@ -25,7 +25,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from core.rag.knowledge_retriever import KnowledgeRetriever
+from core.rag.knowledge_retriever import KnowledgeContext, KnowledgeRetriever
 
 
 # ─────────────────────────────────────────────
@@ -408,3 +408,133 @@ async def test_abs_threshold_exact_boundary_passes_strict_less_than() -> None:
     out = await kr.get_context("경계값 청크 알려줘")
     # 0.84 == 0.84 → `<` 비교에서 False이므로 드롭되지 않고 통과한다.
     assert "경계청크" in out
+
+
+# ─────────────────────────────────────────────
+# 출처 인용 (Point 4-2, 2026-07-08)
+#   - citation 비활성(기본): 헤더·반환이 종전과 100% 동일(무회귀)
+#   - citation 활성: 실제 주입된 청크에만 [출처N] 번호 부착 + citations 생성
+# ─────────────────────────────────────────────
+@pytest.mark.asyncio
+async def test_citation_disabled_output_identical_to_legacy() -> None:
+    """citation 비활성(기본)이면 헤더에 [출처N]이 없고 citations도 비어야 한다(무회귀).
+
+    get_context()(문자열)와 get_context_with_citations().text가 동일하고, 기존
+    헤더 형식([source · title · sim=])을 그대로 유지하는지 골든 검증한다.
+    """
+    store = _make_mock_store(vector_results=[_SAMPLE_CHUNK])
+    emb = _make_mock_embedding(return_value=[[0.1] * 4])
+    kr = KnowledgeRetriever(store=store, embedding_provider=emb)  # citation 기본 OFF
+
+    ctx = await kr.get_context_with_citations("니체 철학")
+    assert isinstance(ctx, KnowledgeContext)
+    # 번호 라벨이 붙지 않고 종전 헤더 형식 그대로다.
+    assert "[출처" not in ctx.text
+    assert "[kowiki · 니체 · 생애 · sim=0.91]" in ctx.text
+    assert ctx.citations == ()
+    # 얇은 래퍼 get_context()가 동일한 text를 돌려준다.
+    legacy_text = await kr.get_context("니체 철학")
+    assert legacy_text == ctx.text
+
+
+@pytest.mark.asyncio
+async def test_citation_enabled_headers_numbered_sequentially() -> None:
+    """citation 활성 시 주입 청크마다 [출처1|~[출처3| 순번을 부여하고 citations를 만든다."""
+    c1 = {
+        "id": "a", "source": "kowiki", "title": "바흐", "section": "생애",
+        "similarity": 0.90, "content": "바흐는 바로크 작곡가다.",
+    }
+    c2 = {
+        "id": "b", "source": "kowiki", "title": "헨델", "section": "",
+        "similarity": 0.88, "content": "헨델도 바로크 작곡가다.",
+    }
+    c3 = {
+        "id": "c", "source": "kowiki", "title": "비발디", "section": "",
+        "similarity": 0.86, "content": "비발디도 바로크 작곡가다.",
+    }
+    store = _make_mock_store(vector_results=[c1, c2, c3])
+    emb = _make_mock_embedding(return_value=[[0.1] * 4])
+    kr = KnowledgeRetriever(
+        store=store, embedding_provider=emb, top_k=5, citation_enabled=True
+    )
+
+    ctx = await kr.get_context_with_citations("바로크 작곡가", max_tokens=1500)
+    # 헤더에 [출처N | 기존헤더] 형식으로 번호가 순서대로 부착된다.
+    assert "[출처1 | kowiki · 바흐 · 생애 · sim=0.90]" in ctx.text
+    assert "[출처2 | kowiki · 헨델 · sim=0.88]" in ctx.text
+    assert "[출처3 | kowiki · 비발디 · sim=0.86]" in ctx.text
+    # citations: index 1~3, 메타데이터/정규화 검증.
+    assert [c.index for c in ctx.citations] == [1, 2, 3]
+    assert ctx.citations[0].title == "바흐"
+    assert ctx.citations[0].section == "생애"
+    assert ctx.citations[0].chunk_id == "a"
+    assert ctx.citations[0].score == pytest.approx(0.90)
+    # 빈 섹션은 None으로 정규화된다(모델 필드 계약).
+    assert ctx.citations[1].section is None
+
+
+@pytest.mark.asyncio
+async def test_citation_budget_cut_excludes_dropped_chunks() -> None:
+    """토큰 예산으로 잘려 실제 주입 안 된 청크에는 번호도 citation도 없어야 한다.
+
+    번호-본문 불일치 차단의 핵심: 예산에 안 들어간 둘째 청크는 [출처2] 라벨도,
+    citations 항목도 만들어지면 안 된다.
+    """
+    big = "가" * 400
+    c1 = {
+        "id": "a", "source": "kowiki", "title": "첫청크", "section": "",
+        "similarity": 0.90, "content": big,
+    }
+    c2 = {
+        "id": "b", "source": "kowiki", "title": "둘째청크", "section": "",
+        "similarity": 0.88, "content": big,
+    }
+    store = _make_mock_store(vector_results=[c1, c2])
+    emb = _make_mock_embedding(return_value=[[0.1] * 4])
+    # chars_per_token=1로 예산을 글자수와 1:1로 두어 예측 가능하게 만든다.
+    # 첫 청크(헤더+400자)는 들어가고, 둘째는 남은 예산(<200)이라 통째로 탈락한다.
+    kr = KnowledgeRetriever(
+        store=store, embedding_provider=emb, top_k=5,
+        citation_enabled=True, chars_per_token=1,
+    )
+
+    ctx = await kr.get_context_with_citations("가나다", max_tokens=440)
+    assert "첫청크" in ctx.text
+    assert "둘째청크" not in ctx.text
+    assert "[출처2" not in ctx.text
+    assert [c.index for c in ctx.citations] == [1]
+    assert ctx.citations[0].title == "첫청크"
+
+
+@pytest.mark.asyncio
+async def test_citation_empty_results_returns_empty_context() -> None:
+    """게이팅으로 전부 드롭되면 citation 활성이어도 text=''·citations=()를 반환한다."""
+    store = _make_mock_store(vector_results=[])
+    emb = _make_mock_embedding(return_value=[[0.1] * 4])
+    kr = KnowledgeRetriever(
+        store=store, embedding_provider=emb, citation_enabled=True
+    )
+
+    ctx = await kr.get_context_with_citations("관련 자료 없는 질의")
+    assert ctx.text == ""
+    assert ctx.citations == ()
+
+
+@pytest.mark.asyncio
+async def test_citation_score_prefers_rerank_over_similarity() -> None:
+    """citation.score는 rerank_score를 우선하고, 없을 때만 similarity를 쓴다."""
+    chunk = {
+        "id": "a", "source": "kowiki", "title": "바흐", "section": "",
+        "similarity": 0.50, "rerank_score": 0.97,
+        "content": "바흐는 독일의 작곡가다.",
+    }
+    store = _make_mock_store(vector_results=[chunk])
+    emb = _make_mock_embedding(return_value=[[0.1] * 4])
+    kr = KnowledgeRetriever(
+        store=store, embedding_provider=emb, citation_enabled=True
+    )
+
+    ctx = await kr.get_context_with_citations("바흐 알려줘")
+    # rerank_score(0.97)가 similarity(0.50)보다 우선한다(헤더도 rr= 표기).
+    assert ctx.citations[0].score == pytest.approx(0.97)
+    assert "rr=0.97" in ctx.text

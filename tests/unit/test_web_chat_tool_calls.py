@@ -25,12 +25,18 @@ from __future__ import annotations
 import pytest
 
 from core.message import (
+    KnowledgeCitation,
     StreamEvent,
     StreamEventType,
     ToolResultBlock,
     ToolUseBlock,
 )
-from web.app import ChatRequest, _app_state, chat
+from web.app import (
+    ChatRequest,
+    _app_state,
+    _strip_invalid_citation_labels,
+    chat,
+)
 
 
 # ─────────────────────────────────────────────
@@ -312,3 +318,78 @@ class TestChatEngineUninitialized:
         assert resp.session_id == "given-sess"
         assert "초기화" in resp.response
         assert resp.tool_calls == []
+
+
+# ─────────────────────────────────────────────
+# 지식 RAG 출처 인용(Point 4-2) — /v1/chat sources 필드 + 허위 라벨 strip
+# ─────────────────────────────────────────────
+def _sources(cites: list[KnowledgeCitation]) -> StreamEvent:
+    """KNOWLEDGE_SOURCES 이벤트(지식 RAG 출처 목록)를 만든다."""
+    return StreamEvent(
+        type=StreamEventType.KNOWLEDGE_SOURCES, knowledge_sources=cites
+    )
+
+
+class TestChatCitationSources:
+    """KNOWLEDGE_SOURCES 이벤트가 ChatResponse.sources로 노출되고 허위 라벨이 제거되는지."""
+
+    async def test_chat_sources_populated_and_invalid_label_stripped(
+        self, _restore_app_state
+    ):
+        """(c) sources 필드 렌더 + (b) 주입 범위 밖 [출처9] 마커 제거를 함께 검증한다.
+
+        config 미주입 시 CitationConfig 기본값(expose=True/strip=True/label='출처')으로
+        폴백하므로, 유효 번호(1)는 유지되고 지어낸 번호(9)는 응답에서 사라진다.
+        """
+        cite = KnowledgeCitation(
+            index=1, source="kowiki", title="바흐", section="생애", score=0.95
+        )
+        events = [
+            _sources([cite]),
+            _text("바흐는 1750년에 사망했다 [출처1]. 근거 없는 문장 [출처9]."),
+        ]
+        _app_state["query_engine"] = _FakeEngine(events)
+
+        resp = await chat(ChatRequest(message="바흐", session_id="sess-A"))
+
+        # (c) sources 필드가 서버 진실(retriever 메타)로 채워진다.
+        assert len(resp.sources) == 1
+        assert resp.sources[0].index == 1
+        assert resp.sources[0].title == "바흐"
+        assert resp.sources[0].section == "생애"
+        # (b) 유효 라벨은 유지, 주입 범위 밖 라벨은 제거된다.
+        assert "[출처1]" in resp.response
+        assert "[출처9]" not in resp.response
+
+    async def test_chat_no_knowledge_sources_leaves_sources_empty(
+        self, _restore_app_state
+    ):
+        """(d) KNOWLEDGE_SOURCES 이벤트가 없으면 sources는 빈 리스트(기존 동작 무회귀)."""
+        events = [_text("그냥 답변입니다.")]
+        _app_state["query_engine"] = _FakeEngine(events)
+
+        resp = await chat(ChatRequest(message="hi", session_id="sess-A"))
+
+        assert resp.sources == []
+        assert resp.response == "그냥 답변입니다."
+
+
+class TestStripInvalidCitationLabels:
+    """_strip_invalid_citation_labels 순수 함수 — 허위 라벨 제거 규칙 격리 검증."""
+
+    def test_keeps_valid_removes_invalid(self):
+        """유효 인덱스 라벨은 유지, 그 외([출처9])는 제거한다."""
+        text = "문장A [출처1]. 문장B [출처9]. 문장C [출처2]."
+        out = _strip_invalid_citation_labels(text, valid_indices={1, 2}, label="출처")
+        assert "[출처1]" in out
+        assert "[출처2]" in out
+        assert "[출처9]" not in out
+
+    def test_respects_custom_label(self):
+        """label이 'Source'면 [Source1] 형식을 대상으로 동작한다."""
+        text = "fact [Source1]. bad [Source5]."
+        out = _strip_invalid_citation_labels(
+            text, valid_indices={1}, label="Source"
+        )
+        assert "[Source1]" in out
+        assert "[Source5]" not in out

@@ -312,6 +312,14 @@ knowledge_rag:
   min_similarity: 0.75      # DB 벡터 검색 1차 컷오프
   abs_threshold: 0.84       # 최상위조차 이 값 미만이면 전부 드롭 (무관 분포 상한 바로 위)
   relevance_margin: 0.03    # top_sim에서 이 폭 이내 결과만 유지 (노이즈 청크 절단)
+  # 출처 인용(Point 4-2) — 주입 청크에 [출처N] 라벨을 붙이고 모델이 본문에 인용하게
+  # 한다. 서버는 검색 메타데이터를 응답 sources 필드로 노출한다(모델 텍스트 아님).
+  citation:
+    enabled: false          # 기본 OFF — 켜기 전 주입 텍스트·응답 스키마 동작 100% 동일
+    label: "출처"           # 라벨 접두어([출처1], [Source1] 등 테넌트별 언어 대응)
+    max_sources: 5          # 응답 sources 필드에 노출할 최대 출처 수(주입 top_k 이하)
+    expose_in_response: true    # false면 프롬프트 인용만 하고 sources 필드는 비움
+    strip_invalid_labels: true  # 주입 범위 밖 번호([출처9] 등)를 응답 텍스트에서 제거
 
 # =============================================================================
 # 웹(FastAPI) API 키 인증 — B200 배포 필수

@@ -975,6 +975,31 @@ class RerankConfig(BaseModel):
     min_similarity: float = 0.6
 
 
+class CitationConfig(BaseModel):
+    """지식 RAG 출처 인용(Point 4-2) 설정 — 기본 OFF(무회귀), yaml 단일 소스.
+
+    A+B 하이브리드:
+      - (A) 본문 마커: 모델이 주입 청크의 `[출처N]` 번호만 답변에 단다.
+      - (B) 출처 실체: 서버가 retriever 메타데이터(title/source/section/score)를
+        응답 sources 필드로 노출한다(모델 텍스트가 아닌 '서버 진실' — downloads 원칙).
+
+    왜 기본 OFF인가 (하위 호환):
+      enabled=False면 청크 헤더·주입 텍스트·응답 스키마 동작이 종전과 100% 동일하다
+      (mmr/rerank와 동일한 "기본 OFF → yaml 활성" 관례). 검증 후 켠다.
+    """
+
+    # 마스터 스위치. False면 [출처N] 라벨을 주입하지 않고 sources도 비운다(무회귀).
+    enabled: bool = False
+    # 라벨 접두어([출처1], [Source1] 등 테넌트별 언어 대응). 하드코딩 금지(#4).
+    label: str = "출처"
+    # 응답 sources 필드에 노출할 최대 출처 수(주입 top_k 이하로 상한 고정).
+    max_sources: int = 5
+    # False면 프롬프트 인용(본문 마커)만 하고 응답 sources 필드는 비운다.
+    expose_in_response: bool = True
+    # True면 주입 범위 밖 번호([출처9] 등, 모델이 지어낸 라벨)를 응답 텍스트에서 제거.
+    strip_invalid_labels: bool = True
+
+
 class KnowledgeRagConfig(BaseModel):
     """
     지식 베이스(tb_knowledge) RAG 검색·게이팅 설정.
@@ -1017,6 +1042,11 @@ class KnowledgeRagConfig(BaseModel):
     # (엔티티 게이팅은 유지). 기본 OFF라 켜기 전까지 동작은 종전과 100% 동일하다.
     # MMR과 동시 활성 시 리랭커 우선(관련도 자체를 다루므로 MMR 스킵).
     rerank: RerankConfig = Field(default_factory=lambda: RerankConfig())
+    # ── 출처 인용 (Point 4-2, 2026-07-08) ──────────────────────────────────
+    # 주입 청크에 [출처N] 라벨을 붙이고 모델이 본문에 인용하게 한다. 서버는 검색
+    # 메타데이터를 응답 sources 필드로 노출한다(모델 텍스트 아님). 기본 OFF라
+    # 켜기 전까지 주입 텍스트·응답 스키마 동작은 종전과 100% 동일하다.
+    citation: CitationConfig = Field(default_factory=lambda: CitationConfig())
 
 
 # ─────────────────────────────────────────────

@@ -296,7 +296,7 @@ class KnowledgeStore(PgVectorStore):
             params.append(list(allowed_sources))
 
         query = f"""
-            SELECT source, title, section, content, tags, metadata{embed_col},
+            SELECT id, source, title, section, content, tags, metadata{embed_col},
                    (embedding <=> $1::vector) AS distance
             FROM tb_knowledge
             {where}
@@ -320,6 +320,9 @@ class KnowledgeStore(PgVectorStore):
         out: list[dict[str, Any]] = []
         for r in rows:
             item: dict[str, Any] = {
+                # id — tb_knowledge 기본키(출처 인용 chunk_id·감사/추적용). 반환 dict에
+                # 키 하나가 늘 뿐이라 기존 소비자(키 존재를 가정 안 함)에 하위 호환.
+                "id": r["id"],
                 "source": r["source"],
                 "title": r["title"],
                 "section": r["section"],
@@ -467,6 +470,9 @@ def _inmemory_search(
     out: list[dict[str, Any]] = []
     for sim, e in scored[:top_k]:
         item: dict[str, Any] = {
+            # id — DB 경로와 대칭으로 동봉(출처 인용 chunk_id·추적용). KnowledgeEntry.id는
+            # source/title/section/chunk_index 해시라 폴백 경로에서도 결정론적이다.
+            "id": e.id,
             "source": e.source, "title": e.title, "section": e.section,
             "content": e.content, "tags": list(e.tags),
             "similarity": round(sim, 4), "metadata": e.metadata,

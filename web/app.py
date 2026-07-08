@@ -102,6 +102,11 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+# 지식 RAG 출처 인용(Point 4-2) — ChatResponse.sources 필드가 참조하는 출처 모델.
+# core/message는 pydantic/표준만 의존하는 경량 모듈이라 안전하다(web → core 순방향,
+# 순환 없음). 이 파일의 다른 import처럼 코드 뒤에 오므로(E402는 파일 전반의 기존
+# 사항) noqa로 표기해 신규 lint를 만들지 않는다.
+from core.message import KnowledgeCitation  # noqa: E402
 from web.middleware import ApiKeyAuthMiddleware, CORSConfig, RequestLoggingMiddleware
 
 logger = logging.getLogger("nexus.web.app")
@@ -614,6 +619,12 @@ class ChatResponse(BaseModel):
     downloads: list[dict[str, str]] = Field(
         default_factory=list, description="생성 문서 다운로드 목록({url, filename})"
     )
+    # 지식 RAG 출처 인용(Point 4-2) — 이번 답변에 주입된 지식 청크의 출처 목록.
+    # downloads와 동일 원칙: 모델 텍스트가 아니라 서버가 retriever 메타에서 확보한
+    # 진실이다. citation 비활성이면 빈 리스트라 기존 클라이언트에 무영향(무회귀).
+    sources: list[KnowledgeCitation] = Field(
+        default_factory=list, description="답변 근거 출처 목록([출처N]이 가리키는 실체)"
+    )
 
 
 # ─────────────────────────────────────────────
@@ -1073,6 +1084,8 @@ async def chat(
     tool_calls_by_id: dict[str, ToolCallInfo] = {}
     tool_calls_order: list[str] = []
     downloads: list[dict[str, str]] = []  # 파일 생성 도구 다운로드 링크(정확한 URL)
+    # 지식 RAG 출처 인용(Point 4-2) — KNOWLEDGE_SOURCES 이벤트로 받은 출처 목록.
+    knowledge_sources: list[KnowledgeCitation] = []
     # 결과 본문이 과도하게 길면 응답이 비대해지므로 요약 길이를 제한한다(과설계 금지).
     result_summary_max = 500
     response_session_id = session_id
@@ -1124,6 +1137,14 @@ async def chat(
                     total_tokens=event.usage.total_tokens,
                 )
 
+            elif (
+                event.type == StreamEventType.KNOWLEDGE_SOURCES
+                and event.knowledge_sources
+            ):
+                # 지식 RAG 출처 인용(Point 4-2) — 서버 진실인 출처 메타를 그대로 수집.
+                # 응답 노출(max_sources 상한/strip)은 루프 종료 후 일괄 처리한다.
+                knowledge_sources = list(event.knowledge_sources)
+
             elif event.type == StreamEventType.TOOL_USE_STOP and event.tool_use:
                 # 도구 호출 확정 — 이름/입력/tool_use_id를 등록한다.
                 tu = event.tool_use
@@ -1164,12 +1185,29 @@ async def chat(
     # 등장 순서대로 ToolCallInfo 목록을 만든다.
     tool_calls_info: list[ToolCallInfo] = [tool_calls_by_id[tid] for tid in tool_calls_order]
 
+    # ─── 지식 RAG 출처 인용(Point 4-2) 응답 shaping ─────────────────
+    # (1) 응답 텍스트에서 '주입 범위 밖' 번호 마커([출처9] 등)를 제거(strip),
+    # (2) sources 필드에 최대 max_sources개까지 노출(expose_in_response=True일 때만).
+    # 출처가 없으면(citation 비활성/주입 없음) 두 처리 모두 무영향 → 기존 동작과 동일.
+    response_text = "".join(response_text_parts)
+    sources_out: list[KnowledgeCitation] = []
+    if knowledge_sources:
+        expose, strip_invalid, max_sources, label = _citation_settings()
+        if strip_invalid:
+            valid_indices = {c.index for c in knowledge_sources}
+            response_text = _strip_invalid_citation_labels(
+                response_text, valid_indices, label
+            )
+        if expose:
+            sources_out = knowledge_sources[:max_sources]
+
     return ChatResponse(
         session_id=response_session_id,
-        response="".join(response_text_parts),
+        response=response_text,
         tool_calls=tool_calls_info,
         usage=usage,
         downloads=downloads,
+        sources=sources_out,
     )
 
 
@@ -1437,6 +1475,12 @@ async def chat_stream(
                         sse_data["content"] = _content
                     if event.error_code:
                         sse_data["error_code"] = event.error_code
+                    # 지식 RAG 출처 인용(Point 4-2) — KNOWLEDGE_SOURCES 이벤트의 출처
+                    # 목록을 SSE로 그대로 통과시켜 UI가 실시간 표시하게 한다(서버 진실).
+                    if event.knowledge_sources is not None:
+                        sse_data["sources"] = [
+                            c.model_dump() for c in event.knowledge_sources
+                        ]
                     if event.usage:
                         sse_data["usage"] = {
                             "input_tokens": event.usage.input_tokens,
@@ -1623,6 +1667,45 @@ def _inject_openai_context(
 
     # 이 턴에 새로 생기는 tool_result 메시지에서만 다운로드를 추출하기 위한 기준점.
     return len(engine._messages)
+
+
+def _citation_settings() -> tuple[bool, bool, int, str]:
+    """config.knowledge_rag.citation에서 응답 노출 설정을 읽는다(출처 인용 Point 4-2).
+
+    반환: (expose_in_response, strip_invalid_labels, max_sources, label).
+    config 미로드/테스트에서는 CitationConfig 기본값(True/True/5/"출처")으로 폴백한다.
+    이 값들은 '웹 계층 관심사'(응답 shaping)라 retriever가 아니라 여기서 읽는다.
+    """
+    cfg = _app_state.get("config")
+    citation = getattr(getattr(cfg, "knowledge_rag", None), "citation", None)
+    if citation is None:
+        return True, True, 5, "출처"
+    return (
+        bool(citation.expose_in_response),
+        bool(citation.strip_invalid_labels),
+        int(citation.max_sources),
+        str(citation.label),
+    )
+
+
+def _strip_invalid_citation_labels(
+    text: str, valid_indices: set[int], label: str
+) -> str:
+    """응답 본문에서 '주입 범위 밖' 출처 번호 마커([출처9] 등)를 제거한다.
+
+    모델이 지어낸(주입되지 않은 번호를 참조하는) 라벨을 지워 "근거 있어 보이는
+    할루시네이션"을 줄인다. valid_indices(실제 주입된 출처 번호)에 있는 번호는
+    그대로 둔다. label은 config에서 오며 정규식 특수문자를 이스케이프한다.
+    """
+    if not text:
+        return text
+    pattern = re.compile(r"\[" + re.escape(label) + r"(\d+)\]")
+
+    def _repl(m: re.Match) -> str:
+        # 유효 번호면 원문 유지, 아니면 빈 문자열로 치환(마커 제거).
+        return m.group(0) if int(m.group(1)) in valid_indices else ""
+
+    return pattern.sub(_repl, text)
 
 
 def _downloads_markdown(downloads: list[dict[str, str]]) -> str:

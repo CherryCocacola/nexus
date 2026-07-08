@@ -131,6 +131,27 @@ async def test_store_inmemory_search_by_vector_sorts_by_cosine() -> None:
 
 
 @pytest.mark.asyncio
+async def test_search_by_vector_returns_id_key() -> None:
+    """search_by_vector 결과 dict에 'id' 키가 포함된다(출처 인용 chunk_id용, 인메모리 경로).
+
+    KnowledgeEntry.id는 결정론적 해시라, 반환 dict의 id가 그 entry.id와 일치해야 한다.
+    """
+    store = KnowledgeStore(pg_pool=None)
+    entry = KnowledgeEntry(
+        source="kowiki", title="바흐", content="바흐는 작곡가다.", chunk_index=0,
+        embedding=(1.0, 0.0, 0.0),
+    )
+    await store.add(entry)
+
+    results = await store.search_by_vector(
+        embedding=[1.0, 0.0, 0.0], top_k=1, min_similarity=0.1,
+    )
+    assert len(results) == 1
+    assert "id" in results[0]
+    assert results[0]["id"] == entry.id
+
+
+@pytest.mark.asyncio
 async def test_store_inmemory_search_by_text() -> None:
     store = KnowledgeStore(pg_pool=None)
     await store.add(KnowledgeEntry(

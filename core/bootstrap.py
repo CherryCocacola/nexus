@@ -462,6 +462,10 @@ async def init_phase2(state: GlobalState) -> dict:
             # ivfflat 재현율(probes) — search_by_vector가 SET LOCAL로 적용. lists=1000
             # 인덱스에서 기본 probes=1은 정답 문서를 놓쳐 그라운딩 실패를 유발한다.
             ivfflat_probes=krag.ivfflat_probes,
+            # 출처 인용(Point 4-2). yaml knowledge_rag.citation에서 주입. enabled 기본
+            # False라 켜기 전까지 헤더·주입·반환이 종전과 100% 동일하다(무회귀).
+            citation_enabled=krag.citation.enabled,
+            citation_label=krag.citation.label,
         )
         components["knowledge_store"] = knowledge_store
         components["knowledge_retriever"] = knowledge_retriever

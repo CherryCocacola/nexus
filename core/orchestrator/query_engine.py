@@ -284,6 +284,21 @@ class QueryEngine:
             decision=decision,
         )
 
+        # ─── 지식 RAG 출처 인용 (Point 4-2) ─────────────────
+        # 프롬프트 조립 직후, 이번 턴에 KB로 '실제 주입된' 청크의 출처 목록이 있으면
+        # KNOWLEDGE_SOURCES StreamEvent 1건을 먼저 흘려보낸다(4-Tier 체인 준수 —
+        # 웹 핸들러 직참조 대신 이벤트로 전달). citation 비활성/주입 없음이면 목록이
+        # 비어 있어 이벤트를 내지 않는다(무회귀). 미지 타입을 무시하는 기존 소비자에는
+        # 하위 호환(신규 이벤트 추가일 뿐 기존 이벤트 수정 아님 — anti-patterns #3).
+        knowledge_citations = getattr(
+            self._prompt_assembler, "last_knowledge_citations", ()
+        )
+        if knowledge_citations:
+            yield StreamEvent(
+                type=StreamEventType.KNOWLEDGE_SOURCES,
+                knowledge_sources=list(knowledge_citations),
+            )
+
         # TurnState 저장 콜백 — query_loop이 턴 완료 시 호출
         def _on_turn_complete(turn_state: Any) -> None:
             if self._turn_state_store is not None:

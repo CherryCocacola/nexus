@@ -43,6 +43,12 @@ import logging
 import re
 from typing import TYPE_CHECKING
 
+from pydantic import BaseModel
+
+# 출처 인용 데이터 모델(KnowledgeCitation)은 core/message.py에 둔다 — StreamEvent가
+# 이를 필드로 참조하기 때문이다. core/rag → core/message는 순방향 import라 의존성
+# 방향 규칙(P2)을 지킨다(역방향이면 순환 import 위험).
+from core.message import KnowledgeCitation
 from core.rag.pgvector_base import cosine_similarity as _cosine
 
 if TYPE_CHECKING:
@@ -50,6 +56,26 @@ if TYPE_CHECKING:
     from core.rag.knowledge_store import KnowledgeStore
 
 logger = logging.getLogger("nexus.rag.knowledge_retriever")
+
+
+class KnowledgeContext(BaseModel):
+    """get_context_with_citations()의 반환 — 주입 텍스트 + 출처 목록.
+
+    출처 인용(Point 4-2)을 위해 도입한 반환 타입이다. 기존 get_context()는
+    조립된 문자열 하나만 돌려줘서 상위 계층이 "어떤 청크가 주입됐는지"를 알 수
+    없었다. 이 모델은 그 두 정보를 함께 담아 웹 응답의 sources 필드로 노출할 수
+    있게 한다. frozen 불변(도메인 규칙 P5).
+
+    필드:
+      text      : 프롬프트 주입용 조립 문자열(기존 get_context 반환과 동일 형식).
+      citations : 실제로 주입된 청크의 출처 목록. 순서 = index 순서.
+                  citation 비활성이거나 주입 청크가 없으면 빈 튜플.
+    """
+
+    model_config = {"frozen": True}
+
+    text: str = ""
+    citations: tuple[KnowledgeCitation, ...] = ()
 
 
 class KnowledgeRetriever:
@@ -125,6 +151,16 @@ class KnowledgeRetriever:
         rerank_min_similarity: float = 0.6,
         # ivfflat 재현율 튜닝 — search_by_vector에 probes로 전달.
         ivfflat_probes: int = 40,
+        # ── 출처 인용(Point 4-2, 2026-07-08) ───────────────────────────────
+        # 왜 기본값이 "인용 비활성"인가 (하위 호환):
+        #   citation_enabled=False면 청크 헤더·조립·반환이 종전과 100% 동일하고
+        #   citations도 비어(()) 있어 상위(assembler/web)가 아무 것도 노출하지 않는다
+        #   → 동작이 현재와 완전히 같다(회귀 0). 실제 값은 bootstrap이 config.
+        #   knowledge_rag.citation에서 주입한다(게이팅/MMR/리랭커와 동일 패턴).
+        #   활성 시 청크 헤더에 `[{label}{N} | ...]` 번호를 '실제 주입된 청크에만'
+        #   부여하고, 그 청크들의 출처 메타를 KnowledgeContext.citations로 돌려준다.
+        citation_enabled: bool = False,
+        citation_label: str = "출처",
     ) -> None:
         """게이팅 임계와 검색 파라미터를 보관한다.
 
@@ -164,6 +200,20 @@ class KnowledgeRetriever:
         self._rerank_min_score = rerank_min_score
         # 리랭킹용 벡터검색 1차 컷오프(리콜 그물을 넓히려 기존 min_similarity보다 완화).
         self._rerank_min_similarity = rerank_min_similarity
+        # 출처 인용 설정 (기본 비활성 — 위 주석의 하위 호환 근거 참조).
+        self._citation_enabled = citation_enabled
+        # 라벨 접두어("출처1", "Source1" 등). 하드코딩 금지 규칙(#4)에 따라 config화.
+        self._citation_label = citation_label
+
+    @property
+    def citation_enabled(self) -> bool:
+        """출처 인용 활성 여부(읽기 전용) — 상위(prompt_assembler)가 trailer 판단에 쓴다."""
+        return self._citation_enabled
+
+    @property
+    def citation_label(self) -> str:
+        """출처 라벨 접두어(읽기 전용) — 인용 trailer 문구를 헤더와 같은 라벨로 맞춘다."""
+        return self._citation_label
 
     async def get_context(
         self,
@@ -171,16 +221,34 @@ class KnowledgeRetriever:
         max_tokens: int = 1500,
         allowed_sources: list[str] | None = None,
     ) -> str:
-        """
-        질의에 관련된 지식 청크를 검색해 시스템 프롬프트용 문자열로 반환한다.
+        """질의에 관련된 지식 청크를 시스템 프롬프트용 '문자열'로 반환한다.
 
-        이 메서드가 클래스의 유일한 공개 진입점이다. 내부 흐름은 크게 5단계다:
+        하위 호환 얇은 래퍼 — 실제 로직은 get_context_with_citations()에 있고,
+        여기서는 그 결과의 .text만 돌려준다. 시그니처·반환 타입(str)이 종전과
+        동일해 기존 호출부·테스트가 그대로 동작한다(무회귀). 출처 목록(citations)
+        까지 필요한 상위 계층은 get_context_with_citations()를 직접 호출한다.
+        """
+        result = await self.get_context_with_citations(
+            query, max_tokens, allowed_sources
+        )
+        return result.text
+
+    async def get_context_with_citations(
+        self,
+        query: str,
+        max_tokens: int = 1500,
+        allowed_sources: list[str] | None = None,
+    ) -> KnowledgeContext:
+        """
+        질의에 관련된 지식 청크를 검색해 (주입 텍스트 + 출처 목록)으로 반환한다.
+
+        이 메서드가 클래스의 실질 진입점이다. 내부 흐름은 크게 5단계다:
           (1) 벡터 검색 → (2) 텍스트 폴백(임베딩 불능일 때만) →
           (3) 리랭킹/게이팅/엔티티/MMR 필터 → (4) top_k 컷 →
-          (5) 토큰 예산 내 블록 조립.
+          (5) 토큰 예산 내 블록 조립(+ 인용 활성 시 [출처N] 번호 부착).
 
         매개변수:
-          query          : 사용자 질의 원문. 빈 문자열이면 즉시 "" 반환.
+          query          : 사용자 질의 원문. 빈 문자열이면 즉시 빈 컨텍스트 반환.
           max_tokens     : 주입 예산(토큰). chars_per_token으로 글자수로 환산해
                            그 상한까지만 청크를 쌓는다(기본 1500).
           allowed_sources: tb_knowledge.source 화이트리스트(멀티테넌시, Part 5
@@ -189,13 +257,16 @@ class KnowledgeRetriever:
                            필터로 넘겨 cross-tenant 누설을 구조적으로 막는다.
 
         반환:
-          "[출처 · 제목 · 점수]\n본문" 블록들을 빈 줄로 이어 붙인 하나의 문자열.
-          검색 실패·임베딩 오류·관련 청크 0건 등 어떤 이유로든 넣을 근거가 없으면
-          빈 문자열("")을 반환한다. 호출자는 ""를 "관련 자료 없음"으로 처리해
-          모델이 추측 대신 "모른다"고 답하도록 유도한다(할루시네이션 방지).
+          KnowledgeContext(text, citations).
+          - text: "[출처 · 제목 · 점수]\n본문" 블록들을 빈 줄로 이어 붙인 문자열
+            (citation 활성 시 헤더에 "[출처N | " 번호 접두 추가).
+          - citations: 실제로 주입된 청크의 출처 목록(citation 활성 시에만 채움).
+          검색 실패·임베딩 오류·관련 청크 0건 등 넣을 근거가 없으면 text=""·
+          citations=()인 빈 컨텍스트를 반환한다. 호출자는 빈 text를 "관련 자료
+          없음"으로 처리해 모델이 추측 대신 "모른다"고 답하도록 유도한다.
         """
         if not query:
-            return ""
+            return KnowledgeContext()
 
         # 1) 벡터 검색 — 임베딩 서버가 살아있을 때만
         # allowed_sources는 DB-level 필터로 넘겨 cross-tenant 누설을 구조적으로 막는다
@@ -266,7 +337,7 @@ class KnowledgeRetriever:
                     results = [r for r in results if r.get("source") in allowed_set]
             except Exception as e:
                 logger.debug("KnowledgeRetriever 텍스트 검색 실패: %s", e)
-                return ""
+                return KnowledgeContext()
 
         # ★ 크로스인코더 리랭킹 (2026-07-05) — 임베딩 성공 경로에서만.
         #   왜 여기(게이팅 앞)인가:
@@ -370,7 +441,7 @@ class KnowledgeRetriever:
             ]
 
         if not results:
-            return ""
+            return KnowledgeContext()
 
         # ★ 리랭커 적용 시 최종 top_k 컷 — 재정렬·게이팅·엔티티게이팅을 통과한
         #   상위 rerank_top_k개만 남겨 토큰예산 조립부로 넘긴다(조립 로직은 재사용).
@@ -405,6 +476,11 @@ class KnowledgeRetriever:
         budget_chars = max_tokens * self._chars_per_token
         lines: list[str] = []
         used = 0  # 지금까지 누적한 글자수 (구분자 여유 포함)
+        # 출처 인용(Point 4-2) — 실제로 주입된 청크에만 번호를 부여하기 위해 이
+        # 조립 루프 안에서 citations를 만든다. citation_idx는 '주입 확정된' 청크
+        # 개수(=다음에 붙일 [출처N]의 N-1). 비활성이면 citations는 끝까지 빈 채다.
+        citations: list[KnowledgeCitation] = []
+        citation_idx = 0
         for r in results:
             title = r.get("title", "(untitled)")
             section = r.get("section") or ""
@@ -418,27 +494,63 @@ class KnowledgeRetriever:
             # e5 코사인 유사도(sim=)를 쓴다(리랭킹 안 된 경로는 rerank_score 키 없음).
             rr = r.get("rerank_score")
             score_part = f"rr={rr:.2f}" if rr is not None else f"sim={sim:.2f}"
-            header = f"[{source} · {title}{section_part} · {score_part}]"
+            # 이번 청크가 받게 될 출처 번호(주입이 확정될 때만 실제로 커밋한다).
+            next_index = citation_idx + 1
+            if self._citation_enabled:
+                # 인용 활성: 기존 헤더를 대체하지 않고 "[출처N | " 번호만 앞에 덧붙여
+                # 기존 e2e(광합성·바흐)와의 시각적 차이를 최소화한다.
+                header = (
+                    f"[{self._citation_label}{next_index} | "
+                    f"{source} · {title}{section_part} · {score_part}]"
+                )
+            else:
+                header = f"[{source} · {title}{section_part} · {score_part}]"
             block = f"{header}\n{content}"
+            # 이번 청크가 실제로 주입되면(전체/부분) 그 출처 메타를 만들어 둔다
+            # (citation 비활성이면 None → 아래에서 커밋하지 않는다).
+            citation = (
+                KnowledgeCitation(
+                    index=next_index,
+                    source=source,
+                    title=title,
+                    # 섹션은 빈 문자열이면 None으로 정규화(모델 필드 계약).
+                    section=section or None,
+                    # 점수는 rerank 우선, 없으면 similarity(헤더 표기와 동일 기준).
+                    score=float(rr) if rr is not None else float(sim),
+                    # tb_knowledge.id(감사·추적용). SELECT에 없으면 None.
+                    chunk_id=r.get("id"),
+                )
+                if self._citation_enabled
+                else None
+            )
+
             if used + len(block) > budget_chars:
                 # 잘라서라도 하나 더 넣을지 — 여유 있으면 자르고 중단
                 remaining = budget_chars - used
                 if remaining > 200:
+                    # 잘린 청크도 헤더(번호 포함)와 함께 실제로 주입되므로 인용을 커밋한다.
                     lines.append(block[:remaining] + " …")
+                    citation_idx = next_index
+                    if citation is not None:
+                        citations.append(citation)
                 break
             lines.append(block)
+            citation_idx = next_index
+            if citation is not None:
+                citations.append(citation)
             used += len(block) + 2  # 구분자 여유
 
         if not lines:
-            return ""
+            return KnowledgeContext()
 
         logger.debug(
-            "KnowledgeRetriever: '%s...' → %d개 청크 주입 (~%d자)",
+            "KnowledgeRetriever: '%s...' → %d개 청크 주입 (~%d자, citations=%d)",
             query[:30],
             len(lines),
             used,
+            len(citations),
         )
-        return "\n\n".join(lines)
+        return KnowledgeContext(text="\n\n".join(lines), citations=tuple(citations))
 
     # ─────────────────────────────────────────────
     # MMR(Maximal Marginal Relevance) 선별 — 순수 파이썬 구현

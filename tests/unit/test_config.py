@@ -12,6 +12,7 @@ import pytest
 import yaml
 
 from core.config import (
+    CitationConfig,
     GPUServerConfig,
     KnowledgeRagConfig,
     NexusConfig,
@@ -272,3 +273,67 @@ class TestKnowledgeRagConfigYamlLoad:
         config = load_and_validate_config(str(config_file))
         assert config.knowledge_rag.abs_threshold == pytest.approx(0.84)
         assert config.knowledge_rag.relevance_margin == pytest.approx(0.03)
+
+
+# ─────────────────────────────────────────────
+# CitationConfig — 지식 RAG 출처 인용 설정 (Point 4-2, 2026-07-08)
+# ─────────────────────────────────────────────
+class TestCitationConfigDefaults:
+    """CitationConfig 기본값(무회귀: enabled=False)과 KnowledgeRagConfig 연동을 검증한다."""
+
+    def test_citation_config_defaults_off(self):
+        """출처 인용은 기본 OFF여야 한다(무회귀). 나머지 기본값도 고정한다."""
+        cfg = CitationConfig()
+        assert cfg.enabled is False
+        assert cfg.label == "출처"
+        assert cfg.max_sources == 5
+        assert cfg.expose_in_response is True
+        assert cfg.strip_invalid_labels is True
+
+    def test_knowledge_rag_config_citation_default_factory(self):
+        """KnowledgeRagConfig()가 citation을 기본 OFF로 채우는지 확인한다."""
+        cfg = KnowledgeRagConfig()
+        assert cfg.citation.enabled is False
+        assert cfg.citation.label == "출처"
+
+    def test_nexus_config_citation_default_off(self):
+        """NexusConfig()의 knowledge_rag.citation도 기본 OFF다(전역 무회귀)."""
+        config = NexusConfig()
+        assert config.knowledge_rag.citation.enabled is False
+
+
+class TestCitationConfigYamlLoad:
+    """yaml에서 knowledge_rag.citation 값이 반영되는지 검증한다."""
+
+    def test_citation_yaml_load_overrides_defaults(self, tmp_path):
+        """yaml에 명시한 citation 값이 기본값을 덮어쓴다."""
+        config_file = tmp_path / "citation.yaml"
+        config_data = {
+            "knowledge_rag": {
+                "citation": {
+                    "enabled": True,
+                    "label": "Source",
+                    "max_sources": 3,
+                    "expose_in_response": False,
+                    "strip_invalid_labels": False,
+                },
+            },
+        }
+        config_file.write_text(yaml.dump(config_data), encoding="utf-8")
+
+        config = load_and_validate_config(str(config_file))
+        assert config.knowledge_rag.citation.enabled is True
+        assert config.knowledge_rag.citation.label == "Source"
+        assert config.knowledge_rag.citation.max_sources == 3
+        assert config.knowledge_rag.citation.expose_in_response is False
+        assert config.knowledge_rag.citation.strip_invalid_labels is False
+
+    def test_citation_absent_uses_off_default(self, tmp_path):
+        """yaml에 citation이 없으면 기본 OFF로 폴백한다(무회귀)."""
+        config_file = tmp_path / "no_citation.yaml"
+        config_file.write_text(
+            yaml.dump({"knowledge_rag": {"top_k": 7}}), encoding="utf-8"
+        )
+
+        config = load_and_validate_config(str(config_file))
+        assert config.knowledge_rag.citation.enabled is False
