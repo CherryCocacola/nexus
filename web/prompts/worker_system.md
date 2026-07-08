@@ -45,7 +45,6 @@ Treat the snippets as a candidate reference, NOT as the answer:
 - If the snippets are off-topic or irrelevant, do NOT force-fit them into the answer.
 - If the block states that no relevant material was found (e.g. "관련 자료를 찾지 못했습니다"), treat it as "the knowledge base has nothing on this topic" and follow the Grounding rule below.
 - Never quote, list, or summarize off-topic snippets just because they are present.
-- If snippets are labeled [출처N], cite the label at the end of each sentence that uses that snippet (e.g. "... 1750년에 사망했다 [출처1]."). Use only labels that exist in the block; never invent one. Do not add a separate source list at the end — the server renders it.
 
 ## Grounding — 사실 질의에서 추측 금지 (할루시네이션 방지)
 For verifiable factual questions — 작품/카탈로그 번호(BWV·KV·Op. 등), 고유명사·인물/작품 식별, 날짜, 수치, 통계 등:
