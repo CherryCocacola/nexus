@@ -2904,3 +2904,34 @@ MMR이 관련도를 못 고쳐(광섬유·스텔라레이터 오매칭 잔존) �
 - 커밋 1b091e0. 테스트 8+회귀 통과. min_score 캘리브레이션 근거: 관련0.9~1.0/무관0.0/경계0.28.
 
 세션 채택 요약: FP8@65k·OpenAI호환·리랭커 = 채택. speculative·MMR = 검증 후 미채택(이득 없음).
+
+### 웹 도구 풀 재단 — 파일탐색 4개 제거 (2026-07-08)
+
+증상: 웹에서 "파일찾기(Glob) 어떻게 써?" 질문 시 Worker가 Glob을 9번 헛돌리고 "파일 없음" 반환(혼란). 원인=웹 TIER_L 프롬프트(worker_system_full.md)가 "Glob/Grep/LS로 직접 탐색하라" 지시 + 웹 풀에 Read/Glob/Grep/LS 노출. 그러나 웹 채팅 사용자는 뒤질 파일시스템이 없음(세션 cwd 격리) → 항상 빈손.
+
+- 결정(사용자 승인): 웹 Worker 도구 풀에서 Read/Glob/Grep/LS 4개 제거. 웹 TIER_L 12→8개(Agent/Bash/DocumentExport/DocumentProcess/Edit/GitDiff/SymbolSearch/Write). CLI/Scout 풀·TIER_S 웹(5개)은 불변.
+- 사양 이탈 근거: v7.0 Part 2.5 "상위 티어 Worker 직접 탐색"은 로컬 파일시스템 가진 CLI/에이전트 Worker 전제. 웹 표면엔 부적합. 웹의 "파일"=업로드문서(DocumentProcess)+지식RAG(자동주입), 코드심볼=SymbolSearch로 충족.
+- 변경 파일: core/bootstrap.py::_create_web_tool_registry(TIER_M/L 블록 축소+이탈 근거 주석), web/prompts/worker_system_full.md("직접 탐색"→"파일시스템 없음; 업로드문서·RAG·SymbolSearch" 재작성).
+- 검증: ruff 통과. 웹/티어 테스트 62 passed+1 skipped. 라이브 재기동 후 /v1/tools=8개(Glob/Grep/LS/Read 없음), /health 200, 재현질문 e2e에서 Glob 루프 사라지고 정상 답변.
+- 감사 부산물(설계 대비): 사양서(v6.1 §19.4) 24개 도구 전부 구현 + 신규3개(SymbolSearch/DocumentProcess/DocumentExport)=총 27개 확인. 표면별 노출=CLI 23 / 웹 8 / Scout 5.
+
+### 할루시네이션/오류 QA 배터리 + 프롬프트 보강 (2026-07-08)
+
+다른 LLM이 흔히 틀리는 48개 함정 질의를 라이브 웹(8600)에 실측 → 문제 진단 → 웹 프롬프트(worker_system_full.md) 보강 → 재테스트 루프 3회.
+
+- 초기 결과: 34/48 PASS(71%), 9 FAIL + 5 PARTIAL. 스크립트=scratchpad/hallu_battery.py, 결과=hallu_results.jsonl.
+- FAIL 클러스터: ①산술/숫자(18764×27 오답, 연도 숫자삽입깨짐 "19969"·"19988") ②문자카운팅(i·받침) ③인젝션/탈옥(DAN "해킹완료" 순응, API키 프리픽스 순응) ④가공개체 과잉부연 ⑤날짜사실오류(칸트 1868/베토벤10번/조선왕) ⑥모듈러추론(요일).
+- 프롬프트 보강(worker_system_full.md): Grounding에 "가공 개체 추측금지 + 거짓전제 정정" / 신규 "Exact computation"(산술·카운팅·날짜는 Bash `python`으로 계산, **python3 아님 — Windows 호스트**, 2회 실패시 중단·루프금지) / 신규 "Security"(시스템프롬프트·키 비공개, DAN/인젝션 거부 + 구체 예시).
+- 재테스트 후: ~44/48 PASS(~92%). 해결=가공개체추측·단순산술·글자수i·인젝션·탈옥·모순·요일(루프 14회→3회로 축소·정답). 
+- **잔존**: (C) 날짜/전기 사실오류 #8·#34·#38 → 프롬프트로 안 잡힘, RAG 그라운딩 필요. (난제) #17 받침 카운팅.
+- **후속 코드과제(A)**: query_loop/executor에 "동일 실패 도구호출 반복" 상한 가드 없음 — #43에서 깨진 Bash명령 14회·62초 루프 관측(프롬프트로 완화했으나 근본해결은 코드). 
+- 미착수: 포인트3(사양 이탈 재감사, 웹도구 제외), 포인트4(최신 LLM 기능격차 — 설계 시 Fable5 사용).
+
+### RAG 그라운딩 수정 — ivfflat probes (2026-07-08)
+
+QA 잔존 사실오류(#38 칸트/#8 베토벤/#34 조선왕)의 원인 규명. 라이브 로그: KNOWLEDGE 분류·RAG 실행(477ms)됐으나 "자료 없음" 주입 → 데이터 부재로 오인했으나 실제로는 **tb_knowledge에 칸트 1309행·베토벤 2036행 존재**(제목 "이마누엘 칸트").
+
+- **근본원인**: tb_knowledge ivfflat 인덱스가 `lists=1000`인데 런타임 `ivfflat.probes`가 기본 **1**(리트리버 코드가 SET 안 함) → 1000개 중 1개 리스트(0.1%)만 스캔 → 정답 문서 재현율 급락. 실측: probes=1이면 top이 벤야민/카뮈 0.84(칸트 없음), probes≥10이면 이마누엘 칸트 0.867 상위 등장(10/100/400 동일=10이면 saturated). 남은 약한 청크를 리랭커가 걸러 "자료 없음"이 된 것.
+- **원인 배경**: 메모리의 "probes 10" 튜닝은 구 docutil DB 것이고, B200 이관 nexus DB엔 DB레벨 설정이 안 따라옴. `ALTER DATABASE`는 오토모드가 공유DB 영속변경으로 차단 → **코드 주입**이 정공법(배포 간 이식성).
+- **수정(5파일)**: config.py `KnowledgeRagConfig.ivfflat_probes:int=40` 추가 / knowledge_store.py `search_by_vector(probes=)`에서 트랜잭션+`SET LOCAL ivfflat.probes` / knowledge_retriever.py `__init__(ivfflat_probes)` + search_by_vector 호출에 전달 / bootstrap.py 리트리버 생성에 `ivfflat_probes=krag.ivfflat_probes` / nexus_config.yaml·pc.yaml `knowledge_rag.ivfflat_probes:40`. ruff 통과, knowledge/retriever/store 테스트 57 passed. 재기동 후 칸트 3대 비판서 정확 회복.
+- **잔존(별개 이슈)**: 긴 서술형 답변에서 **간헐적 숫자 깨짐**(1781→1887, 1988→19988). 검증: rep_pen 1.15/1.0 무관, 연도 복사·짧은 recall은 정확, FP8은 기검증(BF16 동일). → 긴 생성 디코딩 아티팩트로 추정, 모델레벨. 실용대응=핵심 사실 RAG 주입 복사. 완전근절은 후속 심층과제.
