@@ -20,7 +20,10 @@
 
 이 모듈은 4-Tier AsyncGenerator 체인에서 Tier 3~4에 해당한다:
   Tier 3: stream() — SSE 스트림 파싱 및 StreamEvent 변환
-  Tier 4: httpx 클라이언트로의 실제 HTTP 왕복 (재시도 정책은 별도 with_retry가 담당)
+  Tier 4: httpx 클라이언트로의 실제 HTTP 왕복
+    (주의: Tier 4 with_retry는 아직 이 왕복부에 배선되지 않았다. 현재 일시 오류는
+     컨텍스트 초과 재시도 루프 + 연결 오류의 ERROR 이벤트 변환으로 처리하며,
+     스트림 정지 재시도는 Tier 2 query_loop이 담당한다. architecture.md P1 구현 현황 참조.)
 
 의존 방향: 이 파일은 core.message의 도메인 타입만 의존하며, 외부로는 httpx로 LAN의
 vLLM 서버에만 접근한다(에어갭 규칙 준수 — 외부 인터넷 호출 없음).

@@ -26,7 +26,7 @@ Nexus는 테넌트(고객사/조직)마다 별도의 LoRA 어댑터를 학습한
 - main(): 실제 실행 오케스트레이션 (정규화 → 생성 → 통계 로깅)
 
 [외부 의존]
-- training.adapter_naming.normalize_tenant_id — 테넌트 ID 정규화 규칙의 단일 소스
+- core.adapter_naming.normalize_tenant_id — 테넌트 ID 정규화 규칙의 단일 소스
 - training.bootstrap_generator.BootstrapGenerator — 데이터 생성 본체(비동기)
 
 사용 예시:
@@ -63,7 +63,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 # training 패키지 의존성 — sys.path 설정 이후에 import해야 하므로 E402 예외 처리.
-from training.adapter_naming import normalize_tenant_id  # noqa: E402
+from core.adapter_naming import normalize_tenant_id  # noqa: E402
 from training.bootstrap_generator import BootstrapGenerator  # noqa: E402
 
 # 로깅 기본 설정: 시각 + 레벨 + 메시지 형식으로 INFO 이상을 표준 출력한다.

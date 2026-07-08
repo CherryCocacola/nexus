@@ -294,7 +294,10 @@ class StreamEvent(BaseModel):
 
     # use_enum_values: enum을 원시 문자열 값으로 저장(직렬화 단순화).
     # protected_namespaces=(): model_id 등 model_ 접두 필드 경고를 끈다.
-    model_config = {"use_enum_values": True, "protected_namespaces": ()}
+    # frozen=True — StreamEvent는 4-Tier 체인 전체를 흐르는 불변 데이터 단위다
+    # (domain-model.md·architecture.md P1, anti-patterns #3). 생성 후 수정 불가로
+    # 두어 하위 Tier가 만든 이벤트를 상위에서 몰래 바꾸는 사고를 원천 차단한다.
+    model_config = {"frozen": True, "use_enum_values": True, "protected_namespaces": ()}
 
     type: StreamEventType  # 이 이벤트의 종류 — 나머지 필드 해석의 기준
 

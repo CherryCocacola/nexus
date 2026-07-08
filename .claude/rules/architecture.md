@@ -14,7 +14,21 @@ Tier 4: with_retry()                  — 재시도 + httpx 클라이언트
 
 - 새 기능을 추가할 때 이 체인을 우회하거나 단축하지 않는다
 - 각 Tier는 자기 하위 Tier의 AsyncGenerator만 소비한다 (Tier 1이 Tier 4를 직접 호출 금지)
-- StreamEvent는 frozen dataclass — 생성 후 수정 불가
+- StreamEvent는 frozen Pydantic 모델 — 생성 후 수정 불가 (`core/message.py`, `frozen=True`)
+
+### 구현 현황 주석 (2026-07-09 사양 감사 반영)
+
+Tier 4 `with_retry`(`core/orchestrator/retry.py`)는 지수 백오프 재시도 **프리미티브**로
+정의·단위테스트되어 있으나, **현재 프로덕션 스트리밍 경로에는 아직 배선되지 않았다**.
+실제 일시 오류 처리는 다음 두 지점이 담당한다.
+- **Tier 2(`query_loop`)**: `StreamWatchdog` 타임아웃(스트림 정지/GPU 행)을
+  `model_error_count`/`MAX_MODEL_ERROR_RETRY`로 재시도.
+- **Tier 3(`inference`)**: 컨텍스트 초과 재시도 루프 + 연결 오류를 `ERROR` StreamEvent로
+  변환(즉시 상위 전파, 연결 레벨 백오프는 미적용).
+
+즉 이름상 4-Tier이나 Tier 4의 백오프 재시도는 아직 프리미티브 상태다. httpx 왕복부를
+`with_retry`로 감싸 연결 오류 백오프를 실제 적용하는 것은 **후속 과제**(TODO). 이 문단은
+문서-구현 불일치(감사 MED)를 정직하게 명시하기 위한 것이다.
 
 ## P2. 디렉토리 구조 및 의존성 방향
 

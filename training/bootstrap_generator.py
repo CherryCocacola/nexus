@@ -27,7 +27,7 @@ JSONL 학습 샘플을 대량으로 찍어낸다.
     · _generate_knowledge_sample(): 장문 지식 샘플 1개 생성.
 
 [외부 의존]
-  - training.adapter_naming: 테넌트 ID 정규화(normalize_tenant_id)와 기본값 상수.
+  - core.adapter_naming: 테넌트 ID 정규화(normalize_tenant_id)와 기본값 상수.
     멀티테넌시(M7)에서 테넌트별 데이터를 서브디렉토리로 격리하기 위해 사용한다.
 
 [왜 "합성" 데이터인가 — 설계 배경]
@@ -1262,7 +1262,7 @@ class BootstrapGenerator:
         """
         # tenant_id 정규화 — 불허 문자는 ValueError로 조기 차단 (잘못된 경로 생성 방지).
         # normalize_tenant_id는 None/빈값/'default'를 모두 'default'로 수렴시킨다.
-        from training.adapter_naming import DEFAULT_TENANT_ID, normalize_tenant_id
+        from core.adapter_naming import DEFAULT_TENANT_ID, normalize_tenant_id
         tid = normalize_tenant_id(tenant_id)
 
         # 출력 디렉토리 해석 — default는 기존 경로, 테넌트는 서브디렉토리로 격리.

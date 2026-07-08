@@ -22,7 +22,7 @@
   - main()                          : 모델 로드→데이터 준비→학습→저장 전 과정
 
 [의존 모듈]
-  - training.adapter_naming : 테넌트 ID·경로·어댑터 이름 규칙을 한곳에 모은 모듈
+  - core.adapter_naming : 테넌트 ID·경로·어댑터 이름 규칙을 한곳에 모은 모듈
   - unsloth / datasets / trl : 실제 4bit 로드·데이터셋·SFT 학습 (GPU 서버 전용)
 
 사용 예시:
@@ -62,7 +62,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from training.adapter_naming import (  # noqa: E402
+from core.adapter_naming import (  # noqa: E402
     MAX_PHASE,
     MIN_PHASE,
     compose_adapter_name,

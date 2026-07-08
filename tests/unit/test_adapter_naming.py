@@ -1,7 +1,7 @@
 """
 M7 어댑터 네이밍 규약 테스트 (2026-04-22).
 
-- training.adapter_naming 의 순수 함수들
+- core.adapter_naming 의 순수 함수들
 - core.config.TenantConfig.adapter_name()
 - training.trainer.TrainingConfig.resolved_output_dir / resolved_adapter_name
 
@@ -16,8 +16,7 @@ from __future__ import annotations
 
 import pytest
 
-from core.config import TenantConfig
-from training.adapter_naming import (
+from core.adapter_naming import (
     DEFAULT_TENANT_ID,
     MAX_PHASE,
     MIN_PHASE,
@@ -26,6 +25,7 @@ from training.adapter_naming import (
     compose_output_dir,
     normalize_tenant_id,
 )
+from core.config import TenantConfig
 from training.trainer import TrainingConfig
 
 

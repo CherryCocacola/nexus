@@ -22,7 +22,7 @@ Nexus는 두 대의 머신으로 구성된다. Machine A(오케스트레이터, 
 
 [의존/연동]
   - httpx(비동기 HTTP)로 GPU 서버의 /v1/training/* 엔드포인트를 호출한다.
-  - M7(멀티테넌시) 경로/이름 해석은 training.adapter_naming 모듈에 위임한다.
+  - M7(멀티테넌시) 경로/이름 해석은 core.adapter_naming 모듈에 위임한다.
 
 [에어갭 준수]
   GPU 서버 URL은 반드시 LAN 주소(localhost/127.0.0.1/10.x/172.x/192.168.x)여야
@@ -122,7 +122,7 @@ class TrainingConfig:
         M7: tenant_id + phase 조합으로 실제 출력 디렉토리 경로를 계산해 돌려준다.
 
         멀티테넌시 환경에서는 테넌트/단계별로 체크포인트를 격리 저장해야 하므로,
-        경로 규칙을 이 클래스에 하드코딩하지 않고 training.adapter_naming 모듈의
+        경로 규칙을 이 클래스에 하드코딩하지 않고 core.adapter_naming 모듈의
         compose_output_dir()에 위임한다(경로 규칙 변경 시 한 곳만 고치면 됨).
 
         단, tenant_id나 phase 중 하나라도 None이면 멀티테넌시를 쓰지 않는
@@ -138,7 +138,7 @@ class TrainingConfig:
         if self.tenant_id is None or self.phase is None:
             return self.output_dir
         # 순환 import를 피하기 위해 함수 내부에서 지연 import 한다.
-        from training.adapter_naming import compose_output_dir
+        from core.adapter_naming import compose_output_dir
         return compose_output_dir(self.tenant_id, self.phase, base_dir=base_dir)
 
     def resolved_adapter_name(self) -> str | None:
@@ -155,7 +155,7 @@ class TrainingConfig:
         if self.tenant_id is None or self.phase is None:
             return None
         # resolved_output_dir()과 마찬가지로 순환 import 회피용 지연 import.
-        from training.adapter_naming import compose_adapter_name
+        from core.adapter_naming import compose_adapter_name
         return compose_adapter_name(self.tenant_id, self.phase)
 
     def to_dict(self) -> dict[str, Any]:

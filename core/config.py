@@ -25,7 +25,7 @@ Claude Code의 enableConfigs() + applySafeConfigEnvironmentVariables()에 대응
     테넌트 병합까지 수행하는 공식 로더. 애플리케이션 기동 시 이걸 호출한다.
 
 호출/의존 관계: cli/·web/ 진입점과 core 전반이 이 모듈을 읽는다. 반대로 이
-모듈은 core.security.network_guard(LAN 판정)와 training.adapter_naming(지연
+모듈은 core.security.network_guard(LAN 판정)와 core.adapter_naming(지연
 임포트)에만 의존한다 — 의존성 방향(P2: config → security 허용)을 지킨다.
 
 에어갭 검증: GPU 서버 URL이 로컬/LAN 주소인지 자동으로 확인한다(외부면 경고).
@@ -76,7 +76,8 @@ class GPUServerConfig(BaseModel):
     # 넉넉히 120초로 둔다(짧게 잡으면 정상 추론이 타임아웃으로 끊긴다).
     timeout_seconds: float = 120.0
     # 일시적 네트워크/서버 오류 시 재시도 횟수. GPU 서버 재기동·잠깐의 과부하를
-    # 견디도록 10회로 둔다(Tier 4 with_retry에서 사용).
+    # 견디도록 10회로 둔다(Tier 4 with_retry 프리미티브의 설정값 — 현재 스트리밍
+    # 경로 미배선, architecture.md P1 구현 현황 참조).
     max_retries: int = 10
     # 재시도 사이 대기의 기준 시간(초). 보통 지수 백오프의 base로 쓰여
     # 0.5 → 1.0 → 2.0초 식으로 점점 늘어난다.
@@ -678,12 +679,13 @@ class TenantConfig(BaseModel):
     def adapter_name(self, phase: int) -> str:
         """이 테넌트의 phaseN LoRA 어댑터 이름을 반환한다 (M7).
 
-        컴포지션은 `training.adapter_naming.compose_adapter_name`에 위임한다.
+        컴포지션은 `core.adapter_naming.compose_adapter_name`에 위임한다.
         default 테넌트는 `nexus-phaseN` (기존 호환), 그 외는 `nexus-{id}-phaseN`.
         `adapter_name_prefix`가 설정되면 해당 값이 우선.
         """
-        # 순환 import 방지 — 함수 호출 시점에 지연 임포트
-        from training.adapter_naming import compose_adapter_name
+        # core.adapter_naming(순수 문자열 모듈)에 위임. training이 아닌 core에 두어
+        # 의존성 방향(P2)을 지킨다. 지연 임포트는 config 모듈 로드 비용 절감용.
+        from core.adapter_naming import compose_adapter_name
 
         return compose_adapter_name(
             self.id,
