@@ -2955,3 +2955,18 @@ QA #43(깨진 Bash 명령을 못 고치고 14회·62초 반복)의 근본 방어
 - **인용 회귀 수정(92dd581)**: OFF인데 정적 프롬프트가 [출처N] 지시→모델이 근거없는 마커 날조. 정적 지시 제거, 게이팅 trailer로 일원화. OFF=마커0 복원, ON=정상.
 
 **다음**: 포인트 3(사양 재감사, 웹도구·포인트4는 의도적 이탈로 제외). 이후 [[project_multicorpus_rag]] 파이프라인 준비.
+
+---
+
+### IDINO NOVA 리브랜딩 + 라이트 테마 재디자인 (2026-07-09)
+
+**리브랜딩(브랜드만, 인프라 유지)**: NEXUS→IDINO NOVA. 커밋 `ced808d`. 웹 UI 문구·로고·AI 자기소개 교체. DB명 nexus·NEXUS_* env·API키 nexus-b200·.nexus/·NexusConfig 클래스명은 파손방지 위해 유지. 개발사 표기 교정(워커 프롬프트에 정체성 고정 블록 — "IDINO가 개발", 베이스모델 비노출).
+
+**로고 자산**: 가로형 워드마크=`web/static/images.png`(중앙 welcome), 정사각 N/V 엠블럼=`web/static/emblem.png`(헤더·아바타·파비콘·탭). 커밋 `4b90005`.
+
+**라이트 테마 재디자인**: 서빙 UI(index.html)를 다크→로고 화이트 배경 기준 소프트 라이트로 전환. 페이지=#f1f4fa(눈부심 완화 소프트화이트), 표면=#fff, 코드/인셋=#e7ecf4, 강조=로고 네이비#00479d+블루#1a73e8, 버튼=네이비→블루 그라데이션(--accent-grad).
+
+**원복 방법(중요)**:
+- 물리 백업: `web/ui_backup/index.html.dark-theme.bak`(다크 원본), `web/ui_backup/chrome.html.bak`.
+- 원복 시: `cp web/ui_backup/index.html.dark-theme.bak web/static/index.html` 후 웹 재기동.
+- 또는 git: 리브랜딩 이전 상태는 커밋 `2d91cbf` 직후, 라이트테마 이전은 `4b90005`.
