@@ -8,7 +8,7 @@
 <meta name="theme-color" content="#ffffff">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
-<link rel="icon" type="image/png" href="/static/images.png">
+<link rel="icon" type="image/png" href="/static/emblem.png">
 <style>
 /* ─── Chrome 스타일 컬러 팔레트 (밝은 테마) ─── */
 :root {
@@ -983,7 +983,7 @@ function renderTabs() {
     tab.className = 'tab' + (s.id === currentSessionId ? ' active' : '');
     tab.onclick = () => switchSession(s.id);
     tab.innerHTML = `
-      <img src="/static/images.png" alt="" class="tab-icon">
+      <img src="/static/emblem.png" alt="" class="tab-icon">
       <span class="tab-title">${escapeHtml(s.title)}</span>
       <button class="tab-close" onclick="closeSession('${s.id}', event)" aria-label="탭 닫기">&times;</button>
     `;
@@ -1161,7 +1161,7 @@ function appendMessage(role, content, save = true) {
     // AI 메시지: 왼쪽 흰색 카드 + 아바타
     div.className = 'message ai-msg';
     div.innerHTML = `
-      <img src="/static/images.png" alt="IDINO NOVA" class="message-avatar ai-avatar">
+      <img src="/static/emblem.png" alt="IDINO NOVA" class="message-avatar ai-avatar">
       <div class="ai-content">
         <div class="ai-sender">IDINO NOVA</div>
         <div class="message-bubble">${formatContent(content)}</div>
@@ -1219,7 +1219,7 @@ function showThinking() {
   div.id = 'thinkingIndicator';
   div.className = 'thinking-indicator';
   div.innerHTML = `
-    <img src="/static/images.png" alt="IDINO NOVA" class="message-avatar ai-avatar">
+    <img src="/static/emblem.png" alt="IDINO NOVA" class="message-avatar ai-avatar">
     <div class="thinking-content">
       <span>생각하는 중</span>
       <div class="thinking-dots"><span></span><span></span><span></span></div>
@@ -1248,7 +1248,7 @@ function startStreamingMessage() {
   div.id = 'streamingMessage';
 
   div.innerHTML = `
-    <img src="/static/images.png" alt="IDINO NOVA" class="message-avatar ai-avatar">
+    <img src="/static/emblem.png" alt="IDINO NOVA" class="message-avatar ai-avatar">
     <div class="ai-content">
       <div class="ai-sender">IDINO NOVA</div>
       <div class="message-bubble streaming-cursor" id="streamingBody"></div>

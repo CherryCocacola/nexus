@@ -8,7 +8,7 @@
 <meta name="theme-color" content="#0b0b0c">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<link rel="icon" type="image/png" href="/static/images.png">
+<link rel="icon" type="image/png" href="/static/emblem.png">
 <style>
 /* ─── idino 컬러 팔레트 ─── */
 :root {
@@ -23,7 +23,7 @@
   --text-secondary: #a1a1a1;
   --text-muted: #6c737d;
   --accent: #00479d;
-  --accent-light: #0e70b4;
+  --accent-light: #1a73e8;
   --accent-hover: #005087;
   --border: #2b2e32;
   --border-light: #363a3f;
@@ -297,7 +297,7 @@ body {
 }
 
 .message-avatar.user { background: var(--bg-message-user); color: #fff; }
-.message-avatar.assistant { background: var(--accent); color: #fff; }
+.message-avatar.assistant { background: #fff; color: #fff; object-fit: cover; }
 
 .message-sender { font-size: 13px; font-weight: 600; }
 
@@ -860,7 +860,7 @@ body {
     <button class="header-btn" onclick="toggleSidebar()" title="세션 목록">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg>
     </button>
-    <img src="/static/images.png" alt="IDINO NOVA" class="header-logo">
+    <img src="/static/emblem.png" alt="IDINO NOVA" class="header-logo">
     <span class="header-title">IDINO NOVA</span>
     <span class="header-subtitle">by IDINO</span>
   </div>
@@ -1340,7 +1340,7 @@ function appendMessage(role, content, save = true) {
   const sender = role === 'user' ? '사용자' : 'IDINO NOVA';
   const avatarHtml = role === 'user'
     ? `<div class="message-avatar user">U</div>`
-    : `<img src="/static/images.png" alt="N" class="message-avatar assistant" style="object-fit:cover;">`;
+    : `<img src="/static/emblem.png" alt="N" class="message-avatar assistant" style="object-fit:cover;">`;
 
   div.innerHTML = `
     <div class="message-header">
@@ -1536,7 +1536,7 @@ function showThinking() {
   div.className = 'message';
   div.innerHTML = `
     <div class="message-header">
-      <img src="/static/images.png" alt="N" class="message-avatar assistant" style="object-fit:cover;">
+      <img src="/static/emblem.png" alt="N" class="message-avatar assistant" style="object-fit:cover;">
       <div class="message-sender">IDINO NOVA</div>
     </div>
     <div class="thinking">
@@ -1588,7 +1588,7 @@ function startStreamingMessage() {
 
   div.innerHTML = `
     <div class="message-header">
-      <img src="/static/images.png" alt="N" class="message-avatar assistant" style="object-fit:cover;">
+      <img src="/static/emblem.png" alt="N" class="message-avatar assistant" style="object-fit:cover;">
       <div class="message-sender">IDINO NOVA</div>
     </div>
     <div class="activity-area" id="streamingActivity">
