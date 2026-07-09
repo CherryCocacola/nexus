@@ -746,6 +746,28 @@ body {
 }
 .dl-link:hover { background: var(--accent-grad-hover); }
 
+/* ─── 채팅 인라인 이미지 썸네일 (클릭 시 우측 캔버스에서 원본 확대) ─── */
+.img-thumb {
+  display: block;
+  max-width: 320px;
+  width: 100%;
+  height: auto;
+  margin-top: 10px;
+  border: 1px solid var(--border);
+  border-radius: 12px;          /* 디자인 토큰 --radius-md 미정의 → 12px 고정 */
+  cursor: pointer;
+  transition: box-shadow 0.15s, border-color 0.15s;
+}
+.img-thumb:hover {
+  border-color: var(--accent-light);
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.12);
+}
+/* 인증 fetch 로 objectURL 을 받기 전(src 없음)엔 옅은 placeholder 박스로 보이게 한다 */
+.img-thumb:not([src]) {
+  min-height: 120px;
+  background: var(--border-light);
+}
+
 /* ─── 문서 미리보기 캔버스 (아티팩트 스타일) ─── */
 .canvas-panel {
   flex-shrink: 0;
@@ -970,27 +992,36 @@ body {
   };
 })();
 
+// ─── 인증 fetch → blob → objectURL 헬퍼 ───
+// web_auth 로 보호된 /v1/download 링크와 생성 이미지 fetch 가 공통으로 쓴다.
+// 위 window.fetch 오버라이드가 상대경로(/...)에 Authorization: Bearer 헤더를
+// 자동으로 붙여주므로 여기선 별도 헤더 없이 fetch 하면 인증이 통과된다.
+// 반환한 objectURL 은 호출부에서 (다운로드 후 revoke / 캔버스 재사용 등) 관리한다.
+async function authFetchBlob(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  const blob = await res.blob();
+  return URL.createObjectURL(blob);
+}
+
 // ─── 다운로드 링크 처리 ───
 // /v1/download/ 링크는 web_auth 때문에 인증 헤더가 필요하다. 브라우저 기본 이동
-// (<a> href)은 헤더를 안 실으므로 401 이 난다. 그래서 클릭을 가로채 fetch(위의
-// 인증 자동주입 적용)로 blob 을 받아 파일로 저장한다. 인증을 켠 채 다운로드 가능.
+// (<a> href)은 헤더를 안 실으므로 401 이 난다. 그래서 클릭을 가로채 인증 fetch→blob
+// 으로 받아 파일로 저장한다(authFetchBlob 재사용). 인증을 켠 채 다운로드 가능.
 document.addEventListener('click', async (e) => {
   const a = e.target.closest ? e.target.closest('a.dl-link') : null;
   if (!a) return;
   e.preventDefault();
   const href = a.getAttribute('href');
   try {
-    const resp = await fetch(href);
-    if (!resp.ok) throw new Error('HTTP ' + resp.status);
-    const blob = await resp.blob();
-    const objUrl = URL.createObjectURL(blob);
+    const objUrl = await authFetchBlob(href);
     const tmp = document.createElement('a');
     tmp.href = objUrl;
     tmp.download = decodeURIComponent(href.split('/').pop());
     document.body.appendChild(tmp);
     tmp.click();
     tmp.remove();
-    URL.revokeObjectURL(objUrl);
+    URL.revokeObjectURL(objUrl);  // 다운로드용은 즉시 해제 (이미지 미리보기와 달리 재사용 없음)
   } catch (err) {
     alert('다운로드 실패: ' + err.message);
   }
@@ -1954,8 +1985,51 @@ function renderDownloadButtons(msgEl, downloads) {
   body.appendChild(wrap);
 }
 
+// download 항목이 이미지인지 판별한다. 서버가 준 값만 신뢰하며(모델 텍스트 파싱 금지),
+// 확장자(.png/.jpg/.jpeg/.webp) 또는 format 필드로 판단한다. (현재 이미지 도구는 .png)
+function isImageDownload(d) {
+  const name = (d.url || d.filename || '').toLowerCase().split('?')[0];
+  if (/\.(png|jpe?g|webp)$/.test(name)) return true;
+  const fmt = (d.format || '').toLowerCase();
+  return ['png', 'jpg', 'jpeg', 'webp', 'image'].includes(fmt);
+}
+
+// 생성된 이미지의 인라인 썸네일을 메시지 본문에 붙인다. 다운로드 버튼(renderDownloadButtons)
+// 은 그대로 두고 그 위/아래에 미리보기를 추가한다. 클릭하면 우측 캔버스에서 원본을 확대한다.
+// authFetchBlob 로 얻은 objectURL 은 썸네일과 캔버스가 공유(재fetch 불필요)한다.
+function renderImagePreviews(msgEl, downloads) {
+  const imgs = (downloads || []).filter(isImageDownload);
+  if (!imgs.length) return;
+  const body = msgEl.querySelector('.message-body') || msgEl;
+  for (const d of imgs) {
+    // 로드 전에는 src 없는 빈 img(=placeholder 박스). 인증 fetch 성공 시 src 를 채운다.
+    const thumb = document.createElement('img');
+    thumb.className = 'img-thumb';
+    thumb.loading = 'lazy';
+    thumb.alt = decodeURIComponent(d.filename || '이미지');
+    body.appendChild(thumb);
+    authFetchBlob(d.url).then((objUrl) => {
+      thumb.src = objUrl;
+      // 확장자에서 배지용 포맷 추정(서버 format 이 비어 있을 때 대비)
+      const ext = (d.filename || d.url).split('.').pop().split('?')[0].toLowerCase();
+      const fmt = d.format || ext;
+      // 클릭 → 같은 objectURL 로 캔버스에 원본 표시(재fetch 없음)
+      thumb.addEventListener('click', () => openCanvas({
+        filename: d.filename,
+        url: d.url,
+        format: fmt,
+        imageURL: objUrl,
+      }));
+      // 메모리: 이 objectURL 은 세션 동안 유지된다. 데모 규모(이미지 소수)라 명시적
+      // revoke 는 생략한다. 대량 생성 시엔 메시지/세션 정리 시 revoke 를 고려할 것.
+    }).catch((err) => {
+      thumb.alt = '이미지 로드 실패: ' + err.message;
+    });
+  }
+}
+
 // ─── 문서 미리보기 캔버스 ───
-// doc = { url, filename, content(마크다운), format }
+// doc = { url, filename, content(마크다운), format } — 이미지면 imageURL(objectURL) 를 받는다.
 function openCanvas(doc) {
   const panel = document.getElementById('canvasPanel');
   if (!panel) return;
@@ -1970,8 +2044,20 @@ function openCanvas(doc) {
   }
   const dl = document.getElementById('canvasDownload');
   dl.setAttribute('href', doc.url || '#');   // dl-link 위임 핸들러가 인증 다운로드 처리
-  // 개선된 공용 렌더러 재사용 — 제목/목록/중첩까지 문서답게 표시
-  document.getElementById('canvasBody').innerHTML = formatContent(doc.content || '');
+  const canvasBody = document.getElementById('canvasBody');
+  if (doc.imageURL) {
+    // 이미지 모드: 텍스트가 아니므로 formatContent 를 호출하지 않는다. 썸네일과 같은
+    // objectURL 을 재사용해 원본을 크게 표시(재fetch 없음).
+    canvasBody.innerHTML = '';
+    const img = document.createElement('img');
+    img.src = doc.imageURL;
+    img.alt = decodeURIComponent(doc.filename || '이미지');
+    img.style.cssText = 'max-width:100%;height:auto;border-radius:8px;';
+    canvasBody.appendChild(img);
+  } else {
+    // 기존 텍스트 문서 경로 — 개선된 공용 렌더러 재사용(제목/목록/중첩까지 문서답게 표시)
+    canvasBody.innerHTML = formatContent(doc.content || '');
+  }
   panel.classList.add('open');
   panel.setAttribute('aria-hidden', 'false');
 }
@@ -2247,6 +2333,8 @@ async function sendMessage() {
   if (pendingDownloads.length) {
     // 다운로드 버튼을 붙일 대상 말풍선. 답변 말풍선이 없던 경우(문서만 생성)엔 안내 버블을 새로 만든다.
     const target = _streamMsgEl || appendMessage('assistant', '문서를 생성했습니다.');
+    // 이미지는 인라인 썸네일을 먼저(위) 붙이고, 다운로드 버튼은 그대로 그 아래에 유지한다.
+    renderImagePreviews(target, pendingDownloads);
     renderDownloadButtons(target, pendingDownloads);
     // Claude 아티팩트처럼, 본문(content)이 있는 가장 최근 생성 문서를 오른쪽 캔버스에 자동으로 연다.
     // 캔버스가 이미 열려 있으면 openCanvas 가 내용만 갈아끼운다.
