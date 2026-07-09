@@ -902,10 +902,13 @@ class DocumentExportConfig(BaseModel):
     필드 설명:
       - exports_dir: 생성 파일 저장 디렉토리. 빈 값이면 런타임 폴백.
       - formats: 노출/허용 포맷 목록(참고·검증용). 실제 렌더러는 RENDERERS 가 관장.
+      - retention_days: 생성물 보존 일수. 정리 잡(cleanup_expired_artifacts)이
+        이 값을 기준으로 만료 파일·메타를 지운다(증식 방지). 0 이하이면 정리 안 함.
     """
 
     exports_dir: str = ""
     formats: list[str] = Field(default_factory=lambda: ["docx", "pptx", "hwpx", "md", "txt"])
+    retention_days: int = 90
 
 
 class SecurityConfig(BaseModel):

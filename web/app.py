@@ -46,6 +46,7 @@ CLI(터미널) 말고도 HTTP/SSE로 Nexus를 사용할 수 있게 해 주는 �
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -96,7 +97,7 @@ def _sanitize_history_inplace(history: list) -> None:
                 )
 
 
-from fastapi import FastAPI, Header, HTTPException, UploadFile
+from fastapi import FastAPI, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -169,6 +170,101 @@ def _collect_downloads(messages: list) -> list[dict[str, str]]:
         dl["format"] = inp.get("format", "") or ""
         out.append(dl)
     return out
+
+
+# sha256 계산 시 파일을 한 번에 읽지 않고 스트리밍하는 청크 크기(64KB).
+_SHA256_CHUNK = 64 * 1024
+# sha256을 계산할 파일 크기 상한(8MB). 이보다 큰 파일은 성능을 위해 해시를 생략한다.
+_SHA256_MAX_BYTES = 8 * 1024 * 1024
+
+
+def _sha256_file(path: Path) -> str | None:
+    """파일 내용의 sha256 16진수 다이제스트를 계산한다(실패 시 None).
+
+    64KB씩 스트리밍으로 읽어 큰 파일도 메모리를 적게 쓴다. 읽기 오류는
+    삼키고 None을 돌려 호출부(메타 기록)가 해시 없이도 진행하게 한다.
+    """
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(_SHA256_CHUNK), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
+async def _record_artifacts(downloads: list, tenant: Any, session_id: str | None) -> None:
+    """생성물(다운로드 확정분)의 메타데이터를 tb_artifacts에 fail-soft로 기록한다.
+
+    [왜 web 계층에서 기록하는가]
+      생성물이 "다운로드 URL"로 확정되는 지점(_collect_downloads)이 web이다.
+      도구(image_generate/document_export)는 DB를 import하지 않는다(의존성 단방향
+      유지 — core/tools/** → DB 금지). 그래서 저장/조회는 web + core/storage에서만
+      한다. 결과적으로 CLI 경로는 web을 안 거치므로 자동으로 미기록된다(정상).
+
+    [무엇을 남기는가 — 바이트는 파일시스템, 메타만 PG]
+      각 다운로드에 대해 파일시스템(exports_dir)에서 크기(stat)와 sha256(선택)을
+      뽑고, 확장자→MIME 매핑(MEDIA_TYPES 재사용)으로 mime을 정한 뒤 record_artifact로
+      멱등 기록한다. tenant는 요청에서 해석된 TenantConfig의 id를 소유자로 쓴다.
+
+    [fail-soft]
+      pg_pool이 없으면 조용히 스킵한다. 개별 파일 stat/해시 오류도 삼켜, 메타 기록
+      실패가 채팅 응답을 절대 깨뜨리지 않게 한다(가용성 우선).
+    """
+    if not downloads:
+        return
+    pool = _app_state.get("pg_pool")
+    if pool is None:
+        return
+
+    # lazy import — 순환 import 방지 + DB가 없을 때 비용 회피.
+    from core.storage.artifacts import record_artifact
+    from core.tools.implementations.document_export_renderers import MEDIA_TYPES
+    from core.tools.implementations.document_export_tool import resolve_exports_dir
+
+    config = _app_state.get("config")
+    configured = getattr(getattr(config, "document_export", None), "exports_dir", "")
+    try:
+        exports_dir = resolve_exports_dir(configured).resolve()
+    except Exception as e:  # noqa: BLE001 — 경로 해석 실패 시 기록만 생략(무회귀)
+        logger.warning("생성물 기록 스킵 — exports_dir 해석 실패: %s", e)
+        return
+
+    tenant_id = getattr(tenant, "id", None)
+    for dl in downloads:
+        filename = dl.get("filename") if isinstance(dl, dict) else None
+        if not filename:
+            continue
+        # 다운로드 라우트와 동일한 경로 순회 방어: basename만 취하고 exports_dir 밖은 배제.
+        safe_name = Path(filename).name
+        target = (exports_dir / safe_name).resolve()
+        if target.parent != exports_dir:
+            continue
+
+        size_bytes: int | None = None
+        sha256: str | None = None
+        try:
+            if target.is_file():
+                size_bytes = target.stat().st_size
+                # 큰 파일은 sha256을 생략한다(성능). 상한 이하만 계산.
+                if size_bytes is not None and size_bytes <= _SHA256_MAX_BYTES:
+                    sha256 = _sha256_file(target)
+        except OSError:
+            # 파일 stat 실패는 치명적이지 않다 — 크기/해시 없이 메타만 남긴다.
+            pass
+
+        ext = target.suffix.lstrip(".").lower()
+        mime = MEDIA_TYPES.get(ext, "application/octet-stream")
+        await record_artifact(
+            pool,
+            filename=safe_name,
+            tenant_id=tenant_id,
+            session_id=session_id,
+            mime=mime,
+            size_bytes=size_bytes,
+            sha256=sha256,
+        )
 
 
 def _build_todo_update_frame(engine: Any, session_id: str) -> dict[str, Any] | None:
@@ -891,6 +987,18 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # v0.14.8: 임베딩 keepalive task — 종료 시 cancel하기 위해 보관
         _app_state["embedding_keepalive_task"] = components.get("embedding_keepalive_task")
 
+        # 생성물 메타데이터(tb_artifacts)용 asyncpg 풀 보관 + 스키마 멱등 보장.
+        # 바이트는 파일시스템(exports_dir), 메타/소유자만 이 풀로 PG에 남긴다.
+        # pg_pool이 None(DB 미가동/테스트)이면 ensure_artifacts_schema는 no-op이라
+        # 무회귀다. 스키마 보장 실패도 fail-soft로 서버 기동을 막지 않는다.
+        _app_state["pg_pool"] = components.get("pg_pool")
+        try:
+            from core.storage.artifacts import ensure_artifacts_schema
+
+            await ensure_artifacts_schema(_app_state["pg_pool"])
+        except Exception as e:  # noqa: BLE001 — 스키마 준비 실패가 기동을 막지 않게 삼킴
+            logger.warning("tb_artifacts 스키마 보장 실패(무시): %s", e)
+
         # 웹 전용 QueryEngine — 도구 8개로 축소 (토큰 예산 관리)
         # RTX 5090 (8192 ctx)에서 도구 24개(~6,102토큰)는 컨텍스트 초과.
         # 핵심 도구 8개(~1,851토큰)만 사용하여 입력+출력 공간 확보.
@@ -1238,6 +1346,9 @@ async def chat(
 
         # 응답에 실을 세션 ID는 엔진이 확정한 값을 쓴다(fake 엔진 테스트 호환).
         response_session_id = engine.session_id
+
+        # 생성물 메타데이터를 tb_artifacts에 fail-soft 기록(pg 없으면 조용히 스킵).
+        await _record_artifacts(downloads, tenant, response_session_id)
 
     # 등장 순서대로 ToolCallInfo 목록을 만든다.
     tool_calls_info: list[ToolCallInfo] = [tool_calls_by_id[tid] for tid in tool_calls_order]
@@ -1594,7 +1705,10 @@ async def chat_stream(
         # 프레임으로 보낸다 → UI가 모델 텍스트(오탈자 가능) 대신 이걸로 버튼/미리보기 생성.
         # TODO(nexus): TOOL_RESULT StreamEvent 발신 리팩터 후에는 consume 루프 안에서
         #   이벤트로 바로 download 프레임을 내보내고 이 사후 스캔을 제거한다.
-        for _dl in _collect_downloads(engine._messages[dl_start_idx:]):
+        _dls = _collect_downloads(engine._messages[dl_start_idx:])
+        # 생성물 메타데이터를 tb_artifacts에 fail-soft 기록(pg 없으면 조용히 스킵).
+        await _record_artifacts(_dls, tenant, session_id)
+        for _dl in _dls:
             yield f"data: {json.dumps({'type': 'download', **_dl}, ensure_ascii=False)}\n\n"
 
         # 이번 턴의 user/assistant 텍스트 메시지만 히스토리에 저장
@@ -1950,6 +2064,8 @@ async def chat_completions(
 
     # 문서 생성 다운로드를 이 턴 메시지에서 추출(기존 헬퍼 재사용).
     downloads = _collect_downloads(engine._messages[dl_start_idx:])
+    # 생성물 메타데이터를 tb_artifacts에 fail-soft 기록(pg 없으면 조용히 스킵).
+    await _record_artifacts(downloads, tenant, session_id)
 
     content = "".join(response_text_parts)
     # 표준 클라이언트도 링크를 볼 수 있게 content 끝에 마크다운으로 덧붙인다.
@@ -2080,6 +2196,8 @@ async def _openai_stream_generate(
 
     # 이 턴에 생성된 문서 다운로드 링크를 마지막 content 청크로 덧붙인다.
     downloads = _collect_downloads(engine._messages[dl_start_idx:])
+    # 생성물 메타데이터를 tb_artifacts에 fail-soft 기록(pg 없으면 조용히 스킵).
+    await _record_artifacts(downloads, tenant, session_id)
     dl_md = _downloads_markdown(downloads)
     if dl_md:
         yield _chunk({"content": dl_md})
@@ -2569,7 +2687,7 @@ async def upload_file(file: UploadFile) -> dict[str, Any]:
 
 
 @app.get("/v1/download/{filename}")
-async def download_file(filename: str):
+async def download_file(filename: str, request: Request):
     """
     DocumentExport 도구가 생성한 문서 파일을 다운로드로 내려준다.
 
@@ -2577,9 +2695,19 @@ async def download_file(filename: str):
       1) Path(filename).name 으로 디렉토리 성분(../, 절대경로 등)을 제거.
       2) 확정 경로의 부모가 정확히 exports 디렉토리인지 재확인.
     둘 중 하나라도 어긋나거나 파일이 없으면 404.
+
+    조건부 테넌트 소유권 검사(IDOR 점진 차단):
+      경로검증·파일존재 확인 뒤, tb_artifacts에 소유 테넌트가 기록돼 있고 그 값이
+      요청 테넌트와 '불일치'하면 404로 숨긴다(403이 아니라 404 — 존재 은닉,
+      fail-closed). 반면 (a) 행이 없음(레거시/기록 전 파일), (b) 소유자 미상,
+      (c) 인증 미사용으로 요청 테넌트를 알 수 없음, (d) DB 없음/조회 오류 는 모두
+      '통과'시킨다(하위호환·가용성 우선, fail-soft).
+      TODO(nexus): 이 단계는 '점진 강화' 준비다. 로그인·세션 소유권이 도입되면
+        소유자 미상/요청 테넌트 미상도 차단하는 fail-closed로 전환한다.
     """
     from fastapi import HTTPException
 
+    from core.storage.artifacts import ARTIFACT_NOT_FOUND, get_artifact_owner
     from core.tools.implementations.document_export_renderers import MEDIA_TYPES
     from core.tools.implementations.document_export_tool import resolve_exports_dir
 
@@ -2592,6 +2720,24 @@ async def download_file(filename: str):
 
     if target.parent != exports_dir or not target.is_file():
         raise HTTPException(status_code=404, detail="파일을 찾을 수 없습니다.")
+
+    # ── 조건부 테넌트 소유권 검사 ─────────────────────────────────────
+    # 요청 테넌트는 인증 미들웨어가 request.state.tenant에 실어준다(인증 성공 시).
+    # 인증이 꺼져 있으면 request.state.tenant가 없어 req_tenant_id가 None이 되고,
+    # 그 경우 '판정 불가'로 통과시킨다(신뢰 LAN 가정 — fail-soft).
+    pool = _app_state.get("pg_pool")
+    if pool is not None:
+        owner = await get_artifact_owner(pool, safe_name)
+        req_tenant = getattr(request.state, "tenant", None)
+        req_tenant_id = getattr(req_tenant, "id", None)
+        # 오직 "요청 테넌트를 알고 + 소유자가 특정 테넌트 + 서로 불일치"일 때만 404.
+        if (
+            req_tenant_id is not None
+            and owner is not ARTIFACT_NOT_FOUND
+            and owner is not None
+            and owner != req_tenant_id
+        ):
+            raise HTTPException(status_code=404, detail="파일을 찾을 수 없습니다.")
 
     ext = target.suffix.lstrip(".").lower()
     media = MEDIA_TYPES.get(ext, "application/octet-stream")

@@ -153,7 +153,13 @@ class ApiKeyAuthMiddleware(BaseHTTPMiddleware):
         if tenant is None:
             return self._unauthorized()
 
-        # 인증 통과 — 다음 핸들러로 진행(테넌트 해석은 기존 _resolve_tenant가 담당).
+        # 인증 통과 — 해석된 테넌트를 request.state에 실어 라우트가 읽게 한다.
+        # (다운로드 라우트의 조건부 소유권 검사가 request.state.tenant로 요청 테넌트를
+        #  식별한다. 인증이 꺼져 있으면 이 경로를 타지 않아 state.tenant가 없고, 그때는
+        #  라우트가 '판정 불가'로 통과시킨다 — fail-soft.)
+        # 채팅 등 다른 라우트의 테넌트 해석(body/헤더 우선순위)은 기존 _resolve_tenant가
+        # 그대로 담당한다 — 여기서 싣는 값은 인가/소유권 검사 보조용이다.
+        request.state.tenant = tenant
         return await call_next(request)
 
     @staticmethod
