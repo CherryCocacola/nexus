@@ -248,8 +248,9 @@ routing:
     max_tokens: 8192          # 도구 호출/프로젝트 작업 — 8192로 상향(4096→8192)
     enable_thinking: false
     top_p: 0.95
-    repetition_penalty: 1.0   # 비활성 — tool_call JSON/XML 반복 토큰 보호
-    frequency_penalty: 0.0
+    repetition_penalty: 1.0   # 비활성 — tool_call JSON/XML 반복 토큰 보호(프롬프트 재현 페널티 회피)
+    frequency_penalty: 0.15   # runaway degeneration(반복 붕괴) 억제. rep과 달리 프롬프트 토큰
+                              # 미포함 + 출현횟수 비례라 tool_call JSON 무결성 지키며 붕괴만 차단
     presence_penalty: 0.0
     description: "도구 호출 / 프로젝트 작업"
   chat_mode:

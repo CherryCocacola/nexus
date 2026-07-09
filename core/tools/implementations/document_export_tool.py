@@ -281,13 +281,15 @@ class DocumentExportTool(BaseTool):
         download_url = f"/v1/download/{filename}"
         logger.info("DocumentExport %s (%d bytes) → %s", filename, size, out_path)
 
-        # 모델이 사용자에게 그대로 제시할 수 있도록 마크다운 링크를 결과 본문에 포함한다.
-        # (download_url 등 구조화 메타데이터도 함께 넘겨, 웹이 신뢰할 값은 모델 텍스트가
-        #  아니라 이 메타데이터에서 뽑아 쓰도록 한다.)
+        # 결과 본문에는 URL을 "한 번만" 넣는다(서버가 _DOWNLOAD_URL_RE로 추출 → UI에 자동 첨부).
+        # 모델에게는 URL/파일명을 재현하지 말라고 지시한다 — 긴 UUID 문자열을 FP8 모델이
+        # 반복 재현하다 degeneration(반복 붕괴)에 빠지는 것을 막기 위함이다(ImageGenerate와 동일 규약).
         return ToolResult.success(
-            f"문서를 생성했습니다: {filename} ({size:,} bytes).\n"
-            f"사용자에게 아래 다운로드 링크를 그대로 제시하세요:\n"
-            f"[{filename} 다운로드]({download_url})",
+            f"문서 생성 완료: {filename} ({size:,} bytes).\n"
+            f"[시스템] 다운로드 링크는 서버가 사용자 화면에 자동으로 첨부합니다. "
+            f"답변에는 파일명·URL·마크다운 링크를 다시 쓰지 말고, "
+            f"'요청하신 문서를 생성했습니다.' 같은 짧은 한 줄만 작성하세요.\n"
+            f"(서버 링크 추출용, 사용자에게 노출 금지: {download_url})",
             download_url=download_url,
             filename=filename,
             format=fmt,
