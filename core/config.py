@@ -76,6 +76,13 @@ class GPUServerConfig(BaseModel):
     # POST /v1/images/generate 요청을 보낸다. 메인 추론(8000)·임베딩(8002)과
     # 부하/모델을 분리하려고 포트를 따로 둔다(8003). 실제 운영값은 yaml에서 주입.
     image_url: str = "http://127.0.0.1:8003"
+    # 비전(이미지 이해) 전용 vLLM 서버 — AnalyzeImage 도구가 여기로 OpenAI 비전
+    # 형식 POST /v1/chat/completions 요청을 보낸다. Qwen2.5-VL 을 서빙하며,
+    # 다른 서버들과 부하/모델을 분리하려고 포트를 따로 둔다(8004). 운영값은 yaml에서 주입.
+    vision_url: str = "http://127.0.0.1:8004"
+    # 비전 서버의 served-model-name — AnalyzeImage 요청 body의 "model" 값으로 쓰인다.
+    # vLLM이 Qwen2.5-VL 을 이 이름으로 서빙한다고 본다(운영값은 yaml에서 오버라이드).
+    vision_model: str = "gemma-4-12b"
     # HTTP 요청 1건의 최대 대기 시간(초). 27B 모델의 긴 생성도 끊기지 않도록
     # 넉넉히 120초로 둔다(짧게 잡으면 정상 추론이 타임아웃으로 끊긴다).
     timeout_seconds: float = 120.0

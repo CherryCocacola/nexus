@@ -1059,6 +1059,7 @@ def _create_web_tool_registry(tier: Any = None):  # noqa: ANN202
     # 매칭 실패(None/미지 값) 시 아래 블록을 건너뛰어 TIER_S로 폴백 = fail-closed.
     tier_val = getattr(tier, "value", tier)
     if tier_val in (HardwareTier.TIER_M.value, HardwareTier.TIER_L.value):
+        from core.tools.implementations.analyze_image_tool import AnalyzeImageTool
         from core.tools.implementations.document_export_tool import DocumentExportTool
         from core.tools.implementations.document_tool import DocumentProcessTool
         from core.tools.implementations.git_tools import GitDiffTool
@@ -1069,6 +1070,7 @@ def _create_web_tool_registry(tier: Any = None):  # noqa: ANN202
                 DocumentProcessTool(),  # 업로드 문서(.pdf/.docx/.xlsx/.hwp/.pptx) 파싱
                 DocumentExportTool(),  # 문서 생성(.docx/.pptx/.hwpx/.md/.txt) + 다운로드
                 ImageGenerateTool(),  # 이미지 생성(프롬프트→PNG) + 다운로드/미리보기
+                AnalyzeImageTool(),  # 이미지 분석(VLM, 업로드 이미지→텍스트) — 읽기 전용
                 GitDiffTool(),  # git 변경 조회(읽기 전용). GitCommit은 제외.
                 # ※ Read/Glob/Grep/LS는 웹 표면에서 제외 — 위 docstring 근거 참조.
             ]

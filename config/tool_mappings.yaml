@@ -101,6 +101,14 @@ tool_configuration:
       enabled: true
       require_permission: false
 
+    # ── 이미지 분석 (1개) ──
+    # Gemma 4 12B 비전 서버(gpu_server.vision_url)로 업로드 이미지→텍스트(분석) 위임.
+    # 2026-07-09 B200에 Gemma 4 12B VLM(포트 8004) 기동 완료 → 활성화.
+    # 메모리 압박 시 false 한 줄로 즉시 비활성(레지스트리에서 제외).
+    - name: "AnalyzeImage"
+      enabled: true
+      require_permission: false
+
   disabled_tools:
     - name: "WebFetch"
       reason: "인터넷 접근 필요"

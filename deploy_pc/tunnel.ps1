@@ -30,6 +30,7 @@ ssh -N `
   -L 18001:127.0.0.1:8001 `
   -L 18002:127.0.0.1:8002 `
   -L 18003:127.0.0.1:8003 `
+  -L 18004:127.0.0.1:8004 `
   -L 15440:127.0.0.1:5440 `
   -L 16340:127.0.0.1:6340 `
   -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes `

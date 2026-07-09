@@ -444,6 +444,10 @@ def _build_web_engine_parts(components: dict, state: Any) -> dict:
 
     # AgentTool·SymbolSearchTool이 해석할 의존성 일체 — tenant를 제외한 '공용' 옵션.
     # 세션별 assemble에서 {**base_options, "tenant": tenant}로 얕은 복제해 격리한다.
+    # 업로드 디렉토리 해석 함수 — /v1/upload 라우트와 AnalyzeImage 도구가 같은
+    # 폴더를 가리키도록 단일 소스(resolve_uploads_dir)를 공유한다.
+    from core.tools.implementations.analyze_image_tool import resolve_uploads_dir
+
     base_options = {
         "memory_manager": components.get("memory_manager"),
         "task_manager": components.get("task_manager"),
@@ -465,6 +469,13 @@ def _build_web_engine_parts(components: dict, state: Any) -> dict:
         # 이미지 생성 서버 주소 — ImageGenerate 도구가 읽는다(config.gpu_server.image_url).
         # 미주입이면 도구가 DEFAULT_IMAGE_URL 로 폴백한다.
         "image_url": getattr(getattr(state.config, "gpu_server", None), "image_url", ""),
+        # 비전 서버 주소·모델명 — AnalyzeImage 도구가 읽는다(config.gpu_server.vision_*).
+        # 미주입이면 도구가 DEFAULT_VISION_URL/DEFAULT_VISION_MODEL 로 폴백한다.
+        "vision_url": getattr(getattr(state.config, "gpu_server", None), "vision_url", ""),
+        "vision_model": getattr(getattr(state.config, "gpu_server", None), "vision_model", ""),
+        # 업로드 첨부 저장 디렉토리 — AnalyzeImage 가 "이 디렉토리 하위" 이미지만 읽도록
+        # 제한하는 기준. /v1/upload 라우트와 같은 resolve_uploads_dir 로 단일 소스를 공유한다.
+        "uploads_dir": str(resolve_uploads_dir()),
     }
 
     # 시스템 프롬프트는 파일 읽기 + 서브에이전트 가이드 조립이라 비교적 무겁다 →
@@ -2538,10 +2549,12 @@ async def upload_file(file: UploadFile) -> dict[str, Any]:
     모델이 파일 내용을 읽어 분석할 수 있다(모델은 파일 자체가 아니라 경로를 받는다).
     반환: {status, file_path, file_name, size_bytes}.
     """
-    import tempfile
+    # 업로드 저장 위치 — AnalyzeImage 도구의 경로 검증과 같은 resolve_uploads_dir 로
+    # 단일 소스를 공유한다({tempdir}/nexus_uploads). 저장 경로와 분석 허용 경로가
+    # 어긋나지 않도록 하기 위함이다.
+    from core.tools.implementations.analyze_image_tool import resolve_uploads_dir
 
-    upload_dir = Path(tempfile.gettempdir()) / "nexus_uploads"
-    upload_dir.mkdir(exist_ok=True)
+    upload_dir = resolve_uploads_dir()
 
     file_path = upload_dir / file.filename
     content = await file.read()
