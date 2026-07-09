@@ -1062,11 +1062,13 @@ def _create_web_tool_registry(tier: Any = None):  # noqa: ANN202
         from core.tools.implementations.document_export_tool import DocumentExportTool
         from core.tools.implementations.document_tool import DocumentProcessTool
         from core.tools.implementations.git_tools import GitDiffTool
+        from core.tools.implementations.image_generate_tool import ImageGenerateTool
 
         registry.register_many(
             [
                 DocumentProcessTool(),  # 업로드 문서(.pdf/.docx/.xlsx/.hwp/.pptx) 파싱
                 DocumentExportTool(),  # 문서 생성(.docx/.pptx/.hwpx/.md/.txt) + 다운로드
+                ImageGenerateTool(),  # 이미지 생성(프롬프트→PNG) + 다운로드/미리보기
                 GitDiffTool(),  # git 변경 조회(읽기 전용). GitCommit은 제외.
                 # ※ Read/Glob/Grep/LS는 웹 표면에서 제외 — 위 docstring 근거 참조.
             ]

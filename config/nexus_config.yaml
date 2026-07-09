@@ -42,6 +42,7 @@
 gpu_server:
   url: "http://127.0.0.1:8001"            # B200 컨테이너 내부 vLLM 추론 서버(co-located)
   embedding_url: "http://127.0.0.1:8002"  # e5-large 임베딩 서버(같은 컨테이너 내부)
+  image_url: "http://127.0.0.1:8003"      # FLUX 이미지 생성 서버(ImageGenerate 도구)
   timeout_seconds: 120.0     # 단일 요청 타임아웃 — 장문 생성 여유까지 고려한 값
   max_retries: 10            # with_retry(Tier 4) 최대 재시도 횟수 (콜드/일시장애 흡수)
   retry_base_delay: 0.5      # 지수 백오프 기준 지연(초) — 0.5→1→2…로 증가

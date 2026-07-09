@@ -93,6 +93,14 @@ tool_configuration:
     - name: "MemoryWrite"
       enabled: true
 
+    # ── 이미지 생성 (1개) ──
+    # FLUX 이미지 서버(gpu_server.image_url)로 프롬프트→PNG 생성.
+    # 아직 이미지 서버 미기동이므로 fail-closed 로 기본 비활성(enabled: false).
+    # 서버 기동 후 true 로 바꾸면 웹 TIER_M/L Worker 도구 풀에 노출된다.
+    - name: "ImageGenerate"
+      enabled: false
+      require_permission: false
+
   disabled_tools:
     - name: "WebFetch"
       reason: "인터넷 접근 필요"

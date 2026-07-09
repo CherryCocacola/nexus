@@ -335,4 +335,7 @@ MEDIA_TYPES: dict[str, str] = {
     "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
     "hwpx": "application/hwp+zip",
+    # ImageGenerate 도구가 저장한 PNG를 웹 다운로드 라우트가 image/png 로 서빙해
+    # <img> 미리보기가 올바르게 표시되도록 한다(없으면 octet-stream 폴백).
+    "png": "image/png",
 }

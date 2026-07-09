@@ -2970,3 +2970,23 @@ QA #43(깨진 Bash 명령을 못 고치고 14회·62초 반복)의 근본 방어
 - 물리 백업: `web/ui_backup/index.html.dark-theme.bak`(다크 원본), `web/ui_backup/chrome.html.bak`.
 - 원복 시: `cp web/ui_backup/index.html.dark-theme.bak web/static/index.html` 후 웹 재기동.
 - 또는 git: 리브랜딩 이전 상태는 커밋 `2d91cbf` 직후, 라이트테마 이전은 `4b90005`.
+
+---
+
+### 이미지 생성 도구 (ImageGenerate) — Machine A 구현 (2026-07-09)
+
+**결정 경위**: 이미지 생성이 Claude Code에 없는 신규 확장임을 확인. 로고급(텍스트 포함) 품질 기준 → **FLUX.1 schnell**(Apache 2.0 상업OK, 텍스트 우수, 1~4스텝). 최저 사양 **GB10**(128GB) 기준으로도 저스텝이라 수용 가능(~5–15초 추정). 사양은 `PROJECT_NEXUS_SPEC_v7.4_IMAGE_GEN.md` 신규 개정본.
+
+**구현(Machine A, executor(opus) 위임 → 검토 통과)**:
+- 신규 `core/tools/implementations/image_generate_tool.py` (`ImageGenerateTool`) + `tests/unit/test_image_generate_tool.py`(6).
+- DocumentExport 패턴 대칭: `resolve_exports_dir()`/`_safe_filename()` 재사용, 동일 exports 샌드박스 저장, `/v1/download/{filename}` URL, `MEDIA_TYPES["png"]=image/png` 추가.
+- 서버 계약: `POST {image_url}/v1/images/generate {prompt,width,height,steps,seed}` → `{image_base64,...}`.
+- config: `GPUServerConfig.image_url`(yaml=8003, pc.yaml=18003 터널). bootstrap 웹 registry 등록, app.py가 image_url 주입.
+- fail-closed: is_read_only/is_concurrency_safe=False, `tool_mappings.yaml`에 **enabled:false**(FLUX 서버 미기동).
+- 검증: 17 passed(이미지6+DocExport11), ruff clean, 레지스트리 등록·config 기본값 확인.
+
+**남은 것(Machine B)**: B200/GB10에 FLUX schnell FastAPI 서버(계약대로) 기동 + 오프라인 가중치 번들 → enabled:true → 실 e2e.
+
+**참고 — 조사 결과 기록**:
+- 비전(이미지 이해) 도구: **없음**. ContentBlock=Text|ToolUse|ToolResult|Thinking(이미지 블록 없음). 문서첨부는 DocumentProcess 텍스트 추출만. → 별도 과제(방식 A=AnalyzeImage 도구+VLM Qwen2.5-VL / 방식 B=ContentBlock ImageBlock 네이티브). 보류 중.
+- 컨텍스트 압축: **가동 중**(hardware_tier=large=TIER_L, query_loop이 apply_all+auto_compact_if_needed 매 턴 호출, emergency/reactive compact). 단 65536창이라 한계 근접 시만 실동작. **UI 미표시**(CONTEXT_COMPACT 이벤트 emit 없음) — Claude식 화면표시는 후속 옵션.

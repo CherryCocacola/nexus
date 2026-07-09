@@ -462,6 +462,9 @@ def _build_web_engine_parts(components: dict, state: Any) -> dict:
         # 생성 문서 저장 위치 — DocumentExport 도구가 읽는다. 빈 값이면 도구가
         # {tempdir}/nexus_exports 로 폴백(다운로드 라우트와 동일 경로).
         "exports_dir": getattr(getattr(state.config, "document_export", None), "exports_dir", ""),
+        # 이미지 생성 서버 주소 — ImageGenerate 도구가 읽는다(config.gpu_server.image_url).
+        # 미주입이면 도구가 DEFAULT_IMAGE_URL 로 폴백한다.
+        "image_url": getattr(getattr(state.config, "gpu_server", None), "image_url", ""),
     }
 
     # 시스템 프롬프트는 파일 읽기 + 서브에이전트 가이드 조립이라 비교적 무겁다 →

@@ -72,6 +72,10 @@ class GPUServerConfig(BaseModel):
     # 임베딩 전용 vLLM 인스턴스 — 메인 추론과 부하/모델을 분리하려고 포트를
     # 따로 둔다(8002). e5-large 임베딩 호출이 여기로 간다.
     embedding_url: str = "http://localhost:8002"
+    # 이미지 생성(FLUX 등 확산 모델) 전용 서버 — ImageGenerate 도구가 여기로
+    # POST /v1/images/generate 요청을 보낸다. 메인 추론(8000)·임베딩(8002)과
+    # 부하/모델을 분리하려고 포트를 따로 둔다(8003). 실제 운영값은 yaml에서 주입.
+    image_url: str = "http://127.0.0.1:8003"
     # HTTP 요청 1건의 최대 대기 시간(초). 27B 모델의 긴 생성도 끊기지 않도록
     # 넉넉히 120초로 둔다(짧게 잡으면 정상 추론이 타임아웃으로 끊긴다).
     timeout_seconds: float = 120.0
