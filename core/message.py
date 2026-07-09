@@ -105,6 +105,15 @@ class StreamEventType(str, Enum):
     SYSTEM_INFO = "system_info"  # 정보성 알림
     SYSTEM_WARNING = "system_warning"  # 경고성 알림
 
+    # 컨텍스트 압축 표시 (2026-07-09)
+    # ContextManager가 "실제로" 대화를 줄였을 때(no-op 통과가 아닐 때만) Tier 2
+    # (query_loop)가 1회 yield해, UI에 "🗜️ 대화 압축 중 · <요약>"을 클로드처럼
+    # 보여주기 위한 전용 이벤트. message 필드에 사람이 읽을 압축 요약 문구를 담는다
+    # (예: "이전 대화 3턴 요약", "긴 도구 결과 정리", "대화 요약 생성(모델 호출)").
+    # 미지 타입을 무시하는 기존 소비자에는 하위 호환(신규 type 추가일 뿐 기존 이벤트
+    # 수정 아님 — anti-patterns #3 준수: StreamEvent는 새 인스턴스로만 생성).
+    CONTEXT_COMPACT = "context_compact"  # 실제 압축 발생 알림(message = 사람이 읽을 요약)
+
     # 진행 상태
     TOOL_RESULT = "tool_result"  # 도구 실행 결과를 스트림으로 전달
     STREAM_REQUEST_START = "stream_request_start"  # 모델 요청 시작 마커

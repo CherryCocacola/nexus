@@ -467,6 +467,10 @@ async def _try_recover_from_model_error(
             )
             if context_manager is not None:
                 state.messages = await context_manager.emergency_compact(state.messages)
+                # 긴급 압축이 실제로 줄였으면 CONTEXT_COMPACT를 UI에 흘려보낸다.
+                _compact_ev = _compaction_event(context_manager)
+                if _compact_ev is not None:
+                    events.append(_compact_ev)
             state.continue_reason = ContinueReason.COLLAPSE_DRAIN_RETRY
             await streaming_executor.cancel_all()
             return _RecoveryOutcome(recovered=True, events=events)
@@ -484,6 +488,10 @@ async def _try_recover_from_model_error(
                 state.messages = await context_manager.auto_compact_if_needed(
                     state.messages, force=True
                 )
+                # 반응적 압축이 실제로 줄였으면 CONTEXT_COMPACT를 UI에 흘려보낸다.
+                _compact_ev = _compaction_event(context_manager)
+                if _compact_ev is not None:
+                    events.append(_compact_ev)
             state.continue_reason = ContinueReason.REACTIVE_COMPACT_RETRY
             await streaming_executor.cancel_all()
             return _RecoveryOutcome(recovered=True, events=events)
@@ -511,6 +519,31 @@ async def _try_recover_from_model_error(
 
     # 어떤 복구도 발동하지 못함 (미대상 패턴 또는 예산 소진)
     return _RecoveryOutcome(recovered=False, events=events)
+
+
+def _compaction_event(context_manager: Any | None) -> StreamEvent | None:
+    """
+    context_manager가 직전 호출에서 "실제로" 대화를 줄였으면, 그 요약 문구를 담은
+    CONTEXT_COMPACT StreamEvent를 1회 만들어 돌려준다(없으면 None).
+
+    [왜 별도 헬퍼인가]
+      압축 호출 지점이 세 곳(매 턴 apply_all/auto_compact, 긴급 압축, 반응적 압축)이라
+      "실제 압축 여부를 꺼내(take) 이벤트로 변환"하는 로직을 한곳에 모아 중복을 없앤다.
+
+    [무회귀·방어]
+      context_manager는 타입이 Any(모의객체·구버전 가능)이므로 take_last_compaction
+      훅이 없으면 조용히 None을 반환한다. no-op 통과(압축 없음)에서도 None을 반환해
+      매 턴 표시가 뜨지 않도록 한다(anti-patterns #3: StreamEvent는 새 인스턴스 생성).
+    """
+    if context_manager is None:
+        return None
+    take = getattr(context_manager, "take_last_compaction", None)
+    if take is None:
+        return None
+    phrase = take()
+    if not phrase:
+        return None
+    return StreamEvent(type=StreamEventType.CONTEXT_COMPACT, message=phrase)
 
 
 # ─────────────────────────────────────────────
@@ -651,6 +684,13 @@ async def query_loop(
             except Exception as e:
                 logger.error(f"컨텍스트 압축 실패: {e}")
                 # 압축 실패 시 원본 사용
+
+            # 이번 턴 압축이 "실제로" 대화를 줄였으면 UI에 CONTEXT_COMPACT를 1회
+            # 흘려보낸다("🗜️ 대화 압축 중 · <요약>"). 임계치 미달 no-op 통과에서는
+            # _compaction_event가 None을 반환해 아무것도 표시하지 않는다(매 턴 방지).
+            _compact_ev = _compaction_event(context_manager)
+            if _compact_ev is not None:
+                yield _compact_ev
 
         # 1b. 도구 스키마 준비 (이름순 정렬 — prompt cache 안정성)
         # 구조화 출력 모드에서는 도구를 아예 노출하지 않는다(1차 방어).

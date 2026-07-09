@@ -596,6 +596,11 @@ body {
   margin-left: 2px;
 }
 
+/* 컨텍스트 압축 표시 (예: "🗜️ 대화 압축 중 · 이전 대화 3턴 요약")
+   활동 단계(.activity-step)와 같은 muted 톤을 그대로 쓰고, 아이콘(🗜️)만
+   초록 체크(✓) 대신 얹는다. 완료 후에도 트레일에 은은하게 남는다. */
+.activity-compact .activity-compact-icon { flex-shrink: 0; opacity: 0.85; }
+
 /* 진행 중 라이브 인디케이터, 예: "🔧 문서 생성 중 · DocumentExport" + 스피너 */
 .activity-live {
   align-items: center;
@@ -1821,6 +1826,24 @@ function activityStop(kind, toolName, toolDesc) {
   scrollToBottom();
 }
 
+// context_compact — 백엔드 컨텍스트 압축이 "실제로" 대화를 줄였을 때 오는 이벤트.
+// 활동 트레일에 "🗜️ 대화 압축 중 · <요약>" 한 줄을 도구 단계와 같은 muted 톤으로
+// 남긴다(스트림이 끝나도 트레일에 은은하게 남아 "언제 압축됐는지" 흔적이 된다).
+// text: 사람이 읽을 압축 요약 문구(예: "이전 대화 3턴 요약"). 없으면 문구 없이 표시.
+function activityCompact(text) {
+  const trail = document.getElementById('activityTrail');
+  if (!trail) return;
+  const step = document.createElement('div');
+  step.className = 'activity-step activity-compact';
+  step.innerHTML =
+    '<span class="activity-compact-icon">🗜️</span>' +
+    '<span class="activity-step-text">대화 압축 중' +
+    (text ? ' · ' + escapeHtml(text) : '') + '</span>';
+  trail.appendChild(step);
+  activityHideLive();
+  scrollToBottom();
+}
+
 // 신규 tool_result 프레임 — 도구/서브에이전트의 실행 결과를 "접힌 상세 블록"으로 쌓는다.
 // data = { type:'tool_result', session_id, tool_use_id, name, tool_desc?, is_error, preview, content }
 //   - preview: 짧은 한 줄 요약(summary에 표시)
@@ -2132,6 +2155,11 @@ async function sendMessage() {
               activityStart('thinking', null);          // "생각하는 중" 표시 시작
             } else if (data.type === 'thinking_stop') {
               activityStop('thinking', null);           // 생각 종료
+            } else if (data.type === 'context_compact') {
+              // 백엔드가 "실제로" 대화를 압축했을 때만 오는 이벤트(no-op면 안 옴).
+              // 활동 트레일과 같은 톤으로 "🗜️ 대화 압축 중 · <요약>" 한 줄을 남긴다.
+              if (!streamStarted) { streamStarted = true; startStreamingMessage(); }
+              activityCompact(data.message || data.text || '');
             } else if (data.type === 'tool_use_delta' || data.type === 'thinking_delta') {
               // 도구 인자 조각 / 사고 과정 조각은 화면에 그대로 보여줄 내용이 아니다(노이즈).
               // 특히 thinking_delta 는 text 필드를 갖고 있어서, 아래 "답변 누적" 경로로 새어들면

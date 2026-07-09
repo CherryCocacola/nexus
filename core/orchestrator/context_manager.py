@@ -158,6 +158,12 @@ class ContextManager:
         self._compact_summary: str | None = None
         # _total_compactions: 지금까지 수행한 총 압축 횟수(통계/디버깅용).
         self._total_compactions: int = 0
+        # _last_compaction: 직전 공개 메서드 호출에서 "실제로" 압축이 일어났을 때
+        # (메시지/토큰이 실제로 줄었을 때만) 사람이 읽을 요약 문구를 담는 최소 훅.
+        # None이면 이번 호출은 no-op(압축 없음)이라는 뜻. query_loop이 압축 직후
+        # take_last_compaction()으로 꺼내(consume) CONTEXT_COMPACT 이벤트 발생 여부를
+        # 판단한다. no-op 통과에서는 계속 None이라 매 턴 표시가 뜨지 않는다.
+        self._last_compaction: str | None = None
 
     # ═══════════════════════════════════════════
     # Public API
@@ -274,6 +280,10 @@ class ContextManager:
                 f"(절약: {token_count - new_count})"
             )
 
+            # 모델 호출로 전체를 요약한 "가장 큰" 압축 — 표시 문구를 남긴다
+            # (앞 단계(예산/스닙)가 남긴 문구가 있어도 이걸로 덮어쓴다).
+            self._last_compaction = "대화 요약 생성(모델 호출)"
+
             return result
 
         except Exception as e:
@@ -313,6 +323,9 @@ class ContextManager:
         self._compact_summary = summary
         self._compact_boundary = len(messages) - len(recent)
 
+        # 컨텍스트가 터지기 직전의 가장 공격적인 축소 — 표시 문구를 남긴다.
+        self._last_compaction = "긴급 압축 — 최근 대화만 보존"
+
         return [
             Message.system(f"[긴급 요약] {summary}"),
             *recent,
@@ -348,6 +361,7 @@ class ContextManager:
             else []
         )
 
+        truncated_count = 0  # 실제로 잘라낸 도구 결과 수(표시 문구 판단용).
         for idx in budget_indices:
             msg = result[idx]
             content = str(msg.content)
@@ -355,6 +369,7 @@ class ContextManager:
 
             # 예산을 넘는 결과만 축약 대상이다.
             if content_tokens > self.tool_result_budget:
+                truncated_count += 1
                 # 토큰→글자 환산은 대략 토큰당 3자로 잡는다.
                 char_budget = self.tool_result_budget * 3
                 # 앞부분을 더 많이(1/2), 끝부분을 조금(1/4) 남긴다.
@@ -377,6 +392,11 @@ class ContextManager:
                     truncated,
                     msg.is_error or False,
                 )
+
+        # 실제로 하나라도 잘랐으면 표시 문구를 남긴다(뒤 단계가 더 큰 압축을 하면
+        # 덮어씀 — 우선순위: 도구결과 예산 < 턴 스닙 < 모델/긴급 요약).
+        if truncated_count > 0:
+            self._last_compaction = f"긴 도구 결과 정리 ({truncated_count}건)"
 
         return result
 
@@ -411,6 +431,7 @@ class ContextManager:
         # 목표치: 임계치보다 조금(0.1) 더 낮은 수준까지 줄이면 스닙을 멈춘다.
         target = self.max_tokens * (self.snip_threshold - 0.1)
 
+        snipped_count = 0  # 실제로 접은(스닙한) 턴 수(표시 문구 판단용).
         for i, turn in enumerate(turns):
             # 보존 구간 이전이고, 아직 목표치보다 크면 이 턴을 접는다.
             if i < preserve_start and token_count > target:
@@ -418,6 +439,7 @@ class ContextManager:
                 summary = self._summarize_turn_rule_based(turn)
                 snip_msg = Message.system(f"[스닙된 턴 {i + 1}: {summary}]")
                 result.append(snip_msg)
+                snipped_count += 1
 
                 # 교체로 절약된 토큰만큼 현재 추정치를 깎아 목표 도달을 판정한다.
                 saved = self._estimate_tokens(turn) - self._estimate_tokens([snip_msg])
@@ -427,10 +449,14 @@ class ContextManager:
                 result.extend(turn)
 
         logger.debug(
-            f"스닙 압축: {len(turns)}개 턴 → "
-            f"{sum(1 for m in result if '스닙된' in str(m.content))}개 스닙, "
+            f"스닙 압축: {len(turns)}개 턴 → {snipped_count}개 스닙, "
             f"남은 ~{token_count} 토큰"
         )
+
+        # 실제로 턴을 접었을 때만 표시 문구를 남긴다(1단계 도구결과 예산보다 상위 —
+        # 있으면 덮어씀). 접은 게 없으면 no-op라 이전 문구를 건드리지 않는다.
+        if snipped_count > 0:
+            self._last_compaction = f"이전 대화 {snipped_count}턴 요약"
 
         return result
 
@@ -575,6 +601,8 @@ class ContextManager:
         """
         recent = self._extract_recent_turns(messages, 2)
         summary = self._rule_based_summary(messages)
+        # 모델 요약 실패 폴백도 실제로 대화를 줄이는 압축 — 표시 문구를 남긴다.
+        self._last_compaction = "대화 압축(요약 폴백)"
         return [
             Message.system(f"[강제 스닙 요약] {summary}"),
             *recent,
@@ -792,6 +820,25 @@ class ContextManager:
         상위 계층이 "압축을 실제로 수행하는 관리자인지"를 판단할 때 참조한다.
         """
         return self._passthrough
+
+    def take_last_compaction(self) -> str | None:
+        """
+        직전 압축 호출에서 "실제로" 압축이 일어났으면 사람이 읽을 요약 문구를 1회
+        반환하고 내부 상태를 비운다(consume). 이번엔 압축이 없었으면 None.
+
+        [왜 consume(꺼내면 지움)인가]
+          query_loop이 매 턴 apply_all/auto_compact 직후 이 값을 꺼내 CONTEXT_COMPACT
+          이벤트를 UI에 1회만 흘려보내기 위해서다. 꺼내면 즉시 None으로 되돌려,
+          압축이 없는 다음 턴에서 같은 문구가 다시 뜨지 않게 한다(중복 표시 방지).
+
+        [무엇이 "실제 압축"인가]
+          1단계(도구 결과 예산 절단)·2단계(오래된 턴 스닙)·4단계(모델/폴백 요약)·
+          긴급 압축이 실제로 메시지를 줄였을 때만 _last_compaction이 채워진다.
+          임계치 미달로 아무것도 안 바뀐 no-op 통과에서는 계속 None이다.
+        """
+        phrase = self._last_compaction
+        self._last_compaction = None
+        return phrase
 
 
 # ─────────────────────────────────────────────
