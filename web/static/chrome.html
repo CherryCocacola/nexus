@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Nexus — IDINO AI Assistant</title>
+<title>IDINO NOVA — AI Assistant</title>
 <link rel="manifest" href="/static/manifest.json">
 <meta name="theme-color" content="#ffffff">
 <meta name="apple-mobile-web-app-capable" content="yes">
@@ -403,11 +403,10 @@ body {
 }
 
 .welcome-logo {
-  width: 64px;
-  height: 64px;
+  /* 가로형 워드마크 로고 — 비율 유지(height:auto)로 찌그러짐 방지, 중앙 표시용 확대 */
+  width: 200px;
+  height: auto;
   margin-bottom: 24px;
-  border-radius: var(--radius-md);
-  box-shadow: var(--shadow-md);
 }
 
 .welcome h2 {
@@ -807,7 +806,7 @@ body {
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
     </span>
     <span class="omnibox-text">
-      <strong>IDINO Nexus</strong> — Qwen 3.5 27B (INT4)
+      <strong>IDINO NOVA</strong> — Qwen 3.5 27B (INT4)
     </span>
   </div>
 
@@ -839,7 +838,7 @@ body {
       새 대화
     </button>
     <div class="session-list" id="sessionList"></div>
-    <div class="sidebar-footer">Nexus v0.1.0 &middot; IDINO</div>
+    <div class="sidebar-footer">IDINO NOVA v0.1.0 &middot; IDINO</div>
   </div>
 
   <!-- 메인 콘텐츠 -->
@@ -848,8 +847,8 @@ body {
       <div class="messages-inner" id="messagesInner">
         <!-- 환영 화면 -->
         <div class="welcome" id="welcome">
-          <img src="/static/images.png" alt="Nexus" class="welcome-logo">
-          <h2>IDINO Nexus</h2>
+          <img src="/static/images.png" alt="IDINO NOVA" class="welcome-logo">
+          <h2>IDINO NOVA</h2>
           <p>코드 분석 &middot; 파일 탐색 &middot; 문서 분석을 도와드립니다</p>
           <div class="welcome-cards">
             <div class="welcome-card" onclick="insertPrompt('이 프로젝트의 구조를 분석해 주세요')">
@@ -885,7 +884,7 @@ body {
           </button>
           <input type="file" id="fileInput" multiple accept=".txt,.py,.js,.ts,.json,.yaml,.yml,.md,.csv,.html,.css,.sql,.xml,.log,.pdf,.docx,.hwp,.xlsx" onchange="handleFileSelect(event)">
           <textarea id="userInput"
-                    placeholder="Nexus에게 물어보세요..."
+                    placeholder="IDINO NOVA에게 물어보세요..."
                     rows="1"
                     onkeydown="handleKeyDown(event)"
                     oninput="autoResize(this)"
@@ -896,7 +895,7 @@ body {
             </svg>
           </button>
         </div>
-        <div class="input-footer">Nexus 는 AI이며 실수할 수 있습니다. 응답을 다시 한번 확인해 주세요.</div>
+        <div class="input-footer">IDINO NOVA 는 AI이며 실수할 수 있습니다. 응답을 다시 한번 확인해 주세요.</div>
       </div>
     </div>
   </div>
@@ -1013,8 +1012,8 @@ function clearMessages() {
   const inner = document.getElementById('messagesInner');
   inner.innerHTML = `
     <div class="welcome" id="welcome">
-      <img src="/static/images.png" alt="Nexus" class="welcome-logo">
-      <h2>IDINO Nexus</h2>
+      <img src="/static/images.png" alt="IDINO NOVA" class="welcome-logo">
+      <h2>IDINO NOVA</h2>
       <p>코드 분석 &middot; 파일 탐색 &middot; 문서 분석을 도와드립니다</p>
       <div class="welcome-cards">
         <div class="welcome-card" onclick="insertPrompt('이 프로젝트의 구조를 분석해 주세요')">
@@ -1162,9 +1161,9 @@ function appendMessage(role, content, save = true) {
     // AI 메시지: 왼쪽 흰색 카드 + 아바타
     div.className = 'message ai-msg';
     div.innerHTML = `
-      <img src="/static/images.png" alt="Nexus" class="message-avatar ai-avatar">
+      <img src="/static/images.png" alt="IDINO NOVA" class="message-avatar ai-avatar">
       <div class="ai-content">
-        <div class="ai-sender">Nexus</div>
+        <div class="ai-sender">IDINO NOVA</div>
         <div class="message-bubble">${formatContent(content)}</div>
       </div>`;
   }
@@ -1220,7 +1219,7 @@ function showThinking() {
   div.id = 'thinkingIndicator';
   div.className = 'thinking-indicator';
   div.innerHTML = `
-    <img src="/static/images.png" alt="Nexus" class="message-avatar ai-avatar">
+    <img src="/static/images.png" alt="IDINO NOVA" class="message-avatar ai-avatar">
     <div class="thinking-content">
       <span>생각하는 중</span>
       <div class="thinking-dots"><span></span><span></span><span></span></div>
@@ -1249,9 +1248,9 @@ function startStreamingMessage() {
   div.id = 'streamingMessage';
 
   div.innerHTML = `
-    <img src="/static/images.png" alt="Nexus" class="message-avatar ai-avatar">
+    <img src="/static/images.png" alt="IDINO NOVA" class="message-avatar ai-avatar">
     <div class="ai-content">
-      <div class="ai-sender">Nexus</div>
+      <div class="ai-sender">IDINO NOVA</div>
       <div class="message-bubble streaming-cursor" id="streamingBody"></div>
     </div>`;
 

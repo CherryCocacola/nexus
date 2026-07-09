@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Nexus — AI Assistant</title>
+<title>IDINO NOVA — AI Assistant</title>
 <link rel="manifest" href="/static/manifest.json">
 <meta name="theme-color" content="#0b0b0c">
 <meta name="apple-mobile-web-app-capable" content="yes">
@@ -255,10 +255,10 @@ body {
 }
 
 .welcome-logo {
-  width: 56px; height: 56px;
+  /* 가로형 워드마크 로고 — 비율 유지(height:auto)로 찌그러짐 방지, 중앙 표시용 확대 */
+  width: 180px; height: auto;
   margin-bottom: 20px;
-  opacity: 0.9;
-  border-radius: 12px;
+  opacity: 0.95;
 }
 
 .welcome h2 { font-size: 22px; font-weight: 600; margin-bottom: 8px; }
@@ -860,8 +860,8 @@ body {
     <button class="header-btn" onclick="toggleSidebar()" title="세션 목록">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg>
     </button>
-    <img src="/static/images.png" alt="Nexus" class="header-logo">
-    <span class="header-title">Nexus</span>
+    <img src="/static/images.png" alt="IDINO NOVA" class="header-logo">
+    <span class="header-title">IDINO NOVA</span>
     <span class="header-subtitle">by IDINO</span>
   </div>
   <div class="header-right">
@@ -884,7 +884,7 @@ body {
       <button class="sidebar-close-btn" onclick="toggleSidebar()">&times;</button>
     </div>
     <div class="session-list" id="sessionList"></div>
-    <div class="sidebar-footer">Nexus v0.1.0</div>
+    <div class="sidebar-footer">IDINO NOVA v0.1.0</div>
   </div>
 
   <!-- 메인 -->
@@ -892,8 +892,8 @@ body {
     <div class="messages" id="messages">
       <div class="messages-inner" id="messagesInner">
         <div class="welcome" id="welcome">
-          <img src="/static/images.png" alt="Nexus" class="welcome-logo">
-          <h2>IDINO Nexus 입니다. 어떤 도움을 드릴까요?</h2>
+          <img src="/static/images.png" alt="IDINO NOVA" class="welcome-logo">
+          <h2>IDINO NOVA 입니다. 어떤 도움을 드릴까요?</h2>
           <p>일반대화 · 코드 분석 · 문서 분석</p>
         </div>
       </div>
@@ -921,7 +921,7 @@ body {
             </svg>
           </button>
         </div>
-        <div class="input-footer">Nexus 는 AI이며 실수할 수 있습니다. 응답을 다시 한번 확인해 주세요.</div>
+        <div class="input-footer">IDINO NOVA 는 AI이며 실수할 수 있습니다. 응답을 다시 한번 확인해 주세요.</div>
       </div>
     </div>
   </div>
@@ -1226,8 +1226,8 @@ function clearMessages() {
   const inner = document.getElementById('messagesInner');
   inner.innerHTML = `
     <div class="welcome" id="welcome">
-      <img src="/static/images.png" alt="Nexus" class="welcome-logo">
-      <h2>Nexus에 오신 것을 환영합니다</h2>
+      <img src="/static/images.png" alt="IDINO NOVA" class="welcome-logo">
+      <h2>IDINO NOVA에 오신 것을 환영합니다</h2>
       <p>무엇을 도와드릴까요?</p>
     </div>`;
 }
@@ -1337,7 +1337,7 @@ function appendMessage(role, content, save = true) {
   const div = document.createElement('div');
   div.className = 'message';
 
-  const sender = role === 'user' ? '사용자' : 'Nexus';
+  const sender = role === 'user' ? '사용자' : 'IDINO NOVA';
   const avatarHtml = role === 'user'
     ? `<div class="message-avatar user">U</div>`
     : `<img src="/static/images.png" alt="N" class="message-avatar assistant" style="object-fit:cover;">`;
@@ -1537,7 +1537,7 @@ function showThinking() {
   div.innerHTML = `
     <div class="message-header">
       <img src="/static/images.png" alt="N" class="message-avatar assistant" style="object-fit:cover;">
-      <div class="message-sender">Nexus</div>
+      <div class="message-sender">IDINO NOVA</div>
     </div>
     <div class="thinking">
       <span id="thinkingLabel">생각하는 중</span>
@@ -1589,7 +1589,7 @@ function startStreamingMessage() {
   div.innerHTML = `
     <div class="message-header">
       <img src="/static/images.png" alt="N" class="message-avatar assistant" style="object-fit:cover;">
-      <div class="message-sender">Nexus</div>
+      <div class="message-sender">IDINO NOVA</div>
     </div>
     <div class="activity-area" id="streamingActivity">
       <div class="todo-panel" id="todoPanel" style="display:none"></div>

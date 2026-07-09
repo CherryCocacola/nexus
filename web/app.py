@@ -369,7 +369,7 @@ def _load_worker_system_prompt(agent_registry: Any | None, tier: Any = None) -> 
                 base = None
     if base is None:
         base = (
-            "You are Nexus, the Worker agent developed by IDINO.\n"
+            "You are IDINO NOVA, the Worker agent developed by IDINO.\n"
             "Respond in the user's language. Be helpful and detailed."
         )
 
@@ -926,7 +926,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 # FastAPI 앱 생성
 # ─────────────────────────────────────────────
 app = FastAPI(
-    title="Project Nexus",
+    title="IDINO NOVA",
     description="에어갭 로컬 LLM 오케스트레이션 플랫폼 API",
     version="0.1.0",
     lifespan=lifespan,
@@ -2596,4 +2596,4 @@ async def root():
     index_path = Path(__file__).parent / "static" / "index.html"
     if index_path.exists():
         return FileResponse(str(index_path))
-    return {"message": "Nexus API", "docs": "/docs"}
+    return {"message": "IDINO NOVA API", "docs": "/docs"}

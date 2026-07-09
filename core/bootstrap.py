@@ -1085,7 +1085,7 @@ def _build_default_system_prompt(agent_registry: Any | None = None) -> str:
       - Worker는 Scout JSON 결과를 해석해 최종 답변 생성
     """
     base = (
-        "You are Nexus, the Worker agent in an air-gapped environment.\n"
+        "You are IDINO NOVA, the Worker agent in an air-gapped environment.\n"
         "You are a 27B model — the brain. Scout (a 4B helper) does all file "
         "exploration for you.\n\n"
         "## Your tools (execution only)\n"
