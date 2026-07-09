@@ -2990,3 +2990,19 @@ QA #43(깨진 Bash 명령을 못 고치고 14회·62초 반복)의 근본 방어
 **참고 — 조사 결과 기록**:
 - 비전(이미지 이해) 도구: **없음**. ContentBlock=Text|ToolUse|ToolResult|Thinking(이미지 블록 없음). 문서첨부는 DocumentProcess 텍스트 추출만. → 별도 과제(방식 A=AnalyzeImage 도구+VLM Qwen2.5-VL / 방식 B=ContentBlock ImageBlock 네이티브). 보류 중.
 - 컨텍스트 압축: **가동 중**(hardware_tier=large=TIER_L, query_loop이 apply_all+auto_compact_if_needed 매 턴 호출, emergency/reactive compact). 단 65536창이라 한계 근접 시만 실동작. **UI 미표시**(CONTEXT_COMPACT 이벤트 emit 없음) — Claude식 화면표시는 후속 옵션.
+
+---
+
+### 이미지 생성 도구 ON — FLUX.1-schnell 서버 기동 완료 (2026-07-09)
+
+**결과**: 한글 요청 → 모델이 ImageGenerate 도구 호출 → FLUX(터널 18003→8003) → PNG(1024², 333KB) 다운로드까지 e2e 정상. 로고급 품질 확인(파란 그라데이션 NV 모노그램).
+
+**B200 운영 구성(재현 정보)**:
+- **vLLM 메모리 축소**: `run_vllm_fp8.sh`의 `--gpu-memory-utilization 0.92 → 0.70`(약 40GB 반환). 백업 `run_vllm_fp8.sh.bak.util092`. 재기동은 `setsid nohup bash run_vllm_fp8.sh > logs/vllm_fp8.log 2>&1 </dev/null &`. GPU: vLLM ~135GB, FLUX용 여유 ~48GB. KV풀 여전히 충분(65536).
+- **FLUX 서버**: `/NHNHOME/nexus/flux_server.py`(FastAPI, FluxPipeline + `enable_model_cpu_offload`, guidance_scale=0, steps 4). 기동 `setsid nohup venv/bin/python -m uvicorn flux_server:app --host 127.0.0.1 --port 8003`. 로그 `logs/flux_server.log`. 첫 호출 모델로딩 포함 ~21초, 이후 더 빠름.
+- **가중치**: `black-forest-labs/FLUX.1-schnell`(Apache 2.0, gated) → HF 토큰(IDINO_NOVA 계정)으로 다운로드. **xet 버그로 실패 → `HF_HUB_DISABLE_XET=1` 필수**. hf_cache에 상주(~35GB).
+- **diffusers**: 기존 venv에 `--upgrade-strategy only-if-needed`로 설치(transformers 무손상, vLLM 영향 없음).
+- **터널**: 18003→8003 tunnel.ps1에 추가(+현재 별도 포워드 가동). pc.yaml gpu_server.image_url=`http://127.0.0.1:18003`.
+- **도구**: tool_mappings.yaml ImageGenerate `enabled: true`.
+
+**원복**: `cp run_vllm_fp8.sh.bak.util092 run_vllm_fp8.sh` 후 재기동하면 util 0.92 복귀. 도구 끄려면 tool_mappings `enabled: false`.
