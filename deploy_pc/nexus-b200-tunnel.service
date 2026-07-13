@@ -1,0 +1,36 @@
+# 112 서비스 서버가 B200 vLLM(A.X-4.0)에 붙기 위한 상주 SSH 터널 systemd 유닛
+# ---------------------------------------------------------------------------
+# 무엇인가:
+#   nexus-web 컨테이너(--network host)는 nexus_config.112.yaml 에서 추론 서버를
+#   http://127.0.0.1:18001 로 바라본다. 이 유닛이 112 호스트에 그 로컬포트를 열어
+#   NHN Bastion(59.150.33.1:45702)을 거쳐 B200 컨테이너의 vLLM(8001)로 포워딩한다.
+#   (임베딩·PG·Redis 는 112 로컬이라 터널 불필요 — vLLM 18001 하나만 연다.)
+#
+# 전제:
+#   - /home/idino/nexus-tunnel/nexus_key : SSH 키(600). 이 키는 passphrase 가 없어
+#     systemd 무인 기동이 바로 가능하다(2026-07-13 확인 — tunnel.ps1 주석은 오기).
+#   - Bastion 접속정보(User/Host/Port)는 tunnel.ps1 과 동일.
+#
+# 끊김 복구: Restart=always + ServerAliveInterval 로 상시 재연결.
+[Unit]
+Description=Nexus B200 vLLM SSH tunnel (112 -> bastion -> B200:8001)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=idino
+# -N: 원격 명령 없이 포워딩만. ExitOnForwardFailure: 포워딩 실패 시 즉시 종료(→ Restart).
+# BatchMode=yes: passphrase/프롬프트 필요하면 붙지 말고 실패(→ nopass 키 아니면 바로 드러남).
+ExecStart=/usr/bin/ssh -N \
+  -L 127.0.0.1:18001:127.0.0.1:8001 \
+  -o ExitOnForwardFailure=yes \
+  -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
+  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+  -o BatchMode=yes \
+  -i /home/idino/nexus-tunnel/nexus_key \
+  -p 45702 idino_user@59.150.33.1
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
