@@ -3006,3 +3006,52 @@ QA #43(깨진 Bash 명령을 못 고치고 14회·62초 반복)의 근본 방어
 - **도구**: tool_mappings.yaml ImageGenerate `enabled: true`.
 
 **원복**: `cp run_vllm_fp8.sh.bak.util092 run_vllm_fp8.sh` 후 재기동하면 util 0.92 복귀. 도구 끄려면 tool_mappings `enabled: false`.
+
+---
+
+### 112 서비스 서버 이관 — Docker 올인원 (2026-07-11)
+
+> 이 섹션은 2026-07-12에 메모리(`project_112_service_host.md`) 기반으로 소급 기록. 당시 세션이 메모리에만 남기고 progress.md 추가를 누락했던 공백 보완.
+
+**배경.** 192.168.21.112(사내 Ubuntu 22.04, RTX 5090 32GB·24코어·62GB RAM·1.6TB)를 **Docker 올인원 서비스 서버**로 이관. 헤비 추론은 B200(터널), GPU는 학습데이터 생성용, 이 PC(5090 윈도우)는 학습데이터 생성 등 별도 용도로 분리.
+
+**1단계 — 컨테이너 기동.** 112에 Docker 29.1.3 설치 + 컨테이너 2개(restart=unless-stopped).
+- `idino-postgres` = pgvector/pgvector:pg17 (PG 17.10 + pgvector 0.8.5). 호스트 포트 **5440**→5432. DB `idino_ai` / 유저 `idino_user` / 스키마 `nexus` / extension vector.
+- `idino-redis` = redis:7. 호스트 포트 **6340**→6379.
+- 기존 미변경: 112 로컬 PG(5432, 넥서스 무관), vLLM(8001)/임베딩(8002)/llama-server(8003), `nexus-vllm.service`·`nexus-embedding.service`.
+- 주의: 112 커널 업그레이드 대기(5.15.0-181→185). 재부팅 시 vLLM 죽으니 계획된 정비 때만.
+
+**2단계 — 39 DB 데이터 이관.** 192.168.10.39(DB 서버, PG :5440 db=nexus)를 pg_dump(-Fc, 5.6GB)→112 idino_ai 복원. tb_knowledge 1,067,978 / tb_memories 284,772 / tb_symbols 3,065행, 벡터인덱스 3종 재생성(idx_knowledge_embed ivfflat lists=1000, idx_memories_embedding hnsw, idx_symbols_embed ivfflat). public→nexus 스키마 이동, `ALTER ROLE idino_user IN DATABASE idino_ai SET search_path TO nexus, public`로 앱 무접두어 동작. 39 원본 무변경(읽기만).
+- 교훈: 컨테이너 기본 maintenance_work_mem 64MB로는 1M행 ivfflat 빌드 실패(200MB 필요) → SET으로 2GB 상향. pg_restore는 반드시 `-U idino_user`.
+
+**3단계 — config 갱신 + e2e.** `config/nexus_config.112.yaml`(pc.yaml 복사본) 신설 — 전부 112 직결(gpu_server=192.168.21.112:8001·embedding=8002, redis=:6340, pg=:5440/idino_ai/idino_user). .venv_pc(Py3.11)로 웹(8601) 기동해 `POST /v1/chat` e2e 통과("광합성" 질의에 kowiki RAG 주입→Qwen 응답, 11초).
+- 핵심 교훈(112 로컬 추론 config 필수 3종): ①모델명 `qwen3.5-27b`(ax-4.0 아님), primary_model + query_routing 3모드 모두 교체. ②112 Qwen `max_model_len=8192` → tier=small, max_context_tokens 49152→5632, mode max_tokens→2048 (안 그러면 컨텍스트초과 빈응답). ③rerank enabled:false (112 8002엔 /v1/rerank 없음).
+
+**4단계 — nexus Docker 정식 배포.** `deploy_pc/Dockerfile`(python:3.11-slim + requirements-pc.txt, GPU라이브러리 제외, 662MB) 신설. 코드 tar SFTP→112 /home/idino/nexus-app→`docker build -t nexus-web:latest`. 컨테이너 `nexus-web` 기동(`--network host`, restart=unless-stopped, -v exports 마운트, env NEXUS_CONFIG=nexus_config.112.yaml). 112 내부 e2e 통과.
+- **LAN 개방(사용자 승인).** ufw로 8600을 LAN(192.168.0.0/16) 개방 → `http://192.168.21.112:8600` LAN 접속 e2e 통과. 인증은 API키(Bearer) 유지.
+- CLI: `ssh idino@112 → docker exec -it nexus-web python -m cli.repl`.
+
+**AgentHub DB 이관.** 112 호스트 PG(5432)의 `idino_ai."AIAgentMngtDB"` 스키마(document_chunks 619행+vector)를 Docker PG(5440) idino_ai로 스키마명 유지 이관. pg_dump `-n '"AIAgentMngtDB"'`(대소문자 보존 위해 큰따옴표 필수). 호스트 5432 원본 무변경.
+- search_path 정리: idino_user 기본을 **`nexus, public`**로 확정(Nexus 격리). AgentHub는 스키마 명시로 자체 처리. [[project_agenthub_integration]].
+
+**미결/후속.** `config/nexus_config.112.yaml`·`deploy_pc/Dockerfile` 미커밋(비번은 env). docutil 등 다른 서비스도 112 Docker로(별도). [[reference_servers]]의 39 DB 정보는 이관 전 시점이라 최신화 필요.
+
+---
+
+### 112 서비스 추론을 B200(A.X-4.0)로 전환 — 컨텍스트 오버플로 근본 해소 (2026-07-13)
+
+**증상.** 112 `nexus-web`(Docker)에서 문서 요약 시 "입력(6145) > 컨텍스트(5632) 초과" 에러. 사용자 의문("B200에서 이 정도로 컨텍스트가 차진 않을 텐데")이 결정적 단서.
+
+**근본원인.** `config/nexus_config.112.yaml`이 gpu_server를 **112 로컬 vLLM(qwen3.5-27b, max_model_len=8192)** 로 가리키고 있었다(max_context_tokens=5632). 이 파일은 원래 3단계 "112 단독 e2e 검증용"(B200 없이 로컬만으로 도는지 증명)이라 일부러 로컬을 박아둔 것인데, 4단계에서 그 테스트 config가 그대로 운영 컨테이너에 배포됨. 헤더 주석은 B200/65536이라 적혀 있어(템플릿 복사 잔재) 착각을 유발. 설계 의도(헤비 추론=B200 터널)와 배포가 어긋난 상태였다. 실측: 짧은 "수도?" 질의조차 prompt_tokens=7117이라 5632창에선 사실상 모든 실질 질의가 오버플로였다.
+
+**조치(config, 추론부만 — DB/Redis/임베딩은 112 로컬 유지).** gpu_server.url→`127.0.0.1:18001`(B200 터널), primary_model 및 knowledge/tool/chat 3모드→`ax-4.0`, max_context_tokens 5632→**49152**, default_max_tokens 2048→8192, hardware_tier small→large. **FABLE5(fable) 검토로 결함 2건 추가 수정**: (HIGH) output_token_escalation `[1024,2048]`→`[4096,8192]`(default_max 8192가 리스트 최대와 불일치 시 8192 잘림→2048 역축소되는 실동작 결함), (MED) tool_result_budget 2000→8000. 불변식 49152+8192=57344 ≤ 65536.
+
+**112→B200 터널.** 개발 PC(tunnel.ps1)와 동일 경로 = NHN bastion `idino_user@59.150.33.1:45702` + `nexus_key`. **핵심 발견: 이 키는 passphrase 없음**(tunnel.ps1 주석 "passphrase 있음"은 오기). 112에 상주 systemd 유닛(`deploy_pc/nexus-b200-tunnel.service`) 설치 — `ssh -N -L 127.0.0.1:18001:127.0.0.1:8001`, Restart=always, enabled(재부팅 복구). 임베딩·PG·Redis는 112 로컬이라 vLLM 18001 하나만 포워딩.
+
+**B200 서빙 모델 실측(질문2).** `/v1/models` = `ax-4.0`(root skt/A.X-4.0, max_model_len 65536). config 값과 일치 확인.
+
+**config 영속화.** docker cp만으론 이미지 재생성 시 원복되므로, config를 호스트 파일 **bind-mount**(`/home/idino/nexus-config/nexus_config.112.yaml`:ro→/app/config/...)로 컨테이너 재생성(run 스펙: --network host, restart=unless-stopped, exports 마운트, NEXUS_* env, uvicorn web.app:app:8600). 빌드 컨텍스트(`/home/idino/nexus-app/config`)도 갱신해 향후 재빌드 정합.
+
+**e2e 검증.** `/v1/chat/completions`(OpenAI messages)로 긴 입력(13045·8842 prompt_tokens) 정상 요약, model=ax-4.0, finish=stop. health 200. 옛 5632의 2배 넘는 입력이 문제없이 처리됨 — 근본 해소 확인.
+
+**미결/주의.** 이미지(nexus-web:latest 39h) 자체는 아직 옛 config 박힘(bind-mount가 오버라이드하므로 무해, 재빌드 시 정합). 터널 단절=전체 추론 불가(단일 경로) — systemd Restart로 자동복구.
