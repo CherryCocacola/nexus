@@ -470,17 +470,39 @@ def _load_worker_system_prompt(agent_registry: Any | None, tier: Any = None) -> 
         )
 
     if agent_registry is not None and len(agent_registry) > 0:
+        # TIER_M/L에는 scout 전용 서버(scout_provider)가 없어(bootstrap: TIER_S에서만 생성)
+        # scout 위임이 무의미하다 — Worker가 큰 컨텍스트로 직접 처리하는 게 정상 경로다.
+        # 그래서 확장 티어에서는 목록·권장 모두에서 scout를 제외한다(불필요한 위임·오류 방지).
         agent_lines = [
-            f"  - {name}: {desc}" for name, desc in agent_registry.list_descriptions().items()
+            f"  - {name}: {desc}"
+            for name, desc in agent_registry.list_descriptions().items()
+            if not (is_expanded and name == "scout")
         ]
+        base += "\n\n## Sub-agents (Agent tool)\n"
+        base += "Delegate specialized tasks to sub-agents via the Agent tool.\n"
+        if agent_lines:
+            base += "Available sub-agents:\n" + "\n".join(agent_lines) + "\n"
         base += (
-            "\n\n## Sub-agents (Agent tool)\n"
-            "Delegate specialized tasks to sub-agents via the Agent tool.\n"
-            "Available sub-agents:\n" + "\n".join(agent_lines) + "\n\nWhen to use sub-agents:\n"
+            "\nWhen to use sub-agents:\n"
             "  - Simple questions or greetings → answer directly, NO tools\n"
-            "  - Single file task → use Read/Edit/Write directly\n"
-            '  - Broad project exploration → Agent(subagent_type="scout")\n'
-            "NEVER invoke scout for trivial tasks — it is slow (~30s on CPU)."
+            "  - Editing/creating a known file → use Edit/Write directly "
+            "(this web surface has NO Read/Glob/Grep/LS filesystem browsing)\n"
+        )
+        if is_expanded:
+            base += (
+                "  - Analyzing an uploaded document or broad exploration → handle it "
+                "directly with your tools (large context; no scout delegation needed)\n"
+            )
+        else:
+            base += (
+                "  - Analyzing an uploaded document or broad exploration → "
+                'Agent(subagent_type="scout")\n'
+                "NEVER invoke scout for trivial tasks — it is slow (~30s on CPU).\n"
+            )
+        base += (
+            "When you use any tool or sub-agent, do NOT narrate the tool mechanics "
+            "(never mention tool names, arguments, or that you are 'filling in' a parameter); "
+            "call it silently and give the user a concise, natural answer."
         )
     return base
 
@@ -2675,18 +2697,31 @@ async def upload_file(file: UploadFile) -> dict[str, Any]:
     # 업로드 저장 위치 — AnalyzeImage 도구의 경로 검증과 같은 resolve_uploads_dir 로
     # 단일 소스를 공유한다({tempdir}/nexus_uploads). 저장 경로와 분석 허용 경로가
     # 어긋나지 않도록 하기 위함이다.
+    import uuid
+    from pathlib import Path as _Path
+
     from core.tools.implementations.analyze_image_tool import resolve_uploads_dir
 
     upload_dir = resolve_uploads_dir()
 
-    file_path = upload_dir / file.filename
+    # 저장 파일명은 ASCII-safe로 만든다. 이유: 이후 채팅에서 모델이 이 "서버 경로"를
+    # DocumentProcess 도구 인자로 다시 타이핑해야 하는데, 한글·특수문자가 긴 경로는
+    # 모델이 재현하다 오타를 내 "파일을 찾을 수 없습니다"로 실패한다(긴 문자열 재현 취약성).
+    # 짧은 ASCII 경로(upload-<uuid>.<ext>)면 안정적으로 재현된다. 원본 이름은 표시용으로만 반환.
+    orig_name = file.filename or "upload"
+    suffix = _Path(orig_name).suffix.lower()
+    if len(suffix) > 8 or not all(c.isalnum() or c == "." for c in suffix):
+        suffix = ""  # 확장자가 비정상이면 붙이지 않는다(경로 안전)
+    stored_name = f"upload-{uuid.uuid4().hex[:12]}{suffix}"
+
+    file_path = upload_dir / stored_name
     content = await file.read()
     file_path.write_bytes(content)
 
     return {
         "status": "ok",
-        "file_path": str(file_path),
-        "file_name": file.filename,
+        "file_path": str(file_path),   # ASCII-safe 실제 저장 경로(모델이 재현할 경로)
+        "file_name": orig_name,        # 원본 파일명(표시용)
         "size_bytes": len(content),
     }
 

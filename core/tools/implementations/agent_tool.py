@@ -68,6 +68,24 @@ DISALLOWED_TOOLS_FOR_AGENTS = frozenset(
     }
 )
 
+# ad-hoc 서브에이전트(경로 B)의 시스템 프롬프트에 자동으로 덧붙이는 "출력 규약".
+# 왜 필요한가: ad-hoc 경로는 사용자가 준 description을 그대로 프롬프트로 쓰고 위험 도구만
+# 뺀 전체 도구 풀(DocumentExport 등 산출물 도구 포함)을 받는다. 그런데 description에는
+# 출력 형식 규칙이 없어, 모델이 "DocumentExport의 content 인자를 채워야 합니다" 같은 도구
+# 내부 서술을 노출하거나 생성물 본문을 답변에 통째로 도배할 수 있다. Claude 앱/웹처럼
+# 도구는 조용히 부르고 결과만 간결히 보여주도록, 모든 ad-hoc 서브에이전트에 공통 규약을 강제한다.
+_SUBAGENT_OUTPUT_CONTRACT = (
+    "\n\n---\n"
+    "## 출력 규약 (반드시 준수)\n"
+    "- 도구 사용 자체를 설명하지 마라. 도구 이름·인자·'인자를 채운다' 같은 내부 동작을 "
+    "답변 텍스트에 쓰지 말고, 도구는 조용히 호출하라.\n"
+    "- 파일/문서를 생성할 때는 생성물 본문 전체를 답변에 다시 쓰지 말고 해당 도구의 "
+    "content(본문) 인자에 담아라. 완료 후에는 1~2문장의 짧은 확인만 남겨라.\n"
+    "- 도구나 다른 에이전트가 돌려준 결과 원문을 그대로 복사해 붙여넣지 마라. "
+    "핵심만 간결히 종합하라.\n"
+    "- 사고 과정을 출력하지 마라."
+)
+
 
 class AgentTool(BaseTool):
     """
@@ -511,8 +529,10 @@ class AgentTool(BaseTool):
         ]
         # ad-hoc은 정의된 max_turns가 없으므로 보수적으로 10턴으로 고정하고,
         # 모델은 부모 것을 그대로 재사용한다(전용 프로바이더 없음).
+        # description(사용자 지정 프롬프트) 뒤에 공통 출력 규약을 덧붙여, 도구 내부 서술·
+        # 생성물 본문 도배를 막고 Claude식 간결 표시를 강제한다.
         return _AgentConfig(
-            system_prompt=description,
+            system_prompt=description + _SUBAGENT_OUTPUT_CONTRACT,
             tools=filtered_tools,
             max_turns=10,
             model_provider=parent_model_provider,
@@ -532,20 +552,22 @@ class AgentTool(BaseTool):
 
         동작:
           - None            → 부모 Worker의 프로바이더를 그대로 재사용
-          - "scout"         → context.options["scout_provider"](CPU 4B 전용) 사용
+          - "scout"         → context.options["scout_provider"](CPU 4B 전용) 사용.
+                              단 미가용(TIER_M/L 등)이면 부모 Worker 프로바이더로 폴백한다.
           - 그 외 알 수 없는 이름 → 경고 로그 후 보수적으로 부모 프로바이더 재사용
-        scout_provider가 필요한데 없으면(_서버 미연결 등) _AgentConfigError를 던진다.
         """
         if override_name is None:
             return parent_model_provider
         if override_name == "scout":
             scout_provider = context.options.get("scout_provider")
             if scout_provider is None:
-                # Scout 전용 서버가 붙어 있지 않은 환경(TIER_M/L 등)에서는 실행 불가.
-                raise _AgentConfigError(
-                    "scout_provider가 context.options에 없습니다 "
-                    "(Scout 서버 미연결 또는 TIER_M/L 환경)"
+                # Scout 전용 서버가 붙어 있지 않은 환경(TIER_M/L 등)에서는 죽이지 않고
+                # 부모 Worker 모델로 폴백한다. TIER_M/L은 원래 Worker 단독 수행이 정상
+                # 경로이므로(scout 위임 불필요), 폴백해도 결과 품질은 오히려 낫다.
+                logger.warning(
+                    "Agent: scout_provider 미가용(TIER_M/L 등) → 부모 Worker 모델로 폴백"
                 )
+                return parent_model_provider
             return scout_provider
         # 알 수 없는 override → 예외로 죽이지 않고 보수적으로 부모 모델로 폴백한다.
         logger.warning(

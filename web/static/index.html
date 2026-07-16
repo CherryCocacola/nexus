@@ -121,25 +121,41 @@ body {
 .layout { display: flex; flex: 1; overflow: hidden; position: relative; }
 
 .sidebar {
-  width: 260px;
+  width: var(--sidebar-w, 260px);
   background: var(--bg-secondary);
   border-right: 1px solid var(--border);
   display: flex;
   flex-direction: column;
   flex-shrink: 0;
-  transition: transform 0.25s ease, opacity 0.25s ease;
-  position: absolute;
-  left: 0; top: 0; bottom: 0;
-  z-index: 10;
-  transform: translateX(0);
-  opacity: 1;
+  overflow: hidden;
+  transition: width 0.22s ease;
 }
 
+/* 닫힘: 폭 0으로 접어 메인을 넓힌다(오버레이가 아니라 인-플로우 → 프롬프트를 가리지 않는다) */
 .sidebar.collapsed {
-  transform: translateX(-100%);
-  opacity: 0;
-  pointer-events: none;
+  width: 0;
+  border-right: none;
 }
+
+/* 패널 사이 드래그 리사이저 (데스크톱에서 폭 조절) */
+.resizer {
+  flex: 0 0 6px;
+  cursor: col-resize;
+  background: transparent;
+  position: relative;
+  z-index: 6;
+  transition: background 0.15s ease;
+}
+.resizer::before {
+  content: "";
+  position: absolute;
+  top: 0; bottom: 0; left: 2px;
+  width: 1px;
+  background: var(--border);
+}
+.resizer:hover, .resizer.dragging { background: var(--border-light); }
+.resizer[hidden] { display: none; }
+body.resizing { cursor: col-resize; user-select: none; }
 
 .sidebar-header {
   padding: 14px 16px;
@@ -780,8 +796,8 @@ body {
   flex-direction: column;
   transition: width 0.28s ease;
 }
-/* 데스크톱: 우측 42% 폭 — .main(flex:1)이 자동으로 줄어든다 */
-.canvas-panel.open { width: 42%; }
+/* 데스크톱: 우측 폭(기본 42%, 드래그로 조절) — .main(flex:1)이 자동으로 줄어든다 */
+.canvas-panel.open { width: var(--canvas-w, 42%); }
 
 .canvas-header {
   display: flex;
@@ -869,8 +885,29 @@ body {
 .canvas-body pre code { background: none; padding: 0; }
 
 /* ─── 반응형 ─── */
+/* 태블릿: 캔버스 기본 폭을 조금 넓게, 여백 축소 */
+@media (max-width: 1024px) {
+  .messages-inner { padding: 0 16px; }
+  .canvas-panel.open { width: var(--canvas-w, 50%); }
+}
+
+/* 모바일: 사이드바는 오버레이(슬라이드), 리사이저 숨김, 글자 크기 축소 */
 @media (max-width: 768px) {
-  .sidebar { width: 100%; }
+  .sidebar {
+    position: absolute;
+    left: 0; top: 0; bottom: 0;
+    z-index: 30;
+    width: min(82vw, 300px);
+    box-shadow: 2px 0 14px rgba(0,0,0,0.18);
+    transition: transform 0.25s ease;
+  }
+  /* 모바일 닫힘: 폭은 유지하되 화면 밖으로 슬라이드(인-플로우가 아니라 오버레이) */
+  .sidebar.collapsed {
+    width: min(82vw, 300px);
+    transform: translateX(-100%);
+    border-right: 1px solid var(--border);
+  }
+  .resizer { display: none; }
   .messages-inner { padding: 0 12px; }
   .input-area { padding: 12px; }
   /* 좁은 화면: 캔버스는 전체 오버레이 */
@@ -881,6 +918,21 @@ body {
     z-index: 30;
   }
   .canvas-panel.open { width: 100%; }
+  /* 반응형 글자 크기 — 좁은 화면에서 어색하지 않게 */
+  .message-body, .message-body p, .canvas-body { font-size: 14px; line-height: 1.65; }
+  .message-body h2, .canvas-body h2 { font-size: 17px; }
+  .message-body h3, .canvas-body h3 { font-size: 15px; }
+  .input-box textarea { font-size: 16px; }  /* iOS 자동 확대 방지 위해 16px 이상 */
+  .input-footer { font-size: 11px; }
+  .welcome h2 { font-size: 20px; }
+}
+
+/* 아주 좁은 화면 */
+@media (max-width: 420px) {
+  .messages-inner { padding: 0 10px; }
+  .message-body, .canvas-body { font-size: 13.5px; }
+  .welcome h2 { font-size: 18px; }
+  .welcome p { font-size: 13px; }
 }
 </style>
 </head>
@@ -919,14 +971,17 @@ body {
     <div class="sidebar-footer">IDINO NOVA v0.1.0</div>
   </div>
 
+  <!-- 사이드바↔메인 폭 조절 리사이저 (사이드바 열림 시에만 표시) -->
+  <div class="resizer" id="sidebarResizer" hidden></div>
+
   <!-- 메인 -->
   <div class="main">
     <div class="messages" id="messages">
       <div class="messages-inner" id="messagesInner">
         <div class="welcome" id="welcome">
-          <img src="/static/images.png" alt="IDINO NOVA" class="welcome-logo">
-          <h2>IDINO NOVA 입니다. 어떤 도움을 드릴까요?</h2>
-          <p>일반대화 · 코드 분석 · 문서 분석</p>
+          <img src="/static/idino-nova.png" alt="IDINO NOVA" class="welcome-logo">
+          <h2 id="welcomeGreeting">안녕하세요.</h2>
+          <p>무엇을 도와드릴까요?</p>
         </div>
       </div>
     </div>
@@ -957,6 +1012,9 @@ body {
       </div>
     </div>
   </div>
+
+  <!-- 메인↔캔버스 폭 조절 리사이저 (캔버스 열림 시에만 표시) -->
+  <div class="resizer" id="canvasResizer" hidden></div>
 
   <!-- 문서 미리보기 캔버스 (기본 숨김: width 0). 문서 생성 시 미리보기 버튼으로 열림 -->
   <aside class="canvas-panel" id="canvasPanel" aria-hidden="true" aria-label="문서 미리보기">
@@ -1052,6 +1110,9 @@ window.addEventListener('DOMContentLoaded', () => {
       if (panel && panel.classList.contains('open')) closeCanvas();
     }
   });
+  // 초기 welcome 문구를 시간대별 인사말로 설정(정적 HTML 블록이 남아 있는 경우).
+  const wg = document.getElementById('welcomeGreeting');
+  if (wg) wg.textContent = greetingByHour();
   document.getElementById('userInput').focus();
 });
 
@@ -1267,10 +1328,38 @@ function clearMessages() {
   const inner = document.getElementById('messagesInner');
   inner.innerHTML = `
     <div class="welcome" id="welcome">
-      <img src="/static/images.png" alt="IDINO NOVA" class="welcome-logo">
-      <h2>IDINO NOVA에 오신 것을 환영합니다</h2>
+      <img src="/static/idino-nova.png" alt="IDINO NOVA" class="welcome-logo">
+      <h2 id="welcomeGreeting">${greetingByHour()}</h2>
       <p>무엇을 도와드릴까요?</p>
     </div>`;
+}
+
+// 시간대별 인사말 — 브라우저(= LAN 서버와 같은 타임존) 시각으로 시간대를 나누고,
+// 각 시간대의 감성적인 문구 후보 중 하나를 랜덤으로 골라 매번 조금씩 다르게 인사한다.
+// 서버 왕복 없이 즉시 표시되며(에어갭 친화), 같은 게이트웨이라 서버시간과 사실상 동일하다.
+function greetingByHour() {
+  const h = new Date().getHours();
+  let pool;
+  if (h < 5) {            // 00~04 새벽
+    pool = ['고요한 새벽이네요.', '늦은 밤까지 수고가 많으세요.',
+            '새벽 공기가 차분한 시간이에요.', '잠 못 드는 새벽인가요.'];
+  } else if (h < 11) {    // 05~10 아침
+    pool = ['상쾌한 아침이에요.', '좋은 아침이에요.',
+            '새로운 하루가 시작됐네요.', '아침 햇살이 좋은 날이에요.'];
+  } else if (h < 14) {    // 11~13 한낮·점심
+    pool = ['어느새 한낮이네요.', '점심은 드셨나요.',
+            '따뜻한 한낮이에요.', '나른해지기 쉬운 시간이에요.'];
+  } else if (h < 17) {    // 14~16 오후
+    pool = ['커피 한잔의 여유로운 오후네요.', '나른한 오후예요.',
+            '오후의 햇살이 좋은 시간이네요.', '한숨 돌리기 좋은 오후예요.'];
+  } else if (h < 21) {    // 17~20 저녁
+    pool = ['하루를 마무리하는 저녁이에요.', '노을이 물드는 저녁이네요.',
+            '오늘 하루도 수고 많으셨어요.', '편안한 저녁 시간이에요.'];
+  } else {                // 21~23 밤
+    pool = ['고요한 밤이에요.', '하루의 끝, 편안한 밤 되세요.',
+            '밤이 깊어가네요.', '오늘도 고생 많으셨어요.'];
+  }
+  return pool[Math.floor(Math.random() * pool.length)];
 }
 
 // ─── 토큰 카운터 ───
@@ -1325,17 +1414,16 @@ async function readFileContents() {
     const ext = '.' + file.name.split('.').pop().toLowerCase();
 
     if (binaryExts.includes(ext)) {
-      // 바이너리 파일 → 서버 업로드 후 Scout 서브에이전트로 위임
-      // (Worker 컨텍스트(8K)에 원문을 직접 적재하지 않기 위함)
+      // 바이너리 파일 → 서버 업로드 후 "서버 경로"만 전달한다. 도구 라우팅(직접
+      // DocumentProcess vs Scout 위임)은 티어별 시스템 프롬프트가 결정한다 — 여기서
+      // scout를 강제하지 않는다(TIER_M/L은 Worker가 직접 처리하는 게 정상 경로).
       const uploadPath = await uploadFileToServer(file);
       if (uploadPath) {
         contents.push(
           `사용자가 문서 파일을 업로드했습니다.\n` +
           `파일명: ${file.name}\n` +
           `서버 경로: ${uploadPath}\n` +
-          `Agent 도구를 사용해 subagent_type="scout"으로 이 파일을 분석하고 ` +
-          `요약을 받아 주세요. scout가 DocumentProcess로 청크별로 읽어 ` +
-          `핵심 내용만 반환할 것입니다.`
+          `위 서버 경로의 문서를 분석해 주세요.`
         );
       } else {
         contents.push(`[첨부파일 업로드 실패: ${file.name}]`);
@@ -2060,6 +2148,9 @@ function openCanvas(doc) {
   }
   panel.classList.add('open');
   panel.setAttribute('aria-hidden', 'false');
+  // 데스크톱에서 캔버스 리사이저 노출(캔버스 열림 시)
+  const crz = document.getElementById('canvasResizer');
+  if (crz) crz.hidden = window.innerWidth <= 768;
 }
 
 function closeCanvas() {
@@ -2067,6 +2158,8 @@ function closeCanvas() {
   if (!panel) return;
   panel.classList.remove('open');
   panel.setAttribute('aria-hidden', 'true');
+  const crz = document.getElementById('canvasResizer');
+  if (crz) crz.hidden = true;
 }
 
 // ─── 전송 ───
@@ -2390,8 +2483,68 @@ function scrollToBottom() {
 }
 
 function toggleSidebar() {
-  document.getElementById('sidebar').classList.toggle('collapsed');
+  const collapsed = document.getElementById('sidebar').classList.toggle('collapsed');
+  // 데스크톱에서 사이드바 리사이저는 사이드바가 열려 있을 때만 노출한다.
+  const rz = document.getElementById('sidebarResizer');
+  if (rz) rz.hidden = collapsed || window.innerWidth <= 768;
 }
+
+// ─── 패널 폭 드래그 조절 (사이드바 / 캔버스) ───
+// 각 리사이저를 드래그해 폭을 조절하고 localStorage에 저장한다. 폭은 CSS 변수
+// (--sidebar-w / --canvas-w)로 반영해 .collapsed/.open 클래스의 폭 규칙과 충돌하지 않게 한다.
+function initPanelResizers() {
+  const layout = document.querySelector('.layout');
+  const sidebar = document.getElementById('sidebar');
+  const canvas = document.getElementById('canvasPanel');
+  if (!layout || !sidebar || !canvas) return;
+
+  // 저장된 폭 복원
+  const savedSb = parseInt(localStorage.getItem('nova.sidebarW') || '', 10);
+  if (savedSb) sidebar.style.setProperty('--sidebar-w', savedSb + 'px');
+  const savedCv = localStorage.getItem('nova.canvasW');
+  if (savedCv) canvas.style.setProperty('--canvas-w', savedCv);
+
+  function bindDrag(handle, onMove, onEnd) {
+    if (!handle) return;
+    handle.addEventListener('mousedown', (e) => {
+      if (window.innerWidth <= 768) return;   // 모바일은 오버레이라 폭 조절 안 함
+      e.preventDefault();
+      handle.classList.add('dragging');
+      document.body.classList.add('resizing');
+      const move = (ev) => onMove(ev);
+      const up = () => {
+        handle.classList.remove('dragging');
+        document.body.classList.remove('resizing');
+        document.removeEventListener('mousemove', move);
+        document.removeEventListener('mouseup', up);
+        if (onEnd) onEnd();
+      };
+      document.addEventListener('mousemove', move);
+      document.addEventListener('mouseup', up);
+    });
+  }
+
+  // 사이드바: 오른쪽 끝을 드래그 → 폭 = 마우스X - 레이아웃 왼쪽 (180~480px)
+  bindDrag(document.getElementById('sidebarResizer'), (ev) => {
+    const rect = layout.getBoundingClientRect();
+    const w = Math.max(180, Math.min(480, ev.clientX - rect.left));
+    sidebar.style.setProperty('--sidebar-w', w + 'px');
+  }, () => {
+    const w = parseInt(sidebar.style.getPropertyValue('--sidebar-w'), 10);
+    if (w) localStorage.setItem('nova.sidebarW', w);
+  });
+
+  // 캔버스: 왼쪽 끝을 드래그 → 폭 = 레이아웃 오른쪽 - 마우스X (280px ~ 레이아웃 72%)
+  bindDrag(document.getElementById('canvasResizer'), (ev) => {
+    const rect = layout.getBoundingClientRect();
+    const w = Math.max(280, Math.min(rect.width * 0.72, rect.right - ev.clientX));
+    canvas.style.setProperty('--canvas-w', w + 'px');
+  }, () => {
+    const w = canvas.style.getPropertyValue('--canvas-w');
+    if (w) localStorage.setItem('nova.canvasW', w);
+  });
+}
+initPanelResizers();
 </script>
 </body>
 </html>
