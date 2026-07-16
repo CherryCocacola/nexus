@@ -378,6 +378,7 @@ class SCMockProvider(ModelProvider):
         presence_penalty: float = 0.0,
         structured_output: Any = None,
         n: int = 1,
+        force_tool_choice: str | None = None,
     ) -> AsyncGenerator[StreamEvent, None]:
         self.last_n = n
         yield StreamEvent(type=StreamEventType.MESSAGE_START, model_id="mock")

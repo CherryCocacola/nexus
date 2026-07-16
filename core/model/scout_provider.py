@@ -151,6 +151,7 @@ class ScoutModelProvider(LocalModelProvider):
         presence_penalty: float = 0.0,
         structured_output: StructuredOutputSpec | None = None,
         n: int = 1,
+        force_tool_choice: str | None = None,
     ) -> AsyncGenerator[StreamEvent, None]:
         """
         Scout 전용 stream — enable_thinking을 None으로 강제한다.
@@ -200,6 +201,8 @@ class ScoutModelProvider(LocalModelProvider):
             structured_output=structured_output,
             # SC 표본 수도 시그니처 정합을 위해 그대로 전달(Scout는 SC 대상 아님 — 통상 1).
             n=n,
+            # guided 재시도 강제 도구도 시그니처 정합을 위해 그대로 전달(passthrough).
+            force_tool_choice=force_tool_choice,
         ):
             yield ev
 

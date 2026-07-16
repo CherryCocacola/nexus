@@ -146,6 +146,7 @@ class ModelProvider(ABC):
         presence_penalty: float = 0.0,
         structured_output: StructuredOutputSpec | None = None,
         n: int = 1,
+        force_tool_choice: str | None = None,
     ) -> AsyncGenerator[StreamEvent, None]:
         """
         모델에 스트리밍 요청을 보낸다.
@@ -328,6 +329,7 @@ class LocalModelProvider(ModelProvider):
         presence_penalty: float = 0.0,
         structured_output: StructuredOutputSpec | None = None,
         n: int = 1,
+        force_tool_choice: str | None = None,
     ) -> AsyncGenerator[StreamEvent, None]:
         """
         vLLM /v1/chat/completions SSE 스트리밍.
@@ -408,7 +410,19 @@ class LocalModelProvider(ModelProvider):
         # 도구 스키마 변환: Nexus → OpenAI function_calling
         if tools:
             payload["tools"] = [self._convert_tool_schema(t) for t in tools]
-            payload["tool_choice"] = "auto"
+            # force_tool_choice가 지정되면 해당 함수로 tool_choice를 '강제'한다.
+            # 왜: hermes 파서 + tool_choice="auto"는 인자를 자유형식으로 통과시켜
+            # 모델이 깨진 JSON(미이스케이프 따옴표/개행, 닫는 구조 누락)을 내도 그대로
+            # 흘러간다. 반면 named tool_choice면 vLLM이 그 도구의 parameters 스키마로
+            # guided decoding을 적용해 '유효 JSON'을 보장한다(B200 실서버 확증됨).
+            # 상위(query_loop)가 인자 파싱 실패를 감지했을 때만 이 경로로 재시도한다.
+            if force_tool_choice:
+                payload["tool_choice"] = {
+                    "type": "function",
+                    "function": {"name": force_tool_choice},
+                }
+            else:
+                payload["tool_choice"] = "auto"
 
         # ── 구조화 출력 (guided decoding) 주입 ──────────────────────────────
         # 왜 도구 블록 '직후'인가: tools와 response_format의 동시 사용은 vLLM에서
@@ -469,6 +483,11 @@ class LocalModelProvider(ModelProvider):
             # finish_reason 이후 usage 청크를 기다리기 위한 변수
             # vLLM은 finish_reason 청크 → usage 청크 → [DONE] 순으로 전송한다.
             pending_stop: StopReason | None = None
+            # 누적 tool_calls를 finalize(TOOL_USE_STOP 방출)했는지 표시. finish_reason
+            # 청크 또는 [DONE] 중 먼저 오는 곳에서 정확히 한 번만 finalize하기 위한 가드.
+            # (강제 tool_choice에서는 finish_reason="stop"으로 와도 tool_calls가 있으므로,
+            #  finish_reason 문자열이 아니라 이 플래그로 중복 없이 finalize한다.)
+            tool_calls_finalized = False
 
             # ── 자기일관성(SC) 전용 상태 (n>1일 때만 사용) ──────────────────
             # 표본(choice) 인덱스별 텍스트 조각을 버퍼링한다. 라이브 TEXT_DELTA는
@@ -554,11 +573,17 @@ class LocalModelProvider(ModelProvider):
                                 ):
                                     yield _evt
                                 return
-                            # pending_stop이 없으면 (finish_reason 없이 [DONE] 도달)
-                            # 폴백으로 END_TURN 사용
-                            if pending_stop is None:
+                            # 아직 finalize되지 않은 누적 tool_calls가 있으면 여기서
+                            # 처리한다. (finish_reason 청크가 먼저 오면 그쪽에서 이미
+                            # 처리되어 tool_calls_finalized=True. finish_reason 없이
+                            # [DONE]만 오는 경우엔 여기가 유일한 finalize 지점이다.)
+                            if accumulated_tool_calls and not tool_calls_finalized:
                                 for _evt in self._finalize_tool_calls(accumulated_tool_calls):
                                     yield _evt
+                                tool_calls_finalized = True
+                                # tool_calls가 있으면 종료 이유는 TOOL_USE가 맞다.
+                                if pending_stop is None:
+                                    pending_stop = StopReason.TOOL_USE
                             yield StreamEvent(
                                 type=StreamEventType.MESSAGE_STOP,
                                 stop_reason=pending_stop or StopReason.END_TURN,
@@ -678,11 +703,29 @@ class LocalModelProvider(ModelProvider):
                                 "tool_calls": StopReason.TOOL_USE,
                             }.get(finish_reason, StopReason.END_TURN)
 
-                            if finish_reason == "tool_calls":
+                            # 누적된 tool_calls가 있으면 finalize한다. finish_reason
+                            # 문자열("tool_calls")에만 의존하지 않는 이유: 강제
+                            # tool_choice(named)에서는 vLLM이 tool_calls를 스트리밍하면서도
+                            # finish_reason="stop"을 반환한다(B200 실측). 문자열만 보면
+                            # 이 호출을 텍스트 응답으로 오인해 tool_calls를 유실한다.
+                            # 그래서 실제 누적분 유무로 판정하고, tool_calls가 있으면
+                            # 종료 이유도 TOOL_USE로 바로잡아 상위(query_loop)가 도구
+                            # 실행 턴으로 진행하게 한다.
+                            if accumulated_tool_calls and not tool_calls_finalized:
                                 for _evt in self._finalize_tool_calls(
                                     accumulated_tool_calls
                                 ):
                                     yield _evt
+                                tool_calls_finalized = True
+                                # finish_reason="length"(진짜 max_tokens 절단)는 MAX_TOKENS
+                                # 종료 이유를 보존한다 — query_loop의 max-output 복구 판정에
+                                # 필요하기 때문. 그 외("stop": 강제 tool_choice, "tool_calls":
+                                # 일반)에서만 TOOL_USE로 바로잡는다. 절단된 tool call은 어차피
+                                # parse_error=True로 finalize돼 상위 guided 재생성 경로로
+                                # 흡수되므로, 여기서 TOOL_USE로 덮어써 MAX_TOKENS를 지울
+                                # 필요가 없다(기존 복구 경로 보존).
+                                if finish_reason != "length":
+                                    stop = StopReason.TOOL_USE
 
                             # finish_reason 이후 usage 청크가 올 수 있으므로
                             # 바로 return하지 않고 finish 정보를 저장한다.
@@ -1057,16 +1100,43 @@ class LocalModelProvider(ModelProvider):
                 # 명시적 guided 강제를 검토). {} 폴백은 유지 — 도구 스키마 검증이
                 # 거부하면 tool_use_error가 되어 모델이 자기교정(재호출)한다.
                 raw_args = tc["function"].get("arguments", "{}")
+                # 파싱 실패 신호 — strict=False로도 복구 못 하면 True. 상위(query_loop)가
+                # 이 신호를 보고 tool_choice를 해당 도구로 강제한 guided 재시도를 건다.
+                parse_failed = False
                 try:
                     args = json.loads(raw_args)
-                except json.JSONDecodeError:
-                    logger.warning(
-                        "tool_call arguments JSON 파싱 실패 — 빈 dict 폴백 "
-                        "(tool=%s, raw=%.200r)",
-                        tc["function"]["name"],
-                        raw_args,
-                    )
-                    args = {}
+                except json.JSONDecodeError as e:
+                    # 1차 실패의 실측 원인: A.X-4.0가 DocumentExport 등 긴 content
+                    # 문자열 값 안에 실제 개행/탭(제어문자)을 이스케이프(\\n) 없이
+                    # 그대로 넣어, json 기본(strict=True)이 "Invalid control
+                    # character"로 거부한다. (해당 턴은 output_tokens가 max에 못
+                    # 미치고 stop_reason=tool_use로 정상 종료 → 절단이 아님이 실측됨.)
+                    # strict=False로 재파싱하면 문자열 내부의 실제 제어문자를 허용해
+                    # 대부분 복구된다 → content가 살아 DocumentExport가 파일을 만든다.
+                    try:
+                        args = json.loads(raw_args, strict=False)
+                        logger.warning(
+                            "tool_call arguments 1차 파싱 실패 → strict=False 복구 성공 "
+                            "(tool=%s, err=%s, len=%d)",
+                            tc["function"]["name"],
+                            e,
+                            len(raw_args),
+                        )
+                    except json.JSONDecodeError as e2:
+                        # strict=False로도 실패 = 다른 malformation(절단/구조 파손).
+                        # 말미(tail)를 남겨 원인(절단이면 문자열 미종료)을 추적하고,
+                        # {}로 폴백해 도구 스키마 검증이 거부 → tool_use_error로 모델이
+                        # 스스로 재호출(자기교정)하도록 넘긴다.
+                        logger.warning(
+                            "tool_call arguments JSON 파싱 실패 — 빈 dict 폴백 "
+                            "(tool=%s, err=%s, len=%d, tail=%.200r)",
+                            tc["function"]["name"],
+                            e2,
+                            len(raw_args),
+                            raw_args[-200:],
+                        )
+                        args = {}
+                        parse_failed = True
                 events.append(
                     StreamEvent(
                         type=StreamEventType.TOOL_USE_STOP,
@@ -1074,6 +1144,7 @@ class LocalModelProvider(ModelProvider):
                             id=tc.get("id", f"call_{idx}"),
                             name=tc["function"]["name"],
                             input=args,
+                            parse_error=parse_failed,
                         ),
                     )
                 )

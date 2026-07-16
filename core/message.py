@@ -165,12 +165,17 @@ class ToolUseBlock(BaseModel):
       - name: 실행할 도구 이름(레지스트리 키).
       - input: 도구에 넘길 인자 딕셔너리. 스트리밍 중에는 JSON 조각으로 오다가
         완성 시점(TOOL_USE_STOP)에 파싱되어 채워진다.
+      - parse_error: 모델이 낸 arguments JSON이 (strict=False로도) 파싱 불가여서
+        input이 빈 dict로 폴백됐음을 표시하는 신호. True이면 이 호출을 빈 인자로
+        실행하지 말고(→ 스키마 검증 실패·오답), 상위(query_loop)가 tool_choice를
+        해당 도구로 강제한 guided decoding 재시도로 정상 JSON을 다시 받게 한다.
     """
 
     type: Literal["tool_use"] = "tool_use"
     id: str = Field(default_factory=lambda: f"toolu_{uuid.uuid4().hex[:12]}")
     name: str
     input: dict[str, Any] = Field(default_factory=dict)
+    parse_error: bool = False
 
 
 class ToolResultBlock(BaseModel):

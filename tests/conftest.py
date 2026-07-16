@@ -220,6 +220,7 @@ class EnhancedMockModelProvider(ModelProvider):
         presence_penalty: float = 0.0,
         structured_output: Any = None,
         n: int = 1,
+        force_tool_choice: str | None = None,
     ) -> AsyncGeneratorType[StreamEvent, None]:
         """
         MockResponse에 따라 StreamEvent를 yield한다.

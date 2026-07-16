@@ -130,6 +130,10 @@ class LoopState:
     # 에러 복구 카운터
     tool_parse_retry_count: int = 0
     model_error_count: int = 0
+    # guided 재시도용 — 도구 인자 JSON 파싱이 실패한 도구 이름. 다음 턴 stream()에
+    # tool_choice로 강제 전달돼 vLLM guided decoding으로 유효 JSON을 받게 한다.
+    # 한 턴만 유효(one-shot): stream() 호출 직후 None으로 리셋한다.
+    force_tool_choice: str | None = None
     compact_retry_count: int = 0
     collapse_drain_count: int = 0
 
@@ -778,7 +782,15 @@ async def query_loop(
             #   - base_max_tokens: 모드/설정이 정한 상한(예: KNOWLEDGE_MODE 2048)
             #   - dynamic_max: 컨텍스트에 실제로 남은 공간
             # 즉 "남은 공간 안에서, 설정 상한을 넘지 않되, 최소 512은 보장"한다.
-            max_tokens = max(512, min(base_max_tokens, dynamic_max))
+            if state.force_tool_choice:
+                # guided 재시도 턴: 긴 문서(DocumentExport content 등)를 스키마대로
+                # 완결된 JSON으로 다시 쓰게 해야 하므로, 설정 상한(base_max_tokens,
+                # 예: tool_mode 8192)에 막혀 절단되지 않도록 base cap을 풀고 잔여
+                # 윈도우(dynamic_max) 전체를 출력에 할당한다. dynamic_max는 이미
+                # max_context - 입력 - 200으로 윈도우 불변식을 지키므로 안전하다.
+                max_tokens = max(512, dynamic_max)
+            else:
+                max_tokens = max(512, min(base_max_tokens, dynamic_max))
 
         # ═══════════════════════════════════════
         # Phase 2: API Call (모델 스트리밍)
@@ -789,6 +801,9 @@ async def query_loop(
         # 이번 턴 동안 스트림에서 수집할 정보들. 매 턴 새로 초기화한다.
         assistant_text_parts: list[str] = []  # TEXT_DELTA 누적
         tool_use_blocks: list[dict[str, Any]] = []  # 완성된 tool_use 블록
+        # 인자 JSON 파싱이 실패한 도구 이름들(parse_error=True). 이 도구는 빈 인자로
+        # 실행하지 않고(오답 방지), 스트림 종료 후 guided 재시도 판정에 쓴다.
+        parse_failed_tools: list[str] = []
         turn_usage = TokenUsage()  # 이번 턴의 토큰 사용량
         stop_reason: StopReason | None = None  # 모델 종료 이유
         model_error: str | None = None  # 모델 에러 메시지
@@ -849,7 +864,13 @@ async def query_loop(
                 structured_output=structured_output,
                 # SC 표본 수 — sc_active일 때만 n>1, 아니면 1(기존 단일 경로, 무회귀).
                 n=sc_n if sc_active else 1,
+                # guided 재시도: 이전 턴에서 인자 파싱 실패가 감지된 도구가 있으면
+                # 그 도구로 tool_choice를 강제해 vLLM이 유효 JSON을 내게 한다.
+                force_tool_choice=state.force_tool_choice,
             )
+            # one-shot 리셋 — 이 턴에만 강제하고, 다음 턴은 다시 auto로 돌아간다.
+            # (재시도 응답도 실패하면 Phase 3에서 다시 세팅된다.)
+            state.force_tool_choice = None
             async for event in stream_with_watchdog(
                 _raw_stream,
                 idle_timeout=30.0,
@@ -880,13 +901,20 @@ async def query_loop(
                     # 도구 호출 완성 — tool_use_blocks에 추가하고
                     # StreamingToolExecutor에도 전달하여 병렬 실행 시작
                     if event.tool_use:
-                        tu_dict = {
-                            "id": event.tool_use.id,
-                            "name": event.tool_use.name,
-                            "input": event.tool_use.input,
-                        }
-                        tool_use_blocks.append(tu_dict)
-                        streaming_executor.add_tool(tu_dict)
+                        # 인자 JSON 파싱이 실패한 도구는 실행하지 않는다. 빈 인자로
+                        # 실행하면 스키마 검증 실패(예: "content는 비어 있을 수 없습니다")
+                        # → 모델이 본문을 채팅에 덤프하는 UX 붕괴로 이어진다. 대신 이름만
+                        # 기록해 스트림 종료 후 guided decoding 재시도로 정상 JSON을 받는다.
+                        if getattr(event.tool_use, "parse_error", False):
+                            parse_failed_tools.append(event.tool_use.name)
+                        else:
+                            tu_dict = {
+                                "id": event.tool_use.id,
+                                "name": event.tool_use.name,
+                                "input": event.tool_use.input,
+                            }
+                            tool_use_blocks.append(tu_dict)
+                            streaming_executor.add_tool(tu_dict)
 
                 elif event_type == StreamEventType.MESSAGE_STOP.value:
                     # 모델 응답 종료
@@ -1015,6 +1043,46 @@ async def query_loop(
             type=StreamEventType.USAGE_UPDATE,
             usage=state.cumulative_usage,
         )
+
+        # ─── 도구 인자 파싱 실패 → guided decoding 재시도 (Option 1) ───
+        # A.X-4.0는 tool_choice="auto" + hermes 파서에서 긴 인자 JSON을 자유형식으로
+        # 내다 깨뜨린다(미이스케이프 따옴표/개행, 닫는 "·}·필수필드 누락). 빈 인자로
+        # 실행하면 스키마 검증 실패(예: "content는 비어 있을 수 없습니다") → 모델이
+        # 본문을 채팅에 덤프하는 UX 붕괴로 이어진다. 그래서 그 도구로 tool_choice를
+        # 'named'로 강제해 다시 요청하면, vLLM이 그 도구의 parameters 스키마로 guided
+        # decoding을 적용해 유효 JSON을 보장한다(B200 실서버 확증). 정상 파싱된 도구가
+        # 하나라도 있으면(tool_use_blocks 비어있지 않음) 그걸로 진행하므로 건너뛴다.
+        if parse_failed_tools and not tool_use_blocks:
+            # 중복 제거하며 순서 보존
+            unique_failed = list(dict.fromkeys(parse_failed_tools))
+            # 복수 도구가 동시에 파싱 실패하면 named tool_choice로 하나만 강제할 수
+            # 없어 나머지 호출이 소실된다 → guided 재시도 대신 정직한 에러(가짜 완료 금지).
+            if len(unique_failed) == 1 and state.tool_parse_retry_count < MAX_TOOL_PARSE_RETRY:
+                state.tool_parse_retry_count += 1
+                state.force_tool_choice = unique_failed[0]  # 다음 턴 stream()에 강제
+                state.continue_reason = ContinueReason.NEXT_TURN
+                yield StreamEvent(
+                    type=StreamEventType.SYSTEM_WARNING,
+                    message=(
+                        f"[도구 인자 재생성 {state.tool_parse_retry_count}/"
+                        f"{MAX_TOOL_PARSE_RETRY}] {unique_failed[0]}"
+                    ),
+                )
+                await streaming_executor.cancel_all()
+                continue
+            else:
+                # guided 재시도로도 유효 JSON을 못 받았거나(대개 진짜 length 절단)
+                # 복수 도구 동시 실패. 빈 인자 실행/인라인 덤프 대신 정직한 에러로 종료.
+                yield StreamEvent(
+                    type=StreamEventType.ERROR,
+                    error_code="TOOL_ARGS_UNPARSEABLE",
+                    message=(
+                        "요청하신 산출물이 너무 길어 한 번에 생성하지 못했습니다. "
+                        "범위를 나눠(예: 섹션별로) 다시 요청해 주세요."
+                    ),
+                )
+                await streaming_executor.cancel_all()
+                return
 
         # 모델 에러 처리 (도구 호출 JSON 파싱 실패 등)
         # 조건이 "에러 O + 도구 블록 X"인 이유: 도구가 하나라도 정상 파싱됐다면

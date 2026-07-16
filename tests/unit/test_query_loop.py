@@ -44,6 +44,8 @@ class ScriptedProvider(ModelProvider):
           (실제 inference가 raise하지 않고 ERROR를 yield하는 상황을 재현)
       {"raise": Exception(...)}              → 예외를 raise (기존 except 경로 재현)
       {"text": "..."}                        → 정상 텍스트 응답(END_TURN)
+      {"tool_parse_error": "ToolName"}       → 인자 파싱 실패 도구 호출 재현
+          (parse_error=True인 TOOL_USE_STOP + stop_reason=TOOL_USE)
 
     마지막 action은 리스트를 벗어난 호출에서 반복 사용된다.
     """
@@ -56,6 +58,8 @@ class ScriptedProvider(ModelProvider):
         self.last_structured_output: Any = None
         self.last_tools: list[dict[str, Any]] | None = None
         self.last_n: int = 1
+        # 매 호출에서 받은 force_tool_choice를 순서대로 기록(guided 재시도 검증용).
+        self.force_tool_choice_history: list[str | None] = []
 
     async def stream(
         self,
@@ -73,16 +77,41 @@ class ScriptedProvider(ModelProvider):
         presence_penalty: float = 0.0,
         structured_output: Any = None,
         n: int = 1,
+        force_tool_choice: str | None = None,
     ) -> AsyncGenerator[StreamEvent, None]:
         # 전파 검증용 기록 — 실제 동작은 흉내내지 않는다.
         self.last_structured_output = structured_output
         self.last_tools = tools
         self.last_n = n
+        self.last_force_tool_choice = force_tool_choice
+        self.force_tool_choice_history.append(force_tool_choice)
         idx = min(self.call_count, len(self._script) - 1)
         action = self._script[idx]
         self.call_count += 1
 
         yield StreamEvent(type=StreamEventType.MESSAGE_START, model_id="mock")
+
+        if "tool_parse_error" in action:
+            # 인자 JSON 파싱 실패 도구 호출 재현: parse_error=True인 TOOL_USE_STOP.
+            # (inference._finalize_tool_calls가 strict=False로도 실패 시 내는 형태)
+            from core.message import ToolUseBlock
+
+            name = action["tool_parse_error"]
+            yield StreamEvent(
+                type=StreamEventType.TOOL_USE_START,
+                tool_use=ToolUseBlock(id="call_x", name=name, input={}),
+            )
+            yield StreamEvent(
+                type=StreamEventType.TOOL_USE_STOP,
+                tool_use=ToolUseBlock(
+                    id="call_x", name=name, input={}, parse_error=True
+                ),
+            )
+            yield StreamEvent(
+                type=StreamEventType.MESSAGE_STOP,
+                stop_reason=StopReason.TOOL_USE,
+            )
+            return
 
         if "raise" in action:
             # inference가 예외를 그대로 던지는 상황(기존 except 경로) 재현
@@ -378,3 +407,80 @@ async def test_error_event_connect_error_does_not_trigger_recovery(
 
     assert cm.emergency_compact_calls == 0
     assert True not in cm.auto_compact_forces
+
+
+# ─────────────────────────────────────────────
+# (g) 도구 인자 파싱 실패 → guided decoding 재시도(named tool_choice)
+# ─────────────────────────────────────────────
+def _warnings(events: list[StreamEvent | Message]) -> list[str]:
+    """SYSTEM_WARNING 이벤트의 메시지만 모은다."""
+    return [
+        e.message or ""
+        for e in events
+        if isinstance(e, StreamEvent)
+        and e.type == StreamEventType.SYSTEM_WARNING.value
+    ]
+
+
+async def test_tool_args_parse_error_retries_with_forced_tool_choice(
+    tool_use_context: ToolUseContext,
+) -> None:
+    """
+    인자 파싱 실패(parse_error) 도구 호출이 오면, 다음 턴에서 그 도구로
+    tool_choice를 강제(force_tool_choice)해 재시도한 뒤 정상 종료한다.
+    """
+    provider = ScriptedProvider(
+        [
+            {"tool_parse_error": "DocumentExport"},  # 턴0: 인자 파싱 실패
+            {"text": "완료"},  # 턴1(재시도): 정상 응답 → 종료
+        ]
+    )
+    cm = SpyContextManager()
+
+    events = await _run_loop(provider, cm, tool_use_context)
+
+    # 턴0은 auto(None), 턴1(재시도)은 DocumentExport로 강제되어야 한다
+    assert provider.force_tool_choice_history == [None, "DocumentExport"]
+    # 재시도 안내(SYSTEM_WARNING)가 나왔는지
+    assert any("도구 인자 재생성" in w and "DocumentExport" in w for w in _warnings(events))
+    # 빈 인자 도구 실행/인라인 덤프 없이 정상 종료
+    assert "완료" in _texts(events)
+    assert not any(
+        isinstance(e, StreamEvent)
+        and e.type == StreamEventType.ERROR.value
+        and e.error_code == "TOOL_ARGS_UNPARSEABLE"
+        for e in events
+    )
+
+
+async def test_tool_args_parse_error_exhausted_yields_honest_error(
+    tool_use_context: ToolUseContext,
+) -> None:
+    """
+    guided 재시도(MAX_TOOL_PARSE_RETRY회)로도 계속 파싱 실패하면, 빈 인자 실행
+    대신 정직한 TOOL_ARGS_UNPARSEABLE 에러를 내고 종료한다(가짜 완료 금지).
+    """
+    provider = ScriptedProvider(
+        [
+            {"tool_parse_error": "DocumentExport"},  # 마지막 action → 매 턴 반복
+        ]
+    )
+    cm = SpyContextManager()
+
+    events = await _run_loop(provider, cm, tool_use_context)
+
+    # 초기 1회 + guided 재시도 MAX_TOOL_PARSE_RETRY회 = 총 3회 호출
+    from core.orchestrator.query_loop import MAX_TOOL_PARSE_RETRY
+
+    assert len(provider.force_tool_choice_history) == MAX_TOOL_PARSE_RETRY + 1
+    assert provider.force_tool_choice_history[0] is None
+    assert all(
+        f == "DocumentExport" for f in provider.force_tool_choice_history[1:]
+    )
+    # 정직한 에러로 종료
+    assert any(
+        isinstance(e, StreamEvent)
+        and e.type == StreamEventType.ERROR.value
+        and e.error_code == "TOOL_ARGS_UNPARSEABLE"
+        for e in events
+    )
