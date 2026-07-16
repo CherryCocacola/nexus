@@ -559,6 +559,11 @@ def _build_web_engine_parts(components: dict, state: Any) -> dict:
         # 문서 청크 크기 — 하드코딩 외부화(2026-07-03). DocumentProcess가 읽음.
         # 예산 미제공(None)이면 도구가 CHUNK_SIZE(2500)로 폴백.
         "document_chunk_size": (_web_budgets.document_chunk_size if _web_budgets else None),
+        # 문서 통짜 반환 상한 — 이 이하 문서는 청크 없이 1회 반환. None/0이면 비활성
+        # → 기존 청크 동작. CLI(bootstrap)와 쌍으로 주입해 표면 간 동작을 일치시킨다.
+        "document_singleshot_chars": (
+            _web_budgets.document_singleshot_chars if _web_budgets else None
+        ),
         # 생성 문서 저장 위치 — DocumentExport 도구가 읽는다. 빈 값이면 도구가
         # {tempdir}/nexus_exports 로 폴백(다운로드 라우트와 동일 경로).
         "exports_dir": getattr(getattr(state.config, "document_export", None), "exports_dir", ""),

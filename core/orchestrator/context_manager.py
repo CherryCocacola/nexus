@@ -367,15 +367,21 @@ class ContextManager:
             content = str(msg.content)
             content_tokens = self._estimate_tokens_text(content)
 
-            # 예산을 넘는 결과만 축약 대상이다.
-            if content_tokens > self.tool_result_budget:
+            # 토큰→글자 환산은 대략 토큰당 3자로 잡는다.
+            char_budget = self.tool_result_budget * 3
+            # 예산을 넘는 결과만 축약 대상이다. 단 토큰 추정(한글 2자/토큰)과 글자
+            # 환산(3자/토큰)이 어긋나, "토큰은 예산 초과이나 글자 수는 char_budget
+            # 이하"인 한글 결과를 잘못 축약하면 head(content 전부) + tail(끝 일부)이
+            # 중복돼 오히려 메시지가 팽창하는 버그가 있었다. 그래서 토큰·글자 양쪽 모두
+            # 예산을 넘을 때만 축약한다(글자 수가 이미 예산 이하면 잘라도 줄지 않는다).
+            if content_tokens > self.tool_result_budget and len(content) > char_budget:
                 truncated_count += 1
-                # 토큰→글자 환산은 대략 토큰당 3자로 잡는다.
-                char_budget = self.tool_result_budget * 3
                 # 앞부분을 더 많이(1/2), 끝부분을 조금(1/4) 남긴다.
                 # 보통 결과의 시작 쪽에 핵심(경로·헤더·요약)이 있기 때문이다.
                 head_size = char_budget // 2
-                tail_size = char_budget // 4
+                # 끝부분은 head가 가져간 뒤 남은 글자 안에서만 취해 head와 겹치지
+                # 않게 한다(len(content) > char_budget 가드로 tail_size ≥ 0 보장).
+                tail_size = min(char_budget // 4, len(content) - head_size)
 
                 # 잘린 자리에는 "얼마나 잘렸는지"를 사람이 읽을 수 있게 표기한다.
                 truncated = (
@@ -477,33 +483,51 @@ class ContextManager:
           - 100줄 초과 → 앞 80줄 + "... (N줄 생략)" + 끝 10줄
           - 같은 줄 반복 → "... (N번 반복)"으로 압축
           - 바이너리로 보이면 통째로 안내 문구로 대체
+
+        [최근성 면제] 최근 N개(preserve_recent_tool_results) 도구 결과는 대화에 가장
+        중요하므로(특히 방금 읽은 문서 본문) 손실 압축(100줄 접기·중복 줄 압축)을
+        건너뛴다. 이 면제가 없으면 DocumentProcess의 문서 통짜 반환이 다음 턴 apply_all
+        에서 90줄로 접혀 모델이 전문을 보지 못한다(대용량 문서 분석 품질 열화의 원인).
+        무손실 정리(빈 줄·공백 정규화)와 바이너리 대체는 최근 결과에도 그대로 적용한다.
         """
+        # 도구 결과들의 위치를 모아 최근 N개 인덱스를 면제 집합으로 만든다.
+        # preserve_recent_tool_results가 0이면 면제 없음(빈 집합) — [-0:]가 전체를
+        # 뜻하는 슬라이스 함정을 피하려 0을 명시적으로 걸러낸다.
+        tr_indices = [i for i, m in enumerate(messages) if _is_tool_result(m)]
+        preserve_idx = set(
+            tr_indices[-self.preserve_recent_tool_results :]
+            if self.preserve_recent_tool_results > 0
+            else []
+        )
+
         result: list[Message] = []
 
-        for msg in messages:
+        for i, msg in enumerate(messages):
             # 도구 결과에만 정리 규칙을 적용한다.
             if _is_tool_result(msg):
                 content = str(msg.content)
 
-                # 3개 이상 연속된 빈 줄을 2줄로 줄여 세로 공백을 절약한다.
+                # 3개 이상 연속된 빈 줄을 2줄로 줄여 세로 공백을 절약한다(무손실).
                 content = re.sub(r"\n{3,}", "\n\n", content)
 
-                # 4칸 이상 연속 공백을 4칸으로 정규화한다(들여쓰기 낭비 제거).
+                # 4칸 이상 연속 공백을 4칸으로 정규화한다(들여쓰기 낭비 제거, 무손실).
                 content = re.sub(r" {4,}", "    ", content)
 
-                # 줄 수가 너무 많으면 앞뒤만 남기고 가운데를 생략 표기로 접는다.
-                lines = content.split("\n")
-                if len(lines) > 100:
-                    head = lines[:80]
-                    tail = lines[-10:]
-                    content = (
-                        "\n".join(head)
-                        + f"\n\n... ({len(lines) - 90}줄 생략) ...\n\n"
-                        + "\n".join(tail)
-                    )
+                # 최근 도구 결과가 아닐 때만 손실 압축을 적용한다(최근 것은 원본 보존).
+                if i not in preserve_idx:
+                    # 줄 수가 너무 많으면 앞뒤만 남기고 가운데를 생략 표기로 접는다.
+                    lines = content.split("\n")
+                    if len(lines) > 100:
+                        head = lines[:80]
+                        tail = lines[-10:]
+                        content = (
+                            "\n".join(head)
+                            + f"\n\n... ({len(lines) - 90}줄 생략) ...\n\n"
+                            + "\n".join(tail)
+                        )
 
-                # 로그처럼 같은 줄이 반복되는 경우를 "N번 반복"으로 접는다.
-                content = self._compress_duplicate_lines(content)
+                    # 로그처럼 같은 줄이 반복되는 경우를 "N번 반복"으로 접는다.
+                    content = self._compress_duplicate_lines(content)
 
                 # 이미지·바이너리가 텍스트로 흘러들어온 경우는 통째로 안내로 대체한다.
                 if self._looks_binary(content):

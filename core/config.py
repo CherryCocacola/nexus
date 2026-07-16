@@ -1187,6 +1187,12 @@ class ContextBudgetConfig(BaseModel):
     # ⑦ DocumentProcess 도구가 문서를 나눌 청크 크기(글자 수). 8192 ctx 기준으로
     #    tool_result가 컨텍스트를 넘지 않도록 잡은 값(현행 CHUNK_SIZE=2500).
     document_chunk_size: int = 2500
+    # ⑦-b 문서 전체를 청크로 쪼개지 않고 "한 번에" 반환할 상한(글자 수). 문서 전체
+    #    길이가 이 값 이하이면 DocumentProcess가 1회 호출로 전문을 돌려준다(모델이
+    #    청크마다 재호출·진행 안내를 반복하던 문제 해소). 0이면 비활성 → 항상 기존
+    #    청크 동작(document_chunk_size)으로 폴백한다(fail-closed 기본값, 무회귀).
+    #    큰 창(B200 49152 입력)에서만 config로 켠다.
+    document_singleshot_chars: int = 0
 
     # ── 출력 토큰 에스컬레이션 (출처: core/orchestrator/query_loop.py) ──
     # ⑧ 응답이 max_tokens로 잘렸을 때 출력 한도를 점진 상향하는 단계.

@@ -183,15 +183,24 @@ class DocumentProcessTool(BaseTool):
         if not path.exists():
             return ToolResult.error(f"파일을 찾을 수 없습니다: {file_path}")
 
-        # 2) 청크 크기 확정 — 하드코딩 외부화(2026-07-03). bootstrap이 config의
-        # context_budgets.document_chunk_size를 ToolUseContext.options에 주입한다.
+        # 2) 청크/통짜 예산 확정 — 하드코딩 외부화(2026-07-03). bootstrap·web/app이
+        # config의 context_budgets 값을 ToolUseContext.options에 주입한다.
         # 값이 없으면(테스트/경량 경로) 모듈 상수 CHUNK_SIZE(현행 2500)로 폴백한다.
         # 이렇게 하면 설정 없이 호출하던 기존 코드도 동작이 변하지 않는다(무회귀).
         chunk_size = context.options.get("document_chunk_size") or CHUNK_SIZE
+        # 통짜 반환 상한(글자). 문서 전체가 이 값 이하이면 청크로 쪼개지 않고 1회
+        # 호출로 전문을 돌려준다 → 모델이 청크마다 재호출·진행 안내를 반복하던
+        # 문제를 없앤다. 0(기본, 미주입)이면 비활성 → 항상 기존 청크 동작(무회귀).
+        singleshot_chars = context.options.get("document_singleshot_chars") or 0
 
-        # 캐시 키는 심볼릭 링크/상대경로를 정규화한 절대경로로 삼는다.
-        # 같은 파일이면 이미 파싱한 결과를 재사용하고, 없을 때만 새로 파싱한다.
-        cache_key = str(path.resolve())
+        # 캐시 키는 정규화 절대경로 + 파일 상태(mtime·크기) + 분할 파라미터로 삼는다.
+        # 왜 상태·파라미터까지 넣나: 같은 경로에 다른 파일이 재업로드되거나(mtime/크기
+        # 변경) config 청크값이 바뀌면 낡은 분할 결과를 재사용하면 안 되기 때문이다.
+        stat = path.stat()
+        cache_key = (
+            f"{path.resolve()}|{stat.st_mtime_ns}|{stat.st_size}"
+            f"|{singleshot_chars}|{chunk_size}"
+        )
         if cache_key not in _document_cache:
             try:
                 # 확장자에 맞는 파서로 문서 전체 텍스트를 추출한다.
@@ -202,8 +211,13 @@ class DocumentProcessTool(BaseTool):
                 logger.error("문서 파싱 실패: %s — %s", file_path, e)
                 return ToolResult.error(f"문서 파싱 실패: {type(e).__name__}: {e}")
 
-            # 추출한 전체 텍스트를 확정한 chunk_size 기준으로 잘라 캐시에 저장한다.
-            _document_cache[cache_key] = self._split_chunks(full_text, chunk_size)
+            # 통짜 상한 이하이면 전문을 1청크로, 초과하면 chunk_size로 최소 분할한다.
+            # (_split_chunks도 chunk_size 이하는 [text]로 돌려주므로, singleshot은
+            #  "chunk_size보다 크지만 창에는 들어오는" 중간 크기 문서까지 통짜로 넓힌다.)
+            if singleshot_chars > 0 and len(full_text) <= singleshot_chars:
+                _document_cache[cache_key] = [full_text]
+            else:
+                _document_cache[cache_key] = self._split_chunks(full_text, chunk_size)
 
         # 3) 캐시에서 청크 리스트를 꺼내 전체 규모(청크 수·글자 수)를 계산한다.
         chunks = _document_cache[cache_key]
@@ -226,16 +240,23 @@ class DocumentProcessTool(BaseTool):
             f"현재: 청크 {chunk_index + 1}/{total_chunks}]"
         )
 
-        # 푸터: 다음 청크가 남아 있으면 그걸 읽는 호출 예시를 보여주고,
-        # 마지막 청크면 더 읽을 게 없다고 알려 무한 반복 호출을 막는다.
+        # 푸터: 다음 청크가 남아 있으면 그걸 읽는 호출 예시를 보여주되, 청크마다
+        # 진행 안내 문장을 반복하지 말라고 명시한다(반복 내레이션 억제 — 프롬프트
+        # 규칙과 이중 방어). 마지막/유일 청크면 재호출 금지를 분명히 해 무한 반복을 막는다.
         if chunk_index < total_chunks - 1:
             footer = (
-                f"\n\n[다음 청크를 읽으려면 "
+                f"\n\n[청크 {chunk_index + 1}/{total_chunks}. 남은 청크가 있습니다 — "
+                f"진행 안내 문장 없이 즉시 "
                 f'DocumentProcess(file_path="{file_path}", chunk_index={chunk_index + 1}) '
-                f"를 호출하세요]"
+                f"를 호출해 이어 읽고, 모든 청크를 읽은 뒤 한 번에 분석하세요]"
+            )
+        elif total_chunks == 1:
+            footer = (
+                f"\n\n[문서 전체({total_chars}자)를 한 번에 반환했습니다. "
+                f"이 문서에 대해 DocumentProcess를 다시 호출하지 마세요]"
             )
         else:
-            footer = "\n\n[마지막 청크입니다. 문서 전체를 읽었습니다.]"
+            footer = "\n\n[마지막 청크입니다. 문서 전체를 읽었습니다. 이제 한 번에 분석하세요]"
 
         # 헤더 + 본문 + 푸터를 합쳐 최종 텍스트를 만든다.
         result_text = f"{header}\n\n{chunk_text}{footer}"

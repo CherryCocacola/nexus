@@ -323,6 +323,9 @@ async def init_phase2(state: GlobalState) -> dict:
             # 문서 청크 크기 — 하드코딩 외부화(2026-07-03). DocumentProcess 도구가
             # 이 값을 읽어 청크를 나눈다. 미주입 시 도구가 CHUNK_SIZE(2500)로 폴백.
             "document_chunk_size": config.context_budgets.document_chunk_size,
+            # 문서 통짜 반환 상한 — 이 이하 문서는 청크 없이 1회 반환. 0(기본)이면
+            # 비활성 → 기존 청크 동작. 웹(web/app.py)과 쌍으로 주입해 표면 간 동작 일치.
+            "document_singleshot_chars": config.context_budgets.document_singleshot_chars,
             # 권한 강제 파이프라인 배선(감사 Critical #1~3, 2026-07-03) — executor가
             # options에서 꺼내 쓴다. 왜 options인가: ToolUseContext는 이미 executor까지
             # 흐르고, memory_manager/agent_registry 등 세션 의존성도 전부 options로

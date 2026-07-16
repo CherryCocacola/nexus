@@ -25,6 +25,7 @@ EXPECTED_DEFAULTS = {
     "preserve_recent_turns": 3,  # context_manager — 압축 시 보존할 최근 턴 수
     "preserve_recent_tool_results": 2,  # context_manager — 보존할 최근 도구 결과 수
     "document_chunk_size": 2500,  # document_tool CHUNK_SIZE — 문서 분할 청크 크기
+    "document_singleshot_chars": 0,  # document_tool — 통짜 반환 상한(0=비활성, 무회귀)
     "output_token_escalation": [4096, 8192, 16384],  # query_loop — 출력 토큰 증가 단계
 }
 

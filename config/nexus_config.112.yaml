@@ -433,7 +433,12 @@ context_budgets:
   preserve_recent_turns: 6       # 압축해도 원본 보존할 최근 턴 수 (3→6)
   preserve_recent_tool_results: 3  # 압축해도 원본 보존할 최근 도구 결과 수 (2→3)
   # 문서 도구 청크 크기 (출처: document_tool.py CHUNK_SIZE)
-  document_chunk_size: 8000      # DocumentProcess가 문서를 나눌 청크 글자 수 (2500→8000)
+  # 문서 전체 길이가 이 값 이하이면 청크로 쪼개지 않고 1회 호출로 전문 반환(0=비활성).
+  # B200 49152 입력창 근거: 오버헤드(프롬프트+스키마+RAG 주입 ~8.5K토큰) 제외 시 문서
+  # 몫 ~25K토큰 ≈ 한글 40000자. 이 이하 문서는 모델이 청크 재호출·진행 안내 반복 없이
+  # 한 번에 읽는다(대용량 분석→보고서 반복 붕괴 해소).
+  document_singleshot_chars: 40000
+  document_chunk_size: 26000     # 통짜 상한 초과 시 분할 청크 글자 수 (8000→26000). 76000자 문서 → 3청크
   # 출력 토큰 에스컬레이션 단계 (출처: query_loop.py OUTPUT_TOKEN_ESCALATION)
   #   ★불변식 준수: 최대값 8192 → 입력 49152 + 8192 = 57344 ≤ axmodel max_model_len(65536).
   #   현재 default_max_tokens(8192)가 리스트 최대값과 일치해야 잘림 시 축소 폴백이 없다.
