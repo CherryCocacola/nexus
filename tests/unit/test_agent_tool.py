@@ -212,14 +212,14 @@ class TestSubagentTypePath:
         assert result.is_error
         assert "agent_registry" in (result.error_message or "")
 
-    async def test_missing_scout_provider_returns_error(
+    async def test_missing_scout_provider_falls_back_to_parent(
         self,
         tmp_path: Path,
         all_tools: list[MagicMock],
         registry_with_scout: AgentRegistry,
         worker_provider: MagicMock,
     ):
-        """Scout를 요청했는데 scout_provider가 없으면 에러 (TIER_M/L 상황)."""
+        """Scout를 요청했는데 scout_provider가 없으면(TIER_M/L) 에러 대신 부모 Worker로 폴백."""
         ctx = ToolUseContext(
             cwd=str(tmp_path),
             session_id="s",
@@ -232,11 +232,20 @@ class TestSubagentTypePath:
             },
         )
         tool = AgentTool()
-        result = await tool.call(
-            {"prompt": "hi", "subagent_type": "scout"}, ctx
-        )
-        assert result.is_error
-        assert "scout_provider" in (result.error_message or "")
+        captured: dict = {}
+
+        async def fake_run(self, prompt, config, parent_context):
+            captured["model_provider"] = config.model_provider
+            return "done", 1
+
+        with patch.object(AgentTool, "_run_subagent", fake_run):
+            result = await tool.call(
+                {"prompt": "hi", "subagent_type": "scout"}, ctx
+            )
+
+        # 에러 없이 실행되고, scout_provider 부재 → 부모 Worker 프로바이더로 폴백해야 한다.
+        assert not result.is_error
+        assert captured["model_provider"] is worker_provider
 
 
 # ─────────────────────────────────────────────
@@ -273,8 +282,9 @@ class TestDescriptionPath:
         tool_names = {t.name for t in captured["tools"]}
         assert "Agent" not in tool_names
         assert tool_names >= {"Read", "Glob", "Grep", "LS", "Write", "Edit"}
-        # system_prompt가 description 값
-        assert captured["system_prompt"] == "helper role"
+        # system_prompt는 description으로 시작하고, 뒤에 공통 출력 규약이 덧붙는다.
+        assert captured["system_prompt"].startswith("helper role")
+        assert "출력 규약" in captured["system_prompt"]
 
 
 # ─────────────────────────────────────────────
