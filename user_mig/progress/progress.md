@@ -3114,3 +3114,11 @@ QA #43(깨진 Bash 명령을 못 고치고 14회·62초 반복)의 근본 방어
 **배포.** 112 nexus-web에 백업 우선(컨테이너 원본 6파일 + 호스트 config → `/home/idino/deploy_backup_20260716_035421`) → config bind-mount surgical 편집 + 코드 6파일 docker cp + restart. 빌드 컨텍스트(`/home/idino/nexus-app`) cp만 소유권(197609)으로 실패 — 컨테이너 writable layer엔 반영(서비스 정상), 이미지 재빌드 파리티는 후속.
 
 **미결/후속.** ①커밋(이 수정 + 앞선 DocumentExport guided-retry 등 미커밋분) → 이미지 재빌드로 fragility 근본 해소(현재 writable layer라 컨테이너 재생성 시 원복 위험). ②singleshot 경로에서 "읽기/작성" 2문장이 다소 유사 중복(반복 벽 아님, 프롬프트 미세 튜닝 선택). ③112 테스트 잔여물(업로드/exports test docx 수개 + tb_artifacts 몇 행) — 무해, 정리 대기.
+
+### 커밋 정리 + durability 이미지 baking (2026-07-16, 위 후속 ①)
+
+**커밋(6개, feature/b200-bakeoff).** 미커밋분을 논리 단위로 분리. 212e3f8[core/tools][config] 문서 청킹 수정 / 4b21c23[core/model][core/orchestrator] DocumentExport guided 재시도 / 3458e10[web][core/tools] 결과표시 정합+scout 폴백+업로드 ASCII / 035dd76[deploy][scripts] 배포 스크립트+API 스모크 테스트 / e4b0c9e[docs] progress / 57c7ec1[test] agent_tool scout 폴백 테스트. web/app.py·worker_system_full.md는 hunk 스테이징(git apply --cached)으로 청킹분/결과표시분 분리. 로컬 48 passed. push 미실행. 남은 uncommitted=로컬설정(.claude/·.omc/)·자산(NHN PDF·이미지)뿐.
+
+**durability(원복 fragility 근본 해소).** 진단: 112 빌드 컨텍스트(/home/idino/nexus-app)가 stale(오늘 청킹 수정 + 수 주간 docker cp분 누락) → Dockerfile 순진 재빌드는 회귀 위험. **안전 방식 채택**: 검증된 실행 컨테이너(e2e 통과 상태)를 `docker commit`으로 이미지化 → 회귀 위험 0으로 정합. 백업(구 이미지 prefix-backup-20260716_082558=54edca) + 구 컨테이너 stop·rename(롤백용) 후 새 이미지로 재생성. **결과**: nexus-web:latest=cc2a0fcd(스냅샷, 모든 수정 포함), 컨테이너가 이미지에서 부팅·restart=unless-stopped → 재생성돼도 수정 유지. 스모크 8케이스 전부 통과(청킹 upload_analyze DocumentProcess=1 포함). **주의**: commit-스냅샷이라 Dockerfile 재빌드 재현성은 별도 과제(빌드 컨텍스트 전수 정합 필요, 비긴급). docker run에 PG 비번 하드코딩은 commit이 env를 이미지에 캡처하므로 -e 불요(재노출 방지).
+
+**API 스모크 테스트 셋(신규).** scripts/api_smoke_test.py — URL http://192.168.21.112:8600, Bearer nexus-b200-test-key-001. health·auth차단·인사·지식·도구·문서생성+다운로드·업로드분석 8케이스. `python -m scripts.api_smoke_test [--only ...]`.
