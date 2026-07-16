@@ -3055,3 +3055,62 @@ QA #43(깨진 Bash 명령을 못 고치고 14회·62초 반복)의 근본 방어
 **e2e 검증.** `/v1/chat/completions`(OpenAI messages)로 긴 입력(13045·8842 prompt_tokens) 정상 요약, model=ax-4.0, finish=stop. health 200. 옛 5632의 2배 넘는 입력이 문제없이 처리됨 — 근본 해소 확인.
 
 **미결/주의.** 이미지(nexus-web:latest 39h) 자체는 아직 옛 config 박힘(bind-mount가 오버라이드하므로 무해, 재빌드 시 정합). 터널 단절=전체 추론 불가(단일 경로) — systemd Restart로 자동복구.
+
+---
+
+### 결과 표시 Claude식 정합 — 1단계: 메타 내레이션·본문 도배 제거 (2026-07-13)
+
+**목표.** 사용자들이 Claude 앱/웹에 익숙하므로, IDINO NOVA 웹의 모든 요청 결과 표시를 Claude 방식으로. 계기: 파일 생성 요청 시 모델이 "DocumentExport의 content 인자를 채워야 합니다" 같은 도구 내부 서술 + 요약 본문 전체를 채팅에 도배.
+
+**진단(raw SSE 캡처 + FABLE5 검토).** 문구는 코드에 없음 → 모델(A.X-4.0) 생성. 활성 프롬프트는 tier로 갈림(app.py:431): TIER_S=worker_system.md, TIER_M/L=worker_system_full.md. B200 전환(tier=large)으로 지금은 full.md 활성 — 여긴 이미 "Creating documents/never paste inline·짧은 확인" 규칙이 있어 단순 파일생성 raw 스트림이 이미 깔끔("요청하신 문서를 생성했습니다."). **FABLE5가 내 초기 진단(worker_system.md 규칙 부재가 원인) 반증**: TIER_S 도구 풀엔 DocumentExport가 아예 없어(bootstrap) 스키마를 볼 수 없음 → 그 경로에서 나올 수 없음. 진짜 구멍 2곳 = (1) ad-hoc Agent 경로(agent_tool.py: description을 프롬프트로 쓰고 전체 도구 풀 부여, 출력 규약 전무), (2) app.py:476 서브에이전트 블록이 "Single file task→Read/Edit/Write"라고 지시하나 full.md는 "Read/Glob/Grep/LS 없음" — 정면 모순(활성).
+
+**수정(4파일).** ①agent_tool.py: `_SUBAGENT_OUTPUT_CONTRACT`(도구 내부 서술 금지·산출물 본문 도배 금지·결과 원문 재붙여넣기 금지·사고과정 금지) 신설, ad-hoc 경로 system_prompt에 append. ②app.py: 서브에이전트 블록을 표면 인지형으로("Edit/Write 직접, 이 표면엔 Read/Glob/Grep/LS 없음") + 도구 내레이션 금지 1줄. ③worker_system_full.md: "도구·산출물 표시 규약" 섹션(내레이션 금지·산출물 짧은 확인·결과 원문 재붙여넣기 금지 — 마지막 규칙은 full.md에 없던 것) 추가. ④worker_system.md: 내레이션 금지 1줄(파리티).
+
+**검증.** py_compile+ruff(내 구간 clean), 단위테스트 test_agent_tool+test_web_chat 37 passed(ad-hoc system_prompt 단언 갱신). 배포(컨테이너 docker cp + 빌드컨텍스트 갱신 + restart, health 200). e2e: 파일생성 text_delta="요청하신 문서를 생성했습니다."뿐 + 다운로드 카드 / 지식질의·인사 회귀 없음.
+
+**미결(후속).** 2단계=마크다운 렌더·아티팩트/캔버스 표시 Claude 정합(현재 상당 부분 구현됨). 3단계=세부 정렬. 코드 변경(app.py·agent_tool.py)은 컨테이너 writable layer+빌드컨텍스트에 반영 — 이미지 재빌드 시 완전 정합(현재 bind-mount는 config만).
+
+### scout_provider 에러 수정 (2026-07-13, 위 1단계 후속)
+
+**증상.** tier=large(B200)에서 `<tool_use_error>scout_provider가 context.options에 없습니다 (TIER_M/L 환경)</tool_use_error>` 반복.
+**원인.** scout_provider는 TIER_S에서만 생성(bootstrap:367 `if tier==TIER_S`)되는데, agent_registry는 tier 무관하게 scout를 등록(230)하고 프롬프트가 scout 위임을 권함 → tier=large에서 호출 시 provider 없어 _AgentConfigError.
+**수정(2파일).** ①agent_tool.py `_resolve_model_provider`: scout override인데 provider 없으면 예외 대신 **부모 Worker 모델로 폴백**(TIER_M/L은 Worker 단독이 정상 경로라 품질 손실 없음). ②app.py `_load_worker_system_prompt`: `is_expanded`(TIER_M/L)면 서브에이전트 목록·권장에서 scout 제외 + "큰 컨텍스트로 직접 처리" 안내로 대체. 테스트 갱신(폴백 검증), 37 passed. 배포·health 200·회귀(수도=서울) 정상.
+
+### 문서 업로드→분석 실패 수정 (2026-07-13) — "파일을 찾을 수 없습니다"
+
+**증상.** tier=large 전환 후, 한글명 문서 업로드→분석이 "죄송합니다, 문서 파일을 찾을 수 없어…"로 실패("scout · Agent ×2"). 로그: DocumentProcess가 0.00초에 반복 실패(즉시 file-not-found).
+**진단.** 파일은 `/tmp/nexus_uploads/`에 실재(3.7MB). 저장명은 NFC 정상(정규화 문제 아님). 원인 = 모델이 긴 **한글 경로**를 DocumentProcess 인자로 재입력하다 오타(긴 문자열 재현 취약성 [[project_degeneration_fix]]). 프론트가 업로드 시 scout 위임을 하드코딩(index.html)해 재입력이 2홉(Worker→scout→도구)이라 더 취약. tier=large는 scout_provider 없어(위 scout 폴백) 부모 모델로 도는데 설계상 원래 Worker가 DocumentProcess 직접 처리하는 티어.
+**수정 2건.** ①web/app.py `/v1/upload`: 저장 파일명을 ASCII-safe(`upload-<uuid12>.<ext>`)로 생성·반환(원본명은 file_name으로 표시용 유지). 모델이 짧은 ASCII 경로만 재현 → 오타 근절. ②index.html: 업로드 메시지에서 `subagent_type="scout"` 강제 지시 제거 → 티어별 프롬프트가 라우팅(large=DocumentProcess 직접 1홉 / small=worker_system.md가 scout 위임). worker_system.md는 이미 "문서 분석→scout" 명시라 무손상.
+**검증(실서버 e2e).** 한글 docx 업로드→`file_path=/tmp/nexus_uploads/upload-04f2915e9ba8.docx` 반환→분석 요청→Worker가 DocumentProcess 직접 실행해 실제 3문장 요약 생성. "찾을 수 없" 에러 소멸.
+
+### DocumentExport 다운로드 링크 실패 수정 — tool-arg JSON 붕괴 + guided 재시도 (2026-07-14)
+
+**증상.** 문서 업로드→"Word 보고서 작성" 요청 시 `<tool_use_error>DomainValidationError: content는 비어 있을 수 없습니다</tool_use_error>` → 다운로드 링크 없이 모델이 보고서 본문을 채팅에 통째로 덤프.
+
+**진단(실서버 로그+SSE+덤프 실측, FABLE5 2회 검토).** 빈 content가 아니라 **tool_call arguments JSON 파싱 실패→빈 dict 폴백**이 원인(inference.py `_finalize_tool_calls`). A.X-4.0가 `tool_call_parser="hermes"` + `tool_choice="auto"`에서 인자 JSON을 **자유형식으로 생성**(문법 강제 전무)해, 긴 보고서 content 직렬화 시 간헐 붕괴: (1)제어문자 미이스케이프(Invalid control character), (2)닫는 `"`·`}`·format필드 누락(Unterminated string, output_tokens<max·stop=tool_use로 절단 아님 실측), (3)미이스케이프 따옴표(Expecting delimiter), (4)잘못된 `\escape`. 성공하던 export도 실측 475자 껍데기였음. 설계문서 `point4_1_structured_output.md` 결론=인자 문법 강제 레버는 named `tool_choice`(vLLM이 parameters 스키마로 guided decoding 자동 적용).
+
+**수정(Option 1, FABLE5 승인, 4파일).** ①message.py: `ToolUseBlock.parse_error` 신호. ②inference.py: `_finalize_tool_calls`에 `json.loads(strict=False)` 1차 복구(제어문자) + 실패 시 parse_error=True; `stream()`에 `force_tool_choice` 파라미터(지정 시 named tool_choice로 guided 강제). ③query_loop.py: parse_error 도구는 빈 인자 실행 금지·이름만 수집→Phase3에서 그 도구로 `force_tool_choice` 걸어 1회 재시도(기존 tool_parse_retry_count 재사용, MAX=2), 재시도 턴은 max_tokens를 잔여창 전체로 완화, 소진 시 빈 실행 대신 정직한 `TOOL_ARGS_UNPARSEABLE` 에러(가짜 완료 금지). ④scout_provider.py: force_tool_choice passthrough.
+
+**2차 근본원인(구현 중 발견).** 강제 tool_choice는 tool_calls를 스트리밍하면서도 vLLM이 `finish_reason="stop"` 반환(비스트리밍 관문은 통과했으나 스트리밍 실제턴이 END_TURN으로 샘). 기존 파서가 `finish_reason=="tool_calls"`일 때만 finalize→강제호출 tool_calls 유실. **수정: finish_reason 문자열이 아니라 누적 tool_calls 유무로 finalize**(tool_calls_finalized 가드), tool_calls 있으면 stop→TOOL_USE 보정. 단 `finish_reason="length"`(진짜 절단)는 MAX_TOKENS 보존(기존 max-output 복구 경로 유지, FABLE5 필수지적 반영).
+
+**검증.** 단위테스트 신규/갱신 다수(strict=False 복구·parse_error 플래그·강제 tool_choice 스트리밍 finalize·length 절단 MAX_TOKENS 보존·query_loop guided 재시도 발동·소진 정직에러), 전체 unit green(로컬 hwpx 1건은 python-hwpx 미설치, 서버 정상). **실서버 e2e**: 74k 문서→auto DocumentExport가 `Invalid \escape` 실패→`[도구 인자 재생성 1/2]` guided 재시도→**실제 6552자 완결 .docx(42992 bytes) + `/v1/download/document-*.docx` 링크 생성**. B200 재기동 불필요(요청 파라미터만).
+
+**미결/후속(FABLE5 권장, 비차단).** ①혼합 턴(정상+parse-fail 공존) 시 실패 호출에 합성 tool_result 에러 주입(현재 조용히 드롭). ②이미지 재빌드 시 4파일 정합(현재 docker cp writable layer). 커밋 대기(사용자 승인 후).
+
+---
+
+### 대용량 문서 분석→보고서 "반복 벽·다운로드 실패" 수정 — 통짜 반환 + 컨텍스트 절단 버그 2건 (2026-07-16)
+
+**증상(112 프로덕션).** 업로드한 대용량 문서(강원대 제안서 등)를 "분석해서 Word 보고서로 작성" 요청 시 (1) 채팅에 "다음 청크를 읽어야 합니다"류 문장이 5~11회 반복 표시("동일 작업 내용 계속 표시"), (2) 더 큰 문서에서 다운로드 실패 + 우측 캔버스 미표시.
+
+**진단(HTTP 실서버 재현으로 확정, 추측 아님).** 단일턴 "보고서 작성"(문서분석 없음)은 정상(DocumentExport·다운로드·짧은 확인) → DocumentExport/다운로드/캔버스 파이프라인은 건강. 문제는 **대용량 문서 청크 페이지네이션 × 청크별 내레이션**. `document_tool.py`가 문서를 `document_chunk_size`(8000자, 원래 5090 8K창 역산값)로 잘라, 대용량 문서가 10+ 청크가 되고 footer가 매번 재호출을 명령("[다음 청크를 읽으려면…]"). worker_system_full.md:41-45가 "각 단계 전 한 문장 진행 안내"를 권장 → 청크마다 거의 동일한 문장 반복. 재현: 40KB docx(≈92000자)→DocumentProcess ×11, 반복 안내 ×10, 누적 input 327,357토큰.
+
+**FABLE5 계획이 추가로 발견한 절단 버그 2건(코드 검증).** ①`context_manager._micro_compact`(TIER_M/L 매 턴 apply_all)가 100줄 초과 tool_result를 **최근성 면제 없이** 90줄로 접음 → 문서 통짜 반환을 구현해도 다음 턴에 접혀 무효. ②`_apply_tool_result_budget` 팽창 버그: 한글 토큰 추정(2자/토큰) vs 절단 환산(3자/토큰) 모순 → "토큰 초과·글자 이하" 한글 결과가 head+tail 중복으로 오히려 팽창.
+
+**수정(권고안 B, 3축).** ①`document_tool.py`: `document_singleshot_chars`(통짜 상한, 0=비활성) 신설 — 문서 전체가 상한 이하면 1청크로 전문 반환. 초과 시 `document_chunk_size`로 최소 분할. footer 재설계(통짜=재호출 금지 명시, 중간 청크="진행 안내 문장 없이 즉시 이어읽기"). 캐시키에 mtime·크기·분할파라미터 포함. ②`context_manager.py`: micro_compact 최근성 면제(최근 N개 도구결과는 손실압축 스킵) + budget 팽창 버그 수정(토큰·글자 양쪽 초과일 때만 축약, tail 겹침 가드). ③config 3곳+예시: `document_singleshot_chars: 40000`(112 49152창 근거) + `document_chunk_size` 8000→26000. bootstrap.py·web/app.py 주입 파리티. ④프롬프트 worker_system_full.md: "청크 이어읽기는 단계 아님 → 반복 안내 금지" 예외. `core/config.py`에 신규 필드(기본 0=무회귀).
+
+**검증.** 신규 `test_document_tool.py`(9) + `test_context_manager_document_preservation.py`(6, 팽창·micro면제 회귀) + `test_context_budget_config.py` 갱신. 로컬 unit 1239 passed(실패분은 전부 docling 미설치 기존 환경 이슈, 무관). ruff 클린(document_tool ASYNC240 1건은 파일 기존 패턴). **112 실서버 e2e**: 40KB 문서 DocumentProcess **11→4회**, 반복 안내 **10회→0**(끝에 1회만), 누적 input 327k→168k. ~25000자 문서(일반 제안서 크기) **5→1회**. 다운로드·캔버스 정상. 회귀(인사·수도=서울·문서없는 보고서) 정상.
+
+**배포.** 112 nexus-web에 백업 우선(컨테이너 원본 6파일 + 호스트 config → `/home/idino/deploy_backup_20260716_035421`) → config bind-mount surgical 편집 + 코드 6파일 docker cp + restart. 빌드 컨텍스트(`/home/idino/nexus-app`) cp만 소유권(197609)으로 실패 — 컨테이너 writable layer엔 반영(서비스 정상), 이미지 재빌드 파리티는 후속.
+
+**미결/후속.** ①커밋(이 수정 + 앞선 DocumentExport guided-retry 등 미커밋분) → 이미지 재빌드로 fragility 근본 해소(현재 writable layer라 컨테이너 재생성 시 원복 위험). ②singleshot 경로에서 "읽기/작성" 2문장이 다소 유사 중복(반복 벽 아님, 프롬프트 미세 튜닝 선택). ③112 테스트 잔여물(업로드/exports test docx 수개 + tb_artifacts 몇 행) — 무해, 정리 대기.
