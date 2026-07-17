@@ -3178,6 +3178,11 @@ QA #43(깨진 Bash 명령을 못 고치고 14회·62초 반복)의 근본 방어
 **Phase 1 기반 착수 — 코드 인지 청커(M2 수정) 완성 (2026-07-17, 덤프 무관·무회귀).** 사용자 지시로 덤프 대기 중 no-regret 기반부터 구축(RAG·학습 두 트랙 공통, 순수 로직).
 - 신규 `scripts/coding_corpus.py`(코딩 코퍼스 공용 정제 모듈): `chunk_code_aware(text, max_chars=1500, overlap=150)`. 불변식 (A)코드블록 원자성 (B)무손실·앞부분보존 (C)초과 코드는 라인경계 분할+재펜스 (D)설명+인접코드 동거 (E)전 청크 max_chars 이하. 세그먼트 분리(_iter_segments)→코드/산문 별도 처리, `_hard_split`이 앞→뒤로 잘라 앞부분 폐기 버그 원천 차단.
 - 신규 `tests/unit/test_coding_corpus.py`(8) — 불변식 회귀. **M2 버그 실증 대조**: 동일 긴 코드에 기존 `split_into_chunks`는 `def pipeline():`(함수 시그니처) **유실**(문장부호 없는 코드→한 '문장'→뒤만 남김), 신규 청커는 전부 보존. 8 passed, ruff 클린.
-- 남은 coding_corpus 구성요소(후속): html_to_markdown(SO Body <pre><code>→펜스), build_provenance(source/url/license/score), dedup_key/detect_languages. 현재는 청커만.
+- 커밋 5bde878(청커+테스트).
+
+**coding_corpus html_to_markdown 추가 (2026-07-17, 덤프 무관).** SO Body는 HTML이라 청커가 실데이터를 씹으려면 펜스 마크다운 변환이 선행. stdlib `html.parser`만 사용(에어갭, BeautifulSoup 등 외부의존 없음).
+- `_SOHtmlToMarkdown(HTMLParser)` + `html_to_markdown(html)`: <pre><code>→```lang 펜스(class lang-python 감지), 구문강조 <span> 제거+텍스트 보존, convert_charrefs로 &lt;/&gt;/&amp; 복원, 인라인 <code>→백틱, <p>빈줄·<li>"- "·<strong>/<em>→**/*, <a>는 텍스트만.
+- 테스트 +8(엔티티 복원·span 제거·언어감지·리스트·청커 연동) → 총 16 passed, ruff 클린. 실제 SO형 Body(span+엔티티+인라인+리스트) e2e 확인.
+- 남은 coding_corpus 구성요소(후속): build_provenance(source/url/license/score metadata), dedup_key/detect_languages, 그리고 prepare_stackoverflow.py(속성 flat XML+ParentId 페어링, PK q{qid} 앵커링) — 파서는 합성 fixture로 덤프 없이 착수 가능.
 
 **API 스모크 테스트 셋(신규).** scripts/api_smoke_test.py — URL http://192.168.21.112:8600, Bearer nexus-b200-test-key-001. health·auth차단·인사·지식·도구·문서생성+다운로드·업로드분석 8케이스. `python -m scripts.api_smoke_test [--only ...]`.
