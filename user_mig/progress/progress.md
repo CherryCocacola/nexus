@@ -3240,7 +3240,11 @@ QA #43(깨진 Bash 명령을 못 고치고 14회·62초 반복)의 근본 방어
 
 **OKKY 소규모 파일럿 완료·검증 (2026-07-17).** 열거·적재 배선 추가: `iter_listing_ids`(sitemap은 상위nav만이라 무용 → **/questions/tech 목록 RSC에서 "id":N,"title": 열거**, 20개/페이지, 1페이지는 파라미터없는 URL, 총 258,923건), `run_ingest`(열거→스크랩(rate-limit 1.2초)→build_entries→임베딩:8002→UPSERT source, prepare_stackoverflow 대칭), CLI(--board/--pages/--limit/--source/--dry-run/--pg/--embed-url). dry-run(15건→16엔트리) 검증. **실 파일럿: tech Q&A 100건 스크랩→stored=119청크(source='okky-pilot')**.
 - **리랭커 검증(한국어 네이티브 매칭)**: 4/8 주입, 정확매칭 rr 0.996~1.000(자바내부클래스1.0·eclipse0.997·아키텍처0.996·이펙티브자바0.813). 드롭 4개는 100건 파일럿에 해당 토픽 부재(rr 0.0 정확 드롭, 노이즈 아님). **"OKKY(한국어)>SO(영어) for 한국사용자" 실측 확인** — 교차언어 브릿지 불요, e5 네이티브 매칭 깨끗.
-- **미결**: 커버리지 위해 벌크 스크랩(수천 건) + tenants 코딩테넌트 'okky' 활성화. min_votes=0(OKKY 투표 희박). 상용 전환 시 DELETE WHERE source='okky*'.
+- 커밋 251337b(열거·적재), 0de681a(ruff).
+
+**OKKY 본격 적재 + 코딩 테넌트 활성화 = 완료 (2026-07-18).** run_ingest 증분저장 리팩토링(질문 20개마다 스크랩→임베딩→저장, 장시간 실패 시 진행분 보존). **본격 스크랩: tech Q&A 3000건 → okky 1,834청크**(최신질문 미답변 다수 제외). 리랭커 검증 **5/8**(파일럿 4/8→개선, react상태관리 rr=0.958 커버, 정확매칭 0.958~1.000, 경계선 스프링0.227·PDF0.241). OKKY 한국어 네이티브라 SO보다 깨끗.
+**전용 코딩 테넌트 신설(사용자 결정 — default 혼합보다 정확).** `config/tenants.yaml`에 `coding`(kowiki·sample·okky·so-pilot, key nexus-coding-key-001, internal-only) 추가. **전용↔범용 전환은 목록 수정+재시작만(재적재 불요)**. 배포: docker cp(백업 .bak.pre-coding)+nexus-web 재시작. **e2e: coding 테넌트 "자바 내부 클래스"→정답(okky접근)·"수도"→서울(kowiki접근), default "자바"→base only(okky 격리 확인)**. citation off라 sources 미표시나 주입은 리랭커경로 실측 확인. 이중방어(테넌트 allowed_sources DB필터 + 리랭커 관련도).
+**상태: 코딩 RAG(OKKY 한국어+SO 영어) 코딩모드로 LIVE.** 후속(비차단): okky-pilot(119) 정리(orphan, DELETE) / 커버리지 위해 OKKY 추가 스크랩 / SO so-pilot→so 정규화(선택) / min_score 튜닝(경계선). 상용 전환 시 coding 테넌트에서 okky 제거 + DELETE source LIKE 'okky%'.
 
 ### 코딩 학습 데이터 계획 — 파킹(향후 코딩 전용 대비) (2026-07-17)
 
