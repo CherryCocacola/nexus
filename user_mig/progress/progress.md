@@ -3183,6 +3183,13 @@ QA #43(깨진 Bash 명령을 못 고치고 14회·62초 반복)의 근본 방어
 **coding_corpus html_to_markdown 추가 (2026-07-17, 덤프 무관).** SO Body는 HTML이라 청커가 실데이터를 씹으려면 펜스 마크다운 변환이 선행. stdlib `html.parser`만 사용(에어갭, BeautifulSoup 등 외부의존 없음).
 - `_SOHtmlToMarkdown(HTMLParser)` + `html_to_markdown(html)`: <pre><code>→```lang 펜스(class lang-python 감지), 구문강조 <span> 제거+텍스트 보존, convert_charrefs로 &lt;/&gt;/&amp; 복원, 인라인 <code>→백틱, <p>빈줄·<li>"- "·<strong>/<em>→**/*, <a>는 텍스트만.
 - 테스트 +8(엔티티 복원·span 제거·언어감지·리스트·청커 연동) → 총 16 passed, ruff 클린. 실제 SO형 Body(span+엔티티+인라인+리스트) e2e 확인.
-- 남은 coding_corpus 구성요소(후속): build_provenance(source/url/license/score metadata), dedup_key/detect_languages, 그리고 prepare_stackoverflow.py(속성 flat XML+ParentId 페어링, PK q{qid} 앵커링) — 파서는 합성 fixture로 덤프 없이 착수 가능.
+- 커밋 c0ff736(html_to_markdown+테스트).
+
+**prepare_stackoverflow.py SO 파서 핵심 완성 (2026-07-17, 합성 fixture·덤프 무관).** FABLE5 CRITICAL 수정(C1/N1)을 코드로 확정. 임베딩·DB 쓰기는 가드(실덤프+인프라 시 배선).
+- 신규 `scripts/prepare_stackoverflow.py`: `iter_posts`(속성 flat XML 스트리밍, PostTypeId 1질문/2답변, elem.clear 메모리관리) → `load_posts`(질문·답변 버킷팅, ParentId 페어링) → `build_combined_document`(**질문+채택답변+고득점답변을 단일 문서로 결합**, 채택 우선·점수순, html_to_markdown로 코드 보존) → `build_entries`(큐레이션 accepted OR score≥N·require_code·min_len, **section=q{qid} 앵커링 → PK 유일**, provenance metadata url/license CC BY-SA/question_id/answer_ids, tags=SO태그). `parse_tags`(신형<>·구형|| 대응). `run_stats`(N5: 임베딩·DB 없이 규모 집계, --stats CLI).
+- 신규 `tests/unit/test_prepare_stackoverflow.py`(8): 파싱·버킷팅·결합순서·큐레이션·**C1/N1 PK유일성 2종**(제목같은 다른질문 id 비충돌 / 복수답변 단일문서 비충돌)·provenance·require_code. 총 24 passed(coding_corpus 16+SO 8), ruff 클린. --stats CLI e2e(kept=2/chunks=2) 확인.
+- **가드/후속**: run_ingest(임베딩 :8002+KnowledgeStore UPSERT+재인덱스)는 실덤프+LAN 인프라 필요 → Phase 0b/1 실서버 배선. load_posts 전량 인메모리는 파일럿용, 전량 덤프는 SQLite 스테이징 2-pass 도입 예정.
+
+**남은 coding_corpus 유틸(후속, 선택)**: build_provenance/dedup_key/detect_languages는 현재 파서가 인라인 처리(tags=SO태그, metadata 직접구성)로 충분해 필요 시 추출. 다음 실질 진전은 SO 덤프 입수 → 0b 파일럿·0c 통계·run_ingest 배선.
 
 **API 스모크 테스트 셋(신규).** scripts/api_smoke_test.py — URL http://192.168.21.112:8600, Bearer nexus-b200-test-key-001. health·auth차단·인사·지식·도구·문서생성+다운로드·업로드분석 8케이스. `python -m scripts.api_smoke_test [--only ...]`.
