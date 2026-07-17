@@ -44,6 +44,7 @@ Phase 0b/1에서 실서버로 검증한다(mock 금지 원칙 [[feedback_real_se
 from __future__ import annotations
 
 import argparse
+import asyncio
 import logging
 import re
 import sys
@@ -51,6 +52,7 @@ import sys
 # 속성 기반 평면 XML 스트리밍 파싱. 로컬 신뢰 덤프만 파싱하므로 S405/S314는 noqa.
 import xml.etree.ElementTree as ET  # noqa: S405 — 로컬 신뢰 SO 덤프만 파싱
 from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -60,7 +62,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # 루트 (core)
 
 from coding_corpus import chunk_code_aware, html_to_markdown  # noqa: E402
 
-from core.rag.knowledge_store import KnowledgeEntry  # noqa: E402
+from core.rag.knowledge_store import KnowledgeEntry, KnowledgeStore  # noqa: E402
 
 logger = logging.getLogger("nexus.scripts.prepare_stackoverflow")
 
@@ -297,8 +299,100 @@ def run_stats(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _embed_texts(base_url: str, texts: list[str]) -> list[list[float]]:
+    """LAN 임베딩 서버(:8002)에 텍스트 배치를 보내 벡터를 받는다(prepare_kowiki와 동일 계약).
+
+    POST /v1/embed {"texts": [...]} → {"embeddings": [[..1024..], ...]}.
+    """
+    import httpx  # 선택적 의존성 — 적재 시에만 필요
+
+    async with httpx.AsyncClient(timeout=120) as client:
+        r = await client.post(base_url.rstrip("/") + "/v1/embed", json={"texts": texts})
+        r.raise_for_status()
+        return r.json()["embeddings"]
+
+
+async def run_ingest(args: argparse.Namespace) -> int:
+    """SO 덤프(표본) → 엔트리 생성 → 임베딩 → tb_knowledge(source) UPSERT.
+
+    파일럿 규모는 --limit로 바운드해 인메모리로 처리한다(전량은 SQLite 스테이징
+    2-pass가 별도 과제). --dry-run이면 엔트리 생성까지만 하고 임베딩·DB를 건드리지
+    않는다(리허설, 인프라 없이 안전 검증). source는 파일럿 격리를 위해 'so-pilot'
+    등으로 지정할 수 있다.
+    """
+    dump = Path(args.dump)
+    if not dump.exists():  # noqa: ASYNC240 — 준비 스크립트(동기 파일 확인)
+        logger.error("덤프 파일 없음: %s", dump)
+        return 1
+
+    with open(dump, "rb") as f:  # noqa: ASYNC230 — 준비 스크립트(동기 배치 파싱)
+        questions, answers = load_posts(f, limit=args.limit)
+    entries = build_entries(
+        questions,
+        answers,
+        source=args.source,
+        min_answer_score=args.min_score,
+        min_question_score=args.min_question_score,
+        require_code=args.require_code,
+    )
+    logger.info(
+        "엔트리 %d개 생성(질문 %d, 답변그룹 %d, source=%s)",
+        len(entries), len(questions), len(answers), args.source,
+    )
+    if args.dry_run:
+        print(f"[dry-run] entries={len(entries)} source={args.source} (임베딩·DB 없음)")
+        return 0
+
+    import asyncpg  # 선택적 의존성 — 실제 적재 시에만 필요
+
+    pool = await asyncpg.create_pool(args.pg, min_size=1, max_size=3)
+    store = KnowledgeStore(pg_pool=pool)
+    await store.ensure_schema()
+
+    stored = 0
+    batch_size = args.batch_size
+    try:
+        for i in range(0, len(entries), batch_size):
+            batch = entries[i : i + batch_size]
+            try:
+                embs = await _embed_texts(args.embed_url, [e.content for e in batch])
+            except Exception as e:
+                # 한 배치 임베딩 실패는 그 배치만 건너뛰고 계속한다(전체 중단 방지).
+                logger.warning("임베딩 실패 배치 %d: %s", i, e)
+                continue
+            for entry, emb in zip(batch, embs, strict=True):
+                # KnowledgeEntry는 frozen이라 embedding을 담은 새 객체로 교체 후 UPSERT.
+                await store.add(replace(entry, embedding=tuple(emb)))
+                stored += 1
+            if stored % 500 == 0:
+                logger.info("적재 진행: %d/%d 청크", stored, len(entries))
+    finally:
+        await pool.close()
+
+    logger.info("완료: %d청크 적재(source=%s)", stored, args.source)
+    print(f"stored={stored} source={args.source}")
+    return 0
+
+
+async def run_build_index(args: argparse.Namespace) -> int:
+    """벡터 인덱스 빌드(전량 적재 후). 주의: build_vector_index는 IF NOT EXISTS라
+    기존 idx_knowledge_embed가 있으면 no-op이다(FABLE5 C2). 전량 적재 시 실제
+    재인덱스(CREATE INDEX CONCURRENTLY + lists 재산정)는 별도 운영 절차로 수행한다.
+    파일럿(so-pilot 소량)은 기존 인덱스에 흡수되므로 이 단계가 필요 없다.
+    """
+    import asyncpg
+
+    pool = await asyncpg.create_pool(args.pg, min_size=1, max_size=2)
+    store = KnowledgeStore(pg_pool=pool)
+    await store.ensure_schema()
+    await store.build_vector_index()
+    await pool.close()
+    logger.info("build_vector_index 호출 완료(no-op 여부는 C2 주석 참조)")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
-    """CLI 진입점 — 현재는 --stats(규모 스캔)만 완전 배선. 적재/인덱스는 후속."""
+    """CLI 진입점 — --stats(규모), --dump 적재(임베딩+UPSERT), --build-index."""
     parser = argparse.ArgumentParser(description="Stack Overflow 덤프 → tb_knowledge 준비")
     parser.add_argument("--dump", help="Posts.xml 로컬 경로")
     parser.add_argument("--stats", action="store_true", help="적재 없이 규모만 집계")
@@ -308,18 +402,32 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--require-code", action="store_true", help="코드 블록 있는 질문만")
     parser.add_argument("--limit", type=int, default=None, help="처리할 최대 row 수(표본 검증용)")
-    parser.add_argument("--build-index", action="store_true", help="(후속) 벡터 인덱스 빌드")
+    parser.add_argument("--source", default="so", help="tb_knowledge.source 값(파일럿=so-pilot)")
+    parser.add_argument("--embed-url", help="LAN 임베딩 서버(:8002)")
+    parser.add_argument("--pg", help="PostgreSQL DSN")
+    parser.add_argument("--batch-size", type=int, default=16, help="임베딩·적재 배치 크기")
+    parser.add_argument("--dry-run", action="store_true", help="엔트리 생성까지만(임베딩·DB 없음)")
+    parser.add_argument("--build-index", action="store_true", help="벡터 인덱스 빌드(C2 주석 참조)")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+    if args.build_index:
+        if not args.pg:
+            parser.error("--build-index 에는 --pg 가 필요합니다")
+        return asyncio.run(run_build_index(args))
 
     if args.stats:
         if not args.dump:
             parser.error("--stats 에는 --dump 가 필요합니다")
         return run_stats(args)
-    # 적재/인덱스 배선은 실덤프+LAN 인프라 준비 후(Phase 0b/1)에 추가한다.
-    parser.error("현재 --stats 만 지원합니다(적재/인덱스는 실덤프 배선 후 활성화).")
-    return 2
+
+    # 적재 모드
+    if not args.dump:
+        parser.error("적재에는 --dump 가 필요합니다(또는 --stats)")
+    if not args.dry_run and (not args.pg or not args.embed_url):
+        parser.error("실제 적재에는 --pg 와 --embed-url 이 필요합니다(리허설은 --dry-run)")
+    return asyncio.run(run_ingest(args))
 
 
 if __name__ == "__main__":

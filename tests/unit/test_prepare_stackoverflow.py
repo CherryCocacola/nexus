@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+import argparse
+import asyncio
 import io
 import sys
 from pathlib import Path
@@ -22,6 +24,7 @@ from prepare_stackoverflow import (  # noqa: E402
     build_entries,
     load_posts,
     parse_tags,
+    run_ingest,
 )
 
 # 합성 Posts.xml — 속성 기반 평면 XML(실제 SO 덤프 구조). Body의 HTML은 XML
@@ -140,3 +143,16 @@ def test_min_question_score_filters_low_quality_questions():
     entries = build_entries(questions, answers, min_answer_score=5, min_question_score=10)
     kept = {e.section for e in entries}
     assert kept == {"q1"}
+
+
+# ── run_ingest --dry-run: 임베딩·DB 없이 엔트리 생성만(인프라 불필요) ──
+def test_run_ingest_dry_run_no_infra(tmp_path):
+    dump = tmp_path / "posts.xml"
+    dump.write_text(_FIXTURE, encoding="utf-8")
+    args = argparse.Namespace(
+        dump=str(dump), limit=None, source="so-pilot", min_score=5,
+        min_question_score=0, require_code=False, dry_run=True,
+        embed_url=None, pg=None, batch_size=16,
+    )
+    # dry_run이면 임베딩·DB를 건드리지 않고 0을 반환해야 한다(안전 리허설).
+    assert asyncio.run(run_ingest(args)) == 0
