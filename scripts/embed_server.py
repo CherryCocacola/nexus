@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """multilingual-e5-large 임베딩 + bge-reranker-v2-m3-ko 리랭커 서버.
 
 이 파일은 Nexus의 "지식 RAG"가 사용하는 경량 추론 서버다. 두 가지 일을 한다.
@@ -42,9 +41,13 @@ _dim = _model.get_sentence_embedding_dimension()
 print(f"[embed] 로드 완료 — 차원={_dim}", flush=True)
 
 # ── 리랭커(크로스인코더) — 지식 RAG 정밀도 향상용 ─────────────────────────────
-# 왜 fp16인가: 0.6B 리랭커를 fp16으로 올려 GPU 메모리를 아낀다(품질 영향 미미,
-# B200 잔여 여유가 넉넉하지 않아 안전 마진 확보). 로드 실패 시 임베딩은 그대로 동작.
+# 왜 device별 dtype인가: GPU(cuda)에서는 0.6B 리랭커를 fp16으로 올려 메모리를 아끼지만
+# (품질 영향 미미), CPU에서는 fp16이 비효율/비호환(대부분 연산이 fp32로 폴백되거나
+# 예외)이라 fp32로 로드한다. 로드 실패 시 임베딩은 그대로 동작(fail-open).
 RERANK_MODEL = os.environ.get("RERANK_MODEL", "dragonkue/bge-reranker-v2-m3-ko")
+# 리랭커 디바이스는 임베딩과 별도로 지정할 수 있다(기본 = 임베딩 디바이스).
+# 예: 112는 GPU를 vLLM이 점유하므로 임베딩·리랭커 모두 CPU로 둔다(EMBED/RERANK_DEVICE=cpu).
+RERANK_DEVICE = os.environ.get("RERANK_DEVICE", DEVICE)
 # RERANK_ENABLED="0"으로 두면 리랭커 자체를 로드하지 않는다(임베딩 전용 모드로 가볍게 운영).
 RERANK_ENABLED = os.environ.get("RERANK_ENABLED", "1") == "1"
 # _reranker는 "미로드" 상태를 None으로 표현한다. 아래에서 성공 시에만 실제 객체로 채운다.
@@ -54,10 +57,12 @@ if RERANK_ENABLED:
         # CrossEncoder는 임베딩과 달리 (질의,문서)를 함께 넣어 단일 관련도 점수를 낸다.
         from sentence_transformers import CrossEncoder
 
-        print(f"[rerank] '{RERANK_MODEL}' 로드 시작 (fp16) ...", flush=True)
-        # torch_dtype=float16으로 로드해 메모리 절감(위 설계 주석 참조).
+        # CPU면 fp32, CUDA면 fp16(위 설계 주석 참조). fp16 강제는 CPU에서 오류·저속의 원인.
+        _rr_kwargs = {"torch_dtype": "float16"} if RERANK_DEVICE == "cuda" else {}
+        _rr_dtype = "fp16" if RERANK_DEVICE == "cuda" else "fp32"
+        print(f"[rerank] '{RERANK_MODEL}' 로드 시작 ({RERANK_DEVICE}, {_rr_dtype}) ...", flush=True)
         _reranker = CrossEncoder(
-            RERANK_MODEL, device=DEVICE, model_kwargs={"torch_dtype": "float16"}
+            RERANK_MODEL, device=RERANK_DEVICE, model_kwargs=_rr_kwargs
         )
         print("[rerank] 로드 완료", flush=True)
     except Exception as e:  # noqa: BLE001 — 리랭커 실패가 임베딩을 막으면 안 됨(fail-open)
@@ -146,6 +151,10 @@ def health() -> dict:
 
 
 # 스크립트를 직접 실행하면(예: python embed_server.py) uvicorn으로 서버를 띄운다.
-# 127.0.0.1 바인딩으로 로컬 전용(에어갭)·포트 8002·로그는 warning 이상만 출력.
+# 바인드 호스트: 기본 127.0.0.1(로컬 전용·에어갭 안전 기본값). 임베딩 서버를 LAN에서
+# 호출하는 배포(예: 112 — 웹 컨테이너·오케스트레이터가 LAN IP 192.168.x로 접근)에서는
+# EMBED_HOST=0.0.0.0으로 연다(LAN 바인딩은 에어갭 위반 아님 — 외부망 호출만 금지).
+# 포트 8002·로그는 warning 이상만 출력.
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=8002, log_level="warning")
+    HOST = os.environ.get("EMBED_HOST", "127.0.0.1")
+    uvicorn.run(app, host=HOST, port=8002, log_level="warning")
