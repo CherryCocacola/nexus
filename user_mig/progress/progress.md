@@ -3228,6 +3228,16 @@ QA #43(깨진 Bash 명령을 못 고치고 14회·62초 반복)의 근본 방어
 **⛔ 사용자 결정 대기(자율 진행 불가 — FABLE5 지목).** ①**리랭커 112 복구**(bge-reranker-v2-m3-ko): 인프라+전 테넌트 게이팅 동작변경이나 **kowiki 회귀까지 고치는 원상복구**(강한 근거). ②**SO→OKKY 우선순위 변경**: 원 지시 "SO 먼저" 명시적 번복이라 에이전트 재량 밖. ③OKKY 스크래핑 개시(ToS/법적). ④so-pilot 정리(DELETE WHERE source='so-pilot'+VACUUM — 현재 tenant미바인딩 경로 노출, 측정 끝나면 정리).
 **자율로 안 한 것**: 리랭커 배포/enabled 변경 안 함, SO중단·OKKY전환 안 함, so-pilot 유지(측정용). 전부 읽기전용 측정만 수행.
 
+### OKKY 소스 검토 + 결정 (2026-07-17)
+
+**법적 검토(사용자와 정밀 논의).** ①robots.txt: 개별 /questions/{id}·/articles/{id} 크롤 가능, /api/·/users/*/questions·/auth/ 차단. **AI 크롤러 명시(GPTBot·ClaudeBot·Claude-User·PerplexityBot·OAI-SearchBot)** = OKKY가 봇 접근 관리 중. ②콘텐츠=사용자생성물 → 저작권 작성자 귀속(한국 저작권법·베른협약, **표시 없어도 창작 시 자동 발생** — "표시 없음=자유이용"은 착각). ③**재사용 라이선스 없음**(SO의 CC BY-SA와 대조 — 침묵=허락 없음=더 제한적). ToS 표준=게시물 저작권 회원 귀속+회사에 운영용 비독점 라이선스만. ④핵심: 침해는 **복사·저장(복제)** 시점(citation on/off·출처표시와 무관). RAG는 원문 저장·재생산이라 학습(추상화)보다 오히려 복제에 가까워 법적으로 더 까다로움. "대부분 LLM이 학습"=다퉈지는 관행+점점 라이선스화(SE 2024 Google/OpenAI 계약), 합법 증명 아님.
+
+**사용자 결정(정보 근거·리스크 수용).** 코딩 모드는 **팀 내부 전용** → 실무 리스크 낮음. **상용 전환 시 provenance(source='okky')로 `DELETE WHERE source='okky'`+재인덱스로 제거**(처음부터 넣은 분리 설계). 즉 OKKY 진행하되 내부한정·제거가능·문서화. SO(CC BY-SA)는 라이선스 명확이라 별도.
+
+**스크래퍼 코어 완성·검증(2026-07-17).** OKKY=Next.js App Router(RSC) 앱 — 콘텐츠가 일반 HTML 아닌 `self.__next_f` RSC 페이로드(정형 JSON: title·text(HTML)·tags·selectedAnswerId·answers.content[]{id,text,voteCount,selected}). /api는 robots 차단이라 **페이지 RSC 파싱이 정합**. 신규 `scripts/prepare_okky.py`: rsc_payload·parse_question·build_combined_document(질문+채택+고득점 결합, SO 대칭)·build_entries(source='okky', section=q{qid} PK, provenance url/license/answer_ids)·fetch_question(robots 준수 rate-limit 1.2초, qid=URL 권위값)·--probe. `coding_corpus`(html_to_markdown·청커) 재사용. 테스트 `test_prepare_okky.py`(5, 합성 RSC)·실페이지 probe(381655 채택답변 결합·1419849 tags추출) 검증. 5 passed, ruff clean.
+- **관찰**: OKKY는 투표 희박(voteCount 0 흔함) → min_answer_votes 낮게(0) or 채택 위주 권장.
+- **미결(적재)**: 열거(sitemap.xml → qid) + rate-limit 벌크 스크랩 + run_ingest(임베딩+UPSERT, prepare_stackoverflow 대칭 가드) + tenants 'okky' 활성화. 리랭커 배포됨(교차언어 무관, OKKY 한국어라 e5 네이티브 매칭 더 유리).
+
 ### 코딩 학습 데이터 계획 — 파킹(향후 코딩 전용 대비) (2026-07-17)
 
 > 사용자 결정: 지금 학습은 안 함(RAG 우선). 단 **데이터·계획은 보존** — 범용 A.X를 이후 코딩 전용으로 쓸 일이 생길 것으로 예상. 소스별 고려를 미리 해둔다.
