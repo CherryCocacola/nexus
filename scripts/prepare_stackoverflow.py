@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import re
 import sys
@@ -116,12 +117,16 @@ def iter_posts(xml_stream: Any) -> Iterator[dict[str, Any]]:
             pid = _int_or_none(a.get("Id"))
             if pid is None:
                 continue
+            # CreationDate="2008-09-02T03:41:06.880" → 연도(정수). 날짜 필터용.
+            cd = a.get("CreationDate", "") or ""
+            year = int(cd[:4]) if cd[:4].isdigit() else 0
             yield {
                 "id": pid,
                 "type": post_type,
                 "parent_id": _int_or_none(a.get("ParentId")),
                 "accepted_answer_id": _int_or_none(a.get("AcceptedAnswerId")),
                 "score": _int_or_none(a.get("Score")) or 0,
+                "year": year,
                 "title": a.get("Title", "") or "",
                 "body": a.get("Body", "") or "",
                 "tags": parse_tags(a.get("Tags", "")),
@@ -261,6 +266,124 @@ def build_entries(
                 )
             )
     return entries
+
+
+def stage_to_sqlite(dump_path: Path, db_path: str, min_year: int, min_qscore: int,
+                    max_rows: int | None = None) -> int:
+    """Pass 1: 덤프를 스트리밍하며 (연도>=min_year, 질문점수>=min_qscore) 질문과 그
+    답변만 SQLite에 스테이징한다(전량 메모리 회피 = OOM 방지, 예전·저품질 제외).
+
+    Id 오름차순이라 답변의 부모(kept 질문)는 이미 kept 집합에 있다. 본문은 SQLite(디스크)
+    에 저장하고, 메모리엔 kept 질문 id 집합만 유지한다. 반환: 스테이징한 질문 수.
+    """
+    import sqlite3
+
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        "PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF;"
+        "DROP TABLE IF EXISTS q; DROP TABLE IF EXISTS a;"
+        "CREATE TABLE q(id INTEGER PRIMARY KEY, title TEXT, body TEXT, tags TEXT,"
+        " score INT, accepted INT);"
+        "CREATE TABLE a(id INTEGER, parent INTEGER, body TEXT, votes INT);"
+    )
+    kept: set[int] = set()
+    nq = na = seen = 0
+    with open(dump_path, "rb") as f:  # noqa: ASYNC230 — 배치 준비 스크립트
+        cur = conn.cursor()
+        for post in iter_posts(f):
+            seen += 1
+            if post["type"] == _POST_QUESTION:
+                if post["year"] >= min_year and post["score"] >= min_qscore:
+                    kept.add(post["id"])
+                    cur.execute(
+                        "INSERT OR IGNORE INTO q VALUES(?,?,?,?,?,?)",
+                        (post["id"], post["title"], post["body"], json.dumps(post["tags"]),
+                         post["score"], post["accepted_answer_id"] or 0),
+                    )
+                    nq += 1
+            elif post["type"] == _POST_ANSWER and post["parent_id"] in kept:
+                cur.execute("INSERT INTO a VALUES(?,?,?,?)",
+                            (post["id"], post["parent_id"], post["body"], post["score"]))
+                na += 1
+            if seen % 2000000 == 0:
+                conn.commit()
+                logger.info("스테이징: %dM행 스캔 → 질문 %d, 답변 %d", seen // 1000000, nq, na)
+            if max_rows and seen >= max_rows:
+                break
+    conn.execute("CREATE INDEX ia ON a(parent)")
+    conn.commit()
+    conn.close()
+    logger.info("스테이징 완료: 질문 %d, 답변 %d (총 %d행 스캔)", nq, na, seen)
+    return nq
+
+
+async def run_staged_ingest(args: argparse.Namespace) -> int:
+    """SQLite 스테이징 기반 대량 적재: (Pass1 스테이징) → Pass2 질문배치 build→임베딩→UPSERT.
+
+    --skip-stage면 기존 SQLite를 재사용(Pass2만). require_code/min_answer_score는 build에서.
+    """
+    import sqlite3
+
+    if not args.skip_stage:
+        stage_to_sqlite(Path(args.dump), args.sqlite, args.min_year,
+                        args.min_question_score, args.stage_max_rows)
+    if args.dry_run:
+        conn = sqlite3.connect(args.sqlite)
+        nq = conn.execute("SELECT count(*) FROM q").fetchone()[0]
+        na = conn.execute("SELECT count(*) FROM a").fetchone()[0]
+        conn.close()
+        print(f"[dry-run] staged questions={nq} answers={na}")
+        return 0
+
+    import asyncpg
+
+    conn = sqlite3.connect(args.sqlite)
+    conn.row_factory = sqlite3.Row
+    qids = [r[0] for r in conn.execute("SELECT id FROM q").fetchall()]
+    logger.info("스테이징 질문 %d개 → 적재 시작", len(qids))
+    pool = await asyncpg.create_pool(args.pg, min_size=1, max_size=3)
+    store = KnowledgeStore(pg_pool=pool)
+    await store.ensure_schema()
+    stored = 0
+    q_batch = 500
+    try:
+        for i in range(0, len(qids), q_batch):
+            batch_ids = qids[i : i + q_batch]
+            marks = ",".join("?" * len(batch_ids))
+            questions: dict[int, dict[str, Any]] = {}
+            for r in conn.execute(f"SELECT * FROM q WHERE id IN ({marks})", batch_ids):  # noqa: S608 — marks=플레이스홀더, 값 바인딩
+                questions[r["id"]] = {
+                    "id": r["id"], "title": r["title"], "body": r["body"],
+                    "tags": json.loads(r["tags"]), "score": r["score"],
+                    "accepted_answer_id": r["accepted"] or None,
+                }
+            answers_by_parent: dict[int, list[dict[str, Any]]] = {}
+            for r in conn.execute(f"SELECT * FROM a WHERE parent IN ({marks})", batch_ids):  # noqa: S608 — marks=플레이스홀더, 값 바인딩
+                answers_by_parent.setdefault(r["parent"], []).append(
+                    {"id": r["id"], "body": r["body"], "score": r["votes"]})
+            entries = build_entries(
+                questions, answers_by_parent, source=args.source,
+                min_answer_score=args.min_score, min_question_score=0,
+                require_code=args.require_code,
+            )
+            for j in range(0, len(entries), args.batch_size):
+                b = entries[j : j + args.batch_size]
+                try:
+                    embs = await _embed_texts(args.embed_url, [e.content for e in b])
+                except Exception as e:
+                    logger.warning("임베딩 실패: %s", e)
+                    continue
+                for entry, emb in zip(b, embs, strict=True):
+                    await store.add(replace(entry, embedding=tuple(emb)))
+                    stored += 1
+            done = min(i + q_batch, len(qids))
+            logger.info("적재 진행: 질문 %d/%d, %d청크", done, len(qids), stored)
+    finally:
+        conn.close()
+        await pool.close()
+    logger.info("완료: %d청크 적재(source=%s)", stored, args.source)
+    print(f"stored={stored} source={args.source}")
+    return 0
 
 
 def run_stats(args: argparse.Namespace) -> int:
@@ -408,6 +531,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--batch-size", type=int, default=16, help="임베딩·적재 배치 크기")
     parser.add_argument("--dry-run", action="store_true", help="엔트리 생성까지만(임베딩·DB 없음)")
     parser.add_argument("--build-index", action="store_true", help="벡터 인덱스 빌드(C2 주석 참조)")
+    # 대량 적재(SQLite 스테이징) — 예전·저품질 제외하고 전량에서 최근·고품질만.
+    parser.add_argument("--stage-ingest", action="store_true", help="SQLite 스테이징 대량 적재")
+    parser.add_argument("--min-year", type=int, default=2018, help="이 연도 이상만(예전 제외)")
+    parser.add_argument("--sqlite", default="so_stage.db", help="스테이징 SQLite 경로")
+    parser.add_argument("--skip-stage", action="store_true", help="기존 SQLite 재사용")
+    parser.add_argument("--stage-max-rows", type=int, default=None, help="스캔 행 상한(테스트)")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -422,7 +551,14 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("--stats 에는 --dump 가 필요합니다")
         return run_stats(args)
 
-    # 적재 모드
+    if args.stage_ingest:
+        if not args.skip_stage and not args.dump:
+            parser.error("--stage-ingest 에는 --dump 가 필요합니다(--skip-stage면 불요)")
+        if not args.dry_run and (not args.pg or not args.embed_url):
+            parser.error("실제 적재에는 --pg 와 --embed-url 이 필요합니다(리허설은 --dry-run)")
+        return asyncio.run(run_staged_ingest(args))
+
+    # 적재 모드(인메모리, 소규모)
     if not args.dump:
         parser.error("적재에는 --dump 가 필요합니다(또는 --stats)")
     if not args.dry_run and (not args.pg or not args.embed_url):
