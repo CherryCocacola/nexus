@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterator
+from html.parser import HTMLParser
 
 # 펜스 코드 블록: ```lang\n ... \n``` (여러 줄, 언어 표기는 선택).
 # non-greedy(.*?)로 가장 가까운 닫는 펜스까지만 한 블록으로 잡는다.
@@ -47,6 +48,132 @@ _SENT_RE = re.compile(r"(?<=[.!?。])\s+")
 
 # 문단 경계: 빈 줄. (산문 1차 분할용)
 _PARA_RE = re.compile(r"\n\s*\n")
+
+# class 속성에서 언어 추출: "lang-python" / "language-js" 등에서 언어명만.
+_LANG_CLASS_RE = re.compile(r"(?:lang|language)-([a-zA-Z0-9+#]+)")
+
+
+class _SOHtmlToMarkdown(HTMLParser):
+    """Stack Overflow Body HTML을 펜스 마크다운으로 변환하는 파서(stdlib만 사용).
+
+    왜 stdlib html.parser인가 (에어갭):
+      BeautifulSoup 같은 외부 의존 없이 표준 라이브러리만으로 변환한다. SO Body는
+      <pre><code>(코드 블록), 인라인 <code>, <p>·<ul>·<a>·구문강조 <span> 등이 섞인
+      HTML이다. 이를 chunk_code_aware가 다룰 수 있는 ```펜스``` 마크다운으로 바꾼다.
+
+    핵심 처리:
+      - <pre>...</pre> 안의 텍스트는 코드로 모아 ```lang ... ```로 감싼다. 언어는
+        <pre>/<code>의 class(lang-python 등)에서 뽑는다. 구문강조용 <span> 태그는
+        무시하고 그 안의 텍스트만 살려 원본 코드를 복원한다.
+      - convert_charrefs(기본 True) 덕분에 &lt; &gt; &amp; 같은 엔티티가 자동으로
+        <, >, & 로 복원되어 코드가 정확히 살아난다.
+      - 인라인 <code>는 `백틱`, <p>는 빈 줄, <li>는 "- ", <strong>/<em>는 **/* 로.
+      - <a>는 표시 텍스트만 남기고 href는 버린다(RAG 본문엔 링크 텍스트로 충분).
+    """
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._out: list[str] = []  # 최종 마크다운 조각 누적
+        self._pre_depth = 0  # <pre> 중첩 깊이(0이면 일반 산문 영역)
+        self._pre_buf: list[str] = []  # <pre> 안에서 모으는 코드 텍스트
+        self._pre_lang = ""  # 현재 코드 블록 언어(class에서 추출)
+        self._in_inline_code = False  # <pre> 밖 인라인 <code> 여부
+
+    @staticmethod
+    def _lang_from_attrs(attrs: list[tuple[str, str | None]]) -> str:
+        """태그 속성에서 프로그래밍 언어명을 뽑는다(class="lang-python" 등). 없으면 ""."""
+        for name, val in attrs:
+            if name == "class" and val:
+                m = _LANG_CLASS_RE.search(val)
+                if m:
+                    return m.group(1).lower()
+        return ""
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "pre":
+            # 코드 블록 시작. 언어를 잡아두고 버퍼를 연다(중첩은 깊이로만 추적).
+            if self._pre_depth == 0:
+                self._pre_buf = []
+                self._pre_lang = self._lang_from_attrs(attrs)
+            self._pre_depth += 1
+        elif tag == "code":
+            if self._pre_depth > 0:
+                # <pre> 안의 <code>는 코드 언어 힌트만 보강(텍스트는 handle_data가 모음).
+                if not self._pre_lang:
+                    self._pre_lang = self._lang_from_attrs(attrs)
+            else:
+                self._out.append("`")  # 인라인 코드 시작
+                self._in_inline_code = True
+        elif self._pre_depth == 0:
+            # 코드 밖에서만 구조 마크업을 적용한다(코드 안에서는 순수 텍스트만).
+            if tag in ("p", "div"):
+                self._out.append("\n\n")
+            elif tag == "br":
+                self._out.append("\n")
+            elif tag == "li":
+                self._out.append("\n- ")
+            elif tag in ("strong", "b"):
+                self._out.append("**")
+            elif tag in ("em", "i"):
+                self._out.append("*")
+            elif tag == "blockquote":
+                self._out.append("\n\n> ")
+            elif re.fullmatch(r"h[1-6]", tag):
+                self._out.append("\n\n" + "#" * int(tag[1]) + " ")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "pre":
+            self._pre_depth -= 1
+            if self._pre_depth == 0:
+                # 모은 코드 텍스트를 펜스로 감싸 출력한다. 앞뒤 개행은 정리.
+                code = "".join(self._pre_buf).strip("\n")
+                fence = f"```{self._pre_lang}" if self._pre_lang else "```"
+                self._out.append(f"\n\n{fence}\n{code}\n```\n\n")
+                self._pre_buf = []
+                self._pre_lang = ""
+        elif tag == "code" and self._pre_depth == 0 and self._in_inline_code:
+            self._out.append("`")
+            self._in_inline_code = False
+        elif self._pre_depth == 0:
+            if tag in ("strong", "b"):
+                self._out.append("**")
+            elif tag in ("em", "i"):
+                self._out.append("*")
+            elif tag in ("p", "div", "blockquote") or re.fullmatch(r"h[1-6]", tag):
+                self._out.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        # <pre> 안이면 코드 버퍼로, 아니면 일반 출력으로 보낸다.
+        # (구문강조 <span> 등은 start/end 태그가 무시되므로 그 안 텍스트만 이리로 온다.)
+        if self._pre_depth > 0:
+            self._pre_buf.append(data)
+        else:
+            self._out.append(data)
+
+    def result(self) -> str:
+        """누적된 조각을 합치고 과도한 빈 줄을 정리해 반환한다."""
+        text = "".join(self._out)
+        text = re.sub(r"\n{3,}", "\n\n", text)  # 빈 줄 3개 이상 → 2개
+        text = re.sub(r"[ \t]+\n", "\n", text)  # 줄 끝 공백 제거
+        return text.strip()
+
+
+def html_to_markdown(html: str) -> str:
+    """Stack Overflow Body HTML을 펜스 마크다운으로 변환한다(chunk_code_aware의 상류).
+
+    Args:
+        html: SO Body 등 HTML 문자열. 비면 빈 문자열.
+
+    Returns:
+        코드 블록이 ```lang ... ```로 보존된 마크다운. 이 결과를 chunk_code_aware에
+        넘기면 코드 원자성을 유지한 청크가 나온다.
+    """
+    if not html or not html.strip():
+        return ""
+    parser = _SOHtmlToMarkdown()
+    parser.feed(html)
+    parser.close()
+    return parser.result()
 
 
 def _iter_segments(text: str) -> Iterator[tuple[str, str]]:

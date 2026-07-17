@@ -15,7 +15,7 @@ from pathlib import Path
 _ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_ROOT / "scripts"))
 
-from coding_corpus import chunk_code_aware  # noqa: E402
+from coding_corpus import chunk_code_aware, html_to_markdown  # noqa: E402
 
 
 def _content_lines(text: str) -> set[str]:
@@ -127,3 +127,71 @@ def test_chunk_roundtrip_completeness_mixed():
     chunks = chunk_code_aware(text, max_chars=120)
     all_lines = _content_lines("\n".join(chunks))
     assert _content_lines(text).issubset(all_lines)
+
+
+# ════════════════════════════════════════════════════════
+# html_to_markdown — SO Body HTML → 펜스 마크다운
+# ════════════════════════════════════════════════════════
+def test_html_empty_returns_empty():
+    assert html_to_markdown("") == ""
+    assert html_to_markdown("   ") == ""
+
+
+def test_html_paragraph_and_code_block():
+    html = "<p>리스트를 뒤집습니다.</p><pre><code>x = [1, 2]\nx.reverse()</code></pre>"
+    md = html_to_markdown(html)
+    assert "리스트를 뒤집습니다." in md
+    assert "```\nx = [1, 2]\nx.reverse()\n```" in md
+
+
+def test_html_language_detection_from_class():
+    html = '<pre class="lang-python s-code-block"><code>print(1)</code></pre>'
+    md = html_to_markdown(html)
+    assert "```python\nprint(1)\n```" in md
+
+
+def test_html_inline_code_becomes_backticks():
+    md = html_to_markdown("<p>내장 함수 <code>list()</code>를 씁니다.</p>")
+    assert "`list()`" in md
+
+
+def test_html_entities_restored_in_code():
+    # &lt; &gt; &amp; 가 실제 <, >, & 로 복원되어 코드가 정확해야 한다.
+    html = "<pre><code>if a &lt; b and b &gt; 0 &amp;&amp; c:</code></pre>"
+    md = html_to_markdown(html)
+    assert "if a < b and b > 0 && c:" in md
+
+
+def test_html_strips_syntax_highlight_spans():
+    # SO 구문강조 <span>은 제거하되 그 안 텍스트(def, f)는 살려야 한다.
+    html = (
+        '<pre><code><span class="hljs-keyword">def</span> '
+        '<span class="hljs-title">f</span>():\n    return 1</code></pre>'
+    )
+    md = html_to_markdown(html)
+    assert "def f():" in md
+    assert "return 1" in md
+    assert "span" not in md  # 태그 흔적이 남지 않아야 한다
+
+
+def test_html_unordered_list():
+    md = html_to_markdown("<ul><li>슬라이싱</li><li>reversed()</li></ul>")
+    assert "- 슬라이싱" in md
+    assert "- reversed()" in md
+
+
+def test_html_then_chunk_integration_preserves_code():
+    # 실제 SO 답변에 가까운 Body → 마크다운 → 청킹까지 코드가 온전히 살아남는다.
+    html = (
+        "<p>세 가지 방법이 있습니다.</p>"
+        '<pre class="lang-python"><code>import os\n'
+        "def reverse_list(items):\n    return items[::-1]</code></pre>"
+        "<p>가장 간단한 방법은 슬라이싱입니다.</p>"
+    )
+    md = html_to_markdown(html)
+    chunks = chunk_code_aware(md, max_chars=1500)
+    joined = "\n".join(chunks)
+    assert "import os" in joined
+    assert "def reverse_list(items):" in joined
+    assert "return items[::-1]" in joined
+    assert "```python" in joined
