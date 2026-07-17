@@ -3244,7 +3244,9 @@ QA #43(깨진 Bash 명령을 못 고치고 14회·62초 반복)의 근본 방어
 
 **OKKY 본격 적재 + 코딩 테넌트 활성화 = 완료 (2026-07-18).** run_ingest 증분저장 리팩토링(질문 20개마다 스크랩→임베딩→저장, 장시간 실패 시 진행분 보존). **본격 스크랩: tech Q&A 3000건 → okky 1,834청크**(최신질문 미답변 다수 제외). 리랭커 검증 **5/8**(파일럿 4/8→개선, react상태관리 rr=0.958 커버, 정확매칭 0.958~1.000, 경계선 스프링0.227·PDF0.241). OKKY 한국어 네이티브라 SO보다 깨끗.
 **전용 코딩 테넌트 신설(사용자 결정 — default 혼합보다 정확).** `config/tenants.yaml`에 `coding`(kowiki·sample·okky·so-pilot, key nexus-coding-key-001, internal-only) 추가. **전용↔범용 전환은 목록 수정+재시작만(재적재 불요)**. 배포: docker cp(백업 .bak.pre-coding)+nexus-web 재시작. **e2e: coding 테넌트 "자바 내부 클래스"→정답(okky접근)·"수도"→서울(kowiki접근), default "자바"→base only(okky 격리 확인)**. citation off라 sources 미표시나 주입은 리랭커경로 실측 확인. 이중방어(테넌트 allowed_sources DB필터 + 리랭커 관련도).
-**상태: 코딩 RAG(OKKY 한국어+SO 영어) 코딩모드로 LIVE.** 후속(비차단): okky-pilot(119) 정리(orphan, DELETE) / 커버리지 위해 OKKY 추가 스크랩 / SO so-pilot→so 정규화(선택) / min_score 튜닝(경계선). 상용 전환 시 coding 테넌트에서 okky 제거 + DELETE source LIKE 'okky%'.
+**🔴 OKKY 403 차단 — 확대 중단(2026-07-18).** 3000건+ 스크랩 후 OKKY가 **status=403으로 스크래핑 차단**(1.2초 rate-limit 준수했음에도 봇보호 발동). robots의 AI크롤러 명시 + 403 = OKKY가 대량수집을 원치 않음이 실증. **봇차단 우회는 윤리·법적으로 부적절**이라 OKKY 스크래핑 중단. 증분·이어받기 코드(skip-existing·start_page, 커밋 0e3f78a)는 넣었으나 차단으로 실사용 보류. **OKKY는 현 1,834청크로 고정** — 더 필요 시 eBrain 정식 허가/API가 유일 깨끗 경로. **확대는 SO(CC BY-SA 라이선스·차단없음·덤프 이미 보유)로 전환 권장**: so-pilot(2008년대 500k행 샘플)을 더 넓은 SO 적재(더 많은 행/최신, SQLite 스테이징)로 확대.
+
+**상태: 코딩 RAG(OKKY 한국어 1834+SO 영어 26971) 코딩모드로 LIVE.** OKKY 확대는 403으로 차단·중단. 후속(비차단): okky-pilot(119) 정리(orphan, DELETE) / 커버리지 위해 OKKY 추가 스크랩 / SO so-pilot→so 정규화(선택) / min_score 튜닝(경계선). 상용 전환 시 coding 테넌트에서 okky 제거 + DELETE source LIKE 'okky%'.
 
 ### 코딩 학습 데이터 계획 — 파킹(향후 코딩 전용 대비) (2026-07-17)
 
