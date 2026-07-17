@@ -3228,6 +3228,59 @@ QA #43(깨진 Bash 명령을 못 고치고 14회·62초 반복)의 근본 방어
 **⛔ 사용자 결정 대기(자율 진행 불가 — FABLE5 지목).** ①**리랭커 112 복구**(bge-reranker-v2-m3-ko): 인프라+전 테넌트 게이팅 동작변경이나 **kowiki 회귀까지 고치는 원상복구**(강한 근거). ②**SO→OKKY 우선순위 변경**: 원 지시 "SO 먼저" 명시적 번복이라 에이전트 재량 밖. ③OKKY 스크래핑 개시(ToS/법적). ④so-pilot 정리(DELETE WHERE source='so-pilot'+VACUUM — 현재 tenant미바인딩 경로 노출, 측정 끝나면 정리).
 **자율로 안 한 것**: 리랭커 배포/enabled 변경 안 함, SO중단·OKKY전환 안 함, so-pilot 유지(측정용). 전부 읽기전용 측정만 수행.
 
+### 코딩 학습 데이터 계획 — 파킹(향후 코딩 전용 대비) (2026-07-17)
+
+> 사용자 결정: 지금 학습은 안 함(RAG 우선). 단 **데이터·계획은 보존** — 범용 A.X를 이후 코딩 전용으로 쓸 일이 생길 것으로 예상. 소스별 고려를 미리 해둔다.
+
+**핵심 — 데이터 손실 없음(공유 상류).** RAG 적재용 정제 코퍼스(`prepare_stackoverflow.build_entries` 등 = 질문+채택답변 결합·코드인지 청킹·provenance)가 **학습의 상류이기도** 하다. 같은 큐레이션 데이터 → 두 싱크(RAG 임베딩 / 학습 JSONL). 즉 지금 RAG 작업이 학습 데이터도 축적한다. 코딩 전용 필요 시 얇은 변환기(`coding_dataset.py`, 미착수)만 붙이면 착수.
+
+**트리거(언제 학습을 꺼내나).** ①범용 A.X → 코딩 전용 모델 필요 시. ②"지식은 RAG로 줘도 코딩 추론·실력이 약함" 병목 관찰 시(RAG는 사실만 주고 추론은 못 키움 — 그건 학습/베이스교체만 레버).
+
+**포맷(사양 §18.2).** `{id, category:"domain", messages:[{role:user, content:질문},{role:assistant, content:채택답변}], metadata:{source,url,license,score,difficulty}}`. 변환기가 정제 코퍼스를 이 형태로.
+
+**소스별 고려(각각).**
+- **SO(영어)**: 코딩 추론/패턴 학습엔 **코드 위주**가 유효(영어 산문은 한국어 답변 학습엔 마찰). 라이선스 CC BY-SA → 학습 시 share-alike 유의.
+- **OKKY(한국어)**: **한국어 코딩 스타일·설명 학습에 최적**(A.X 약점 정조준). ToS·저작권 유의.
+- **GitHub(코드)**: 코드 자체 → 코딩 능력 직접 학습. 라이선스(permissive vs 무관) 유의.
+
+**주의.** catastrophic forgetting(별도 어댑터 + 배포 전 eval 게이트로 비코딩 회귀 확인) / QLoRA on B200(trainer.py HTTP, 수만~수십만 고품질 instruction이면 충분, 양보다 큐레이션) / 세그먼트별 베이스([[project_segment_model_strategy]] 대학=Gemma4·삼진어묵=ExaOne·일반=Qwen).
+
+**현 상태.** 미착수·파킹. RAG 파이프라인이 데이터를 축적 중이므로 착수 시점에 변환기만 추가.
+
+### 리랭커 복구 배포 완료 + kowiki 회귀 수리 확인 (2026-07-17)
+
+**배포(사용자 승인, CPU).** 112 systemd `nexus-embedding`을 리랭커 서버로 교체 완료. ①백업(embedding_server.py.bak.pre-rerank + nexus-embedding.service.bak) ②bge-reranker-v2-m3-ko 다운로드+CPU 로드(31초)·테스트(ko-en 0.997/0.0) ③수정본 embed_server.py 업로드(fp16→fp32 조건부 + **EMBED_HOST env**) ④unit에 env(EMBED_MODEL=로컬e5·EMBED_DEVICE=cpu·RERANK_DEVICE=cpu·RERANK_ENABLED=1·**EMBED_HOST=0.0.0.0**) ⑤재시작. **함정 1건 자초·즉수리**: 리포 embed_server.py가 127.0.0.1 바인딩이라 LAN 끊김(웹은 192.168.21.112:8002 호출) → EMBED_HOST env로 0.0.0.0 재배포 복구. LIVE: /health reranker=dragonkue/bge-reranker-v2-m3-ko·device=cpu, /v1/rerank 200[0.9975,0.0002], /v1/embed 200.
+- 하네스 auto 분류기가 sudo 프로덕션 restart를 차단 → 사용자 모드 변경 후 실행됨.
+- 커밋 안 됨(embed_server.py 로컬 수정 = fp16/fp32 + EMBED_HOST). scratchpad에 배포 스크립트.
+
+**리랭커 경로 실측 = kowiki 회귀 수리 확인.** search(min_sim0.6·top20)→/v1/rerank→min_score0.3 재현: **kowiki 4/4 주입**(광합성 rr=0.989→"광합성"·바흐 1.000→"요한 제바스티안 바흐"[맞는 인물]·측우기 0.999·세종 0.999) = FABLE5 1차 수용기준 충족. **so-pilot 6/10 주입, 깨끗한 분리**(정답 고신뢰 주입 Decimal변환1.0·정렬0.997·SQL0.906·문자열숫자0.983·파일0.860 / 무관 rr≈0.0 배제 — e5가 통과시키던 "Xcode" 노이즈 차단). 교차언어 동전던지기 해소. combine-first 성립 증명.
+
+**웹 활성화 완료 + M7.** nexus_config.112.yaml(bind-mount) rerank.enabled false→true(백업 .bak.pre-rerank-enable) + nexus-web 재시작 → health 200, 광합성·바흐 정답(sources=0은 citation off라 API 미표시, 주입은 리랭커경로 실측으로 확인). **전 테넌트 RAG가 폴백→리랭커로 전환됨(LIVE).** M7 지연 실측: **CPU rerank(20후보) p50≈1948ms(~2초)**, embed 255ms. 지식질의(~11초)에 ~18% 증가 — 수용가능하나 무시못함. 필요시 rerank_fetch_k 20→10 반감(재현율 손실).
+
+**리랭커 복구 = 완료.** kowiki 회귀 수리(광합성·바흐 회복), 교차언어 정밀분리(combine-first 성립), 웹 전환까지. **후속(비차단)**: ①embed_server.py 로컬수정(fp16/fp32+EMBED_HOST) 커밋 ②so-pilot 정리 or SO트랙 계속(사용자 결정) ③citation 활성(agenthub 스키마 확인 후)·관측성 로깅 ④엔티티게이팅 \d 코딩영향(정규식 등 여전히 게이트) ⑤라우팅 도달률(M9) ⑥SO↔OKKY 순서(사용자). ⑦rerank 지연 튜닝(선택).
+
+### 리랭커 복구 준비(리뷰용) — 진단 + 계획 (2026-07-17, 배포 미실행)
+
+**진단(112 읽기전용 SSH).** ①112:8002 = systemd `nexus-embedding` → `/opt/nexus-gpu/embedding_server.py`(**구버전, 리랭커 라우트 없음, e5를 `device="cpu"`로 로드**, 4주 가동). 라우트=/v1/embed·/health만. ②리랭커 코드는 리포 `scripts/embed_server.py`에 완비(커밋 1b091e0)이고 112에도 동기화됨(`/home/idino/nexus-app/scripts/embed_server.py`, rerank 5곳)이나 **실행본이 아님**. ③**bge-reranker-v2-m3-ko 미다운로드**(HF 캐시 비어있음). e5는 로컬(/opt/nexus-gpu/models/e5-large) 있음. ④**GPU 5090 29/32.6GB 사용 — VLLM::EngineCore(112 로컬 vLLM 상주)**. 여유 3.5GB뿐(그래서 e5가 CPU). llama-server(8003, Qwen3.5-4B)도 상주. ⑤서빙 venv(/opt/nexus-gpu/.venv)에 CrossEncoder 있음(sentence_transformers 5.4.0).
+
+**결정: 리랭커 CPU 배치(사용자 확정).** GPU는 vLLM 점유라 CPU가 안전(현 e5처럼, OOM 위험 0). 지연은 M7로 실측.
+
+**코드 조정(리뷰용, 미커밋·미배포).** `scripts/embed_server.py`: `RERANK_DEVICE` env 신설(기본=EMBED_DEVICE) + **CPU면 fp32/CUDA면 fp16 조건부**(기존 fp16 하드코딩은 CPU에서 오류·저속). py_compile OK, ruff clean.
+
+**배포 절차(승인 후).** ①bge-reranker-v2-m3-ko 112 다운로드(~600MB, 준비단계) ②systemd `nexus-embedding.service` ExecStart를 리랭커 서버(리포 embed_server.py)로 교체 + env: EMBED_MODEL=/opt/nexus-gpu/models/e5-large·EMBED_DEVICE=cpu·RERANK_DEVICE=cpu·RERANK_ENABLED=1 ③`systemctl daemon-reload && restart` ④`GET /health`에 reranker 필드 + `POST /v1/rerank` 200 확인 ⑤`nexus_config.112.yaml` rerank.enabled:true(bind-mount) ⑥**kowiki e2e: 광합성·바흐 주입 회복 = 1차 수용기준** + 메타질문·BWV543 오답차단 유지 ⑦M7 지연·M2 ko-en 분리도 실측. **롤백**: ExecStart 원복(구 embedding_server.py) + rerank.enabled:false(코드무변경, fail-safe 검증됨).
+
+**리스크.** CPU 리랭커 지연(M7 미측정) / bge-reranker-v2-m3-ko의 ko질의↔en문서 효능 미검증(M2) / 구 embedding_server.py는 e5 로컬경로·CPU라 리포본 배포 시 EMBED_MODEL·DEVICE env로 동일 동작 보장 필요.
+
+### FABLE5 최대-rigor 최종 청사진 + M0 드리프트 규명 (2026-07-17)
+
+**M0 임베딩 드리프트 = 없음(cos=1.00000).** 저장 kowiki 벡터 vs 원문 재임베딩 코사인 5샘플 전부 1.00000 → 112 이관 e5 드리프트 없음. **전 임계(0.84·0.75·0.6)·SO 파일럿 수치 좌표계 유효**. FABLE5 최우선 우려(0-1 드리프트) 해소. → 좌표계 유효한데 바흐 0.827<무관상한0.83이면 **코사인 단일임계로 kowiki조차 분리 불가 = 리랭커 유일경로 확정**(0-2 논증 활성). 단 0.857(주석)→0.827(실측) 차이는 드리프트 아닌 질의문구 차(내 "요한 제바스티안 바흐"가 "요한 크리스티안 바흐"=다른 인물 매칭).
+
+**FABLE5 청사진 핵심.** 의사결정: **D1 리랭커 복구는 지금 결정 가능**(kowiki 검증구성 복원=독립근거, SO와 무관), D2 SO트랙은 측정 완료까지 불가, D4 SO↔OKKY 순서는 에이전트 재량 밖. 측정 의존순서: **M9 라우팅도달률(3라운드째 공백, 전 트랙 게이트)→M0(완료)→M1 B200리랭커잔존(터널로 미도달 확인)→M2 ko-en분리도→M4 recall@20→M5 빈손A/B→M6 엔티티게이팅→M8 전량재캘리(적재 후만)**. 구현순서: Phase A(리랭커 전 — A1 관측성[최우선, 게이팅경로 로깅으로 404류 무언강등 재발방지]·A3 측정스크립트·A4 엔티티게이팅 source별 온오프 v2M4·A5 so-pilot 처리) → Phase B(리랭커 배포[승인]→kowiki e2e 회복=1차수용기준) → Phase C(SO트랙 v2 Phase1) → Phase D(eval).
+**"완벽한 구현" 수용기준**: kowiki무회귀(광합성·바흐 회복∧메타·BWV543 오답차단유지∧지연상한) + 코딩eval(실로그≥30, 명문화 판정룰) + 빈손경로무해(M5) + 교차언어 실측문서화 + 관측성 + 운영위생.
+**승인경계**: 필수승인=리랭커배포·SO전량적재·tenants활성화·SO↔OKKY순서·OKKY스크래핑·학습배포·so-pilot삭제·커밋. 자율=읽기전용측정 전부+Phase A 코드작성·로컬테스트(운영반영 전까지).
+**청사진 리스크**: M9 3라운드 공백(도달률 낮으면 후반부 가치 붕괴), ko-en 리랭커효능 M2까지 가설, 파일럿→전량 전이성(M8 방어이나 비용비대칭), SO덤프 약관 미확인.
+**FABLE5 지적 미검증승격 4건**: 0-1 드리프트(M0로 해소), 0-2 관련<무관 겹침(M0 후 논증가능), 0-3 SO수치 라운드간 불일치(측정조건 명시필요), 0-4 "~5유용" 판정룰 부재.
+
 **최종 교정(전체 적재 26,971청크 완료 후).** 부분데이터 4/10이 **전체 커버리지에선 7/10 주입**으로 상향(커버리지↑ → 0.84 넘는 매칭 증가). 주입 7개 중 ~5개 정확·유용(C#변환·SQL중복제거·문자열→숫자 TryParse·null체크·팩토리얼인접), 1개 명백노이즈(정규식→"Xcode 숨은기능" 0.841 경계통과), 1개 부분(파일쓰기→C++ open). 반대로 정답이 드롭된 경우도(리스트정렬→"sort a list" 0.838<0.84). **결론 정밀화: SO RAG는 무가치 아니라 "강한 매칭엔 유효, 0.84 경계선에선 양방향 불안정(노이즈통과+정답드롭)"** — e5 교차언어 유사도가 0.83~0.87에 뭉쳐 0.84 게이트가 동전던지기. → 리랭커(노이즈배제 정밀도)+번역/재캘리(정답회수 재현율)로 견실화 가능. 이는 리랭커·번역이 보완재라는 FABLE5 지적과 정합. **파일럿 적재 EXIT 0, 26971청크 상주(so-pilot).**
 
 **API 스모크 테스트 셋(신규).** scripts/api_smoke_test.py — URL http://192.168.21.112:8600, Bearer nexus-b200-test-key-001. health·auth차단·인사·지식·도구·문서생성+다운로드·업로드분석 8케이스. `python -m scripts.api_smoke_test [--only ...]`.
