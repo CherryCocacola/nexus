@@ -3236,7 +3236,11 @@ QA #43(깨진 Bash 명령을 못 고치고 14회·62초 반복)의 근본 방어
 
 **스크래퍼 코어 완성·검증(2026-07-17).** OKKY=Next.js App Router(RSC) 앱 — 콘텐츠가 일반 HTML 아닌 `self.__next_f` RSC 페이로드(정형 JSON: title·text(HTML)·tags·selectedAnswerId·answers.content[]{id,text,voteCount,selected}). /api는 robots 차단이라 **페이지 RSC 파싱이 정합**. 신규 `scripts/prepare_okky.py`: rsc_payload·parse_question·build_combined_document(질문+채택+고득점 결합, SO 대칭)·build_entries(source='okky', section=q{qid} PK, provenance url/license/answer_ids)·fetch_question(robots 준수 rate-limit 1.2초, qid=URL 권위값)·--probe. `coding_corpus`(html_to_markdown·청커) 재사용. 테스트 `test_prepare_okky.py`(5, 합성 RSC)·실페이지 probe(381655 채택답변 결합·1419849 tags추출) 검증. 5 passed, ruff clean.
 - **관찰**: OKKY는 투표 희박(voteCount 0 흔함) → min_answer_votes 낮게(0) or 채택 위주 권장.
-- **미결(적재)**: 열거(sitemap.xml → qid) + rate-limit 벌크 스크랩 + run_ingest(임베딩+UPSERT, prepare_stackoverflow 대칭 가드) + tenants 'okky' 활성화. 리랭커 배포됨(교차언어 무관, OKKY 한국어라 e5 네이티브 매칭 더 유리).
+- 커밋 5bae3ca(스크래퍼 코어).
+
+**OKKY 소규모 파일럿 완료·검증 (2026-07-17).** 열거·적재 배선 추가: `iter_listing_ids`(sitemap은 상위nav만이라 무용 → **/questions/tech 목록 RSC에서 "id":N,"title": 열거**, 20개/페이지, 1페이지는 파라미터없는 URL, 총 258,923건), `run_ingest`(열거→스크랩(rate-limit 1.2초)→build_entries→임베딩:8002→UPSERT source, prepare_stackoverflow 대칭), CLI(--board/--pages/--limit/--source/--dry-run/--pg/--embed-url). dry-run(15건→16엔트리) 검증. **실 파일럿: tech Q&A 100건 스크랩→stored=119청크(source='okky-pilot')**.
+- **리랭커 검증(한국어 네이티브 매칭)**: 4/8 주입, 정확매칭 rr 0.996~1.000(자바내부클래스1.0·eclipse0.997·아키텍처0.996·이펙티브자바0.813). 드롭 4개는 100건 파일럿에 해당 토픽 부재(rr 0.0 정확 드롭, 노이즈 아님). **"OKKY(한국어)>SO(영어) for 한국사용자" 실측 확인** — 교차언어 브릿지 불요, e5 네이티브 매칭 깨끗.
+- **미결**: 커버리지 위해 벌크 스크랩(수천 건) + tenants 코딩테넌트 'okky' 활성화. min_votes=0(OKKY 투표 희박). 상용 전환 시 DELETE WHERE source='okky*'.
 
 ### 코딩 학습 데이터 계획 — 파킹(향후 코딩 전용 대비) (2026-07-17)
 
