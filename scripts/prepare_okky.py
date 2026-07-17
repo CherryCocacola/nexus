@@ -288,7 +288,8 @@ def iter_listing_ids(board: str, max_pages: int) -> list[int]:
     for page in range(1, max_pages + 1):
         time.sleep(_RATE_DELAY)
         # 1페이지는 파라미터 없는 기본 URL이 SSR로 목록을 렌더한다(?page=1은 빈 응답 가능).
-        url = f"{_BASE}/questions/{board}" if page == 1 else f"{_BASE}/questions/{board}?page={page}"
+        base = f"{_BASE}/questions/{board}"
+        url = base if page == 1 else f"{base}?page={page}"
         r = httpx.get(url, headers={"User-Agent": _UA}, timeout=20, follow_redirects=True)
         if r.status_code != 200:
             break
