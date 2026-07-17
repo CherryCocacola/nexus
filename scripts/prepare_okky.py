@@ -275,17 +275,17 @@ def run_probe(args: argparse.Namespace) -> int:
     return 0
 
 
-def iter_listing_ids(board: str, max_pages: int) -> list[int]:
+def iter_listing_ids(board: str, max_pages: int, start_page: int = 1) -> list[int]:
     """기술 Q&A 목록(/questions/{board}?page=N)에서 질문 id를 열거한다(robots 허용).
 
     각 페이지 RSC에서 "id":N,"title": 패턴으로 질문 항목 id를 뽑는다(20개/페이지).
-    rate-limit을 준수하며 max_pages까지 수집한다.
+    rate-limit을 준수하며 start_page부터 max_pages만큼 수집한다(이어받기용 start_page).
     """
     import httpx
 
     ids: list[int] = []
     seen: set[int] = set()
-    for page in range(1, max_pages + 1):
+    for page in range(start_page, start_page + max_pages):
         time.sleep(_RATE_DELAY)
         # 1페이지는 파라미터 없는 기본 URL이 SSR로 목록을 렌더한다(?page=1은 빈 응답 가능).
         base = f"{_BASE}/questions/{board}"
@@ -315,33 +315,39 @@ async def _embed_texts(base_url: str, texts: list[str]) -> list[list[float]]:
         return r.json()["embeddings"]
 
 
+async def _embed_and_store(store, embed_url: str, entries, batch_size: int) -> int:
+    """엔트리 목록을 배치 임베딩해 UPSERT하고 적재 수를 돌려준다."""
+    stored = 0
+    for i in range(0, len(entries), batch_size):
+        batch = entries[i : i + batch_size]
+        try:
+            embs = await _embed_texts(embed_url, [e.content for e in batch])
+        except Exception as e:
+            logger.warning("임베딩 실패 배치: %s", e)
+            continue
+        for entry, emb in zip(batch, embs, strict=True):
+            await store.add(replace(entry, embedding=tuple(emb)))
+            stored += 1
+    return stored
+
+
 async def run_ingest(args: argparse.Namespace) -> int:
-    """열거 → 스크랩(rate-limit) → 결합 → 임베딩 → tb_knowledge(source) UPSERT.
+    """열거 → (질문 배치마다) 스크랩 → 결합 → 임베딩 → tb_knowledge UPSERT.
 
-    소규모 파일럿용. --dry-run이면 스크랩·결합까지만(임베딩·DB 없음). source는 파일럿
-    격리를 위해 'okky-pilot' 등으로 지정 가능(상용 전환 시 source로 제거).
+    **증분 저장**: 질문 20개 단위로 스크랩→임베딩→저장을 반복해, 장시간 스크랩 중
+    실패해도 이미 처리한 배치는 보존한다(재실행은 UPSERT라 멱등, 스크랩만 재수행).
+    --dry-run이면 스크랩·결합까지만(임베딩·DB 없음). source는 격리용 지정 가능
+    (상용 전환 시 DELETE WHERE source='okky*').
     """
-    ids = iter_listing_ids(args.board, args.pages)
-    if args.limit:
-        ids = ids[: args.limit]
-    logger.info("스크랩 대상 %d개 질문 (rate-limit %.1f초/건)", len(ids), _RATE_DELAY)
+    ids = iter_listing_ids(args.board, args.pages, args.start_page)
+    logger.info("열거 %d개 질문(page %d~, delay %.1fs)", len(ids), args.start_page, _RATE_DELAY)
 
-    questions: list[dict[str, Any]] = []
-    for n, qid in enumerate(ids, 1):
-        q = fetch_question(qid)
-        if q:
-            questions.append(q)
-        if n % 20 == 0:
-            logger.info("스크랩 %d/%d", n, len(ids))
-
-    entries = build_entries(
-        questions,
-        source=args.source,
-        min_answer_votes=args.min_votes,
-        require_code=args.require_code,
-    )
-    logger.info("엔트리 %d개 생성(질문 %d, source=%s)", len(entries), len(questions), args.source)
     if args.dry_run:
+        if args.limit:
+            ids = ids[: args.limit]
+        questions = [q for qid in ids if (q := fetch_question(qid))]
+        entries = build_entries(questions, source=args.source,
+                                min_answer_votes=args.min_votes, require_code=args.require_code)
         print(f"[dry-run] questions={len(questions)} entries={len(entries)} source={args.source}")
         return 0
 
@@ -350,18 +356,28 @@ async def run_ingest(args: argparse.Namespace) -> int:
     pool = await asyncpg.create_pool(args.pg, min_size=1, max_size=3)
     store = KnowledgeStore(pg_pool=pool)
     await store.ensure_schema()
-    stored = 0
+    # 이어받기(증분): 이미 적재한 질문은 스킵해 재스크랩을 피한다.
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT DISTINCT metadata->>'question_id' AS qid FROM tb_knowledge WHERE source=$1",
+            args.source,
+        )
+    existing = {int(r["qid"]) for r in rows if r["qid"]}
+    ids = [i for i in ids if i not in existing]
+    if args.limit:
+        ids = ids[: args.limit]
+    logger.info("신규 스크랩 대상 %d개 (기존 %d개 스킵)", len(ids), len(existing))
+    stored = scraped = 0
+    id_batch = 20  # 질문 20개마다 스크랩→저장(증분)
     try:
-        for i in range(0, len(entries), args.batch_size):
-            batch = entries[i : i + args.batch_size]
-            try:
-                embs = await _embed_texts(args.embed_url, [e.content for e in batch])
-            except Exception as e:
-                logger.warning("임베딩 실패 배치 %d: %s", i, e)
-                continue
-            for entry, emb in zip(batch, embs, strict=True):
-                await store.add(replace(entry, embedding=tuple(emb)))
-                stored += 1
+        for i in range(0, len(ids), id_batch):
+            chunk = ids[i : i + id_batch]
+            questions = [q for qid in chunk if (q := fetch_question(qid))]
+            scraped += len(chunk)
+            entries = build_entries(questions, source=args.source,
+                                    min_answer_votes=args.min_votes, require_code=args.require_code)
+            stored += await _embed_and_store(store, args.embed_url, entries, args.batch_size)
+            logger.info("진행: 스크랩 %d/%d, 적재 %d청크", scraped, len(ids), stored)
     finally:
         await pool.close()
     logger.info("완료: %d청크 적재(source=%s)", stored, args.source)
@@ -374,6 +390,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--probe", type=int, help="질문 1건 파싱 검증(qid)")
     parser.add_argument("--board", default="tech", help="Q&A 게시판(tech/career/qna-etc)")
     parser.add_argument("--pages", type=int, default=5, help="열거할 목록 페이지 수(20개/페이지)")
+    parser.add_argument("--start-page", type=int, default=1, help="열거 시작 페이지(이어받기)")
     parser.add_argument("--limit", type=int, default=None, help="스크랩 질문 상한")
     parser.add_argument("--min-votes", type=int, default=1, help="비채택 답변 최소 추천")
     parser.add_argument("--require-code", action="store_true", help="코드 블록 있는 질문만")
