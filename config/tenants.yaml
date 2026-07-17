@@ -53,6 +53,26 @@ tenants:
       consumer: agenthub-dotnet
       issued: "2026-07-05"
 
+  # 코딩 어시스트 모드 — 코딩 지식 RAG(SO/OKKY) + 공개 지식. 팀 내부 전용.
+  # 전용/범용 전환은 아래 allowed_knowledge_sources 목록만 수정 + 웹 재시작(재적재 불필요):
+  #   범용+코딩 = [kowiki, sample, okky, so-pilot] / 순수 코딩 = [okky, so-pilot]
+  # OKKY는 사용자 저작물(재사용 라이선스 없음)로 내부 전용 — 상용 전환 시 이 목록에서
+  # okky 제거(+ DELETE FROM tb_knowledge WHERE source LIKE 'okky%'). 리랭커가 소스별 관련도
+  # 로 자동 선택하고, allowed_knowledge_sources가 DB-레벨 격리를 이중으로 보장한다.
+  - id: coding
+    name: Coding
+    description: 코딩 어시스트 모드 — SO/OKKY 코딩 RAG + 공개 지식(팀 내부 전용)
+    model_override: null
+    allowed_knowledge_sources:
+      - kowiki
+      - sample
+      - okky
+      - so-pilot
+    api_keys: ["nexus-coding-key-001"]
+    metadata:
+      usage: internal-only
+      note: "OKKY 내부전용·저작권 — 상용 전환 시 okky 제거"
+
   # 예시: A학교 — 공개 지식 + A학교 전용 교재
   # - id: school-a
   #   name: A학교
