@@ -3121,4 +3121,63 @@ QA #43(깨진 Bash 명령을 못 고치고 14회·62초 반복)의 근본 방어
 
 **durability(원복 fragility 근본 해소).** 진단: 112 빌드 컨텍스트(/home/idino/nexus-app)가 stale(오늘 청킹 수정 + 수 주간 docker cp분 누락) → Dockerfile 순진 재빌드는 회귀 위험. **안전 방식 채택**: 검증된 실행 컨테이너(e2e 통과 상태)를 `docker commit`으로 이미지化 → 회귀 위험 0으로 정합. 백업(구 이미지 prefix-backup-20260716_082558=54edca) + 구 컨테이너 stop·rename(롤백용) 후 새 이미지로 재생성. **결과**: nexus-web:latest=cc2a0fcd(스냅샷, 모든 수정 포함), 컨테이너가 이미지에서 부팅·restart=unless-stopped → 재생성돼도 수정 유지. 스모크 8케이스 전부 통과(청킹 upload_analyze DocumentProcess=1 포함). **주의**: commit-스냅샷이라 Dockerfile 재빌드 재현성은 별도 과제(빌드 컨텍스트 전수 정합 필요, 비긴급). docker run에 PG 비번 하드코딩은 commit이 env를 이미지에 캡처하므로 -e 불요(재노출 방지).
 
+---
+
+### 코딩 전반 RAG + 학습 데이터 — 설계 단계 (2026-07-17, 계획 확정 전·코드 미착수)
+
+> 이 섹션은 **설계·의사결정 기록**이다. 아직 코드를 쓰지 않았다. cmd 세션 유실 대비로 트레일을 남긴다.
+
+**요청.** 코딩 전반(Stack Overflow·OKKY·GitHub)을 RAG로 구축 + 학습 데이터로 가공. 사용자 결정: 방식=**RAG+학습 둘 다 병행**, 소스=**전부 포함**(OKKY 스크래핑·GitHub ⭐2000+ 라이선스 무관), 착수=**SO 먼저**.
+
+**딥리드로 파악한 통합 씸(실코드 확인).** ①`tb_knowledge`는 스키마 변경 불필요 — `source` 값(so/okky/github)으로 멀티코퍼스 구분(v7.0 §2.5.8·Ch15 사양 명시, v7.3 docingest 선례). ②검색 격리는 `allowed_sources`→DB-level `WHERE source=ANY()`. ③라우팅: KNOWLEDGE만 RAG 주입, `allowed_sources`는 `tenant.allowed_knowledge_sources`가 비면 None(전체)·차면 그 화이트리스트. ④`config/tenants.yaml` default·agenthub 모두 `[kowiki,sample]` 화이트리스트라 **'so' 미추가 시 코딩청크 제외**(자동 아님, 활성화엔 config 한 줄 필요). ⑤학습 포맷=사양 §18.2 `{id,category:"domain",messages,metadata}`(data_collector의 `{messages}`는 부분집합). QLoRA는 B200(trainer.py HTTP).
+
+**사양 이탈 플래그.** 코딩을 **학습(domain finetune)** 으로=사양 정합(v6.1 §18.2 "Domain: coding/DevOps"). 코딩을 **tb_knowledge RAG 코퍼스**로=**사양에 없음(확장)**. 금지 아님(멀티코퍼스 프레임이 source 추가 허용)이나 v7.x AMENDMENT로 문서화 필요.
+
+**FABLE5(fable) 적대 검토 = REVISE(조건부 GO). 코드검증된 결함:**
+- **C1(CRITICAL 무언 데이터유실)**: PK=`SHA256(source|title|section|chunk)`인데 SO 제목은 비유일 → 다른 질문이 같은 id로 UPSERT돼 덮어씀. Fix: `section=q{question_id}` 앵커링.
+- **C2(CRITICAL kowiki 열화)**: 계획 "build-index"는 no-op(`idx_knowledge_embed` 이미 존재+`IF NOT EXISTS`, 코드 DDL `lists=100` vs 운영 `lists=1000` 드리프트). 재인덱스 안 되면 센트로이드가 옛 kowiki 분포 고정→기존 질의 재현율 열화, DROP→재생성 창엔 seq scan 추락. Fix: `CREATE INDEX CONCURRENTLY`(lists≈rows/1000)→구DROP→RENAME + probes 재캘리 + 전후 kowiki 스모크(광합성·바흐).
+- **M1(MAJOR 목적 반쯤 봉쇄)**: `tool_keywords`(파일·file·코드베이스·수정해·Read )·`long_input_threshold=500`으로 대부분 코딩질의가 TOOL→RAG 미주입. "routing.py 무변경" 전제 붕괴.
+- **M2**: `split_into_chunks`가 코드블록 파괴+`buf=s[-max_chars:]`로 코드 앞부분 무언 폐기 → 코드 인지 청커 필요.
+- **M3**: 리랭커·임계(min_sim0.6/min_score0.3)가 한국어 kowiki 캘리브(리랭커 bge-…-ko). 한국어질의↔영어코드 분포 미검증 → 최악 "적재 성공·주입 0건". 활성화 전 파일럿 실측 필수.
+- **M4**: 엔티티게이팅 `\d{2,5}`가 "포트 8080"·"Python 3.12" 숫자로 관련청크 드롭(최악=주입 0건, 무회귀지만 가치감소).
+- **M5**: GitHub 무관=상업/특허 리스크로 기각 권고(SO는 CC BY-SA 표시의무, citation.enabled=false).
+- **M6**: `add_many` 순차단건+임베딩배치5 → 수백만청크=수일. 공유 :8002·공유 PG 부하 지속. Fix: executemany/COPY+배치상향+야간스로틀.
+- 누락: 코딩 eval세트·롤백절차·DB위생(백업/ANALYZE)·SO Posts.xml 속성기반 flat XML+ParentId 2-pass 페어링.
+
+**사용자 결정(FABLE5 후).** ①**계획 전면 재설계**. ②**GitHub 라이선스 무관 유지(리스크 감수)** — provenance로 라이선스 metadata 저장해 나중 분리 가능하게, 상업배포 전 법무검토 권고(책임선).
+
+**재설계 방향(가정 검증 우선 = 파일럿 게이트).** 대규모 적재를 뒤로 미루고 소규모 파일럿으로 M1·M3를 먼저 실측.
+- **Phase 0(진단·파일럿, 저비용·무회귀)**: 0a 라우팅 도달률(코딩질의 40~50개 분류 측정), 0b SO 1만청크 파일럿→한국어 코딩질의 20개로 유사도/리랭크 분포 실측, 0c 인프라 실측(실 lists·행수·디스크·임베딩 처리량). → 데이터 기반 RAG GO/조정/보류 판정.
+- **Phase 1(공용+SO 적재기)**: coding_corpus.py(코드인지 청커·provenance·언어태깅·중복제거+자체테스트), prepare_stackoverflow.py(속성 flat XML+ParentId 2-pass 페어링, PK q{id} 앵커링, executemany/COPY 벌크·야간스로틀), 재인덱스 절차(C2), 큐레이션 기준 확정(accepted OR score≥N — N 미정).
+- **Phase 2(활성화·게이팅)**: 파일럿 임계 반영, 엔티티게이팅 source예외(M4), tenants.yaml 'so' 추가(**default만** 권고, agenthub 별도), citation 활성(CC BY-SA), 코딩 eval 전후비교, 롤백절차.
+- **Phase 3(학습 트랙)**: coding_dataset.py(§18.2 포맷), QLoRA B200 별도어댑터+배포 eval게이트(catastrophic forgetting). Skeptic: 라우팅 봉쇄로 RAG 수혜 제한→학습 트랙 실질가치 클 수 있음, Phase0 결과로 우선순위 재조정.
+- **Phase 4/5(OKKY·GitHub, 후속)**: OKKY 정중 스크래퍼(ToS 미검토), GitHub ⭐2000+ 무관+provenance(법무검토 권고).
+
+**미해결(사용자/후속).** 큐레이션 N 임계값 / SO 덤프 입수경로·현행약관 / tenants 'so' 범위(default 권고) / 학습 vs RAG 우선순위(Phase0 데이터로).
+
+**FABLE5 v2 재검토 = 조건부 GO(재설계 불필요, 수렴).** 5조건 중 C2 충족·M1 충족(주의), C1·M3·M5 부분. 잔여는 전부 **문안 개정 수준**(구조 유지). 착수 전 반영 4건 → v2.1:
+- **N1(CRITICAL 잔여 PK유실)**: `section=q{qid}` 앵커링해도 한 질문에 답변 다수면 같은 id로 덮어씀. **해결책 채택 = 질문+채택답변+고득점답변을 단일 문서로 결합 후 코드인지 청킹**(답변충돌 원천소멸+Q&A맥락 유지). 복수답변 fixture 테스트 필수.
+- **N2(MAJOR 파일럿 임계 전이성)**: 1만 청크 유사도 분포 ≠ 수백만 분포. Phase 0b를 **GO/NO-GO 전용**으로 강등, **최종 임계는 전량 적재+재인덱스 후 재실측**으로 이원화(Phase 2 문안).
+- **N4(MAJOR citation 전역)**: `knowledge_rag.citation.enabled`는 source 구분 없는 전역 스위치 → 켜면 kowiki 헤더에도 [출처N] + **agenthub(.NET) 응답에 sources 필드 추가**. Phase 2에 전역 회귀확인(agenthub 스키마 호환) 단계 추가. per-source citation은 신규개발 항목.
+- **N5(큐레이션 N 미정→규모 추정 불가)**: Phase 0에 **덤프 통계 스캔**(임베딩·DB 없이 파서 dry-run으로 N별 문서/청크 수 집계) 추가해 데이터로 N 결정. 0c 처리량 벤치는 **운영 인덱스 걸린 tb_knowledge INSERT 조건**으로 측정(맨 테이블은 낙관편향).
+- **N3(파일럿 격리 누설)**: 임시 source는 tenants 화이트리스트로만 격리 → CLI/비테넌트(tenant=None, routing.py:396-398) 경로엔 노출. 파일럿 문안에 (1)비테넌트 노출 허용여부 명시 (2)정리단계(DELETE WHERE source='so-pilot'+VACUUM/ANALYZE) 추가.
+- Minor: 엔티티게이팅 개선은 "결과 청크 source별 게이팅 면제"로 확정(질의분류형 아님, BWV543 kowiki 보호 단위테스트 유지) / 0b 측정은 KnowledgeRetriever 직접호출(라우팅 우회) / CIC 실패 시 INVALID 인덱스 DROP 후 재시도 / 수용기준 수치화(코딩 eval 개선≥X, kowiki 회귀 0).
+
+**상태: 계획 v2.1 확정. Phase 0a 착수·완료(아래).**
+
+**Phase 0a 실측 — 코딩 질의 라우팅 도달률 (2026-07-17).** 운영 112 config(routing 섹션, long_input_threshold=500, tool_keywords 53개)의 HeuristicClassifier로 코딩 질의 22개(4범주 균형) 분류. 스크립트: scratchpad/phase0a_routing_reach.py(로컬 probe, 미커밋).
+- **결과: KNOWLEDGE(=RAG 주입) 도달률 17/22=77%.** 범주별: 개념형 8/8·라이브러리 6/6(RAG 수혜 100%), 에러디버깅 3/4("수정해"→TOOL), 파일작업형 0/4(전부 TOOL — 도구작업이라 정상).
+- **해석**: FABLE5 M1(대부분 TOOL로 샘) **부분 반증** — RAG 타깃(개념·how-to·라이브러리)은 ~100% 도달하고 이게 SO 콘텐츠 유형과 정합. TOOL행은 대부분 진짜 도구작업(손실 아님). **진짜 누수 2개 확인**: ①long_input_threshold=500(실제 에러질문은 스택트레이스·코드 붙여 500자 초과→강제 TOOL), ②"파일/디렉토리/repository/codebase" 단어(개념질문도 단어로 TOOL).
+- **한계(선정편향)**: 22개는 자체 구성 세트. 엄밀화엔 실제 질의로그 재측정 + 긴 붙여넣기 케이스 추가 필요(에러범주 실제 도달률은 더 낮을 것).
+- **판정**: RAG 트랙은 개념·how-to 세그먼트에 유효(SO 정합), 폐기 불필요. 라우팅 보강은 "선행 필수"→"수혜 극대화용 후속 옵션"으로 강등. 학습-우선 전환 트리거(도달률 심각히 낮음)엔 해당 안 됨.
+
+**기존 품질 실측(같은 세션, 2026-07-17).** 스모크 8케이스 전부 통과 + 실질질의 8종(광합성·파이썬 리스트뒤집기·1~100합·BWV환각·ML/DL·측우기 등) 응답내용 확인 → **양호**(정확·일관·구조화, degeneration/반복/잘림 없음). 단 전 질의 sources=0 = citation.enabled=false(전역, N4)라 API로는 RAG 실주입 여부 단정 불가. 시사점: 베이스 A.X-4.0가 코딩질문도 RAG 없이 잘 답함(파이썬 질의 sources=0인데 최고품질) → 코딩RAG 한계가치는 Phase0b로 실측 필요(Skeptic 실측 뒷받침).
+
+**다음(덤프 의존).** 0b SO 파일럿 캘리(GO/NO-GO)·0c 덤프 통계+처리량 벤치 → SO 데이터 덤프 입수 후. 0a는 덤프 없이 완료.
+
+**Phase 1 기반 착수 — 코드 인지 청커(M2 수정) 완성 (2026-07-17, 덤프 무관·무회귀).** 사용자 지시로 덤프 대기 중 no-regret 기반부터 구축(RAG·학습 두 트랙 공통, 순수 로직).
+- 신규 `scripts/coding_corpus.py`(코딩 코퍼스 공용 정제 모듈): `chunk_code_aware(text, max_chars=1500, overlap=150)`. 불변식 (A)코드블록 원자성 (B)무손실·앞부분보존 (C)초과 코드는 라인경계 분할+재펜스 (D)설명+인접코드 동거 (E)전 청크 max_chars 이하. 세그먼트 분리(_iter_segments)→코드/산문 별도 처리, `_hard_split`이 앞→뒤로 잘라 앞부분 폐기 버그 원천 차단.
+- 신규 `tests/unit/test_coding_corpus.py`(8) — 불변식 회귀. **M2 버그 실증 대조**: 동일 긴 코드에 기존 `split_into_chunks`는 `def pipeline():`(함수 시그니처) **유실**(문장부호 없는 코드→한 '문장'→뒤만 남김), 신규 청커는 전부 보존. 8 passed, ruff 클린.
+- 남은 coding_corpus 구성요소(후속): html_to_markdown(SO Body <pre><code>→펜스), build_provenance(source/url/license/score), dedup_key/detect_languages. 현재는 청커만.
+
 **API 스모크 테스트 셋(신규).** scripts/api_smoke_test.py — URL http://192.168.21.112:8600, Bearer nexus-b200-test-key-001. health·auth차단·인사·지식·도구·문서생성+다운로드·업로드분석 8케이스. `python -m scripts.api_smoke_test [--only ...]`.
