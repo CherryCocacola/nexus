@@ -131,17 +131,25 @@ def iter_posts(xml_stream: Any) -> Iterator[dict[str, Any]]:
 
 def load_posts(
     xml_stream: Any,
+    limit: int | None = None,
 ) -> tuple[dict[int, dict[str, Any]], dict[int, list[dict[str, Any]]]]:
     """게시물을 질문(id→질문)과 답변(부모 질문 id→답변 리스트)으로 버킷팅한다.
 
     반환: (questions_by_id, answers_by_parent).
-    주의(규모): 이 함수는 전량을 메모리에 올린다. 소규모(파일럿·fixture)엔 충분하나,
-    전량 덤프(수천만 행)엔 SQLite 디스크 스테이징 2-pass가 필요하다(run_ingest에서
-    실덤프 배선 시 도입 예정). 페어링 '로직' 자체는 여기서 확정·검증한다.
+    주의(규모): 이 함수는 (limit까지의) 게시물을 메모리에 올린다. 소규모(파일럿·
+    fixture·limit)엔 충분하나, 전량 덤프(수천만 행)엔 SQLite 디스크 스테이징 2-pass가
+    필요하다(run_ingest에서 실덤프 배선 시 도입 예정). 페어링 '로직'은 여기서 확정·검증한다.
+
+    Args:
+        xml_stream: Posts.xml 파일 객체(또는 파일류).
+        limit: 처리할 최대 row 수(None=전량). 실덤프(96GB, 수천만 행)를 OOM 없이
+               표본 검증하거나 파일럿 규모를 뽑을 때 쓴다.
     """
     questions: dict[int, dict[str, Any]] = {}
     answers: dict[int, list[dict[str, Any]]] = {}
-    for post in iter_posts(xml_stream):
+    for count, post in enumerate(iter_posts(xml_stream)):
+        if limit is not None and count >= limit:
+            break  # 표본 상한 도달 → 조기 종료(전량 덤프 OOM 방지)
         if post["type"] == _POST_QUESTION:
             questions[post["id"]] = post
         elif post["type"] == _POST_ANSWER and post["parent_id"] is not None:
@@ -193,6 +201,7 @@ def build_entries(
     *,
     source: str = "so",
     min_answer_score: int = 5,
+    min_question_score: int = 0,
     require_code: bool = False,
     min_doc_chars: int = 80,
     max_chunk_chars: int = 1500,
@@ -200,15 +209,23 @@ def build_entries(
     """큐레이션을 통과한 질문을 결합·청킹해 KnowledgeEntry 리스트로 만든다.
 
     큐레이션 기준:
+      - 질문 점수 >= min_question_score (질문 자체의 품질 게이트, 0=무필터).
       - 채택답변 OR 점수 >= min_answer_score 답변이 하나라도 있어야 한다.
       - require_code=True면 결합 문서에 코드 블록(```)이 있어야 한다.
       - 결합 문서 길이가 min_doc_chars 이상.
     PK 유일성(C1): section=f"q{qid}" + chunk_index로 질문마다 유일한 id 공간을 준다.
+
+    왜 min_question_score가 필요한가(실측 근거): min_answer_score만으로는 규모가
+    거의 안 줄어든다 — 대부분 질문이 '채택 답변'(점수 무관 포함)으로 통과하기
+    때문이다. 질문 점수 게이트가 코퍼스 규모·품질을 조이는 실질 레버다.
     """
     entries: list[KnowledgeEntry] = []
     # id 순서로 처리해 결과가 결정론적이게 한다(재현성).
     for qid in sorted(questions):
         q = questions[qid]
+        # 질문 품질 게이트 — 저품질 질문을 결합·청킹 전에 싸게 걸러낸다.
+        if q["score"] < min_question_score:
+            continue
         doc, used_ids = build_combined_document(
             q, answers_by_parent.get(qid, []), min_answer_score
         )
@@ -255,24 +272,27 @@ def run_stats(args: argparse.Namespace) -> int:
         logger.error("덤프 파일 없음: %s", dump)
         return 1
     with open(dump, "rb") as f:  # noqa: ASYNC230 — 준비 스크립트(동기 배치)
-        questions, answers = load_posts(f)
+        questions, answers = load_posts(f, limit=args.limit)
     entries = build_entries(
         questions,
         answers,
         min_answer_score=args.min_score,
+        min_question_score=args.min_question_score,
         require_code=args.require_code,
     )
     kept_q = len({e.section for e in entries})
+    limit_note = f" [표본 {args.limit} rows]" if args.limit else " [전량]"
     logger.info(
-        "통계: 질문 %d개 / 답변 그룹 %d개 → 큐레이션 통과 질문 %d개, 청크 %d개 "
+        "통계%s: 질문 %d개 / 답변 그룹 %d개 → 큐레이션 통과 질문 %d개, 청크 %d개 "
         "(min_score=%d, require_code=%s)",
-        len(questions), len(answers), kept_q, len(entries),
+        limit_note, len(questions), len(answers), kept_q, len(entries),
         args.min_score, args.require_code,
     )
     print(
         f"questions={len(questions)} answer_groups={len(answers)} "
         f"kept_questions={kept_q} chunks={len(entries)} "
-        f"min_score={args.min_score} require_code={args.require_code}"
+        f"min_score={args.min_score} min_qscore={args.min_question_score} "
+        f"require_code={args.require_code} limit={args.limit}"
     )
     return 0
 
@@ -283,7 +303,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dump", help="Posts.xml 로컬 경로")
     parser.add_argument("--stats", action="store_true", help="적재 없이 규모만 집계")
     parser.add_argument("--min-score", type=int, default=5, help="비채택 답변 최소 점수")
+    parser.add_argument(
+        "--min-question-score", type=int, default=0, help="질문 최소 점수(품질 게이트)"
+    )
     parser.add_argument("--require-code", action="store_true", help="코드 블록 있는 질문만")
+    parser.add_argument("--limit", type=int, default=None, help="처리할 최대 row 수(표본 검증용)")
     parser.add_argument("--build-index", action="store_true", help="(후속) 벡터 인덱스 빌드")
     args = parser.parse_args(argv)
 

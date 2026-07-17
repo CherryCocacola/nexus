@@ -131,3 +131,12 @@ def test_require_code_filters_codeless_questions():
     kept = {e.section for e in entries}
     # q1만 코드 블록 보유(q4는 산문 답변뿐) → q1만 남는다.
     assert kept == {"q1"}
+
+
+# ── 질문 점수 게이트 ─────────────────────────────────────
+def test_min_question_score_filters_low_quality_questions():
+    questions, answers = _load()
+    # q1 점수 42, q4 점수 5. 질문 점수 >=10 게이트 → q1만 통과(q4는 5<10 제외).
+    entries = build_entries(questions, answers, min_answer_score=5, min_question_score=10)
+    kept = {e.section for e in entries}
+    assert kept == {"q1"}
