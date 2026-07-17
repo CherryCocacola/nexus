@@ -27,11 +27,13 @@ RSC 파싱·결합·엔트리 생성은 --probe(실 페이지 1건) + 합성 페
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import logging
 import re
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -40,7 +42,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # 루트 (core)
 
 from coding_corpus import chunk_code_aware, html_to_markdown  # noqa: E402
 
-from core.rag.knowledge_store import KnowledgeEntry  # noqa: E402
+from core.rag.knowledge_store import KnowledgeEntry, KnowledgeStore  # noqa: E402
 
 logger = logging.getLogger("nexus.scripts.prepare_okky")
 
@@ -273,16 +275,120 @@ def run_probe(args: argparse.Namespace) -> int:
     return 0
 
 
+def iter_listing_ids(board: str, max_pages: int) -> list[int]:
+    """기술 Q&A 목록(/questions/{board}?page=N)에서 질문 id를 열거한다(robots 허용).
+
+    각 페이지 RSC에서 "id":N,"title": 패턴으로 질문 항목 id를 뽑는다(20개/페이지).
+    rate-limit을 준수하며 max_pages까지 수집한다.
+    """
+    import httpx
+
+    ids: list[int] = []
+    seen: set[int] = set()
+    for page in range(1, max_pages + 1):
+        time.sleep(_RATE_DELAY)
+        # 1페이지는 파라미터 없는 기본 URL이 SSR로 목록을 렌더한다(?page=1은 빈 응답 가능).
+        url = f"{_BASE}/questions/{board}" if page == 1 else f"{_BASE}/questions/{board}?page={page}"
+        r = httpx.get(url, headers={"User-Agent": _UA}, timeout=20, follow_redirects=True)
+        if r.status_code != 200:
+            break
+        p = rsc_payload(r.text)
+        page_ids = [int(m) for m in re.findall(r'"id":(\d+),"title":', p)]
+        new = [i for i in page_ids if i not in seen]
+        if not new:
+            break
+        for i in new:
+            seen.add(i)
+        ids.extend(new)
+        logger.info("열거: page %d → 누적 %d개 질문", page, len(ids))
+    return ids
+
+
+async def _embed_texts(base_url: str, texts: list[str]) -> list[list[float]]:
+    """LAN 임베딩 서버(:8002) /v1/embed 로 벡터를 받는다(prepare_kowiki 계약)."""
+    import httpx
+
+    async with httpx.AsyncClient(timeout=120) as client:
+        r = await client.post(base_url.rstrip("/") + "/v1/embed", json={"texts": texts})
+        r.raise_for_status()
+        return r.json()["embeddings"]
+
+
+async def run_ingest(args: argparse.Namespace) -> int:
+    """열거 → 스크랩(rate-limit) → 결합 → 임베딩 → tb_knowledge(source) UPSERT.
+
+    소규모 파일럿용. --dry-run이면 스크랩·결합까지만(임베딩·DB 없음). source는 파일럿
+    격리를 위해 'okky-pilot' 등으로 지정 가능(상용 전환 시 source로 제거).
+    """
+    ids = iter_listing_ids(args.board, args.pages)
+    if args.limit:
+        ids = ids[: args.limit]
+    logger.info("스크랩 대상 %d개 질문 (rate-limit %.1f초/건)", len(ids), _RATE_DELAY)
+
+    questions: list[dict[str, Any]] = []
+    for n, qid in enumerate(ids, 1):
+        q = fetch_question(qid)
+        if q:
+            questions.append(q)
+        if n % 20 == 0:
+            logger.info("스크랩 %d/%d", n, len(ids))
+
+    entries = build_entries(
+        questions,
+        source=args.source,
+        min_answer_votes=args.min_votes,
+        require_code=args.require_code,
+    )
+    logger.info("엔트리 %d개 생성(질문 %d, source=%s)", len(entries), len(questions), args.source)
+    if args.dry_run:
+        print(f"[dry-run] questions={len(questions)} entries={len(entries)} source={args.source}")
+        return 0
+
+    import asyncpg
+
+    pool = await asyncpg.create_pool(args.pg, min_size=1, max_size=3)
+    store = KnowledgeStore(pg_pool=pool)
+    await store.ensure_schema()
+    stored = 0
+    try:
+        for i in range(0, len(entries), args.batch_size):
+            batch = entries[i : i + args.batch_size]
+            try:
+                embs = await _embed_texts(args.embed_url, [e.content for e in batch])
+            except Exception as e:
+                logger.warning("임베딩 실패 배치 %d: %s", i, e)
+                continue
+            for entry, emb in zip(batch, embs, strict=True):
+                await store.add(replace(entry, embedding=tuple(emb)))
+                stored += 1
+    finally:
+        await pool.close()
+    logger.info("완료: %d청크 적재(source=%s)", stored, args.source)
+    print(f"stored={stored} source={args.source}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="OKKY Q&A → tb_knowledge(source='okky')")
     parser.add_argument("--probe", type=int, help="질문 1건 파싱 검증(qid)")
+    parser.add_argument("--board", default="tech", help="Q&A 게시판(tech/career/qna-etc)")
+    parser.add_argument("--pages", type=int, default=5, help="열거할 목록 페이지 수(20개/페이지)")
+    parser.add_argument("--limit", type=int, default=None, help="스크랩 질문 상한")
     parser.add_argument("--min-votes", type=int, default=1, help="비채택 답변 최소 추천")
+    parser.add_argument("--require-code", action="store_true", help="코드 블록 있는 질문만")
+    parser.add_argument("--source", default="okky", help="tb_knowledge.source(파일럿=okky-pilot)")
+    parser.add_argument("--embed-url", help="LAN 임베딩 서버(:8002)")
+    parser.add_argument("--pg", help="PostgreSQL DSN")
+    parser.add_argument("--batch-size", type=int, default=16, help="임베딩·적재 배치 크기")
+    parser.add_argument("--dry-run", action="store_true", help="스크랩·결합까지만(임베딩·DB 없음)")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(message)s")
+
     if args.probe:
         return run_probe(args)
-    parser.error("현재 --probe 만 지원(적재/열거는 검증 후 배선).")
-    return 2
+    if not args.dry_run and (not args.pg or not args.embed_url):
+        parser.error("실제 적재에는 --pg 와 --embed-url 이 필요합니다(리허설은 --dry-run)")
+    return asyncio.run(run_ingest(args))
 
 
 if __name__ == "__main__":
