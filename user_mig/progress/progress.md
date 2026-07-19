@@ -3246,7 +3246,13 @@ QA #43(깨진 Bash 명령을 못 고치고 14회·62초 반복)의 근본 방어
 **전용 코딩 테넌트 신설(사용자 결정 — default 혼합보다 정확).** `config/tenants.yaml`에 `coding`(kowiki·sample·okky·so-pilot, key nexus-coding-key-001, internal-only) 추가. **전용↔범용 전환은 목록 수정+재시작만(재적재 불요)**. 배포: docker cp(백업 .bak.pre-coding)+nexus-web 재시작. **e2e: coding 테넌트 "자바 내부 클래스"→정답(okky접근)·"수도"→서울(kowiki접근), default "자바"→base only(okky 격리 확인)**. citation off라 sources 미표시나 주입은 리랭커경로 실측 확인. 이중방어(테넌트 allowed_sources DB필터 + 리랭커 관련도).
 **🔴 OKKY 403 차단 — 확대 중단(2026-07-18).** 3000건+ 스크랩 후 OKKY가 **status=403으로 스크래핑 차단**(1.2초 rate-limit 준수했음에도 봇보호 발동). robots의 AI크롤러 명시 + 403 = OKKY가 대량수집을 원치 않음이 실증. **봇차단 우회는 윤리·법적으로 부적절**이라 OKKY 스크래핑 중단. 증분·이어받기 코드(skip-existing·start_page, 커밋 0e3f78a)는 넣었으나 차단으로 실사용 보류. **OKKY는 현 1,834청크로 고정** — 더 필요 시 eBrain 정식 허가/API가 유일 깨끗 경로. **확대는 SO(CC BY-SA 라이선스·차단없음·덤프 이미 보유)로 전환 권장**: so-pilot(2008년대 500k행 샘플)을 더 넓은 SO 적재(더 많은 행/최신, SQLite 스테이징)로 확대.
 
-**상태: 코딩 RAG(OKKY 한국어 1834+SO 영어 26971) 코딩모드로 LIVE.** OKKY 확대는 403으로 차단·중단. 후속(비차단): okky-pilot(119) 정리(orphan, DELETE) / 커버리지 위해 OKKY 추가 스크랩 / SO so-pilot→so 정규화(선택) / min_score 튜닝(경계선). 상용 전환 시 coding 테넌트에서 okky 제거 + DELETE source LIKE 'okky%'.
+**상태: 코딩 RAG(OKKY 한국어 1834+SO 영어 26971) 코딩모드로 LIVE.** OKKY 확대는 403으로 차단·중단.
+
+**SO SQLite 스테이징 대량적재 + 중요 발견(2026-07-18).** iter_posts에 연도 추가, stage_to_sqlite(Pass1 스트리밍 필터·kept-parent 답변만)+run_staged_ingest(Pass2 배치 build→임베딩), CLI --stage-ingest/--min-year 등(커밋 b319a9d). **1차 시도(min-year 2020·min-qscore 20·require_code) → so 31,597청크.** 리랭커 검증 현대 코딩질의(async/pandas/docker/타입힌트) **so 2/8·so-pilot 1/8 둘 다 약함.**
+**🔑 근본원인**: **정석 현대 how-to는 그 기술이 나온 ~2012~2019년대에 물어봤는데, so-pilot(2008)은 현대기술 이전이라 없고 so(2020+)는 그 구간을 잘라냄 + 고득점+코드가 니치버그를 골라냄**. "너무 예전 제외"(min-year 2020)가 과했음 — SO는 연도보다 **점수(고득점=정석·evergreen)**로 걸러야. OKKY(5/8)·리랭커는 정상, SO 필터만 문제.
+**재적재 완료: min-year 2012·min-qscore 50·require_code → so 255,769청크(옛 31k의 8배).** 리랭커 재검증 2/8→3/8, 정석 매칭 회복(async rr0.922·pandas 0.904·타입힌트 0.959). 남은 미스(JS프로미스·SQL윈도우·이메일)=corpus 아닌 **recall**(벡터 top-20에 정석이 안 올라옴, FABLE5 M3) → fetch_k↑·질의번역 튜닝 후속.
+**마무리(2026-07-19).** 옛 so-pilot(26971 2008편향)·okky-pilot(119 orphan) DELETE+ANALYZE. coding 테넌트 so-pilot→**so** 교체 배포(docker cp·재시작). e2e: coding "asyncio"·"판다스 병합" 정답. **최종: so 255769+okky 1834+kowiki 1067975.**
+**후속(비차단)**: recall 튜닝(rerank_fetch_k 20→40·질의번역) / OKKY eBrain 허가 시 확대 / citation·관측성 / min_score 경계선. 후속(비차단): okky-pilot(119) 정리(orphan, DELETE) / 커버리지 위해 OKKY 추가 스크랩 / SO so-pilot→so 정규화(선택) / min_score 튜닝(경계선). 상용 전환 시 coding 테넌트에서 okky 제거 + DELETE source LIKE 'okky%'.
 
 ### 코딩 학습 데이터 계획 — 파킹(향후 코딩 전용 대비) (2026-07-17)
 
