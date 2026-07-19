@@ -3252,7 +3252,30 @@ QA #43(깨진 Bash 명령을 못 고치고 14회·62초 반복)의 근본 방어
 **🔑 근본원인**: **정석 현대 how-to는 그 기술이 나온 ~2012~2019년대에 물어봤는데, so-pilot(2008)은 현대기술 이전이라 없고 so(2020+)는 그 구간을 잘라냄 + 고득점+코드가 니치버그를 골라냄**. "너무 예전 제외"(min-year 2020)가 과했음 — SO는 연도보다 **점수(고득점=정석·evergreen)**로 걸러야. OKKY(5/8)·리랭커는 정상, SO 필터만 문제.
 **재적재 완료: min-year 2012·min-qscore 50·require_code → so 255,769청크(옛 31k의 8배).** 리랭커 재검증 2/8→3/8, 정석 매칭 회복(async rr0.922·pandas 0.904·타입힌트 0.959). 남은 미스(JS프로미스·SQL윈도우·이메일)=corpus 아닌 **recall**(벡터 top-20에 정석이 안 올라옴, FABLE5 M3) → fetch_k↑·질의번역 튜닝 후속.
 **마무리(2026-07-19).** 옛 so-pilot(26971 2008편향)·okky-pilot(119 orphan) DELETE+ANALYZE. coding 테넌트 so-pilot→**so** 교체 배포(docker cp·재시작). e2e: coding "asyncio"·"판다스 병합" 정답. **최종: so 255769+okky 1834+kowiki 1067975.**
-**후속(비차단)**: recall 튜닝(rerank_fetch_k 20→40·질의번역) / OKKY eBrain 허가 시 확대 / citation·관측성 / min_score 경계선. 후속(비차단): okky-pilot(119) 정리(orphan, DELETE) / 커버리지 위해 OKKY 추가 스크랩 / SO so-pilot→so 정규화(선택) / min_score 튜닝(경계선). 상용 전환 시 coding 테넌트에서 okky 제거 + DELETE source LIKE 'okky%'.
+**후속(비차단)**: recall 튜닝(rerank_fetch_k 20→40·질의번역) / OKKY eBrain 허가 시 확대 / citation·관측성 / min_score 경계선.
+
+---
+
+## ★★★ 세션 핸드오프 — 코딩 RAG (2026-07-19, 다음 세션용) ★★★
+
+**■ 지금 LIVE인 것**
+- **리랭커**: 112 systemd `nexus-embedding` → `/opt/nexus-gpu/embedding_server.py`(리포 embed_server.py의 리랭커판, **CPU fp32**). `/v1/rerank` 200. env(unit): EMBED_MODEL=/opt/nexus-gpu/models/e5-large·EMBED_DEVICE=cpu·RERANK_DEVICE=cpu·RERANK_ENABLED=1·**EMBED_HOST=0.0.0.0**(127.0.0.1이면 LAN 끊김 주의). 백업 embedding_server.py.bak.pre-rerank·nexus-embedding.service.bak.
+- **`nexus_config.112.yaml`**(bind-mount `/home/idino/nexus-config/`): `rerank.enabled:true`. 게이트 min_sim0.75·abs0.84·rerank min_score0.3·min_similarity0.6·**rerank_fetch_k(기본20)**. 백업 .bak.pre-rerank-enable.
+- **코딩 테넌트**(`config/tenants.yaml`의 `coding`, key **nexus-coding-key-001**): sources=[kowiki,sample,okky,so]. **전용↔범용=목록 수정+웹재시작만(재적재 불요)**. tenants.yaml은 **컨테이너 이미지 내부**(bind-mount 아님) → 변경은 `docker cp config/tenants.yaml nexus-web:/app/config/tenants.yaml`+`docker restart nexus-web`. 백업 tenants.yaml.bak.pre-coding.
+- **tb_knowledge source**: **so 255,769**(2012+·score≥50·code 정석) / **okky 1,834**(한국어, 403차단 고정) / kowiki 1,067,975. citation OFF(내부용).
+- 접속: SSH idino@192.168.21.112 pw=idino!@#$, sudo 암호필요. PG 5440/idino_ai(.env NEXUS_PG_PASSWORD). embed:8002.
+
+**■ 이 세션에서 한 것**: 리랭커 배포(kowiki 회귀수리+교차언어해결+combine-first) / SO 파서·SQLite스테이징(prepare_stackoverflow.py) / OKKY 스크래퍼(prepare_okky.py, RSC파싱, 403차단으로 1834 고정) / 코딩 전용테넌트 / SO 연도필터 교정(2012+·score50). coding_corpus.py(코드청커·html_to_markdown) 공용. 커밋 다수(feature/b200-bakeoff, **미push**).
+
+**■ 다음 할 작업(우선순위)**
+1. **recall 튜닝**: 현대 질의 3/8(미스=정석이 벡터 top-20 미진입). `nexus_config.112.yaml` rerank.rerank_fetch_k 20→40~60 + 웹 재시작 → 재검증(scratchpad/verify_so.py). 근본은 질의번역(한국어→영어 후 임베딩, prompt_assembler 또는 retriever 앞단).
+2. **push**: origin/feature/b200-bakeoff보다 크게 앞섬. 사용자 지시 시 push.
+3. **OKKY 확대**: 403 차단이라 스크래핑 불가 → eBrain(info@okky.kr) 정식 허가/API만 깨끗. 코드는 준비됨(prepare_okky.py, skip-existing·start_page 증분지원).
+4. **SO 추가확대(선택)**: min_qscore 낮춰(30) 재적재하면 커버리지↑(현 50은 정석만). prepare_stackoverflow --stage-ingest --min-year 2012 --min-question-score N. Posts.xml=user_mig/Posts.xml(96.8GB).
+5. **citation·관측성**(선택): citation.enabled 전역이라 agenthub .NET 스키마 호환 확인 후. 게이팅 경로 로깅(404류 무언강등 재발방지).
+6. **학습 트랙**: 파킹([[project_coding_corpus_rag]] 메모리). 정제코퍼스가 상류라 coding_dataset.py(§18.2) 변환기만 붙이면 착수.
+
+**■ 주의**: 리랭커/embed 재배포 시 EMBED_HOST=0.0.0.0 필수(LAN). 웹/embed 재시작은 sudo(auto 분류기가 차단 가능—사용자 승인/모드변경). so-pilot·okky-pilot는 삭제됨(orphan 정리). scratchpad 드라이버: run_so_staged.py·verify_so.py·finalize_so.py·activate_coding_tenant.py·run_okky_bulk.py. 후속(비차단): okky-pilot(119) 정리(orphan, DELETE) / 커버리지 위해 OKKY 추가 스크랩 / SO so-pilot→so 정규화(선택) / min_score 튜닝(경계선). 상용 전환 시 coding 테넌트에서 okky 제거 + DELETE source LIKE 'okky%'.
 
 ### 코딩 학습 데이터 계획 — 파킹(향후 코딩 전용 대비) (2026-07-17)
 
