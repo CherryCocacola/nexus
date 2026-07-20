@@ -21,9 +21,10 @@ import pytest
 
 from core.message import StreamEvent, StreamEventType
 from core.orchestrator.stream_watchdog import (
+    _PINGABLE_EVENTS,
+    DegenerationMonitor,
     StreamWatchdog,
     StreamWatchdogTimeout,
-    _PINGABLE_EVENTS,
     stream_with_watchdog,
 )
 
@@ -341,3 +342,101 @@ class TestStreamWithWatchdog:
                 pass
         # finally 블록이 실행되어 watchdog.stop()이 호출됨
         # 예외가 RuntimeError로 전파되면 테스트 통과
+
+
+# ─────────────────────────────────────────────
+# DegenerationMonitor 테스트 (생성 중 붕괴 감지)
+# ─────────────────────────────────────────────
+class TestDegenerationMonitor:
+    """생성 텍스트 붕괴(동일라인 반복·문자샐러드·이모지 폭주) 감지 검증."""
+
+    def test_repeated_line_flagged(self):
+        # 같은 라인이 5회 이상 반복되면 붕괴(kd04 표 헤더 무한반복 유형).
+        m = DegenerationMonitor(min_chars=20, check_every=1)
+        m.feed("정상 도입부 문장이 여기에 있습니다. ")
+        for _ in range(6):
+            m.feed("붕괴로 계속 무한 반복되는 매우 긴 표 헤더 라인 예시입니다\n")
+        assert m.is_degenerate()
+
+    def test_char_salad_flagged(self):
+        # 단일 문자 폭주(대시/기호 샐러드) → 4gram 최빈 비율 초과.
+        m = DegenerationMonitor(min_chars=20, check_every=1)
+        m.feed("정상 시작 문장입니다. ")
+        m.feed("─" * 400)
+        assert m.is_degenerate()
+
+    def test_emoji_spam_flagged(self):
+        # 이모지 폭주(kd01 유형) → 이모지 밀도 초과.
+        m = DegenerationMonitor(min_chars=20, check_every=1)
+        m.feed("객체지향의 추상화를 설명합니다. ")
+        m.feed("🚗🚀💨☕♨️" * 80)
+        assert m.is_degenerate()
+
+    def test_short_answer_not_flagged(self):
+        # min_chars 미만 짧은 정상 답변은 검사하지 않는다(오탐 방지).
+        m = DegenerationMonitor(min_chars=700, check_every=1)
+        m.feed("리스트는 sorted(lst, reverse=True)로 내림차순 정렬합니다.")
+        assert not m.is_degenerate()
+
+    def test_legit_long_varied_not_flagged(self):
+        # 각 줄 내용이 다른 긴 정상 답변은 붕괴로 오탐하지 않는다.
+        m = DegenerationMonitor(check_every=1)
+        text = "\n".join(
+            f"{i}. {chr(44032 + i)} 항목은 서로 다른 고유한 설명 문장을 담고 있는 정상 라인 {i}"
+            for i in range(60)
+        )
+        m.feed(text)
+        assert not m.is_degenerate()
+
+    def test_legit_table_not_flagged(self):
+        # 행마다 내용이 다른 정상 마크다운 표는 통과한다.
+        m = DegenerationMonitor(check_every=1)
+        words = ["정수", "실수", "문자열", "리스트", "튜플", "딕셔너리", "집합", "불린",
+                 "바이트", "복소수", "범위", "제너레이터"]
+        rows = "\n".join(
+            f"| {w} | {w}는 고유한 자료형 설명 {i}번을 가진다 | 예시값_{w}_{i} |"
+            for i, w in enumerate(words * 4)
+        )
+        m.feed("자료형 정리 표입니다.\n| 타입 | 설명 | 예시 |\n|---|---|---|\n" + rows)
+        assert not m.is_degenerate()
+
+
+# ─────────────────────────────────────────────
+# stream_with_watchdog degeneration 절단 테스트
+# ─────────────────────────────────────────────
+async def _degenerate_stream() -> AsyncGenerator[StreamEvent, None]:
+    """정상 앞부분 뒤 동일 라인이 반복되는 붕괴 스트림."""
+    yield StreamEvent(type=StreamEventType.TEXT_DELTA, text="정상 시작 부분입니다. ")
+    for _ in range(12):
+        yield StreamEvent(
+            type=StreamEventType.TEXT_DELTA,
+            text="붕괴로 계속 무한 반복되는 매우 긴 표 헤더 라인 예시입니다\n",
+        )
+    yield StreamEvent(type=StreamEventType.MESSAGE_STOP)
+
+
+class TestDegenerationTruncation:
+    """stream_with_watchdog의 degeneration 조기 절단 검증."""
+
+    async def test_degeneration_truncates_without_exception(self):
+        # 감지 켜짐 → 붕괴 반복 도중 예외 없이 조기 종료(MESSAGE_STOP 도달 못 함).
+        mon = DegenerationMonitor(min_chars=20, check_every=1)
+        events = []
+        async for e in stream_with_watchdog(
+            _degenerate_stream(), detect_degeneration=True, degen_monitor=mon
+        ):
+            events.append(e)
+        types = [e.type for e in events]  # use_enum_values=True → 문자열
+        assert StreamEventType.MESSAGE_STOP.value not in types  # 절단되어 종료이벤트 미도달
+        text_events = [t for t in types if t == StreamEventType.TEXT_DELTA.value]
+        assert len(text_events) < 13  # 반복 12개를 다 흘리기 전에 끊김
+
+    async def test_degeneration_disabled_passes_through(self):
+        # 감지 꺼짐(기본) → 붕괴 콘텐츠도 전부 통과(무회귀).
+        events = []
+        async for e in stream_with_watchdog(
+            _degenerate_stream(), detect_degeneration=False
+        ):
+            events.append(e)
+        types = [e.type for e in events]
+        assert StreamEventType.MESSAGE_STOP.value in types  # 절단 없이 끝까지

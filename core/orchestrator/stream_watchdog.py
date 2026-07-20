@@ -30,13 +30,122 @@ GPU 행(hang), vLLM 데드락, 네트워크 끊김처럼 "응답이 멈춘" 상�
 from __future__ import annotations
 
 import logging
+import re
 import time
+from collections import Counter
 from collections.abc import AsyncGenerator
-from typing import Any
 
 from core.message import StreamEvent, StreamEventType
 
 logger = logging.getLogger("nexus.orchestrator.stream_watchdog")
+
+
+# 이모지·기호 스팸 감지용 유니코드 범위(대략). degeneration 시 모델이 확률질량을
+# 이모지/기호로 흘려 폭주하는 케이스(kd01 🚗🚀☕♨️)를 잡으려는 목적이다.
+_EMOJI_RANGES = (
+    (0x1F300, 0x1FAFF),  # 그림 이모지 전반(표정·사물·기호)
+    (0x2600, 0x27BF),    # 기타 기호·딩벳(☕♨️✂️ 등)
+    (0x2190, 0x21FF),    # 화살표(→↘⬆ 등 — 붕괴 시 화살표 폭주 관측)
+    (0x2B00, 0x2BFF),    # 기타 기호·화살표
+    (0xFE00, 0xFE0F),    # variation selector(이모지 표현 결합)
+)
+
+
+def _is_emoji(ch: str) -> bool:
+    """문자가 이모지/기호 범위에 속하는지(생성 붕괴의 이모지 폭주 감지용)."""
+    o = ord(ch)
+    return any(lo <= o <= hi for lo, hi in _EMOJI_RANGES)
+
+
+class DegenerationMonitor:
+    """스트리밍 생성 텍스트를 누적하며 '생성 중 붕괴(degeneration)'를 감지한다.
+
+    왜 필요한가(2026-07-20 품질 114건 테스트 실증):
+      반복 페널티 완화로 finish=length 런어웨이(→에스컬레이션 19k 폭주)는 사라졌으나,
+      긴 열거/설명형 ~17%가 '자체종료(finish=stop)' 안에서 여전히 붕괴한다
+      (동일 표 헤더 무한반복·문자 샐러드·이모지 폭주). 자체종료라 에스컬레이션
+      가드로는 못 잡으므로, 생성 '도중' 붕괴를 감지해 스트림을 조기 절단해야 한다.
+
+    감지 방식(오탐 최소화 — 정상 표/목록/코드는 통과):
+      - 최근 window 글자만 검사(붕괴는 후반부에 나타남), min_chars 이전엔 검사 안 함
+        (짧은 답변 오탐 방지).
+      - A) 동일 라인 반복: 최근 window에서 같은 비자명 라인(>8자)이 min_line_repeat회
+           이상 → 붕괴(정상 표는 행마다 내용이 달라 미해당).
+      - B) 문자 4-gram 최빈 비율 > max_4gram: 문자 샐러드(HAADODCC…·대시/플러스 폭주).
+      - C) 이모지 밀도 > max_emoji: 이모지/기호 폭주.
+    셋 중 하나면 붕괴로 본다. 임계값은 정상 관측치(표 0.21·요약 0.06 등)보다 넉넉히 위.
+    """
+
+    def __init__(
+        self,
+        min_chars: int = 700,
+        window: int = 1500,
+        max_4gram: float = 0.45,
+        max_emoji: float = 0.15,
+        min_line_repeat: int = 5,
+        min_line_len: int = 20,
+        check_every: int = 200,
+    ) -> None:
+        self._min_chars = min_chars
+        self._window = window
+        self._max_4gram = max_4gram
+        # 이모지/기호 밀도 임계. 실측(kd01 붕괴 0.196 / 정상 응답 0.000)이라 0.15로
+        # 잡되 정상은 안전. 정상 답변은 이모지가 거의 없어 오탐 위험이 낮다.
+        self._max_emoji = max_emoji
+        self._min_line_repeat = min_line_repeat
+        # 라인 반복 검사에서 셀 최소 길이. 짧은 구조 라벨("- **특징:**" 등)이 여러
+        # 항목에 반복되는 것은 정상이므로(kd12 오탐), 붕괴성 긴 라인(표 행 등)만
+        # 세도록 20자 이상만 카운트한다.
+        self._min_line_len = min_line_len
+        self._check_every = check_every
+        # 최근 window 글자만 보관(메모리 O(window)). 전체 누적 길이는 별도 카운트.
+        self._tail = ""
+        self._len = 0
+        self._last_check_len = 0
+
+    def feed(self, text: str) -> None:
+        """TEXT_DELTA 조각을 누적한다(최근 window 글자만 유지)."""
+        self._len += len(text)
+        self._tail = (self._tail + text)[-self._window :]
+
+    @property
+    def length(self) -> int:
+        """지금까지 누적한 전체 생성 글자 수(로그용)."""
+        return self._len
+
+    def is_degenerate(self) -> bool:
+        """현재 누적 상태가 붕괴 징후를 보이는지 판정(비용 절감 위해 간헐 검사)."""
+        # 짧은 생성은 검사하지 않는다(정상 짧은 답변 오탐 방지).
+        if self._len < self._min_chars:
+            return False
+        # 매 델타마다 재검사하면 비싸므로 check_every 글자마다만 검사한다.
+        if self._len - self._last_check_len < self._check_every:
+            return False
+        self._last_check_len = self._len
+        w = self._tail
+
+        # A) 동일 라인 반복 — 붕괴의 가장 강한 신호(정상 콘텐츠는 같은 긴 줄을 반복 안 함).
+        lines = [ln.strip() for ln in w.splitlines() if len(ln.strip()) >= self._min_line_len]
+        if lines:
+            top_line = Counter(lines).most_common(1)[0][1]
+            if top_line >= self._min_line_repeat:
+                return True
+
+        # B) 문자 4-gram 최빈 비율 — 문자 샐러드/대시·기호 폭주.
+        compact = re.sub(r"\s+", "", w)
+        grams = [compact[i : i + 4] for i in range(len(compact) - 3)]
+        if grams:
+            top_gram = Counter(grams).most_common(1)[0][1] / len(grams)
+            if top_gram > self._max_4gram:
+                return True
+
+        # C) 이모지/기호 밀도 — 이모지 폭주.
+        if w:
+            emoji = sum(1 for ch in w if _is_emoji(ch))
+            if emoji / len(w) > self._max_emoji:
+                return True
+
+        return False
 
 
 class StreamWatchdogTimeout(Exception):
@@ -260,6 +369,8 @@ async def stream_with_watchdog(
     stream: AsyncGenerator[StreamEvent, None],
     idle_timeout: float = 30.0,
     total_timeout: float = 300.0,
+    detect_degeneration: bool = False,
+    degen_monitor: DegenerationMonitor | None = None,
 ) -> AsyncGenerator[StreamEvent, None]:
     """
     model_provider.stream()을 StreamWatchdog으로 감싸는 async 래퍼.
@@ -301,6 +412,12 @@ async def stream_with_watchdog(
     )
     watchdog.start()
 
+    # degeneration 감지기 — detect_degeneration이 켜졌을 때만 활성(기본 off=무회귀).
+    # 외부에서 degen_monitor를 주입하면 그 임계값을 쓰고, 아니면 기본값으로 생성한다.
+    monitor: DegenerationMonitor | None = None
+    if detect_degeneration:
+        monitor = degen_monitor or DegenerationMonitor()
+
     try:
         async for event in stream:
             # 이벤트 타입은 str일 수도, Enum일 수도 있어 .value로 정규화한다.
@@ -309,6 +426,26 @@ async def stream_with_watchdog(
             # 실제 생성 진행을 뜻하는 토큰성 이벤트면 살아있음 신호를 보낸다.
             if event_type in _PINGABLE_EVENTS:
                 watchdog.ping()
+
+            # ── degeneration 조기 절단 ──────────────────────────────────
+            # 생성 텍스트를 누적하며 붕괴(동일라인 반복·문자샐러드·이모지 폭주)를
+            # 감지하면, 예외가 아니라 '정상 종료'로 스트림을 끊는다. 이유:
+            #   - 예외로 끊으면 재시도/에스컬레이션 경로를 타 붕괴가 재발한다.
+            #   - MESSAGE_STOP(MAX_TOKENS) 전에 return하므로 Transition 3
+            #     에스컬레이션이 발동하지 않는다 → 깨끗한 앞부분만 남기고 종료.
+            #   - upstream stream을 aclose()해 GPU가 붕괴 꼬리를 계속 생성하는 것도 멈춘다.
+            is_text = event_type == StreamEventType.TEXT_DELTA.value
+            if monitor is not None and is_text and event.text:
+                monitor.feed(event.text)
+                if monitor.is_degenerate():
+                    logger.warning(
+                        "degeneration 감지 — 스트림 조기 절단(%d자 생성 후)", monitor.length
+                    )
+                    try:
+                        await stream.aclose()
+                    except Exception:  # noqa: BLE001, S110 — 종료 실패는 무시(이미 끊는 중)
+                        pass
+                    return
 
             # 타임아웃 직전이라면 경고 문자열을 받아 로그로 남긴다(비차단).
             warning = watchdog.check_warnings()

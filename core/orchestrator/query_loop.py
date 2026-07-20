@@ -157,6 +157,11 @@ MAX_OUTPUT_RECOVERY = 3  # max_output 복구 최대 시도 횟수
 MAX_TOOL_PARSE_RETRY = 2  # 도구 JSON 파싱 재시도 횟수
 MAX_MODEL_ERROR_RETRY = 3  # 모델 에러 재시도 횟수
 MAX_COMPACT_RETRY = 2  # prompt-too-long 압축 재시도 횟수
+# 생성 중 degeneration(동일라인 반복·문자샐러드·이모지 폭주) 감지 시 스트림 조기 절단.
+# 페널티 완화로 런어웨이는 제거됐으나 자체종료 내부 붕괴(~17%)가 잔존해(2026-07-20
+# 품질 114건 실증) 스트리밍 워치독에 붕괴 감지·절단을 켠다. 임계값은 stream_watchdog의
+# DegenerationMonitor 기본값(정상 표/목록/코드는 통과하도록 넉넉히 설정).
+DEGEN_GUARD_ENABLED = True  # False로 두면 종전 동작(감지 없음)과 100% 동일(무회귀)
 MAX_COLLAPSE_DRAIN = 1  # 긴급 압축 최대 횟수
 # 반복 실패 도구 호출 가드 — 모델이 같은 도구를 같은 입력으로 계속 호출하는데
 # 매번 실패하는(예: 깨진 Bash 명령을 못 고치고 반복하는) 상황을 조기에 끊는다.
@@ -875,6 +880,7 @@ async def query_loop(
                 _raw_stream,
                 idle_timeout=30.0,
                 total_timeout=300.0,
+                detect_degeneration=DEGEN_GUARD_ENABLED,
             ):
                 # 이벤트 처리 — type이 enum이거나 문자열일 수 있음
                 # 프로바이더 구현에 따라 둘 중 무엇이 와도 동작하도록 .value로 정규화한다.
