@@ -365,6 +365,17 @@ class TestDegenerationMonitor:
         m.feed("─" * 400)
         assert m.is_degenerate()
 
+    def test_distributed_repetition_flagged(self):
+        # 같은 문장이 전체 출력에 흩어져 반복(어느 window에도 안 몰림) → 전역 구절빈도로 감지.
+        # kd01형: 반복 사이에 서로 다른 긴 정상 내용이 끼어 window 검사로는 못 잡는 케이스.
+        m = DegenerationMonitor(min_chars=20, check_every=1)
+        rep = "이 문장은 전체 출력에 흩어져 반복되는 붕괴 구절입니다.\n"
+        for i in range(10):
+            # 반복 간격을 window(1500)보다 넓게 벌리는 서로 다른 긴 정상 문단.
+            m.feed(f"서로 다른 정상 내용 문단 번호 {i} 가 사이사이에 충분히 길게 들어갑니다.\n" * 12)
+            m.feed(rep)
+        assert m.is_degenerate()
+
     def test_emoji_spam_flagged(self):
         # 이모지 폭주(kd01 유형) → 이모지 밀도 초과.
         m = DegenerationMonitor(min_chars=20, check_every=1)

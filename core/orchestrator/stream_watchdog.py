@@ -84,6 +84,7 @@ class DegenerationMonitor:
         max_emoji: float = 0.15,
         min_line_repeat: int = 5,
         min_line_len: int = 20,
+        max_global_repeat: int = 6,
         check_every: int = 200,
     ) -> None:
         self._min_chars = min_chars
@@ -97,16 +98,36 @@ class DegenerationMonitor:
         # 항목에 반복되는 것은 정상이므로(kd12 오탐), 붕괴성 긴 라인(표 행 등)만
         # 세도록 20자 이상만 카운트한다.
         self._min_line_len = min_line_len
+        # 전역 구절 반복 임계 — 같은 의미있는 구절이 전체 출력에서 이 값을 초과해
+        # 반복되면 붕괴로 본다. 최근 window에만 몰리지 않고 전체에 '분산 반복'되는
+        # 붕괴(kd01: 같은 문장이 19692자에 19회 흩어짐)를 window 검사로는 못 잡아
+        # 추가한 전역 신호다. 정상 콘텐츠가 20자↑ 동일 구절을 7회↑ 반복하는 일은 드묾.
+        self._max_global_repeat = max_global_repeat
         self._check_every = check_every
         # 최근 window 글자만 보관(메모리 O(window)). 전체 누적 길이는 별도 카운트.
         self._tail = ""
         self._len = 0
         self._last_check_len = 0
+        # 전역 구절 빈도(분산 반복 감지). 구절 경계로 완성된 것만 카운트.
+        self._seg_buf = ""
+        self._global_segs: Counter[str] = Counter()
+        self._global_hit = False
 
     def feed(self, text: str) -> None:
-        """TEXT_DELTA 조각을 누적한다(최근 window 글자만 유지)."""
+        """TEXT_DELTA 조각을 누적한다(최근 window + 전역 구절빈도 갱신)."""
         self._len += len(text)
         self._tail = (self._tail + text)[-self._window :]
+        # 전역 구절 빈도 — 개행·문장부호로 구절을 끊어, 의미있는(≥min_line_len) 구절을
+        # 전체에서 카운트한다. 경계로 '완성된' 구절만 세고 미완성 잔여는 버퍼에 남긴다.
+        self._seg_buf += text
+        segs = re.split(r"[\n.!?]", self._seg_buf)
+        for seg in segs[:-1]:
+            s = seg.strip()
+            if len(s) >= self._min_line_len:
+                self._global_segs[s] += 1
+                if self._global_segs[s] > self._max_global_repeat:
+                    self._global_hit = True
+        self._seg_buf = segs[-1]
 
     @property
     def length(self) -> int:
@@ -118,7 +139,11 @@ class DegenerationMonitor:
         # 짧은 생성은 검사하지 않는다(정상 짧은 답변 오탐 방지).
         if self._len < self._min_chars:
             return False
-        # 매 델타마다 재검사하면 비싸므로 check_every 글자마다만 검사한다.
+        # D) 전역 구절 반복 — feed 중 이미 감지된 분산 반복 플래그. window·간격과 무관하게
+        #    즉시 판정(kd01형 분산 반복은 어느 window에도 안 몰려 아래 검사로는 못 잡음).
+        if self._global_hit:
+            return True
+        # 매 델타마다 재검사하면 비싸므로 check_every 글자마다만 검사한다(window 검사).
         if self._len - self._last_check_len < self._check_every:
             return False
         self._last_check_len = self._len
