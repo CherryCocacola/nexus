@@ -64,6 +64,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # 루트 (core)
 from coding_corpus import chunk_code_aware, html_to_markdown  # noqa: E402
 
 from core.rag.knowledge_store import KnowledgeEntry, KnowledgeStore  # noqa: E402
+from core.rag.pgvector_base import parse_vector as _parse_vector  # noqa: E402
 
 logger = logging.getLogger("nexus.scripts.prepare_stackoverflow")
 
@@ -497,6 +498,261 @@ async def run_ingest(args: argparse.Namespace) -> int:
     return 0
 
 
+# ── 문서측 번역(B안, 2026-07-19) ────────────────────────────────────────────
+# 왜(실측 근거): e5·리랭커가 한국어질의↔영어SO 문서를 매칭 못 해(리랭크 0.0~0.09)
+#   빈주입된다. 각 청크에 한국어 제목 글로스를 붙이면 리랭커가 통과시키고(0.0→1.0)
+#   벡터 회수도 top-40 임계 위로 올라온다(프로브 검증, progress.md 2026-07-19).
+#   질의를 번역하면 한국어 코퍼스(kowiki/okky)를 파괴하므로(실측 5중 3 손실),
+#   번역을 '문서측'에 두어 한국어 검색 경로를 전혀 건드리지 않는다.
+
+
+def apply_gloss(content: str, ko_gloss: str) -> str:
+    """청크 본문 맨 앞에 한국어 제목 글로스를 헤더로 덧붙인다.
+
+    왜 임베딩·저장 본문 둘 다에 넣나(프로브 검증): 검색 회수(벡터)뿐 아니라 리랭커도
+    이 본문을 보고 점수를 매긴다. 글로스가 리랭크 대상 텍스트에 있어야 한국어질의가
+    min_score 게이트를 통과한다(본문만이면 0.0~0.08로 드롭). 한국어 사용자에겐 영어
+    답변 위 한글 제목이라 노이즈가 아니라 도움이 된다.
+
+    ko_gloss가 비었으면(번역 실패 폴백) 원문을 그대로 둔다(무손상 — 그 행은 오늘과 동일).
+
+    NUL(0x00)은 항상 제거한다 — PostgreSQL text 컬럼은 널바이트를 거부(UTF8 invalid)하는데,
+    A.X 번역 글로스나 원문에 드물게 섞여 들어와 적재가 중단될 수 있다.
+    """
+    content = content.replace("\x00", "")
+    g = ko_gloss.replace("\x00", "").strip()
+    if not g:
+        return content
+    return f"# {g}\n{content}"
+
+
+def _extract_json_array(text: str) -> Any:
+    """모델 응답에서 첫 JSON 배열을 관대하게 추출한다(코드펜스·부연이 섞여도).
+
+    ```json ... ``` 펜스나 앞뒤 잡텍스트가 있어도 첫 '['~마지막 ']' 구간만 파싱한다.
+    실패하면 None을 돌려 호출부가 원문 유지 폴백을 타게 한다.
+    """
+    s = text.find("[")
+    e = text.rfind("]")
+    if s == -1 or e == -1 or e < s:
+        return None
+    try:
+        return json.loads(text[s : e + 1])
+    except json.JSONDecodeError:
+        return None
+
+
+async def _translate_batch(
+    client: Any, base_url: str, model: str, titles: list[str]
+) -> list[str]:
+    """제목 배치를 A.X /v1/chat/completions로 EN→KO 번역해 리스트로 돌려준다.
+
+    번호 매긴 입력을 같은 개수의 JSON 문자열 배열로 받아 파싱한다. 파싱 실패·개수
+    불일치·요청 오류면 원문(영어) 리스트를 그대로 돌려준다(무손상 폴백).
+    """
+    numbered = "\n".join(f"{j + 1}. {t}" for j, t in enumerate(titles))
+    prompt = (
+        "다음 영어 Stack Overflow 질문 제목들을 자연스러운 한국어 검색어로 번역하라. "
+        "기술 용어(함수명·라이브러리·키워드·기호)는 통용 표기를 쓰되 의미를 살려라. "
+        "설명·부연 없이 입력과 같은 개수의 JSON 문자열 배열로만 출력하라.\n\n"
+        f"{numbered}\n\n"
+        '출력 예: ["첫 번째 한국어 번역", "두 번째 한국어 번역"]'
+    )
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.2,
+        "max_tokens": 2048,
+    }
+    try:
+        r = await client.post(base_url.rstrip("/") + "/v1/chat/completions", json=payload)
+        r.raise_for_status()
+        text = r.json()["choices"][0]["message"]["content"]
+        arr = _extract_json_array(text)
+        if isinstance(arr, list) and len(arr) == len(titles):
+            return [str(x).strip() for x in arr]
+        logger.warning(
+            "번역 배치 파싱 불가/개수 불일치(%s vs %d) → 원문 유지",
+            len(arr) if isinstance(arr, list) else "None", len(titles),
+        )
+    except Exception as e:  # noqa: BLE001 — 번역 실패는 원문 유지로 흡수(적재 계속)
+        logger.warning("번역 배치 실패 → 원문 유지: %s", e)
+    return list(titles)
+
+
+async def translate_titles(
+    base_url: str, model: str, titles: list[str], *,
+    batch_size: int = 20,
+    timeout: float = 180.0,  # noqa: ASYNC109 — 오프라인 배치, httpx 클라이언트 생성용
+) -> dict[str, str]:
+    """영어 제목 리스트를 배치로 EN→KO 번역해 {영어제목: 한국어제목}을 돌려준다.
+
+    오프라인 1회 배치라 생성모델(A.X)로 품질 우선 번역한다. 실패 배치는 원문을
+    유지하므로 그 행은 오늘과 동일하게 동작한다(부분실패 무손상).
+    """
+    import httpx
+
+    result: dict[str, str] = {}
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        for i in range(0, len(titles), batch_size):
+            batch = titles[i : i + batch_size]
+            ko = await _translate_batch(client, base_url, model, batch)
+            for en, k in zip(batch, ko, strict=True):
+                result[en] = k or en
+    return result
+
+
+def _load_gloss_cache(path: str | None) -> dict[str, str]:
+    """번역 캐시(JSON) 로드 — 재실행 시 이미 번역한 제목을 건너뛰기 위함(이어받기)."""
+    if not path:
+        return {}
+    p = Path(path)
+    if not p.exists():
+        return {}
+    return json.loads(p.read_text(encoding="utf-8"))
+
+
+def _save_gloss_cache(path: str | None, cache: dict[str, str]) -> None:
+    """번역 캐시를 원자적으로 저장(중단 안전 — 임시파일 쓰고 교체)."""
+    if not path:
+        return
+    p = Path(path)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(p)
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    """asyncpg의 jsonb 컬럼이 str/dict 어느 쪽으로 오든 dict로 정규화한다."""
+    if isinstance(value, str):
+        return json.loads(value)
+    return dict(value) if value else {}
+
+
+async def _embed_store(
+    store: KnowledgeStore, embed_url: str, entries: list[KnowledgeEntry]
+) -> int:
+    """엔트리 배치를 임베딩(:8002)해 UPSERT하고 적재 건수를 돌려준다.
+
+    임베딩 실패는 그 배치만 건너뛴다(전체 중단 방지) — run_ingest와 동일 정책.
+    """
+    try:
+        embs = await _embed_texts(embed_url, [e.content for e in entries])
+    except Exception as e:  # noqa: BLE001 — 배치 임베딩 실패는 스킵(다음 배치 계속)
+        logger.warning("임베딩 실패 배치(%d개): %s", len(entries), e)
+        return 0
+    stored = 0
+    for entry, emb in zip(entries, embs, strict=True):
+        await store.add(replace(entry, embedding=tuple(emb)))
+        stored += 1
+    return stored
+
+
+async def run_glossify(args: argparse.Namespace) -> int:
+    """기존 source(예: 'so')를 한국어 글로스 부착 + 재임베딩해 target source('so_ko')로 적재.
+
+    Posts.xml 재파싱 없이 이미 큐레이션된 tb_knowledge 행을 변환한다(저렴).
+      1) source 고유 제목을 A.X로 EN→KO 번역(캐시 파일로 재실행 안전).
+      2) 각 청크 content에 글로스 프리픽스 → 재임베딩(:8002) → source=target UPSERT.
+      3) --resume-glossify면 target에 이미 있는 id는 건너뛴다(중단 후 이어받기).
+    섀도 소스라 무중단·롤백(DROP source=target) 안전. 활성화는 tenants 스왑(별도 승인).
+    keyset 페이지네이션(id > last)으로 스트리밍해 255k를 인메모리에 올리지 않는다.
+    """
+    import asyncpg
+
+    src, tgt = args.glossify_source, args.target_source
+    pool = await asyncpg.create_pool(args.pg, min_size=1, max_size=3)
+    store = KnowledgeStore(pg_pool=pool)
+    await store.ensure_schema()
+    try:
+        # 1) 고유 제목 수집 + 번역(캐시로 이어받기)
+        title_rows = await pool.fetch(
+            "SELECT DISTINCT title FROM tb_knowledge WHERE source=$1", src
+        )
+        titles = [r["title"] for r in title_rows]
+        cache = _load_gloss_cache(args.gloss_cache)
+        todo = [t for t in titles if t not in cache]
+        logger.info("고유 제목 %d개(미번역 %d) — A.X EN→KO 번역", len(titles), len(todo))
+        # 500개 청크마다 번역·캐시 저장(중단 시 진행분 보존)
+        for i in range(0, len(todo), 500):
+            chunk = todo[i : i + 500]
+            new = await translate_titles(
+                args.translate_url, args.translate_model, chunk,
+                batch_size=args.translate_batch,
+            )
+            cache.update(new)
+            _save_gloss_cache(args.gloss_cache, cache)
+            logger.info("번역 진행: %d/%d 제목", min(i + 500, len(todo)), len(todo))
+        if args.translate_only:
+            print(f"translated_titles={len(cache)} (glossify 적재는 --translate-only 없이 재실행)")
+            return 0
+
+        # 2) 이어받기: target에 이미 적재된 id
+        done_ids: set[str] = set()
+        if args.resume_glossify:
+            for r in await pool.fetch("SELECT id FROM tb_knowledge WHERE source=$1", tgt):
+                done_ids.add(r["id"])
+            logger.info("이어받기: target 기존 %d행 건너뜀", len(done_ids))
+
+        # 3) keyset 페이지네이션으로 스트리밍 변환 → (재임베딩 or 임베딩 복사) → UPSERT
+        #    --reuse-embedding: 기존 source 임베딩을 그대로 복사(재임베딩 0). 문서측 번역의
+        #    저렴경로 — 리랭커는 글로스 본문을 보고 통과하고, 벡터 fetch는 fetch_k 상향으로
+        #    보완한다(재임베딩 18h 회피). 실측 근거는 progress.md 2026-07-19 참조.
+        reuse = args.reuse_embedding
+        cols = "id, title, section, content, chunk_index, total_chunks, tags, metadata"
+        if reuse:
+            cols += ", embedding"
+        total = await pool.fetchval(
+            "SELECT count(*) FROM tb_knowledge WHERE source=$1", src
+        )
+        stored = skipped = 0
+        last_id = ""
+        while True:
+            rows = await pool.fetch(
+                f"SELECT {cols} FROM tb_knowledge WHERE source=$1 AND id > $2 "  # noqa: S608 — cols=화이트리스트 고정
+                "ORDER BY id LIMIT $3",
+                src, last_id, 500,
+            )
+            if not rows:
+                break
+            last_id = rows[-1]["id"]
+            batch: list[KnowledgeEntry] = []
+            for r in rows:
+                emb = None
+                if reuse and r["embedding"] is not None:
+                    emb = tuple(_parse_vector(r["embedding"]))
+                entry = KnowledgeEntry(
+                    source=tgt,
+                    title=r["title"],
+                    content=apply_gloss(r["content"], cache.get(r["title"], "")),
+                    section=r["section"],
+                    chunk_index=r["chunk_index"],
+                    total_chunks=r["total_chunks"],
+                    tags=tuple(r["tags"] or ()),
+                    embedding=emb,
+                    metadata=_as_dict(r["metadata"]),
+                )
+                if entry.id in done_ids:
+                    skipped += 1
+                    continue
+                batch.append(entry)
+            if reuse:
+                # 임베딩 복사 경로 — 임베딩 서버 호출 없이 바로 UPSERT.
+                for entry in batch:
+                    await store.add(entry)
+                    stored += 1
+            else:
+                for j in range(0, len(batch), args.batch_size):
+                    sub = batch[j : j + args.batch_size]
+                    stored += await _embed_store(store, args.embed_url, sub)
+            logger.info("글로시파이: 적재 %d(+skip %d) / 총 %d", stored, skipped, total)
+    finally:
+        await pool.close()
+    logger.info("완료: %d청크 적재(source=%s, skip %d)", stored, tgt, skipped)
+    print(f"stored={stored} source={tgt} skipped={skipped}")
+    return 0
+
+
 async def run_build_index(args: argparse.Namespace) -> int:
     """벡터 인덱스 빌드(전량 적재 후). 주의: build_vector_index는 IF NOT EXISTS라
     기존 idx_knowledge_embed가 있으면 no-op이다(FABLE5 C2). 전량 적재 시 실제
@@ -537,6 +793,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sqlite", default="so_stage.db", help="스테이징 SQLite 경로")
     parser.add_argument("--skip-stage", action="store_true", help="기존 SQLite 재사용")
     parser.add_argument("--stage-max-rows", type=int, default=None, help="스캔 행 상한(테스트)")
+    # 문서측 번역(B안) — 기존 source를 EN→KO 글로스 부착·재임베딩해 target source로 적재.
+    parser.add_argument("--glossify-source", help="변환할 기존 source(예: so)")
+    parser.add_argument("--target-source", default="so_ko", help="글로스 적재 target source")
+    parser.add_argument("--translate-url", help="A.X 번역 서버(OpenAI 호환, 예: http://127.0.0.1:18001)")
+    parser.add_argument("--translate-model", default="ax-4.0", help="번역 모델 served-name")
+    parser.add_argument("--translate-batch", type=int, default=20, help="1요청당 제목 개수")
+    parser.add_argument("--gloss-cache", default="gloss_cache.json", help="EN→KO 캐시(이어받기)")
+    parser.add_argument("--translate-only", action="store_true", help="번역·캐시만(적재 안 함)")
+    parser.add_argument("--resume-glossify", action="store_true", help="target 기존 id 건너뛰기")
+    parser.add_argument("--reuse-embedding", action="store_true",
+                        help="기존 source 임베딩 복사(재임베딩 0, 저렴경로). --embed-url 불요")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -545,6 +812,13 @@ def main(argv: list[str] | None = None) -> int:
         if not args.pg:
             parser.error("--build-index 에는 --pg 가 필요합니다")
         return asyncio.run(run_build_index(args))
+
+    if args.glossify_source:
+        if not args.pg or not args.translate_url:
+            parser.error("--glossify-source 에는 --pg 와 --translate-url 이 필요합니다")
+        if not args.translate_only and not args.reuse_embedding and not args.embed_url:
+            parser.error("글로스 적재엔 --embed-url 필요(번역만=--translate-only, 복사=--reuse)")
+        return asyncio.run(run_glossify(args))
 
     if args.stats:
         if not args.dump:
