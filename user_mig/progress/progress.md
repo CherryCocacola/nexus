@@ -3277,6 +3277,71 @@ QA #43(깨진 Bash 명령을 못 고치고 14회·62초 반복)의 근본 방어
 
 **■ 주의**: 리랭커/embed 재배포 시 EMBED_HOST=0.0.0.0 필수(LAN). 웹/embed 재시작은 sudo(auto 분류기가 차단 가능—사용자 승인/모드변경). so-pilot·okky-pilot는 삭제됨(orphan 정리). scratchpad 드라이버: run_so_staged.py·verify_so.py·finalize_so.py·activate_coding_tenant.py·run_okky_bulk.py. 후속(비차단): okky-pilot(119) 정리(orphan, DELETE) / 커버리지 위해 OKKY 추가 스크랩 / SO so-pilot→so 정규화(선택) / min_score 튜닝(경계선). 상용 전환 시 coding 테넌트에서 okky 제거 + DELETE source LIKE 'okky%'.
 
+### 코딩 RAG recall 튜닝 실측 — 두 레버 정량화 (2026-07-19)
+
+라이브 112(embed:8002 리랭커·PG 5440 so 255769)에 **읽기전용 측정**으로 recall 레버 2종을 정량화. 스크립트 scratchpad(recall_sweep.py·translate_ab.py·kowiki_ab.py·bilingual_ab.py). 8개 현대 코딩질의(async/컴프리헨션/pandas/JS프로미스/docker/SQL윈도우/정규식이메일/타입힌트).
+
+**① fetch_k 스윕(source=so, MIN_SIM0.6·MIN_SCORE0.3).** fetch_k **20→3/8, 40→4/8, 60·80→4/8**(포화). 40에서 docker(벡터 34위 정석)가 리랭크 후보 진입해 +1. 60/80은 기존 히트 점수만 개선, 추가 전환 없음. **결론: fetch_k 20→40이 값싼 확정 이득(+1), 40에서 포화.**
+
+**② 질의번역 KO→EN A/B(source=so, fetch_k40).** 한국어 원질의 **4/8 → 영어 번역질의 8/8**. 미스 4개(컴프리헨션·프로미스·윈도우·이메일) 전부 0.85~1.00으로 히트, 손실 0건. **영어 SO엔 질의번역이 결정적 레버.** 근본원인=리랭커 `bge-reranker-v2-m3-ko`(이름은 교차언어)가 실측으론 한국어질의↔영어문서에 0.00~0.09(async/pandas/타입힌트가 되는 건 async·pandas·-> 같은 영어토큰 포함 덕분).
+
+**③ 🔴 교차오염 확정 — 번역은 한국어 코퍼스를 파괴.** 무차별 번역 금지 증거. kowiki/okky에 EN질의: **5중 3 손실**(광합성 0.99→0.11·세종 1.00→0.00·이펙티브자바 0.99→0.02). 양방향 concat("KO EN" 단일임베딩)도 동일 파괴(광합성 0.99→0.00·세종→0.00·이펙티브자바→0.01), SO만 3/4 회복 → **단일 질의로 양쪽 살리는 공짜점심 없음**. coding 테넌트가 kowiki+okky+so 동시검색이라 **번역은 반드시 소스-인지적**(이중검색/문서측/소스라우팅)이어야 함.
+
+**설계 위임(사용자 결정).** 번역 아키텍처는 설계단 질문이라 deep-reasoner(Opus)에 위 실측 근거로 위임. 후보 3안: (A)이중검색 KO+EN 소스별 리랭크(런타임 2×+번역기), (B)문서측 번역 적재시 SO청크 한글요약 부착(런타임0·에어갭정합·재적재비용), (C)소스라우팅 영어소스만 번역질의. 제약: 에어갭(번역기 온디바이스=112:8003 llama Qwen3.5-4B or B200 A.X 터널), M7 이미 rerank CPU ~2초, MUST-DO(SO 영어RAG 과투자 금물·수술적). fetch_k 20→40은 아키텍처 무관 값싼 이득이라 별도 적용(라이브 config+웹재시작=승인).
+
+**deep-reasoner 결정 = B안(문서측 번역, 섀도 소스 `so_ko`).** A배제(C에 지배), C배제(MUST-DO 정면충돌 — SO recall 위해 핫패스 상시 번역LLM 금지 + M7 지연). B우세: 런타임 비용/지연 0(오프라인 1회), 한국어 코퍼스 회귀 **구조적 0**(질의·한국어행 불변), 리랭커 게이트 문서측 해소. 번역기=B200 A.X(오프라인이라 품질우선) EN→KO 제목글로스. core/config/retriever 무변경, `scripts/prepare_stackoverflow.py`만 수정. PK 인플레이스 덮어쓰기 롤백소실 방지 위해 신규 source='so_ko'로 적재→검증→tenants swap so→so_ko.
+
+**🔑 B안 프로브 검증 완료(2026-07-19, 읽기전용, 255k 재적재 前 게이트).** 미스4개 gold SO청크 확보 후 한글글로스(내가 EN→KO 직접번역) 부착 측정.
+- **리랭커 게이트가 지배적 병목(deep-reasoner 설계의 갭 확정)**: 본문만 리랭크 3/4 실패(0.000/0.078/0.006) → **글로스+본문 리랭크 4/4 전부 1.000**. 즉 글로스는 임베딩입력뿐 아니라 **리랭커가 보는 저장본문에도** 들어가야 게이트 통과. deep-reasoner의 "본문은 원문유지"면 리랭커가 여전히 드롭 → 교정: 글로스를 content에 프리픽스(uniform, 한국어 사용자에겐 영어답변 위 한글제목 = 노이즈 아닌 도움).
+- **벡터 fetch 진입 확정**: gold(글로스+본문) cos 0.822~0.863 vs 현 top-40임계 0.808~0.848 → **4/4 top-20에도 진입**. 원본본문 cos(0.808~0.838)은 대부분 임계 아래(=미스 원인)였는데 글로스 +0.04가 뭉친 클러스터에서 임계 위로 넘김. 메커니즘 정확 작동.
+- **규모**: so=255,769청크 / 고유질문(section) 67,219 → 번역대상=67,218 제목(청크 아님), 재임베딩=255k(원적재 동일규모, 섀도소스라 무중단 백그라운드).
+- **잔여 미검증**: A.X 67k 배치번역 품질 편차(프로브는 내 고품질 번역 4건). 실적재 후 verify_so 재측정으로 확인.
+- **승인 대기**: ①B 구현(prepare_stackoverflow.py 글로스부착)+so_ko 255k 재적재(번역기 A.X/Qwen + 재임베딩, 수시간 오프라인) ②tenants swap so→so_ko(config+웹재시작 sudo) ③fetch_k 20→40(선택, 문서측글로스면 k=20도 진입하나 마진). 스크립트 scratchpad: recall_sweep·translate_ab·kowiki_ab·bilingual_ab·probe_phase1/2/3.py.
+
+**B안 실행(사용자 승인 완료, 2026-07-19). 진행 중.**
+- **코드 구현 완료(커밋 대기)**: `scripts/prepare_stackoverflow.py`에 `apply_gloss`(청크 앞 `# {한글글로스}` — 임베딩·리랭커 공용), `translate_titles`/`_translate_batch`/`_extract_json_array`(A.X /v1/chat/completions EN→KO 배치, 파싱실패=원문유지 무손상), `run_glossify`(기존 source→글로스+재임베딩→target source, keyset 페이지네이션, 캐시 이어받기, --resume). CLI `--glossify-source/--target-source/--translate-url/--translate-model/--translate-batch/--gloss-cache/--translate-only/--resume-glossify`. 테스트 +6 → 총 21 passed, ruff clean.
+- **실행 아키텍처**: A.X(18001)는 112 컨테이너-루프백이라 **번역만 112에서**(stdlib urllib 번역기 scratchpad/translate_ax.py → 112:/home/idino/so_ko/) → gloss_cache.json 회수 → **글로시파이 적재는 dev에서**(임베딩 8002·PG 5440 LAN). 번역기는 프로덕션 A.X 공유라 workers=4 억제.
+- **상태**: 고유제목 67,218 추출. 112 번역 백그라운드 가동(16제목/초, ETA~70분, A.X 품질 양호·기술용어 보존). 일부 배치 개수불일치→영어유지(무해). **다음**: 캐시완료→dev 글로시파이(255k 재임베딩 so_ko)→verify_so 검증→tenants swap 승인요청.
+
+**🔴 피벗 — 재임베딩 비현실적, 저렴경로 발견 (2026-07-19 밤).**
+- 번역 완료: 67,218 전량(A.X 71분). v2 단건폴백 회수로 영어잔존 4,085→**107(0.16%, 순수 코드/기호)**. 캐시 dev 회수.
+- **글로시파이(255k 재임베딩) 착수했으나 CPU e5가 근본 병목**: 경합 시 49h, 경합 없어도 **18h**(3.9 texts/s). 프로덕션 임베딩서버 공유라 부담. **중단·부분 so_ko(384행) 정리 예정.**
+- **★재분석: 두 레버 분리 가능.** 리랭커(지배병목 0.0→1.0)는 *저장본문*만 봄 → **본문 글로스만 넣으면 재임베딩 없이 통과**. 벡터fetch만 임베딩 글로스 필요→**fetch_k 상향으로 대체**. 즉 `so 임베딩 복사 + 본문 글로스`(SQL 수 분, 재임베딩 0)로 가능.
+- **저렴경로 실측(body임베딩+글로스본문)**: 미스 회수 정규식@k20·JS프로미스@k40·리스트컴프리헨션@k100·SQL윈도우@k100, 대조 3개 k20부터 무손상. **8/8엔 fetch_k=100 필요.**
+- **🔴 리랭커 지연(측정)**: k20=4.8s·k40=8.6s·k60=13.4s·**k100=20.8s**. fetch_k 전역상향은 모든 지식질의(kowiki 포함) 지연 가중 → k100은 과함(+16s).
+- **결정 트리(사용자 몫)**: ①저렴+k40(6/8, 수분배포, +4s 전역) ②저렴+테넌트별 k100(코딩만 8/8·+16s, 소코드변경) ③전량 재임베딩 GPU(8/8·저지연, GPU임베딩 인프라+승인) ④전량 재임베딩 CPU 18h(8/8·저지연, 임베딩서버 18h부담). MUST-DO(SO 과투자 금물·수술적, 답변품질 A/B 미검증)면 ①이 규율적. 스크립트 scratchpad: translate_ax·translate_ax_v2·launch_glossify·cheap_path.py.
+
+**저렴경로 채택·so_ko 적재 완료 (2026-07-20, 사용자 "권장순서대로").** 권장순서(저렴 6/8 배포→답변품질 A/B→가치있으면 GPU 재임베딩 8/8).
+- **코드**: `run_glossify`에 `--reuse-embedding`(기존 so 임베딩 복사, 재임베딩 0) + `apply_gloss` NUL(0x00) 제거(PG text 거부 방지, A.X 글로스에 섞임). 테스트 16 passed, ruff clean. **커밋 대기.**
+- **적재 완료**: `so_ko` 255,769 = so 일치, 임베딩 누락 0. reuse 42행/초, NUL 크래시 1회(181,863)→수정 후 resume 완료. 부분 재임베딩본(1000행) 삭제 후 재생성.
+- **✅ 실적재 검증(verify_soko.py)**: **k20=5/8·k40=6/8·k100=8/8**(기존 so 3/8). **k20(현재값)에서 이미 3/8→5/8 = 지연비용 0 공짜개선**(글로스가 리랭커 게이트 통과). k40 +4s, k100 +16s.
+- **so_ko 아직 미바인딩(inert)**. so 원본 잔존(롤백용). **승인 대기**: tenants 코딩 so→so_ko + 웹재시작(sudo). fetch_k 20 유지(공짜 5/8) or 상향. **다음**: 스왑→답변품질 A/B.
+
+**✅ so_ko 스왑 배포 라이브 + 🔴 A/B가 degeneration 발견 (2026-07-20).**
+- **배포 완료**: tenants 코딩테넌트 so→so_ko(리포+컨테이너 docker cp, 백업 tenants.yaml.bak.pre-soko), 웹 재시작(sudo -S), health 200, e2e 코딩쿼리 정상(so_ko 라이브). fetch_k=20 유지=무료 5/8. 롤백=스왑 되돌리기+원본 so 잔존.
+- **🔴 A/B 결과 = degeneration 발견(recall 아닌 serving 문제)**: 코딩(so_ko RAG) vs default(코딩RAG 없음) 5질의. **양쪽 다 긴 생성에서 붕괴**: SQL윈도우 base=이모지스팸(☕♨️), 판다스 base=ㅠㅠㅠ반복·RAG=공백깨짐, 타입힌트 RAG=19,146자 문자샐러드·base=180s 타임아웃. **default(미변경)도 동일 붕괴 → so_ko 무관, 기존 serving degeneration**. 짧은 답변(리스트뒤집기·정규식)은 RAG·base 품질 비슷.
+- **🔴 핵심**: knowledge_mode가 rep_penalty 1.15·freq 0.3인데도 붕괴, **19k자 출력이 max_tokens 4096 초과 = max_tokens 미적용 or 페널티 무력**. 답변품질 진짜 병목=fetch_k 아닌 **degeneration**. [[project_degeneration_fix]]·[[project_context_overflow_fix]] 관련. **A/B는 degeneration에 오염돼 RAG 가치 판정 불가**(깨끗 구간만 comparable).
+- **최적셋팅 판정**: ①so_ko+fetch_k=20 유지(무료 5/8, 문제없음) ②GPU 8/8 재임베딩 **보류**(degeneration이 품질 지배중이라 recall 더 올려도 무의미) ③**우선순위=degeneration 조사·수정**(별도 태스크, 사용자 지시 대기). 스크립트 scratchpad/ab_test.py, 결과 ab_result.json.
+
+**🔴 degeneration 근본원인 규명 + 수정안(FABLE5 검증) (2026-07-20).**
+- **격리 실측(A.X 18001 직접)**: 같은 질의로 knowledge 파라미터(rep1.15+freq0.3)=23,377자 finish=length 단어샐러드 붕괴 / **페널티 없음=2,910자 finish=stop 깨끗**. 스윕: none·rep1.0+freq0.15·rep1.05+freq0.1·rep1.1 전부 정상, **오직 rep1.15+freq0.3만 붕괴**(타입힌트·SQL윈도우 둘 다).
+- **근본원인**: knowledge_mode rep1.15+freq0.3 과도. freq_penalty가 등장횟수 선형비례→긴 생성에서 종결어미·조사 억눌러 EOS 간접붕괴→희귀어휘 폭주→length. 웹 MAX_OUTPUT_RECOVERY 에스컬레이션이 붕괴 생성 이어붙여 증폭(19k자·타임아웃).
+- **반복억제력 검증**: 열거형 질의로 제안값 rep1.05+freq0.1=반복0(4gram0.013~0.017·고유라인0.97~0.98)·붕괴0. 동시 방지 확인(FABLE5 1순위 리스크 해소).
+- **수정안(FABLE5, 승인 대기)**: ①knowledge_mode rep1.15→1.05·freq0.3→0.1 ②chat_mode rep1.1→1.05·freq0.2→0.1(안전정렬) ③tool_mode 불변 ④max_tokens4096 유지 ⑤2차방어(선택): stop_resolver `_looks_degenerate`+query_loop Transition3 가드로 붕괴 시 에스컬레이션 중단. 배포=112 bind-mount config 수정+백업+웹재시작(sudo), 리포 3본 동기화.
+- **✅ 배포·검증 완료(2026-07-20, 사용자 승인)**: 리포 3본(112/pc/base) 동기화 + 라이브 112 bind-mount sed in-place 4값 수정(rerank.enabled:true 등 라이브 고유값 보존, 백업 .bak-20260720-degen) + 웹재시작. **e2e 재검증: 붕괴 3질의(타입힌트 19146자→2005자·SQL윈도우→2242자·판다스→2263자) 전부 정상종료·4gram최빈0.007~0.013, 지연 135~180s→42~49s 개선.** knowledge/chat=rep1.05·freq0.1, tool 불변. **2차 가드(_looks_degenerate)는 후속(docker 스냅샷 절차).** 커밋 대기.
+
+**AI 응답품질 대량 테스트 114건 (2026-07-20).** Claude식 품질평가 8카테고리, 라이브 코딩 어시스트 대상. 실행=quality_run.py(동시성2), 채점=Claude 에이전트 8개(카테고리별 루브릭). 스크립트 scratchpad/quality_testset.json·quality_run.py·quality_results.json·judge/.
+- **종합: pass 103/114(90%)·partial 4·fail 7(6%)·할루시네이션 3건. finish=length 0(런어웨이 소멸=degen 수정 유지).**
+- 카테고리: 코딩디버깅 15/15·추론수학 15/15·거부적절성 10/10(유해거부·양성응답 완벽, 과잉거부0) 만점 / 지시따르기 14/15 / 거짓전제 13/15(정정, **없는기능 지어내기 0**) / 코딩구현 17/20 / degeneration 10/12 / 모르는것 9/12.
+- **fail 7**: un01/07/08=알수없는값 단정(파이썬버전3.11.15·포트80닫힘·실행시간0.006ms, 할루시네이션3) / co07="n개씩"을"n개그룹"오해석 / if08=코드블록금지 위반 / **kd01=이모지폭주+가짜tool_call붕괴·kd04=표헤더무한반복+문자샐러드(degen4gram0.503)**.
+- **🔴 잔존 degeneration 발견(중요)**: config 수정이 **런어웨이(finish=length→19k에스컬레이션)는 제거**했으나, 긴 열거/설명형에서 **2/12(~17%)가 자체종료(finish=stop) 내부에서 여전히 붕괴**(kd01 이모지+가짜툴콜, kd04 표반복+샐러드). 페널티 완화만으론 100% 제거 안 됨 → **2차방어(스트리밍 워치독으로 생성중 붕괴 감지·절단, 메모리 A3)가 실제로 필요**함이 대량테스트로 실증. 에스컬레이션 가드(_looks_degenerate)는 자체종료 케이스엔 무효(생성중 감지 필요).
+- **약점 2가지**: ①모르는것에 구체값 단정(할루시네이션 3/12) ②잔존 degeneration(2/12 긴생성). 강점: 코딩·추론·안전·지시이행·거짓전제 방어 우수.
+
+**degeneration 스트리밍 워치독 구현·검증 (2026-07-20, 사용자 "워치독부터").** 잔존 붕괴(자체종료 내부)를 생성 중 감지·절단.
+- **구현**: `core/orchestrator/stream_watchdog.py`에 `DegenerationMonitor`(최근 window 누적, 3휴리스틱: 동일 긴라인≥5회반복·문자4gram최빈>0.45·이모지밀도>0.15) + `stream_with_watchdog`에 `detect_degeneration` 파라미터(기본 off=무회귀). 붕괴 감지 시 **예외 아니라 graceful return**(MESSAGE_STOP前 종료→Transition3 에스컬레이션 미발동, 깨끗한 앞부분 유지) + `stream.aclose()`로 GPU 붕괴꼬리 생성 중단. `query_loop.py` 상수 `DEGEN_GUARD_ENABLED=True`로 활성.
+- **실데이터 검증(quality_results.json)**: 붕괴 **kd04 감지@1320자(19543자 샐러드 꼬리 절단)·kd01 감지@5120자(이모지폭주)** / 정상 11건(kd02,03,05~12·if13) **오탐 0**. 임계 튜닝 2회(라인 최소 20자로 kd12 짧은라벨 오탐 제거, 이모지 0.20→0.15로 kd01 회수). 단위테스트 +8 → 27 passed, 내 코드 ruff 클린(잔여 N818·F841은 기존).
+- **미배포**: 이건 config 아닌 **코드 변경**이라 라이브 반영엔 docker 스냅샷 절차(nexus-web 이미지 갱신) 필요 → 별도 승인. 커밋 대기. 배포 후 e2e(kd01/kd04형 질의 재현→절단 확인) 권장.
+
 ### 코딩 학습 데이터 계획 — 파킹(향후 코딩 전용 대비) (2026-07-17)
 
 > 사용자 결정: 지금 학습은 안 함(RAG 우선). 단 **데이터·계획은 보존** — 범용 A.X를 이후 코딩 전용으로 쓸 일이 생길 것으로 예상. 소스별 고려를 미리 해둔다.
