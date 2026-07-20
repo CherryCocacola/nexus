@@ -55,10 +55,11 @@ tenants:
 
   # 코딩 어시스트 모드 — 코딩 지식 RAG(SO/OKKY) + 공개 지식. 팀 내부 전용.
   # 전용/범용 전환은 아래 allowed_knowledge_sources 목록만 수정 + 웹 재시작(재적재 불필요):
-  #   범용+코딩 = [kowiki, sample, okky, so] / 순수 코딩 = [okky, so]
+  #   범용+코딩 = [kowiki, sample, okky, so_ko] / 순수 코딩 = [okky, so_ko]
   # OKKY는 사용자 저작물(재사용 라이선스 없음)로 내부 전용 — 상용 전환 시 이 목록에서
   # okky 제거(+ DELETE FROM tb_knowledge WHERE source LIKE 'okky%'). SO는 CC BY-SA(공식덤프).
-  # so = 최근(2012+)·고득점(≥50) 정석 코딩 Q&A. 리랭커가 소스별 관련도로 자동 선택하고,
+  # so_ko = so(최근·고득점 정석 Q&A)에 한국어 제목 글로스를 문서측 부착한 소스(2026-07-20).
+  #   한국어 코딩질의↔영어SO 교차언어 recall 개선(리랭커 게이트 통과). 원본 so는 롤백용 잔존.
   # allowed_knowledge_sources가 DB-레벨 격리를 이중으로 보장한다.
   - id: coding
     name: Coding
@@ -68,7 +69,7 @@ tenants:
       - kowiki
       - sample
       - okky
-      - so
+      - so_ko
     api_keys: ["nexus-coding-key-001"]
     metadata:
       usage: internal-only
