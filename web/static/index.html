@@ -1527,8 +1527,15 @@ function applyInline(s) {
 // 지원: 펜스 코드블록(```), 인라인코드(`), 굵기(**), 링크([]()),
 //       제목(#/##/### → h2/h3/h4), 순서없는 목록(- / *) + 들여쓰기 중첩,
 //       순서있는 목록(1. 2. …), 빈 줄 단락 분리.
-function formatContent(text) {
+function formatContent(text, streaming) {
   if (text === null || text === undefined) text = '';
+
+  // 0) 스트리밍 중 미완성 코드펜스 보정 — 아직 닫히지 않은 ```가 있으면(개수 홀수)
+  //    임시로 닫아 코드블록으로 렌더한다. 안 그러면 닫히기 전까지 ```와 코드가
+  //    원문 그대로 노출됐다가 닫히는 순간 코드블록으로 '팝인'해 깜빡인다.
+  if (streaming && ((text.match(/```/g) || []).length % 2 === 1)) {
+    text += '\n```';
+  }
 
   // 1) 펜스 코드블록을 먼저 추출해 플레이스홀더로 치환한다.
   //    코드 내부는 마크다운 파싱 대상에서 제외하기 위함(개별로 이스케이프).
@@ -1735,6 +1742,9 @@ function startStreamingMessage() {
   // 때만 thinking 모드로 전환한다.
   _streamThinking = false;
   _streamThinkBuf = '';
+  // 새 스트리밍 본문 — 원문 누적·throttle 타이머 초기화(이전 메시지 잔여 방지).
+  _cancelStreamRender();
+  _streamBodyRaw = '';
 
   inner.appendChild(div);
   scrollToBottom();
@@ -1744,6 +1754,29 @@ function startStreamingMessage() {
 // 스트리밍 중 thinking 상태 (기본: 일반 모드)
 let _streamThinking = false;
 let _streamThinkBuf = '';
+
+// 스트리밍 본문 원문(마크다운) 누적 — 표시(innerHTML)와 분리해 보관한다.
+// 예전엔 body.textContent가 표시·누적을 겸해 스트리밍 중 원문이 그대로 보였다.
+// 이제 원문은 여기에 쌓고, 화면은 formatContent로 렌더한 innerHTML로 갱신한다.
+let _streamBodyRaw = '';
+let _streamRenderTimer = null;   // throttle 타이머(매 토큰마다 재렌더 방지)
+
+// 본문에 원문 조각을 더하고 throttle 렌더를 예약한다.
+function _bodyAppend(text) {
+  _streamBodyRaw += text;
+  if (_streamRenderTimer) return;             // 이미 예약돼 있으면 합류
+  _streamRenderTimer = setTimeout(() => {
+    _streamRenderTimer = null;
+    const body = document.getElementById('streamingBody');
+    if (body) body.innerHTML = formatContent(_streamBodyRaw, true);  // true=스트리밍(미완성 관용)
+    scrollToBottom();
+  }, 60);                                      // ~60ms 간격으로 재렌더(부드럽게)
+}
+
+// throttle 타이머 취소(리셋/finalize 시 잔여 렌더 방지).
+function _cancelStreamRender() {
+  if (_streamRenderTimer) { clearTimeout(_streamRenderTimer); _streamRenderTimer = null; }
+}
 
 function appendStreamChunk(text) {
   const thinkEl = document.getElementById('streamingThinking');
@@ -1762,7 +1795,7 @@ function appendStreamChunk(text) {
         thinkEl.style.display = 'block';
       }
       const after = text.substring(closeIdx + 8);
-      if (after) body.textContent += after;
+      if (after) _bodyAppend(after);
     } else {
       _streamThinkBuf += text;
       if (thinkEl) {
@@ -1775,13 +1808,13 @@ function appendStreamChunk(text) {
     const openIdx = text.indexOf('<think>');
     if (openIdx !== -1) {
       // <think> 이전 부분은 본문에
-      if (openIdx > 0) body.textContent += text.substring(0, openIdx);
+      if (openIdx > 0) _bodyAppend(text.substring(0, openIdx));
       _streamThinking = true;
       const afterOpen = text.substring(openIdx + 7);
       // 같은 청크에 </think>까지 있는 경우 재귀 처리
       if (afterOpen) appendStreamChunk(afterOpen);
     } else {
-      body.textContent += text;
+      _bodyAppend(text);
     }
   }
   scrollToBottom();
@@ -1794,7 +1827,9 @@ function appendStreamChunk(text) {
 //      도구가 전혀 없는 순수 대화에서는 호출되지 않아 회귀가 없다.
 function resetStreamingBody() {
   const body = document.getElementById('streamingBody');
-  if (body) body.textContent = '';
+  _cancelStreamRender();
+  _streamBodyRaw = '';
+  if (body) body.innerHTML = '';
   // 중간 나레이션에 딸린 thinking 임시 상태도 함께 정리
   _streamThinking = false;
   _streamThinkBuf = '';
@@ -1803,11 +1838,14 @@ function resetStreamingBody() {
 }
 
 function finalizeStreamingMessage() {
+  _cancelStreamRender();                       // 예약된 스트리밍 렌더 취소(최종 렌더로 대체)
   const body = document.getElementById('streamingBody');
   const thinkEl = document.getElementById('streamingThinking');
   if (body) {
     body.classList.remove('streaming-cursor');
-    let raw = body.textContent;
+    // 원문은 표시(innerHTML)와 분리해 누적한 _streamBodyRaw에서 가져온다.
+    // (스트리밍 중 body.textContent는 렌더된 HTML의 텍스트라 마크다운 원문이 아니다.)
+    let raw = _streamBodyRaw;
     // 만약 </think> 없이 스트림이 끝났는데 thinking 중이었다면 버퍼의
     // 내용을 본문에 합쳐 넣는다 (사용자에게 빈 응답 방지)
     if (_streamThinking && _streamThinkBuf.trim() && !raw.trim()) {
@@ -2369,12 +2407,10 @@ async function sendMessage() {
               // (한글/영문 섞임을 감안해 4글자 ≈ 1토큰의 러프한 근사).
               if (data.type === 'message_stop') {
                 if (totalOutputTokens === 0 && streamStarted) {
-                  const body = document.getElementById('streamingBody');
-                  if (body) {
-                    totalOutputTokens += Math.ceil(body.textContent.length / 4);
-                    totalInputTokens += Math.ceil(text.length / 4);
-                    updateTokenDisplay();
-                  }
+                  // 렌더된 HTML이 아니라 누적 원문(_streamBodyRaw) 길이로 추정한다.
+                  totalOutputTokens += Math.ceil(_streamBodyRaw.length / 4);
+                  totalInputTokens += Math.ceil(text.length / 4);
+                  updateTokenDisplay();
                 }
               }
 
