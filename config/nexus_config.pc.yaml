@@ -238,8 +238,9 @@ routing:
     max_tokens: 4096          # 사실형 QA — 24K 입력 window에 맞춰 상향(2048→4096)
     enable_thinking: false    # 회귀 이력으로 전부 false 유지
     top_p: 0.95               # 꼬리 토큰 약간 차단
-    repetition_penalty: 1.15  # 사실형 QA — 반복 가장 강하게 억제
-    frequency_penalty: 0.3
+    repetition_penalty: 1.05  # 1.15→1.05 (2026-07-20 degeneration 수정 — 과한 페널티가 긴
+                              # 생성에서 종결토큰 억눌러 EOS 붕괴 유발. 실측: 1.05+0.1은 반복0·붕괴0)
+    frequency_penalty: 0.1    # 0.3→0.1 (등장횟수 선형비례=긴 생성 붕괴 주범)
     presence_penalty: 0.0
     description: "일반 지식 QA"
   tool_mode:
@@ -259,8 +260,8 @@ routing:
     max_tokens: 1024          # 인사·잡담은 짧게(512→1024, 그래도 가장 작게 유지)
     enable_thinking: false
     top_p: 0.9                # 잡담은 다양성 위해 약간 더 좁힘
-    repetition_penalty: 1.1   # 같은 인사말 반복 방지(중간 강도)
-    frequency_penalty: 0.2
+    repetition_penalty: 1.05  # 1.1→1.05 (2026-07-20 degeneration 안전정렬)
+    frequency_penalty: 0.1    # 0.2→0.1
     presence_penalty: 0.0
     description: "인사·잡담 — RAG 미주입, 짧은 응답"
 
