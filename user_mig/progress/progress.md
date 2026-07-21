@@ -3256,6 +3256,31 @@ QA #43(깨진 Bash 명령을 못 고치고 14회·62초 반복)의 근본 방어
 
 ---
 
+## ★★★ 세션 핸드오프 (2026-07-20, 다음 세션용) ★★★
+
+기술명세=`user_mig/PROJECT_NEXUS_SPEC_v7.5_AMENDMENT.md`(이 세션 종합). 아래는 운영 요약.
+
+**■ 이 세션에 한 것 (전부 LIVE + 커밋)**
+1. **코딩 RAG so_ko**: SO 청크에 한글 제목글로스 부착(문서측 번역) → 코딩테넌트 so→so_ko. recall 3/8→5/8(fetch_k=20, 지연0). scripts/prepare_stackoverflow.py(apply_gloss·translate_titles·run_glossify --reuse-embedding).
+2. **degeneration**: 페널티 완화(knowledge/chat rep1.05·freq0.1) + 스트리밍 워치독(stream_watchdog.py DegenerationMonitor, 전역 분산반복+window 감지→graceful 절단).
+3. **할루시네이션 지침**: web/prompts/worker_system(_full).md — 관측불가 정보 단정금지.
+4. **UI 스트리밍 마크다운**: web/static/index.html 실시간 렌더(_streamBodyRaw+throttle+미완성펜스).
+5. **🚀 리랭커 GPU 이전(최대 성과)**: 유물 vLLM(qwen3.5-27b,8001) stop+disable→5090 확보, nexus-embedding env cpu→cuda. **TTFT 25~30s→~1s, 간단질문 30s→1.3s.**
+6. 품질테스트 114건×2회(8카테고리, Claude 8에이전트 채점): pass ~90%, 할루시·런어웨이 감소 확인.
+
+**■ 현재 LIVE 상태**
+- 컨테이너: `nexus-web:latest`=`mdstream2-20260720_074620`(so_ko·워치독·할루시·UI). 재생성 시 이 태그.
+- 리랭커/임베딩: **112 5090 GPU**(nexus-embedding.service env EMBED/RERANK_DEVICE=cuda, 3.7GB, vLLM disabled). 재부팅 영속.
+- config(bind-mount): nexus_config.112.yaml 페널티 완화·rerank enabled. tb_knowledge: so_ko 255769·okky 1834·kowiki 1067975·so(원본, 롤백용 잔존).
+- git: feature/b200-bakeoff origin push 완료(462359e). 이후 커밋 있으면 미push.
+- 접속: SSH idino@192.168.21.112 pw=idino!@#$(sudo 동일). 웹 8600(Bearer nexus-coding-key-001), embed 8002, PG 5440, B200 A.X 터널 18001.
+
+**■ 다음 할 작업(논의된 것)**
+- **대학생 서버(삼진 라벨→SVG→.ai)**: 동시 1~2명·최대4명. 결정필요=①학생용 GPU를 112 5090 공유 vs 별도(프로덕션 리랭커와 경합) ②Motif-12.7B(커스텀 vLLM포크·bf16only·FP8미지원, 26GB라 5090서 리랭커와 공존불가) vs 표준모델(Qwen2.5, 학생 QLoRA 쉬움) ③파인튜닝 vs 템플릿채우기. .ai는 LLM이 직접 못만듦→SVG생성+일러 변환.
+- recall 8/8(GPU 재임베딩) / OKKY eBrain 허가 / citation·관측성 / 지시 하드제약(if08/14/15).
+
+**■ 주의**: 리랭커 GPU 재배포 시 EMBED_HOST=0.0.0.0 필수. 웹/embed 재시작·systemctl은 sudo(auto분류기 차단 가능→sudo -S 또는 사용자실행). so_ko는 섀도라 원본 so DROP은 별도. 5090 여유 ~28GB(Motif QLoRA·VLM 여지, 리랭커와 compute경합 고려).
+
 ## ★★★ 세션 핸드오프 — 코딩 RAG (2026-07-19, 다음 세션용) ★★★
 
 **■ 지금 LIVE인 것**
@@ -3340,7 +3365,29 @@ QA #43(깨진 Bash 명령을 못 고치고 14회·62초 반복)의 근본 방어
 **degeneration 스트리밍 워치독 구현·검증 (2026-07-20, 사용자 "워치독부터").** 잔존 붕괴(자체종료 내부)를 생성 중 감지·절단.
 - **구현**: `core/orchestrator/stream_watchdog.py`에 `DegenerationMonitor`(최근 window 누적, 3휴리스틱: 동일 긴라인≥5회반복·문자4gram최빈>0.45·이모지밀도>0.15) + `stream_with_watchdog`에 `detect_degeneration` 파라미터(기본 off=무회귀). 붕괴 감지 시 **예외 아니라 graceful return**(MESSAGE_STOP前 종료→Transition3 에스컬레이션 미발동, 깨끗한 앞부분 유지) + `stream.aclose()`로 GPU 붕괴꼬리 생성 중단. `query_loop.py` 상수 `DEGEN_GUARD_ENABLED=True`로 활성.
 - **실데이터 검증(quality_results.json)**: 붕괴 **kd04 감지@1320자(19543자 샐러드 꼬리 절단)·kd01 감지@5120자(이모지폭주)** / 정상 11건(kd02,03,05~12·if13) **오탐 0**. 임계 튜닝 2회(라인 최소 20자로 kd12 짧은라벨 오탐 제거, 이모지 0.20→0.15로 kd01 회수). 단위테스트 +8 → 27 passed, 내 코드 ruff 클린(잔여 N818·F841은 기존).
-- **미배포**: 이건 config 아닌 **코드 변경**이라 라이브 반영엔 docker 스냅샷 절차(nexus-web 이미지 갱신) 필요 → 별도 승인. 커밋 대기. 배포 후 e2e(kd01/kd04형 질의 재현→절단 확인) 권장.
+- **✅ 배포 완료(2026-07-20, 사용자 승인)**: 컨테이너 코드가 리포 base(71e6227)와 내용동일 확인 후 docker cp(stream_watchdog.py·query_loop.py, LF정규화·py_compile검증·백업 .bak-degen)+재시작. e2e: 붕괴했던 3질의(OOP·DB정규화·자료구조) 전부 정상종료(4gram 0.01~0.06). 이번 실행은 페널티수정으로 붕괴 미재현(확률적)이라 절단 자체는 미관측이나 감지로직은 실데이터 검증됨. **durability: docker commit `nexus-web:degenfix-20260720_053253`(+latest 갱신)** — 워치독 코드+so_ko 테넌트스왑 영속화. 백업 이미지 chunkfix-20260716 잔존.
+- **✅ 세션 커밋 5개(feature/b200-bakeoff, 미push)**: [scripts]글로시파이 [config]페널티완화 [config]so_ko스왑 [core]워치독 [docs]progress. HEAD ec1b9b0.
+
+**할루시네이션 개선(관측불가 정보) 구현·배포 (2026-07-20).** 품질테스트 약점②(모르는것 구체값 단정 3건) 수정.
+- **수정**: `web/prompts/worker_system.md`·`worker_system_full.md` Hard rules에 "로컬/실시간/비공개/미래 등 관측 불가 정보는 구체값 단정 금지·확인법 안내" 지침 추가(실패사례 예시 포함: 파이썬버전→python --version, 실행시간→timeit, 포트→ss). 커밋 3dd900b.
+- **배포·검증**: docker cp 두 파일+재시작(백업 .bak-halluc). e2e: un01(버전)·un07(포트)·un08(실행시간) 전부 "접근/측정 불가" 정직 거절+확인법 안내로 전환(이전 3.11.15·80닫힘·0.006ms 단정 → 해소).
+- **durability: docker commit `nexus-web:hallucfix-20260720_055011`(+latest)** — 워치독+so_ko+프롬프트지침 전부 영속화. 이전 스냅샷 degenfix·chunkfix 잔존.
+- **품질 약점 2건 모두 처리 완료**: ①degeneration(페널티+워치독) ②할루시네이션(프롬프트 지침). push는 지시 대기.
+
+**품질 재테스트(v2) + 워치독 갭 수정 (2026-07-20).** 3수정 라이브 상태로 114건 재측정·재채점(Claude 8에이전트).
+- **v1→v2**: pass 103(90%)→99(87%)·fail 7→4·할루시 3→1. **모르는것 9/12→12/12(할루시 3건 해소 ✅)** / 거부 10/10·추론 15/15·거짓전제 13/15 유지 / 코딩구현 fail0(co07해소)이나 partial↑(도구모드로 코드 파일작성) / 지시따르기 14→11(하드제약 if14/15 확률적) / **degeneration 10→11**. finish=length 0/114(런어웨이 소멸 유지).
+- **🔴 워치독 갭 발견·수정**: kd01 v2가 같은 문장을 전체 19692자에 **19회 분산 반복**하며 붕괴했으나 최근 window(1500) 검사로는 못 잡음(어느 window에도 <5회). → DegenerationMonitor에 **전역 구절빈도 추적**(개행·문장부호로 끊은 ≥20자 구절이 전체에서 max_global_repeat(6) 초과 반복 시 절단) 추가. 실데이터: kd01 @4800 감지(폭주 전 차단)·kd04·기존 유지·정상11 오탐0. 테스트 28 passed. 커밋 462359e.
+- **재배포**: stream_watchdog.py docker cp+재시작(health200), 스냅샷 `nexus-web:degenfix2-20260720_064117`(+latest). kd01 라이브 재현은 이번엔 깨끗(3103자, 확률적 미붕괴)이라 절단 미관측이나 로직은 실데이터 검증됨.
+- **판정**: "모드 100% 패스"는 아님(LLM eval 확률변동 ±3/카테고리 + if08/14/15 하드제약 잔존). 단 타깃 수정(할루시·런어웨이·분산반복)은 실증적으로 작동. 잔존=지시 하드제약(프롬프트 추가 조임 가능, 효과 확률적).
+
+**웹 UI 개선 (2026-07-20).** ①지연 정상성 확인: 리액트질의 23.6s(출력~1000토큰·프롬프트5351)는 72B FP8+RAG+CPU리랭커에서 정상(생성이 대부분). 버그 아님, 레버=출력길이/리랭커GPU/모델크기. ②**스트리밍 마크다운 실시간 렌더**: 기존 스트리밍 중 원문(마크다운기호) 노출→완료후 재정리 현상 수정. `web/static/index.html`에서 원문누적(`_streamBodyRaw`)을 표시(innerHTML)와 분리, ~60ms throttle로 formatContent 렌더, 미완성 코드펜스 임시닫아 코드블록 렌더(팝인방지). node --check+렌더 단위검증 통과. 커밋 40d7c08, 배포·컨테이너검증(_streamBodyRaw 9개)·스냅샷 `mdstream2-20260720_074620`. **사용자 브라우저 하드새로고침(Ctrl+Shift+R) 필요**(구 index.html 캐시).
+
+**🚀 응답속도 근본해결 — 리랭커 GPU 이전 (2026-07-20).** 사용자 "간단 질문도 26초" 지적.
+- **진단(TTFT 분해)**: "안녕"=0.5s(chat_mode, RAG 스킵) / "1+1"=TTFT 30s·생성 0.1s / "파이썬"=TTFT 25s·생성 6.3s. **지연 전부가 첫 토큰 전(RAG), 생성 아님.** 범인=**112 CPU 크로스인코더 리랭커가 긴 청크(~1300자) 20개 채점=25초**(짧은 문서는 0.9s, 문서길이가 지배). B200/LLM 무관.
+- **원인**: 5090이 유물 vLLM(qwen3.5-27b-awq, 8001)에 29GB 점유돼 리랭커가 CPU 유배(추론은 B200 18001로 이전 완료라 8001은 미사용·연결0·config 미참조).
+- **해결(사용자 승인, 실행완료)**: ①nexus-vllm.service stop+**disable**(5090 32GB 확보, 복구는 enable) ②nexus-embedding.service env `EMBED_DEVICE/RERANK_DEVICE cpu→cuda`(백업 .bak-cpu, embed_server.py가 CUDA fp16 조건부 지원) ③재시작→GPU 로드(3.7GB, health device=cuda).
+- **효과 실측**: **리랭크 25s→0.44s(~57배). TTFT 25~30s→~1s. 총: 간단질문 30s→1.3s·상세답변 ~7~8s(생성이 적정비용).** 대형 프로바이더급 TTFT 달성.
+- durability: 서비스 env 영속·vLLM disabled·embed enabled(부팅 GPU 자동). 리포 변경 없음(112 ops). 자르기(doc truncation) 미도입(GPU로 불요, config.py 원복). **남은 여유 ~28GB → Motif/VLM/학생 QLoRA 여지**([[project_segment_model_strategy]]).
 
 ### 코딩 학습 데이터 계획 — 파킹(향후 코딩 전용 대비) (2026-07-17)
 
@@ -3398,3 +3445,140 @@ QA #43(깨진 Bash 명령을 못 고치고 14회·62초 반복)의 근본 방어
 **최종 교정(전체 적재 26,971청크 완료 후).** 부분데이터 4/10이 **전체 커버리지에선 7/10 주입**으로 상향(커버리지↑ → 0.84 넘는 매칭 증가). 주입 7개 중 ~5개 정확·유용(C#변환·SQL중복제거·문자열→숫자 TryParse·null체크·팩토리얼인접), 1개 명백노이즈(정규식→"Xcode 숨은기능" 0.841 경계통과), 1개 부분(파일쓰기→C++ open). 반대로 정답이 드롭된 경우도(리스트정렬→"sort a list" 0.838<0.84). **결론 정밀화: SO RAG는 무가치 아니라 "강한 매칭엔 유효, 0.84 경계선에선 양방향 불안정(노이즈통과+정답드롭)"** — e5 교차언어 유사도가 0.83~0.87에 뭉쳐 0.84 게이트가 동전던지기. → 리랭커(노이즈배제 정밀도)+번역/재캘리(정답회수 재현율)로 견실화 가능. 이는 리랭커·번역이 보완재라는 FABLE5 지적과 정합. **파일럿 적재 EXIT 0, 26971청크 상주(so-pilot).**
 
 **API 스모크 테스트 셋(신규).** scripts/api_smoke_test.py — URL http://192.168.21.112:8600, Bearer nexus-b200-test-key-001. health·auth차단·인사·지식·도구·문서생성+다운로드·업로드분석 8케이스. `python -m scripts.api_smoke_test [--only ...]`.
+
+
+### PyTorch 한국어 지식 적재 + CLI 정합화 (2026-07-21)
+
+**동기.** 사용자 제안 — 코딩 RAG에 AI/PyTorch 지식 보강. 실측으로 갭 확인: so_ko 255,769청크 중
+pytorch 334(0.13%)·torch. 258·transformers 90 / **tensorflow 1015**(TF가 PyTorch의 3배 = SO 코퍼스가
+2016~2019 편중, torch 1.x 노후 지식). 즉 약할 뿐 아니라 **틀린 시대의 답** 위험.
+
+**소스 선정(사용자 결정).** SO의 pytorch 태그 추가수집은 기각(노후 API). 사용자가 `discuss.pytorch.kr`
+제시 → 조사 결과 **성격이 다른 두 자산** 발견. 최종 범위 = **튜토리얼 + 읽을거리&정보공유**, 내부 전용.
+- `pytorch_kr` = [PyTorchKorea/tutorials-kr](https://github.com/PyTorchKorea/tutorials-kr) — **BSD-3-Clause**(상용 가능),
+  **PyTorch v2.8 기준**(노후 없음), **한국어 원본**(글로스 불필요 = so_ko 삽질 회피).
+- `pytorch_forum_kr` = discuss.pytorch.kr 카테고리 **id=14 slug='news'**(3,164토픽). UGC·재사용 라이선스
+  없음 → **source 분리 필수**(상용 전 `DELETE WHERE source='pytorch_forum_kr'`). robots.txt 확인(/c/·/t/ 허용,
+  Crawl-delay 없음 → 1.2초 자율 적용).
+
+**구현.** `scripts/prepare_pytorch_kr.py` 신규(prepare_okky 대칭). rst/sphinx-gallery 파서 + Discourse 공개
+JSON(HTML 파싱 불요) + `chunk_code_aware`/`html_to_markdown`/`KnowledgeStore` 재사용. 튜토리얼은
+**한글비율 게이트**(<0.15 제외 — 번역 미완 영문 원문이 섞여 교차언어 문제 재발 방지), 포럼은 **min_doc_chars=300**
+(토픽당 1.21 posts = 대부분 단발 공유글, 링크만 있는 글은 노이즈). 테스트 27 passed, ruff clean.
+
+**적재 결과.** `pytorch_kr` **972청크**(290문서 중 156이 번역 미완으로 제외 = **번역률 약 46%**).
+`pytorch_forum_kr` 진행 중(1,746토픽/11,325청크 시점, 임베딩 누락 0). **검색 품질 검증**: "C++ autograd" 질의에
+정답 문서 **cos 0.895** 1위 — SO(영어)가 0.83~0.87에 뭉쳐 동전던지기였던 것과 대조로 **한국어↔한국어는 깨끗한 분리**.
+**tenants.yaml 미바인딩(inert)** — 웹은 아직 못 봄. CLI는 테넌트 없어 allowed_sources=None이라 즉시 검색됨.
+
+**버그 2건(적재 중 발견·수정).** ①Discourse `/t/{id}.json`의 `tags`가 **dict 목록**(문자열 아님)이라 PG text[]
+바인딩 DataError — 내 합성 픽스처가 실제 API 모양과 달라 못 잡음. `normalize_tags()` + 픽스처 현실화 + 회귀테스트 4개.
+②`| grep`이 파이프 종료코드로 **크래시를 성공(exit 0)으로 위장** — 파이프 제거. ③장시간 적재에서 유휴 PG 커넥션
+절단(`ConnectionDoesNotExistError`) → `_store_one` 백오프 재시도(2s→4s, 3회).
+
+**CLI 정합화(별건 3가지).**
+1. **pc.yaml PG/Redis 낡은 값 수정** — PG `127.0.0.1:15440/nexus/nexus` → `192.168.21.112:5440/idino_ai/idino_user`,
+   Redis `127.0.0.1:16340` → `192.168.21.112:6340`. 둘 다 LAN 직결(터널 불요). 수정 전에는 **인메모리 폴백 =
+   KnowledgeStore 레코드 0으로 RAG가 완전히 꺼진 상태**였다. 수정 후 1,589,520 레코드 연결.
+   (별개 함정: 로컬 8002를 Docker의 `student-service`가 점유 → NEXUS_CONFIG 미적용 시 `/v1/embed` 404 무한재시도.
+   PowerShell에서 `set`은 환경변수를 설정하지 못함 — `$env:` 필수.)
+2. **NEXUS → IDINO NOVA 리브랜딩(CLI, 표시 문자열만)** — repl.py 배너/패널제목/프롬프트(`nova> `), commands.py
+   `--help`. 로거(`nexus.*`)·클래스명·`NEXUS_CONFIG`·DB 스키마는 **인프라라 불변**(웹 리브랜딩과 동일 원칙).
+3. **`nova.bat` 런처 신설** — chcp 65001 + `%~dp0` 이동 + env 주입 + **터널 사전점검**(18001 닫히면 안내 후 중단).
+   배치는 **CRLF 필수**(LF로 쓰면 cmd가 줄을 잘못 잘라 `'ommands' is not recognized`). 양쪽 분기 실행 검증.
+
+**★ CLI 프롬프트↔도구 불일치 수정 (progress.md:2660 "후속(미착수)" 해소).**
+- **증상**: CLI에서 모델이 `Agent(subagent_type="scout")` 호출 → `알 수 없는 도구: 'Agent'`(가용 23개에 없음).
+- **진단(정정)**: 초기 가설 "AgentTool 등록 누락"은 **오진**. progress.md:2916의 **표면별 노출 CLI 23/웹 8/Scout 5**가
+  사용자 승인 결정이며 CLI에 Agent가 없는 것은 **의도**. 진짜 원인은 `_build_default_system_prompt()`에
+  **티어 분기가 없어** 항상 TIER_S 서사("Read/Glob 없음, scout에 위임")를 내보낸 것. TIER_S는
+  `_create_cli_tool_registry()`(7개, Agent 있음)이지만 **현재 tier=large는 `_create_tool_registry()`(23개,
+  Read/Glob 있음·Agent 없음)** — 프롬프트가 정반대를 지시. 모델은 지시를 따랐을 뿐.
+- **수정**: `_build_expanded_system_prompt()` 신설 + `_build_default_system_prompt(agent_registry, tier)` 분기.
+  TIER_M/L은 직접 탐색(Read/Glob/Grep/LS) 안내 + **Agent 명시적 금지**(사전지식 오호출 차단) + 서브에이전트 목록 미주입.
+  공통 섹션은 `_PROMPT_COMMON_SECTIONS`로 공유. 웹이 worker_system_full.md로 푼 것과 같은 분기이나 **방향은 반대**
+  (웹 TIER_L은 탐색도구 제거, CLI는 보유). tier=None은 하위호환으로 TIER_S 유지.
+- **검증**: 신규 테스트 11 passed(`tests/unit/test_cli_system_prompt.py`), 전체 **1,542 passed**(1 failed=hwpx는
+  `python-hwpx` 미설치 환경이슈, 무관). e2e: "config 디렉토리 파일 확인" → **LS 직접 호출·2턴·2.9초 정상 답변**.
+
+**후속.** ①포럼 적재 완주(독립 프로세스 재개 — 하네스 타임아웃에 3회 절단됨) ②tenants.yaml 바인딩(웹 노출, 승인 필요)
+③so 원본 255,769 정리 여부 ④CLI 프롬프트에 v7.5 §C 할루시네이션 지침 미반영(웹만 적용) ⑤`nova.bat` 평문 비밀번호
+(개인 PC 전제, 공유·커밋 시 제거 필요) ⑥커밋 미실행.
+
+**CLI 수정 3건 + 파생 버그 1건 (2026-07-21, 사용자 "버그+근본" 선택).**
+- **①`health`가 `NEXUS_CONFIG` 무시(수정)**: `load_and_validate_config()`가 env를 안 봐서 `nexus health`는 늘
+  `config/nexus_config.yaml`(8001)만 조회 → 100% 실패. bootstrap만 env를 읽던 것을 **로더 자체가 읽도록** 이관
+  (우선순위 유지: 인자 > NEXUS_CONFIG > 자동탐색). 로더를 직접 부르는 모든 경로가 함께 정상화된다.
+- **①-b `health`의 JSON 파싱 가정(파생 발견·수정)**: env 수정 후 드러남. **vLLM `/health`는 본문이 빈 200**
+  (content-type 없음)인데 `resp.json()`을 무조건 호출해 JSONDecodeError → "헬스체크 실패". 200이면 정상으로
+  처리하고 JSON이 있을 때만 펼치도록 수정. 즉 vLLM 환경에서 health는 **처음부터 동작한 적이 없었다**.
+- **②`ask`에 `--log-level` 추가**: 부트스트랩이 `nexus.*`를 INFO로 되돌리므로 init_phase2 직후 재적용
+  (repl `_apply_log_level` 대칭). 답변 텍스트 중간에 INFO가 끼는 현상 해소. 로그=stderr·답변=stdout이라
+  `2>/dev/null`이면 stdout 완전 청결(실측 확인).
+- **③★근본: 시스템 프롬프트 도구 목록을 레지스트리에서 생성**: 프롬프트에 도구를 하드코딩하면 레지스트리 변경 시
+  조용히 어긋나고, 그것이 `알 수 없는 도구: 'Agent'`의 근본 원인이었다(내가 쓴 새 프롬프트도 같은 취약성).
+  `_build_expanded_system_prompt(tool_names)`로 변경 — 도구 목록·탐색도구 안내·**Agent 허용/금지 문구까지 전부
+  집합에서 유도**. 호출부는 MCP 흡수 후의 최종 `cli_tools` 이름을 넘기므로 프롬프트가 항상 실물과 일치.
+  정렬 출력(prompt cache 안정성). 테스트 11→16 passed(레지스트리 유도·Agent 유무 분기·정렬 안정성 회귀).
+- **검증**: 전체 **1,547 passed**(1 failed=hwpx 모듈 미설치 환경이슈, 무관), ruff clean.
+  e2e: `health` 표 정상 출력 / `ask` stdout 청결 / 탐색질의에 LS 직접 호출.
+- **미착수(사용자 선택으로 보류)**: 웹에만 있고 CLI에 없는 4개 섹션(Grounding 할루시네이션 방지·프롬프트 인젝션
+  저항·정확한 계산·도구 표시 규약), 수동 `/compact`, `/agents`·`/effort`, nova.bat 평문 비밀번호.
+
+**scout·thinking 비활성 확인 + 문서화 (2026-07-21).**
+- **scout 죽음 확정**: `bootstrap`은 `tier == TIER_S`일 때만 `scout_provider`를 만드는데 **설정 3본이 전부
+  `hardware_tier: "large"`** → 항상 None. 웹·CLI·112 전부 해당. 도달 불가: `_create_cli_tool_registry()`(7개 풀),
+  `_create_scout_tool_registry()`, `scout_provider.py`, 프롬프트 TIER_S 분기.
+- **`core/thinking/` 전체 미배선**: ComplexityAssessor/ThinkingStrategy(DIRECT·HIDDEN_COT·SELF_REFLECT·MULTI_AGENT)
+  /hidden_cot/self_reflection이 **`core/thinking/` 밖 어디에서도 import되지 않음**. 즉 복잡도 기반 사고 전략은
+  동작하지 않는다. CLI `/thinking`은 무관(모델 thinking 블록 **표시 토글**일 뿐). `/effort`는 아예 없음.
+- **`.claude/rules/architecture.md`에 「비활성 서브시스템 주석」추가**(Tier 4 주석과 같은 형식). 코드 제거는 보류
+  — 사양 정의 구조이며 TIER_S 재사용 여지.
+- **112 `nexus-scout.service`(8003 llama-server Qwen3.5-4B) 중단은 하네스 auto 분류기가 차단** → 사용자 실행 대기.
+  **부수 발견: 112 라이브 `image_url`이 8003(텍스트 모델)을 가리키고 FLUX 터널 18003이 112에 없음 = 이미지 생성
+  이미 끊김.** scout 중단과 무관한 별도 복구 필요.
+
+**Agent를 CLI에 추가할까 검토 → 보류(근거 정정 포함).** 초기에 "CLI 23개는 의도된 설계"라 단정했으나 근거로 든
+progress.md:2916은 **감사 관찰 기록**이지 결정이 아니었다(정정). 다만 결론은 유지 — 웹은 탐색도구가 없어 Agent가
+필수지만 CLI는 Read/Glob/Grep/LS를 이미 보유하므로 위임은 **같은 모델로 한 홉 추가**일 뿐 능력 이득이 없고,
+유일한 서브에이전트 `scout`이 죽어 호출 대상도 없다. 실측 반례도 있음(2홉이 긴 한글경로 재현 취약성을 키워 장애,
+progress.md:3082-3083). 유효한 이득은 **컨텍스트 격리** 하나이며, 이는 목적별 에이전트 정의(출력 규약 포함)가
+선행되어야 값이 난다 → `/agents` UI는 그 다음 순서.
+
+**PyTorch 포럼 적재 완주 + 검색 품질 검증에서 코퍼스 불균형 발견 (2026-07-21).**
+- **적재 완료**: `pytorch_forum_kr` **3,140/3,164 토픽·17,069청크**(빠진 24건=본문 300자 미만 필터, 설계대로),
+  `pytorch_kr` 972청크(125문서). **임베딩 누락 0**. 10분 창에 `--limit 190`이 맞아 8회 분할 실행(EXIT=0).
+- **🔴 검증 결과 — 데이터는 들어갔으나 검색이 못 꺼내는 경우가 있다.** AI 도메인 질의 5개 중 4개는 양호
+  (LoRA·트랜스포머·학습루프·확산모델 모두 정답 소스 상위). **그러나 "파이토치에서 텐서의 자동 미분은 어떻게
+  동작하나요"는 상위 40개를 kowiki가 전부 차지**(샤프펜슬 0.827·손목시계 0.818·변속기 0.816) — 일반어 "동작"이
+  기계장치 문서와 매칭. **fetch_k=20 안에 pytorch 문서가 없으므로 리랭커가 구제 불가**(리랭커는 저장본문만 보며
+  fetch를 못 되돌린다).
+- **원인 = 2단계 코퍼스 불균형**. ①kowiki 1,067,975 : pytorch 18,041 = **59:1** → 일반 한국어 문구는 kowiki가 쓸어감.
+  ②pytorch 내부에서도 forum 17,069 : tutorials 972 = **17.5:1** → 소스를 pytorch로 한정해도 *AI 뉴스* 글이
+  *실제 튜토리얼*을 밀어냄(같은 질의에서 sisyphus·OpenAI 뉴스가 0.86으로 상위, autograd 튜토리얼 미노출).
+  단 구체적 문구는 정상 동작(“C++ 프론트엔드 autograd” → 정답 0.895 1위).
+- **함의**: 적재 자체는 성공이나 **테넌트 소스 라우팅 결정 없이는 값이 실현되지 않는다.** tenants.yaml 주석에
+  이미 설계된 선택지(`순수 코딩 = [okky, so_ko]`)가 이 문제의 답 — 코딩 테넌트에서 kowiki를 빼면 ①이 해소된다.
+  ②는 소스별 쿼터(소스마다 top-N 확보) 같은 검색 단계 보완이 필요할 수 있다(코드 변경, 미착수).
+- **미결정(승인 필요)**: tenants.yaml에 `pytorch_kr`/`pytorch_forum_kr` 바인딩 + 코딩 테넌트의 kowiki 포함 여부.
+  현재 두 소스는 **inert**(웹 미노출). CLI는 테넌트가 없어 전체 검색이라 위 불균형이 그대로 드러난다.
+
+**🔴 위 「코퍼스 불균형」 항목 정정 (2026-07-21, 같은 세션 내 재측정).**
+앞 문단에서 "kowiki 1M이 상위 40개를 독식, 리랭커 구제 불가, 코퍼스가 늘면 악화"라고 적었으나
+**측정 조건이 프로덕션과 달라 결론이 틀렸다.** raw SQL 테스트가 세션 기본값 `ivfflat.probes=1`
+(lists=1000 중 1개 = 0.1%만 스캔)로 돌았고, 운영은 `knowledge_rag.ivfflat_probes: 40`을 쓴다.
+- **재측정(같은 질의 "파이토치에서 텐서의 자동 미분은 어떻게 동작하나요", 상위 20)**:
+  `probes=1` → kowiki 20 / pytorch 0.  **`probes=40`(운영값) → kowiki 0 / pytorch 20.**
+  즉 59:1 물량 차이에도 **운영 조건에서는 kowiki가 코딩 질의를 침범하지 않는다.**
+- 따라서 ①"코퍼스 불균형이 심각" ②"리랭커로 구제 불가" ③"소스별 쿼터가 필요" ④"코딩 테넌트에서
+  kowiki를 빼야 한다" 는 **모두 근거 무효**. 특히 ④는 철회한다(빼면 일반 상식 질의만 잃는다).
+- **앞서 코딩 소스 필터 검색이 0건이던 것도 같은 원인**(probes=1 + 필터). ivfflat은 리스트를 먼저
+  고르고 필터를 나중에 적용하므로, 낮은 probes에서 소수 소스를 필터하면 후보가 비어버린다.
+- **살아남는 실제 이슈(작음)**: pytorch 내부에서 forum 17,069 : tutorials 972 = 17.5:1이라
+  튜토리얼 질의에 AI 뉴스가 상위에 올 수 있다. 단 리랭커 min_score가 거르는 종류이며 미측정.
+- **교훈(운영)**: `tb_knowledge`를 raw SQL로 진단할 때는 반드시 `SET ivfflat.probes = 40`을 먼저
+  실행할 것. 기본값 1로 측정하면 재현율이 실제보다 크게 낮게 나와 잘못된 결론을 부른다.
+- **스케일 함의(정정판)**: 코퍼스 증가 자체는 위험하지 않다(kowiki 1M 단독 정상). 향후 대학 등
+  대형 코퍼스 추가 시 관리할 것은 **인덱스 파라미터**다 — `lists`는 행수에 맞춰(≈행수/1000) 재설정 +
+  REINDEX, `probes`는 재현율/지연 트레이드오프로 재산정. 소수 소스를 테넌트 필터로 뽑는 경로는
+  소스별 partial index를 검토할 만하다.

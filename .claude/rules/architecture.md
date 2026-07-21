@@ -30,6 +30,32 @@ Tier 4 `with_retry`(`core/orchestrator/retry.py`)는 지수 백오프 재시도 
 `with_retry`로 감싸 연결 오류 백오프를 실제 적용하는 것은 **후속 과제**(TODO). 이 문단은
 문서-구현 불일치(감사 MED)를 정직하게 명시하기 위한 것이다.
 
+### 비활성 서브시스템 주석 (2026-07-21 확인)
+
+아래 두 서브시스템은 **구현되어 있으나 현재 배포에서 도달 불가**다. 문서만 보고
+"동작 중"이라고 오해하지 않도록 명시한다(코드는 남겨 둔다 — 사양 정의 구조이며
+TIER_S 재사용 가능성이 있다).
+
+**① Scout (4B 보조 모델) — tier=large에서 비활성**
+- `bootstrap.py`는 `if tier == HardwareTier.TIER_S and config.scout.enabled` 일 때만
+  `scout_provider`를 만든다. 그런데 **설정 3본(`nexus_config.yaml`/`.pc.yaml`/`.112.yaml`)이
+  전부 `hardware_tier: "large"`** 이므로 조건이 참이 되지 않는다 → `scout_provider`는 항상 `None`.
+- 따라서 도달 불가: `_create_cli_tool_registry()`(TIER_S 7개 풀),
+  `_create_scout_tool_registry()`, `core/model/scout_provider.py`,
+  `_build_default_system_prompt()`의 TIER_S 분기.
+- `AgentTool`은 남아 있으나 웹 TIER_L 풀에만 있고, 호출돼도 `_resolve_model_provider`가
+  **부모 Worker 모델로 폴백**한다(2026-07-13 수정). 유일한 서브에이전트 정의가 `scout`
+  하나뿐이라 실질 위임 대상이 없다.
+- CLI TIER_M/L 풀(23개)에는 `AgentTool`이 없다. 프롬프트도 이를 명시적으로 금지한다
+  (`_build_expanded_system_prompt`) — 프롬프트↔도구 풀 불일치를 막기 위함.
+
+**② core/thinking/ — 전체 미배선**
+- `ComplexityAssessor` / `ThinkingStrategy`(DIRECT·HIDDEN_COT·SELF_REFLECT·MULTI_AGENT) /
+  `hidden_cot` / `self_reflection` / `cache` 가 구현되어 있으나, **`core/thinking/` 밖의
+  어떤 모듈도 이들을 import하지 않는다**(bootstrap·query_engine·web 전부 미참조).
+- 즉 복잡도 기반 사고 전략 선택은 **현재 동작하지 않는다**. CLI의 `/thinking` 명령은
+  이와 무관하며 모델이 낸 thinking 블록의 **화면 표시 토글**일 뿐이다.
+
 ## P2. 디렉토리 구조 및 의존성 방향
 
 ```
