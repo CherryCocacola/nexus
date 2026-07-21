@@ -679,7 +679,13 @@ async def init_phase2(state: GlobalState) -> dict:
         model_provider=provider,
         tools=cli_tools,
         context=context,
-        system_prompt=_build_default_system_prompt(agent_registry),
+        # tier + 실제 도구 이름을 함께 넘겨 ⑧의 레지스트리 선택과 프롬프트를 일치시킨다.
+        # 도구 목록을 프롬프트에 손으로 적으면 레지스트리 변경 시 조용히 어긋나고,
+        # 그것이 `알 수 없는 도구: 'Agent'` 버그의 근본 원인이었다. MCP 도구까지
+        # 흡수된 최종 cli_tools를 넘기므로 프롬프트가 항상 실물과 일치한다.
+        system_prompt=_build_default_system_prompt(
+            agent_registry, tier, {t.name for t in cli_tools}
+        ),
         context_manager=context_manager,  # Ch 6: 티어별 전략
         max_turns=200,
         turn_state_store=turn_state_store,
@@ -1082,15 +1088,130 @@ def _create_web_tool_registry(tier: Any = None):  # noqa: ANN202
     return registry
 
 
-def _build_default_system_prompt(agent_registry: Any | None = None) -> str:
+# tool_names 미전달 시 가정하는 TIER_M/L 표준 풀(= _create_tool_registry의 23개).
+# 실제 운영 경로는 항상 레지스트리에서 이름을 받아오므로 이 값은 테스트·하위호환용 폴백이다.
+_DEFAULT_EXPANDED_TOOLS = (
+    "Bash", "DockerBuild", "DockerRun", "Edit", "GitBranch", "GitCheckout",
+    "GitCommit", "GitDiff", "GitLog", "GitStatus", "Glob", "Grep", "LS",
+    "MemoryRead", "MemoryWrite", "MultiEdit", "NotebookEdit", "NotebookRead",
+    "Read", "Task", "TodoRead", "TodoWrite", "Write",
+)
+
+# 티어와 무관하게 동일한 대화 규약 — 두 프롬프트 변형이 공유한다(중복 방지).
+_PROMPT_COMMON_SECTIONS = (
+    "## Conversational style (greetings & small talk)\n"
+    "For a short greeting or small talk (안녕, 좋은 아침, hi, thanks, 잘 자 등):\n"
+    "- Reply briefly and warmly in the user's language — one or two short "
+    "sentences — and stop.\n"
+    "- Do NOT volunteer encyclopedic facts, song/movie/book references, or "
+    "trivia even if the words look like a title.\n"
+    "- Do NOT pivot to a topic the user did not ask about.\n\n"
+    "## When a `--- Knowledge base ---` block is present\n"
+    "Treat the snippets as a candidate reference, NOT as the answer:\n"
+    "- Use them ONLY when clearly on-topic.\n"
+    "- If the snippets are off-topic, irrelevant, or contradict common-sense, "
+    "IGNORE them and answer from your own general knowledge.\n"
+    "- Never quote/list off-topic snippets just because they were retrieved.\n\n"
+)
+
+
+def _build_expanded_system_prompt(tool_names: set[str] | None = None) -> str:
+    """CLI Worker용 TIER_M/L 시스템 프롬프트 — 직접 탐색(Scout 위임 없음).
+
+    tool_names를 넘기면 **실제 레지스트리에 등록된 도구 이름**으로 안내를 만든다.
+    프롬프트에 도구를 손으로 나열하면 레지스트리가 바뀔 때 조용히 어긋나고,
+    그것이 이번 `알 수 없는 도구: 'Agent'` 버그의 근본 원인이었다. 따라서
+    "무슨 도구가 있다/없다"는 서술은 전부 이 집합에서 유도한다.
+    None이면(테스트·하위호환) TIER_M/L 표준 풀을 가정한다.
+
+    왜 별도 변형이 필요한가 (progress.md 기존 버그 해소):
+      TIER_M/L의 CLI는 `_create_tool_registry()`(23개)를 쓴다. 이 풀에는
+      Read/Glob/Grep/LS가 **있고** Agent는 **없다**. 그런데 기존 프롬프트는
+      TIER_S 서사("Read/Glob 없음, scout에 위임하라")를 티어와 무관하게
+      내보내고 있었다. 모델이 지시를 그대로 따르면 존재하지 않는 Agent를
+      호출해 `알 수 없는 도구: 'Agent'` 에러가 난다(실제 발생).
+      웹이 worker_system_full.md로 푼 것과 같은 분기를 CLI에도 준다.
+      단 방향은 반대다 — 웹 TIER_L은 탐색 도구를 뺐고, CLI는 가지고 있다.
+    """
+    names = set(tool_names) if tool_names else set(_DEFAULT_EXPANDED_TOOLS)
+
+    # 실제 등록된 이름만 나열한다(등록 순서와 무관하게 정렬 — prompt cache 안정성).
+    tool_list = "".join(f"- {n}\n" for n in sorted(names))
+
+    # 탐색 도구 보유 여부를 집합에서 유도한다(하드코딩 금지 — 불일치 재발 방지).
+    explorers = sorted({"Read", "Glob", "Grep", "LS"} & names)
+    if explorers:
+        explore_note = (
+            "## Exploring a codebase\n"
+            f"You have {'/'.join(explorers)} — use them directly. Investigate "
+            "before answering: list the layout, grep for the relevant symbols, "
+            "read the files to confirm. Base your answer on what you actually "
+            "read, not on assumptions about file names.\n\n"
+        )
+    else:
+        explore_note = ""
+
+    # Agent 유무도 집합에서 유도한다. 없으면 명시적으로 금지해야 모델이 사전지식으로
+    # `Agent(subagent_type=...)`를 호출하는 사고를 막을 수 있다(실제 발생 사례).
+    if "Agent" in names:
+        delegation_note = (
+            "## Sub-agent delegation\n"
+            "`Agent` is available. Use it only when a task is large enough that "
+            "isolating its context is worth an extra hop.\n\n"
+        )
+    else:
+        delegation_note = (
+            "## No sub-agent delegation at this tier\n"
+            "You do NOT have an `Agent` tool and there is no Scout helper here. "
+            "Never call `Agent(...)` or reference `subagent_type` — that tool is "
+            "not registered and the call will fail. Explore on your own.\n\n"
+        )
+
+    return (
+        "You are IDINO NOVA, an AI assistant in an air-gapped environment.\n"
+        "You have a large context window and direct access to your tools — "
+        "explore and act on your own.\n\n"
+        "## Your tools (these are exactly what is registered)\n"
+        + tool_list
+        + "\n"
+        + delegation_note
+        + explore_note
+        + _PROMPT_COMMON_SECTIONS
+        + "## Hard rules\n"
+        "- NEVER create a file the user didn't ask for.\n"
+        "- NEVER call a tool that is not in the list above.\n"
+        "- Simple conversational questions → answer directly, no tools.\n"
+    )
+
+
+def _build_default_system_prompt(
+    agent_registry: Any | None = None,
+    tier: Any | None = None,
+    tool_names: set[str] | None = None,
+) -> str:
     """
     CLI Worker용 기본 시스템 프롬프트 (사양서 Part 2.4 원본 복원).
 
-    원칙 (사양서 Part 2.4):
+    원칙 (사양서 Part 2.4) — **TIER_S 한정**:
       - Worker는 실행 전용 (Edit/Write/Bash/GitCommit/GitDiff/Agent)
       - 파일 탐색·읽기·검색은 모두 Scout에 위임
       - Worker는 Scout JSON 결과를 해석해 최종 답변 생성
+
+    TIER_M/L은 도구 풀이 완전히 다르므로(23개, Agent 없음) 위 서사를 쓰면
+    프롬프트↔도구 불일치가 된다. 그 경우 `_build_expanded_system_prompt()`로
+    분기한다(⑧ 티어별 도구 레지스트리 선택과 짝을 이룬다).
+
+    Args:
+        agent_registry: 등록된 서브에이전트 목록. TIER_S에서만 프롬프트에 주입한다
+            (TIER_M/L은 Agent 도구 자체가 없어 안내하면 오히려 오호출을 부른다).
+        tier: HardwareTier. None이면 기존 동작(TIER_S 서사)을 유지한다.
     """
+    from core.model.hardware_tier import HardwareTier
+
+    # TIER_M/L → 직접 탐색 프롬프트. tier 미지정(None)은 하위 호환으로 TIER_S 취급.
+    if tier is not None and tier != HardwareTier.TIER_S:
+        return _build_expanded_system_prompt(tool_names)
+
     base = (
         "You are IDINO NOVA, the Worker agent in an air-gapped environment.\n"
         "You are a 27B model — the brain. Scout (a 4B helper) does all file "
@@ -1116,20 +1237,8 @@ def _build_default_system_prompt(agent_registry: Any | None = None) -> str:
         "returns, answer the user with whatever information you received. NEVER "
         "call Scout a second time in the same turn — it loops. If the plan seems "
         "sparse, mention that to the user and work with what you have.\n\n"
-        "## Conversational style (greetings & small talk)\n"
-        "For a short greeting or small talk (안녕, 좋은 아침, hi, thanks, 잘 자 등):\n"
-        "- Reply briefly and warmly in the user's language — one or two short "
-        "sentences — and stop.\n"
-        "- Do NOT volunteer encyclopedic facts, song/movie/book references, or "
-        "trivia even if the words look like a title.\n"
-        "- Do NOT pivot to a topic the user did not ask about.\n\n"
-        "## When a `--- Knowledge base ---` block is present\n"
-        "Treat the snippets as a candidate reference, NOT as the answer:\n"
-        "- Use them ONLY when clearly on-topic.\n"
-        "- If the snippets are off-topic, irrelevant, or contradict common-sense, "
-        "IGNORE them and answer from your own general knowledge.\n"
-        "- Never quote/list off-topic snippets just because they were retrieved.\n\n"
-        "## Hard rules\n"
+        + _PROMPT_COMMON_SECTIONS
+        + "## Hard rules\n"
         "- NEVER create a file the user didn't ask for.\n"
         "- NEVER attempt Read/Glob/Grep/LS — those tools aren't available to you.\n"
         "- Simple conversational questions → answer directly, no tools.\n"
