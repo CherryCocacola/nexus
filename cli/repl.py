@@ -207,7 +207,7 @@ class NexusREPL:
                 # 별도 스레드에서 입력을 기다리게 하고 그 완료를 await한다.
                 user_input = await asyncio.get_event_loop().run_in_executor(
                     None,
-                    lambda: self._prompt_session.prompt("nexus> "),
+                    lambda: self._prompt_session.prompt("nova> "),
                 )
 
                 # 공백만 입력한 경우는 아무 것도 하지 않고 다음 입력을 기다린다.
@@ -326,7 +326,7 @@ class NexusREPL:
         # ───── 우측: 회사 카드 + 시스템 정보 ─────
         # Rich의 Text 객체에 append로 조각조각 스타일을 입혀 한 덩어리로 쌓는다.
         info = Text()
-        info.append("Project Nexus", style="bold rgb(0,71,157)")
+        info.append("IDINO NOVA", style="bold rgb(0,71,157)")
         info.append(f"  v{__version__}\n", style="dim white")
         info.append("에어갭 로컬 LLM 오케스트레이션 플랫폼\n", style="white")
         info.append("Powered by ", style="dim white")
@@ -397,7 +397,7 @@ class NexusREPL:
         self.console.print(
             Panel(
                 layout,
-                title="[bold]✻ Welcome to Nexus[/bold]",
+                title="[bold]✻ Welcome to IDINO NOVA[/bold]",
                 title_align="left",
                 subtitle="[dim]IDINO Corp. · 2026[/dim]",
                 subtitle_align="right",

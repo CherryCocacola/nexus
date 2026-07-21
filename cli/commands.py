@@ -42,7 +42,7 @@ logger = logging.getLogger("nexus.cli.commands")
 # 분기시키는 허브 역할만 한다. 아래 각 함수에 붙은 @cli.command() 가 이 그룹에 등록된다.
 @click.group()
 def cli():
-    """Project Nexus — 에어갭 로컬 LLM 오케스트레이션 플랫폼."""
+    """IDINO NOVA — 에어갭 로컬 LLM 오케스트레이션 플랫폼."""
     # 그룹 함수 자체는 실행할 로직이 없으므로 pass. 실제 일은 하위 명령어들이 처리한다.
     pass
 
