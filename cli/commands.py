@@ -177,7 +177,16 @@ def version() -> None:
     type=click.Choice(["primary", "auxiliary"]),
     help="사용할 모델",
 )
-def ask(query: str, model: str) -> None:
+@click.option(
+    "--log-level",
+    default="WARNING",
+    type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"]),
+    help=(
+        "로그 표시 레벨 — 기본 WARNING. 비대화형 모드라 INFO 로그가 답변 텍스트와 "
+        "섞이면 파이프·스크립트에서 파싱이 깨지므로 기본값을 조용하게 둔다."
+    ),
+)
+def ask(query: str, model: str, log_level: str) -> None:
     """
     단일 질문을 보낸다 — 비대화형 1회성 모드 (`nexus ask "<질문>"`).
 
@@ -221,6 +230,15 @@ def ask(query: str, model: str) -> None:
             # 부트스트랩 도중 예외 → 사용자에게 알리고 실패 종료.
             console.print(f"[red]부트스트랩 실패: {e}[/red]")
             sys.exit(1)
+
+        # bootstrap의 _configure_logging이 nexus.* 를 INFO로 되돌려 놓으므로,
+        # 부트스트랩 직후 사용자가 지정한 레벨을 다시 씌운다(repl._apply_log_level 대칭).
+        # 이렇게 하지 않으면 INFO 로그가 답변 텍스트 중간에 섞여 나온다.
+        import logging as _logging
+
+        _logging.getLogger("nexus").setLevel(
+            getattr(_logging, log_level.upper(), _logging.WARNING)
+        )
 
         # 2) 부트스트랩은 됐지만 엔진이 안 잡힌 경우(컴포넌트 누락)도 방어.
         if engine is None:
@@ -288,16 +306,26 @@ def health() -> None:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.get(f"{gpu_url}/health")
                 if resp.status_code == 200:
-                    # 정상 응답: 서버가 준 JSON(모델 로드 상태 등)을 표로 펼친다.
-                    data = resp.json()
+                    # 200이면 서버는 정상이다. 본문 파싱 실패가 "헬스체크 실패"가 되면 안 된다.
+                    #   vLLM의 /health는 **본문이 빈 200**을 돌려준다(content-type 없음).
+                    #   기존 코드는 resp.json()을 무조건 불러 JSONDecodeError로 떨어졌고,
+                    #   그래서 vLLM 환경에서는 `nexus health`가 항상 실패했다.
+                    try:
+                        data = resp.json()
+                    except ValueError:
+                        data = {}
                     table = Table(title="GPU 서버 상태", border_style="green")
                     table.add_column("항목", style="cyan")
                     table.add_column("값", style="white")
                     table.add_row("URL", gpu_url)
                     table.add_row("상태", "[green]정상[/green]")
-                    # 응답 JSON의 모든 키/값을 한 줄씩 표에 추가한다.
-                    for key, value in data.items():
-                        table.add_row(key, str(value))
+                    if isinstance(data, dict) and data:
+                        # 서버가 상세 JSON을 준 경우에만 키/값을 펼친다.
+                        for key, value in data.items():
+                            table.add_row(key, str(value))
+                    else:
+                        # vLLM처럼 본문이 없는 경우 — 그 사실을 있는 그대로 알린다.
+                        table.add_row("응답 본문", "(없음 — vLLM /health는 빈 200을 반환)")
                     console.print(table)
                 else:
                     # 서버가 응답은 했지만 200이 아님(예: 503) → 상태 코드를 알려준다.

@@ -1468,6 +1468,14 @@ def load_and_validate_config(
     # 설정 파일 경로 탐색
     # config_path를 명시하지 않으면 정해진 후보들을 위에서부터 훑어 처음 존재하는
     # 파일을 채택한다(프로젝트 로컬 → 사용자 홈 순). 운영에선 대개 첫 후보가 잡힌다.
+    # NEXUS_CONFIG 환경변수 — config 헤더에 "설정 파일 지정 방법"으로 문서화된 방식이다.
+    # 여기서 처리하는 이유: bootstrap만 이 변수를 읽고 있어서, 로더를 직접 부르는
+    # 경로(`nexus health` 등)는 env를 무시하고 자동 탐색으로 빠졌다. 그 결과 pc.yaml을
+    # 지정해도 health는 늘 config/nexus_config.yaml(8001)을 보고 실패했다.
+    # 우선순위는 bootstrap과 동일하게 유지한다: 인자 > NEXUS_CONFIG > 자동 탐색.
+    if config_path is None:
+        config_path = os.environ.get("NEXUS_CONFIG") or None
+
     if config_path is None:
         candidates = [
             Path("config/nexus_config.yaml"),
