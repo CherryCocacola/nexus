@@ -3582,3 +3582,52 @@ progress.md:3082-3083). 유효한 이득은 **컨텍스트 격리** 하나이며
   대형 코퍼스 추가 시 관리할 것은 **인덱스 파라미터**다 — `lists`는 행수에 맞춰(≈행수/1000) 재설정 +
   REINDEX, `probes`는 재현율/지연 트레이드오프로 재산정. 소수 소스를 테넌트 필터로 뽑는 경로는
   소스별 partial index를 검토할 만하다.
+
+**A① 이미지·비전 경로 복구 (2026-07-21). 비전 복구 완료 / 이미지 생성은 GPU 포화로 미해결.**
+- **진단**: 112 라이브 config의 `image_url`/`vision_url`이 `192.168.21.112:8003/8004`(=112 로컬
+  llama-server·부재)를 가리켜 도달 불가였다. 근본은 `nexus-b200-tunnel.service`가 **18001(vLLM)만**
+  포워딩한 것(유닛 주석에도 "vLLM 18001 하나만 연다"). B200에는 8003(FLUX)·8004(Gemma VLM)가
+  살아 있었다. 즉 112 배포에서 두 도구는 **처음부터 연결된 적이 없었다**(주석 "텍스트 e2e에선 미사용"이 흔적).
+- **조치**: 터널 유닛에 **drop-in override**로 `-L 18003:8003`, `-L 18004:8004` 추가(원본 불변, 되돌리기=
+  `.d` 디렉토리 삭제). 라이브 config를 `127.0.0.1:18003/18004`로 교체(백업 `.bak-noimg-20260721`) +
+  nexus-web 재시작. sudo·프로덕션 설정 변경은 하네스 분류기가 차단해 스크립트를 준비하고 사용자가 실행.
+- **✅ 비전(AnalyzeImage) 복구 확인**: 18004 e2e — 64x64 빨간 PNG에 `"빨간색"` 정답 응답(gemma-4-12b).
+- **🔴 이미지 생성(FLUX)은 여전히 실패 = CUDA OOM**. 웹 e2e에서 도구는 호출되나 500, flux_server.log에
+  `torch.OutOfMemoryError: Tried to allocate 20.00 MiB`. **B200 GPU 182,624/183,359 MiB = 99.6% 포화**:
+  vLLM 130.5GB(util 0.70) + Gemma VLM 35.5GB(util 0.19) + FLUX 10.1GB(부분로드) + B200 embed_server 6.4GB.
+  **비전(Gemma 35GB)을 나중에 올리면서 FLUX가 밀려난 것**이 실질 원인(터널과 무관한 두 번째 장애).
+- **선택지(비용순, 결정 대기)**: ①B200 `embed_server.py` 중지 = 6.4GB 확보. 112는 자체 임베딩(5090,
+  `embedding_url: 192.168.21.112:8002`)을 쓰므로 **미사용 레거시로 확인**. 가장 싸고 되돌리기 쉬우나
+  6.4GB로 FLUX 추론에 충분한지는 미확인. ②Gemma VLM 중지=35GB 확실하나 방금 살린 비전을 잃음(본말전도).
+  ③vLLM util 0.70→0.60 ≈18GB 확보 — 확실하나 **A.X-4.0 재시작 = 전체 서비스 중단**. ④이미지 생성 포기.
+- **교훈**: B200 GPU는 이미 3개 모델이 공유해 여유가 700MB뿐이다. 향후 모델을 추가할 때는 util 총합을
+  먼저 계산해야 한다(이번처럼 나중에 올린 모델이 기존 서비스를 조용히 죽인다).
+
+**A④ FLUX 5090 이전 — 이미지 생성 완전 복구 (2026-07-22).**
+- **경위**: B200은 GPU 99.6% 포화(vLLM 127GB + Gemma VLM 35GB)라 FLUX가 OOM. util 축소·비전 중지는
+  대가가 커서, 지난 세션 vLLM 은퇴로 놀던 **5090(112, 여유 27.3GB)로 FLUX를 이전**하기로 결정(사용자 승인).
+- **막힘 1 — gated repo**: `black-forest-labs/FLUX.1-schnell`은 HF 인증 필요라 재다운로드 401. 그런데
+  **B200 hf_cache에 완결 캐시(54GB)가 이미 있어** rsync로 B200→112 직접 복사(내부망, 인증 불필요). ~10분.
+- **막힘 2 — 바인딩**: FLUX 서버가 `127.0.0.1:8005`에만 바인딩. config가 `192.168.21.112:8005`(LAN IP)로
+  불러 "All connection attempts failed". nexus-web는 **host 네트워크**라 추론(18001)·비전(18004)처럼
+  `127.0.0.1`로 불러야 함(지난 세션 EMBED_HOST 함정과 동형). image_url을 127.0.0.1:8005로 교정.
+- **환경**: 112 `/opt/nexus-gpu/.venv`에 diffusers 0.37.1·accelerate·fastapi 전부 기존 설치. torch
+  2.11+cu130 5090 인식. flux_server.py는 `enable_model_cpu_offload()`라 상주 VRAM 6GB 미만(피크만 큼).
+- **✅ e2e 전 경로 검증**: 웹 /v1/chat → ImageGenerate → FLUX(8005) → exports 저장 → /v1/download.
+  다운로드 URL이 유효 PNG 반환(512 생성 14.5s / 1024급 1.2MB, content-type image/png, 시그니처 OK).
+  downloads 필드는 tool_result에서 서버 추출(모델 텍스트 아님, [[project_document_export]] 계약과 동일).
+- **최종 토폴로지**: 이미지=112 5090 로컬(8005) / 추론·비전=B200 터널(18001·18004) / 임베딩·리랭커=112 5090(8002).
+  B200 터널 18003(FLUX)은 이제 불필요(원복 선택). B200 embed_server는 중지 유지(미사용 레거시).
+- **잔여(비차단)**: ①FLUX가 nohup 기동이라 리부팅 시 소멸 → systemd 유닛화 필요. ②A② nexus-scout(8003
+  llama-server) 중단 미실행(하네스 sudo 차단). ③백업: nexus_config.112.yaml.bak-flux112-20260722.
+
+**🔴 제품화 과제 — 수제 배포의 한계 (2026-07-22, 사용자 지적).**
+오늘 A① 복구 과정(터널 포트 수동 추가, config에 IP/포트 하드코딩, 127.0.0.1 vs LAN IP 매번 확인, GPU 자리
+수동 계산, nohup 기동)이 **한 대짜리 수제 배포**임이 드러났다. 고객사 다수 배포 시 감당 불가.
+- **뿌리**: 인프라가 주소·포트·자원을 코드/설정에 박아두는 구조. 환경이 바뀔 때마다 사람이 손으로 맞춤.
+  [[project_productization_gpu_roadmap]]·[[project_segment_model_strategy]]의 "CLI가 DB 직결 시 격리 붕괴"와 동일 뿌리.
+- **방향(제품화 시)**: IP 하드코딩→서비스명 참조(docker-compose 네트워크면 127/LAN 고민 자체 소멸) /
+  nohup→systemd·compose 상주+자동재시작 / GPU 자리 수동계산→세그먼트별 프로파일 사전정의 /
+  머신마다 손수설정→환경변수 주입 + 단일 compose. **에어갭 배포 패키징을 제품화 시점에 별도 설계**(오늘 즉흥 X).
+- **지금 결정**: 오늘 건은 현재 환경에서 옳은 값(127.0.0.1)으로 마무리. 배포 패키징 재설계 때 주소들은 어차피
+  전량 재작성되므로 지금 완벽화는 낭비. **되게 만들고(완료), 배포 설계는 따로.**
