@@ -50,6 +50,74 @@ logger = logging.getLogger("nexus.tools.bash")
 # 뒷부분(최근 출력)만 남긴다. 모델 컨텍스트가 거대한 로그로 넘치는 것을 막기 위함.
 _MAX_OUTPUT_SIZE = 50_000
 
+# ── P0-a 출력 위생 (2026-07-22, FABLE5 진단) ──────────────────────────────
+# 디렉토리 나열 명령(ls -R·find·tree·dir·Get-ChildItem)이 node_modules 같은
+# 대형 의존성 트리를 통째로 뱉으면 컨텍스트가 수만 토큰의 파일명으로 오염된다.
+# 실측: prompt_flow 분석에서 ls 1회가 37,099 토큰을 주입 → 모델이 node_modules의
+# .js 파일명만 보고 백엔드를 "Node.js"로 오판(실제 FastAPI). 아래 두 장치로 막는다.
+#   1) 나열 명령의 출력에서 노이즈 경로가 포함된 줄을 제거한다.
+#   2) 나열 명령은 상한을 별도로(작게) 적용해 남은 대량 목록도 잘라낸다.
+# 일반 명령(빌드·테스트 로그 등)은 꼬리가 중요하므로 이 프루닝을 적용하지 않는다.
+
+# 나열 명령으로 간주할 첫 토큰(파이프·리다이렉트 앞의 실행 파일명 기준).
+_LISTING_COMMANDS = frozenset({"ls", "find", "tree", "dir", "get-childitem", "gci"})
+
+# 지식이 아니라 노이즈인 디렉토리 이름. 경로에 이 이름이 "한 컴포넌트"로 들어가면
+# (맨 앞이든 중간이든) 그 줄을 제거한다. 예: node_modules/react·./dist/x·a/.venv/b 모두 매칭.
+_NOISE_DIR_NAMES = frozenset({
+    "node_modules", ".git", "dist", "build", ".venv", "venv",
+    "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+    ".next", ".turbo", "site-packages",
+})
+
+# 나열 명령에 적용하는 축소 상한(일반 상한 50k보다 훨씬 작게).
+# 노이즈 제거 후에도 대형 저장소는 파일이 많으므로 앞부분(대개 최상위 구조)만 남긴다.
+_LISTING_MAX_SIZE = 8_000
+
+
+def _first_token(command: str) -> str:
+    """명령 문자열의 첫 실행 토큰을 소문자로 돌려준다(나열 명령 판별용).
+
+    파이프/리다이렉트/인자 앞의 실행 파일명만 본다. 완벽한 셸 파서가 아니라
+    ls·find·tree 같은 나열 명령을 값싸게 식별하기 위한 최소 로직이다.
+    """
+    stripped = command.strip()
+    if not stripped:
+        return ""
+    # 첫 단어만 취해 경로(/usr/bin/ls)·확장자를 떼고 소문자화한다.
+    first = stripped.split()[0]
+    base = first.replace("\\", "/").rsplit("/", 1)[-1]
+    return base.lower()
+
+
+def _prune_listing_output(output: str) -> str:
+    """나열 명령의 출력에서 노이즈 경로가 포함된 줄을 제거한다.
+
+    node_modules 등 의존성 트리의 파일명이 컨텍스트를 오염시키는 것을 막는다.
+    제거한 줄 수를 요약으로 덧붙여, 모델이 "숨겨진 게 있다"는 사실은 알게 한다
+    (조용한 절단은 "다 봤다"는 착각을 부르므로 명시한다).
+    """
+    lines = output.splitlines()
+    kept: list[str] = []
+    dropped = 0
+    for line in lines:
+        # 경로 구분자를 /로 통일하고 컴포넌트로 쪼갠다. 노이즈 디렉토리 이름이
+        # 한 컴포넌트로 들어 있으면(위치 무관) 그 줄을 버린다. .egg-info는 접미사라
+        # 별도로 검사한다(디렉토리 이름이 <pkg>.egg-info 형태).
+        comps = line.replace("\\", "/").lower().split("/")
+        if _NOISE_DIR_NAMES.intersection(comps) or any(c.endswith(".egg-info") for c in comps):
+            dropped += 1
+            continue
+        kept.append(line)
+    if dropped == 0:
+        return output
+    result = "\n".join(kept)
+    return (
+        f"{result}\n"
+        f"[출력 위생: node_modules 등 의존성/빌드 경로 {dropped}줄 제외. "
+        f"이 목록은 프로젝트 소스 구조만 담는다.]"
+    )
+
 
 class BashTool(BaseTool):
     """
@@ -253,8 +321,13 @@ class BashTool(BaseTool):
         # ── 여기부터는 명령어가 (성공이든 실패든) 끝까지 실행된 경우 ──
         # 종료 코드 추출. 0이면 정상, 그 외는 명령어 자체의 실패를 뜻한다.
         exit_code = result.returncode
-        # 출력이 지나치게 길면 뒷부분만 남기도록 잘라낸다. None 방어로 "" 기본값.
-        stdout = _truncate_output(result.stdout or "")
+        # 나열 명령이면 노이즈 경로를 먼저 걸러내고 작은 상한을 적용한다(P0-a).
+        # 그 외 일반 명령은 기존대로 뒷부분(최근 로그)을 보존한다.
+        raw_stdout = result.stdout or ""
+        if _first_token(command) in _LISTING_COMMANDS:
+            stdout = _truncate_output(_prune_listing_output(raw_stdout), _LISTING_MAX_SIZE)
+        else:
+            stdout = _truncate_output(raw_stdout)
         stderr = _truncate_output(result.stderr or "")
 
         # 모델에게 보여줄 최종 텍스트를 부분별로 조립한다.
@@ -351,22 +424,23 @@ def _run_command(command: str, cwd: str, timeout: int) -> subprocess.CompletedPr
     )
 
 
-def _truncate_output(output: str) -> str:
+def _truncate_output(output: str, max_size: int = _MAX_OUTPUT_SIZE) -> str:
     """
     출력 문자열이 너무 길면 앞부분을 버리고 뒷부분만 남긴다.
 
     로그·명령 출력은 대개 마지막 부분(에러 메시지·최종 결과)이 더 중요하다.
-    그래서 상한(_MAX_OUTPUT_SIZE)을 넘으면 앞쪽을 잘라내고 얼마나 지웠는지
-    안내 문구를 붙여 뒷부분만 보존한다. 상한 이하면 그대로 돌려준다.
+    그래서 상한(max_size)을 넘으면 앞쪽을 잘라내고 얼마나 지웠는지 안내 문구를
+    붙여 뒷부분만 보존한다. 상한 이하면 그대로 돌려준다.
 
     Args:
         output: 원본 출력 문자열.
+        max_size: 보존할 최대 글자 수. 나열 명령은 작은 값을 넘긴다(P0-a).
     Returns:
         상한 이하 원본, 또는 앞부분을 생략 안내로 대체한 잘린 문자열.
     """
-    if len(output) <= _MAX_OUTPUT_SIZE:
+    if len(output) <= max_size:
         return output
     # 잘라낸(=제거한) 앞부분의 글자 수를 계산해 안내에 표시한다.
-    removed = len(output) - _MAX_OUTPUT_SIZE
-    # 최근 _MAX_OUTPUT_SIZE 글자만 남기고, 맨 앞에 생략 사실을 알린다.
-    return f"... (앞부분 생략, {removed}자 제거)\n{output[-_MAX_OUTPUT_SIZE:]}"
+    removed = len(output) - max_size
+    # 최근 max_size 글자만 남기고, 맨 앞에 생략 사실을 알린다.
+    return f"... (앞부분 생략, {removed}자 제거)\n{output[-max_size:]}"
