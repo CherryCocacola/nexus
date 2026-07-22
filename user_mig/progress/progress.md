@@ -3664,3 +3664,19 @@ exus-b200인데 분석
 
 **교훈.** 에이전트 능력을 테스트할 때 **작업디렉토리 경계**를 먼저 맞춰야 한다. 밖을 대상으로 하면 권한
 레이어가 파일 도구를 막아 Bash-only로 강등되고, 그 결과를 모델 능력 결함으로 오귀인하게 된다.
+
+**P1-a 구현 — Bash 서버 시작 관측 교정 (2026-07-22, FABLE5 처방 착수).** 결함②(행동 미검증) 대응.
+- **재확인**: 결함②의 1차 원인은 "모델이 검증 안 함"이 아니라 **하네스가 거짓 성공 신호를 줌**. Windows에서
+  `uvicorn ... > log 2>&1 &`가 빈 stdout·exit 0(0.03초)으로 완료 → 모델이 "서버 재시작되었습니다" 단정.
+  POSIX `&`(배포=Linux)도 동일 구조(셸 즉시 반환). 플랫폼 무관하게 "확인 증거 없는 tool_result에서 성공 단정".
+- **구현**: `bash_tool._background_start_advisory` — 서버/데몬 실행기(uvicorn·gunicorn·hypercorn·flask run·
+  manage.py runserver·npm/pnpm/yarn start|dev|serve·vite·next·http.server·serve) 또는 POSIX 백그라운드(`&`,
+  단 `&&` 제외) 감지 시 tool_result에 안내 부착: "exit 0 ≠ 서비스 정상, 포트/헬스체크/로그로 검증 후 보고".
+  일반 명령(ls·git·pytest·mkdir·`&&`)엔 미부착(오탐 방지). 크로스플랫폼·비침습(실행 변경 없음). 테스트 12.
+- **✅ e2e 재현(프로젝트 안)**: 재시작 태스크가 Glob→Read→`ps aux|grep uvicorn`→`bash start-backend.sh`→
+  `ls -lt logs`→`tail backend.log`→**"Application startup complete 근거로 정상 판단"+헬스체크 제안**. 이전의
+  근거 없는 "성공적으로 재시작되었습니다"가 **증거 기반 결론**으로 전환. FABLE5 원칙("올바른 관측을 준다") 검증됨.
+  (부수: 이번엔 prompt_flow 백엔드가 실제 기동(포트8000 LISTEN)돼 테스트 후 uvicorn 잔여 프로세스 수동 정리함.)
+- **후속**: POSIX `&` 실시간 생존확인(wait+kill -0)은 플랫폼종속·실행변경이라 보류. P1-b(TodoWrite 유도·행동후
+  검증 프롬프트 지침)는 미착수. P2(미완료 종료게이트)는 P1-b 실측 후. 전체 1,571 passed(hwpx 환경이슈 1 무관).
+- **커밋**: af83305[P0-a 출력위생] 49c0d52[P1-a 관측교정]. 미push.
