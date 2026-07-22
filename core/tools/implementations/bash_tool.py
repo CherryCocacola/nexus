@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import subprocess
 from typing import Any
 
@@ -73,6 +74,51 @@ _NOISE_DIR_NAMES = frozenset({
 # 나열 명령에 적용하는 축소 상한(일반 상한 50k보다 훨씬 작게).
 # 노이즈 제거 후에도 대형 저장소는 파일이 많으므로 앞부분(대개 최상위 구조)만 남긴다.
 _LISTING_MAX_SIZE = 8_000
+
+# ── P1-a 백그라운드/서버 시작 관측 교정 (2026-07-22, FABLE5 처방) ────────
+# 서버를 띄우는 명령은 종료 코드 0이어도 "셸이 프로세스를 시작했다"는 뜻일 뿐,
+# 서비스가 정상 기동했다는 보장이 아니다. 특히 `&` 백그라운드(POSIX)나 출력
+# 리다이렉트(> log)면 stdout이 비어 돌아와 모델이 "성공했다"고 오판한다.
+# 실측: `uvicorn app.main:app ... &`가 0.03초에 빈 출력으로 완료 → 모델이
+# "서버가 재시작되었습니다"라고 단정(실제는 DB 없이 즉사). exit 0 ≠ 서비스 정상.
+# 아래 휴리스틱에 걸리면 tool_result에 "검증 필요" 안내를 붙여 관측을 교정한다.
+
+# 장기 실행(서버/데몬)을 시작하는 대표적 실행기. 보수적으로 유지해 일반 명령에
+# 오탐이 붙지 않게 한다(예: `docker ... up -d`·`git`·`ls`는 대상 아님).
+_SERVER_START_RE = re.compile(
+    r"\b("
+    r"uvicorn|gunicorn|hypercorn|daphne|"          # Python ASGI/WSGI 서버
+    r"flask\s+run|manage\.py\s+runserver|"          # Flask·Django 개발 서버
+    r"npm\s+(run\s+)?(start|dev|serve)|"            # Node 개발 서버
+    r"pnpm\s+(run\s+)?(start|dev|serve)|"
+    r"yarn\s+(start|dev|serve)|"
+    r"vite|next\s+(dev|start)|"                     # 프런트 개발 서버
+    r"http\.server|"                                # python -m http.server
+    r"serve\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _background_start_advisory(command: str) -> str | None:
+    """명령이 서버/데몬을 시작하는 것으로 보이면 관측 교정 안내를 돌려준다.
+
+    두 신호 중 하나면 대상으로 본다.
+      1) 명령이 `&`로 끝난다(POSIX 백그라운드 — 셸이 즉시 반환, 성공 오인 유발).
+      2) 알려진 장기 실행 서버 실행기가 포함돼 있다(_SERVER_START_RE).
+    해당하지 않으면 None을 돌려 아무 것도 붙이지 않는다(일반 명령 무영향).
+    """
+    stripped = command.strip()
+    is_background = stripped.endswith("&") and not stripped.endswith("&&")
+    if not is_background and not _SERVER_START_RE.search(command):
+        return None
+    return (
+        "[관측 안내] 이 명령은 서버/장기 실행 프로세스를 시작하는 것으로 보인다. "
+        "종료 코드 0은 '셸이 프로세스를 띄웠다'는 뜻일 뿐, 서비스가 정상 기동했다는 "
+        "보장이 아니다(백그라운드·출력 리다이렉트면 성공/실패가 여기 안 보인다). "
+        "'시작했다'고 단정하지 말고, 포트 응답·헬스체크·로그 꼬리 중 하나로 실제 "
+        "기동을 반드시 검증한 뒤 결과를 보고하라."
+    )
 
 
 def _first_token(command: str) -> str:
@@ -339,6 +385,12 @@ class BashTool(BaseTool):
             parts.append(f"STDERR:\n{stderr}")
         # 종료 코드는 항상 마지막 줄에 명시해 성공/실패를 분명히 한다.
         parts.append(f"Exit code: {exit_code}")
+
+        # P1-a: 서버/백그라운드 시작 명령이면 관측 교정 안내를 덧붙인다.
+        # "exit 0 = 서비스 정상"이라는 오인(실측 사례)을 막고 검증을 유도한다.
+        advisory = _background_start_advisory(command)
+        if advisory is not None:
+            parts.append(advisory)
 
         output_text = "\n".join(parts)
 
