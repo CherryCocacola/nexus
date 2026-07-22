@@ -1228,6 +1228,36 @@ def _build_expanded_system_prompt(tool_names: set[str] | None = None) -> str:
     else:
         observe_rule = ""
 
+    # P1-b①: 멀티골 분해. TodoWrite가 풀에 있어도 지침이 없으면 모델이 안 쓴다
+    #   (실측: 3개 목표를 한 번에 주면 각각 얕아지고 TodoWrite 미사용). 다단계·
+    #   다목표 작업이면 첫 턴에 계획을 세우고 하나씩 완결하게 유도한다.
+    if "TodoWrite" in names:
+        plan_note = (
+            "## Multi-step / multi-goal work — plan first, finish one at a time\n"
+            "If a request contains 2+ independent goals, or needs several steps, "
+            "call TodoWrite ONCE at the start to break it into a checklist. Keep "
+            "exactly one item in_progress; mark an item completed ONLY after you "
+            "have concrete evidence (a file you read, a command result). Do NOT "
+            "let a later goal make an earlier one shallow — each goal gets its own "
+            "verification before you move on.\n\n"
+        )
+    else:
+        plan_note = ""
+
+    # P1-b②: 상태를 바꾸는 행동 뒤에는 반드시 검증. 서버 시작/설치/대량 수정은
+    #   "실행했다"와 "성공했다"가 다르다(실측: exit 0인데 서버 즉사인데도 성공 단정).
+    #   Bash 도구가 붙여주는 관측 안내(P1-a)와 짝을 이룬다.
+    if {"Bash", "Edit", "Write"} & names:
+        verify_rule = (
+            "- After a state-changing action (starting/stopping a server, "
+            "installing, running a build, editing many files), you MUST verify "
+            "the outcome before claiming success — check the port, run a health "
+            "check, tail the log, or re-read the file. 'I ran it' is NOT 'it "
+            "worked'. If you could not verify, say so plainly.\n"
+        )
+    else:
+        verify_rule = ""
+
     return (
         "You are IDINO NOVA, an AI assistant in an air-gapped environment.\n"
         "You have a large context window and direct access to your tools — "
@@ -1238,11 +1268,13 @@ def _build_expanded_system_prompt(tool_names: set[str] | None = None) -> str:
         + delegation_note
         + explore_note
         + compute_note
+        + plan_note
         + _PROMPT_COMMON_SECTIONS
         + "## Hard rules\n"
         "- NEVER create a file the user didn't ask for.\n"
         "- NEVER call a tool that is not in the list above.\n"
         + observe_rule
+        + verify_rule
         + "- Simple conversational questions → answer directly, no tools.\n"
     )
 

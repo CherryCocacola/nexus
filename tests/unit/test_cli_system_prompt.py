@@ -200,3 +200,36 @@ def test_observe_rule_omitted_without_inspection_tools():
 def test_both_tiers_declare_nova_identity():
     for tier in (HardwareTier.TIER_S, HardwareTier.TIER_L):
         assert "IDINO NOVA" in _build_default_system_prompt(tier=tier)
+
+
+# ── P1-b: 멀티골 분해 + 행동 후 검증 지침 ────────────────────────────────
+
+
+def test_plan_note_present_when_todowrite_registered():
+    """TodoWrite가 풀에 있으면 멀티골 분해 지침이 나와야 한다."""
+    p = _build_default_system_prompt(
+        tier=HardwareTier.TIER_L, tool_names={"TodoWrite", "Read"}
+    )
+    assert "plan first" in p
+    assert "TodoWrite" in p
+    assert "2+ independent goals" in p
+
+
+def test_plan_note_absent_without_todowrite():
+    """TodoWrite가 없으면 그 도구를 쓰라고 안내하면 안 된다."""
+    p = _build_default_system_prompt(tier=HardwareTier.TIER_L, tool_names={"Read"})
+    assert "plan first" not in p
+
+
+def test_verify_rule_present_with_state_changing_tools():
+    """상태 변경 도구(Bash/Edit/Write)가 있으면 행동 후 검증 규칙이 나와야 한다."""
+    for tools in ({"Bash"}, {"Edit"}, {"Write"}):
+        p = _build_default_system_prompt(tier=HardwareTier.TIER_L, tool_names=tools)
+        assert "verify the outcome before claiming success" in p
+        assert "'I ran it' is NOT 'it" in p
+
+
+def test_verify_rule_absent_without_state_changing_tools():
+    """읽기 전용 풀이면 행동 후 검증 규칙이 불필요하다."""
+    p = _build_default_system_prompt(tier=HardwareTier.TIER_L, tool_names={"Read", "LS"})
+    assert "verify the outcome before claiming success" not in p
