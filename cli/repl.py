@@ -263,10 +263,29 @@ class NexusREPL:
             # Phase 1: 설정/전역 상태 로딩.
             self._state = await init()
 
+            # --resume: 이전 세션 대화를 복원한다. 트랜스크립트가 있으면 그 세션 ID를
+            # 그대로 이어받아(같은 transcript.jsonl에 append) Phase 2가 모든 컴포넌트를
+            # 그 ID로 배선하게 하고, 복원한 메시지는 Phase 2 이후 엔진에 주입한다.
+            # (읽기·주입 인프라는 이미 존재 — read_transcript_messages / bind_request.
+            #  기존엔 배너 표시만 하고 실제 복원 배선이 빠져 있었다.)
+            resumed_messages = self._load_resume_messages()
+
             # Phase 2: 도구 레지스트리 + 메모리 + QueryEngine 구성.
             # 반환은 컴포넌트 dict이며, 이 중 query_engine만 REPL이 직접 쓴다.
             components = await init_phase2(self._state)
             self._query_engine = components.get("query_engine")
+
+            # 복원된 이전 대화를 엔진 메시지 히스토리로 얹는다(있을 때만).
+            if resumed_messages and self._query_engine is not None:
+                self._query_engine.bind_request(
+                    session_id=self._state.session_id,
+                    restore_messages=resumed_messages,
+                )
+                logger.info(
+                    "세션 복원: %d개 메시지 로드 (session=%s)",
+                    len(resumed_messages),
+                    self._resume_session_id,
+                )
             logger.info("REPL 부트스트랩 완료 (Phase 1 + 2)")
         except Exception as e:
             # 구체 예외를 특정하기 어려운 최상위 초기화 단계라 광범위하게 잡되,
@@ -278,6 +297,50 @@ class NexusREPL:
             # INFO로 되돌려 놓기 때문에, 성공/실패와 무관하게(finally) 사용자가 지정한
             # log_level을 여기서 한 번 더 덮어써서 채팅 화면을 깔끔하게 유지한다.
             self._apply_log_level()
+
+    def _load_resume_messages(self) -> list:
+        """--resume 세션의 트랜스크립트를 읽어 Message 리스트로 복원한다.
+
+        반환:
+          복원할 메시지 리스트(user/assistant 순서 보존). resume 미지정이거나
+          해당 세션 파일이 없으면 빈 리스트를 돌려주고, 이어받기를 취소한다
+          (state.session_id는 새 세션 그대로 두어 새 대화로 시작).
+
+        부작용:
+          유효한 트랜스크립트를 찾으면 state.session_id를 그 세션 ID로 덮어써,
+          이후 Phase 2가 생성하는 트랜스크립트·엔진이 같은 파일에 이어 쓰게 한다.
+        """
+        if not self._resume_session_id or self._state is None:
+            return []
+        try:
+            from core.memory.transcript import read_transcript_messages
+            from core.message import Message
+
+            sessions_dir = self._state.config.sessions_dir
+            raw = read_transcript_messages(sessions_dir, self._resume_session_id)
+            if not raw:
+                logger.warning(
+                    "복원할 세션을 찾지 못했습니다: %s — 새 세션으로 시작",
+                    self._resume_session_id,
+                )
+                self._resume_session_id = None
+                return []
+            # 이어받기: 새 발화가 같은 트랜스크립트에 append되도록 세션 ID를 승계한다.
+            self._state.session_id = self._resume_session_id
+            messages: list = []
+            for entry in raw:
+                role = entry.get("role")
+                content = entry.get("content") or ""
+                if role == "user":
+                    messages.append(Message.user(content))
+                elif role == "assistant":
+                    messages.append(Message.assistant(text=content))
+            return messages
+        except Exception as e:  # noqa: BLE001
+            # 복원 실패가 REPL 기동 자체를 막아서는 안 된다 — 새 세션으로 폴백.
+            logger.warning("세션 복원 실패: %s — 새 세션으로 시작", e)
+            self._resume_session_id = None
+            return []
 
     def _apply_log_level(self) -> None:
         """nexus.* 루트 로거의 레벨을 self._log_level 문자열대로 설정한다.

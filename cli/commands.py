@@ -170,6 +170,52 @@ def version() -> None:
 
 
 @cli.command()
+@click.option("--limit", default=20, help="표시할 최근 세션 수")
+def sessions(limit: int) -> None:
+    """
+    저장된 대화 세션 목록을 보여준다 (`nexus sessions`).
+
+    `chat --resume <세션ID>`로 이어받을 수 있도록, 최근 트랜스크립트 세션의
+    ID·마지막 수정 시각·발화 수·첫 질문 미리보기를 표로 나열한다. 세션 ID를
+    복사해 `nexus chat --resume <ID>`에 넣으면 그 대화가 복원된다.
+    """
+    from rich.console import Console
+    from rich.table import Table
+
+    console = Console()
+    try:
+        from core.config import load_and_validate_config
+        from core.memory.transcript import list_transcript_sessions
+
+        config = load_and_validate_config()
+        rows = list_transcript_sessions(config.sessions_dir, limit=limit)
+    except Exception as e:
+        console.print(f"[red]세션 목록을 불러오지 못했습니다: {e}[/red]")
+        return
+
+    if not rows:
+        console.print("[yellow]저장된 세션이 없습니다.[/yellow]")
+        return
+
+    table = Table(title="대화 세션", border_style="blue")
+    table.add_column("세션 ID", style="cyan", no_wrap=True)
+    table.add_column("마지막 수정", style="dim")
+    table.add_column("발화", justify="right")
+    table.add_column("첫 질문", style="white")
+    for r in rows:
+        table.add_row(
+            r.get("session_id", "?"),
+            (r.get("last_modified") or "")[:19].replace("T", " "),
+            str(r.get("entries", 0)),
+            (r.get("title_hint") or "")[:50],
+        )
+    console.print(table)
+    console.print(
+        "[dim]이어받기: [/dim][cyan]nexus chat --resume <세션 ID>[/cyan]"
+    )
+
+
+@cli.command()
 @click.argument("query")
 @click.option(
     "--model",
