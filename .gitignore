@@ -77,3 +77,5 @@ config/ssl/
 
 # 로컬 실행 런처 — 개인 환경 설정(및 비밀번호 입력)을 담으므로 커밋하지 않는다.
 nova.bat
+nova-resume.ps1
+nova-resume.bat

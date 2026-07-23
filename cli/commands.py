@@ -171,13 +171,21 @@ def version() -> None:
 
 @cli.command()
 @click.option("--limit", default=20, help="표시할 최근 세션 수")
-def sessions(limit: int) -> None:
+@click.option(
+    "--plain",
+    is_flag=True,
+    help="기계 판독용 출력(세션ID|첫질문, 한 줄에 하나). 런처 스크립트가 파싱한다.",
+)
+def sessions(limit: int, plain: bool) -> None:
     """
     저장된 대화 세션 목록을 보여준다 (`nexus sessions`).
 
     `chat --resume <세션ID>`로 이어받을 수 있도록, 최근 트랜스크립트 세션의
     ID·마지막 수정 시각·발화 수·첫 질문 미리보기를 표로 나열한다. 세션 ID를
     복사해 `nexus chat --resume <ID>`에 넣으면 그 대화가 복원된다.
+
+    --plain은 배치/셸 런처가 파싱하도록 "세션ID|첫질문"만 한 줄씩 낸다
+    (rich 표 없이). 세션 ID는 UUID라 ASCII로 안전하게 파싱된다.
     """
     from rich.console import Console
     from rich.table import Table
@@ -190,7 +198,19 @@ def sessions(limit: int) -> None:
         config = load_and_validate_config()
         rows = list_transcript_sessions(config.sessions_dir, limit=limit)
     except Exception as e:
-        console.print(f"[red]세션 목록을 불러오지 못했습니다: {e}[/red]")
+        if not plain:
+            console.print(f"[red]세션 목록을 불러오지 못했습니다: {e}[/red]")
+        return
+
+    # 기계 판독 모드: rich 없이 "id|title" 한 줄씩. 파싱 안정성을 위해 title의
+    # 개행·파이프는 공백으로 치환한다(구분자 오염 방지). 결과 없으면 아무 것도 안 냄.
+    if plain:
+        for r in rows:
+            sid = r.get("session_id", "")
+            title = (r.get("title_hint") or "").replace("|", " ").replace("\n", " ")[:50]
+            if sid:
+                # click.echo는 stdout 인코딩을 안전하게 처리한다.
+                click.echo(f"{sid}|{title}")
         return
 
     if not rows:
