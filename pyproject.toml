@@ -67,7 +67,7 @@ dev = [
 ]
 
 [project.scripts]
-nexus = "cli.repl:main"
+nexus = "cli.commands:cli"
 
 # ===========================
 # Ruff (린터 + 포매터)

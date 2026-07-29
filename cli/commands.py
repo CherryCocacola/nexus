@@ -40,11 +40,16 @@ logger = logging.getLogger("nexus.cli.commands")
 # @click.group() 은 여러 하위 명령어를 담는 "최상위 명령 그룹"을 만든다.
 # 즉 `nexus` 자체는 아무 동작도 하지 않고, 그 아래 chat/ask/version/health 로
 # 분기시키는 허브 역할만 한다. 아래 각 함수에 붙은 @cli.command() 가 이 그룹에 등록된다.
-@click.group()
-def cli():
+@click.group(invoke_without_command=True)
+@click.pass_context
+def cli(ctx):
     """IDINO NOVA — 에어갭 로컬 LLM 오케스트레이션 플랫폼."""
-    # 그룹 함수 자체는 실행할 로직이 없으므로 pass. 실제 일은 하위 명령어들이 처리한다.
-    pass
+    # 서브커맨드 없이 그냥 `nexus`만 치면 대화형 chat을 기본으로 실행한다.
+    # (기존 진입점이 인자 파싱 없는 repl:main이라 --resume·--log-level·sessions 등이
+    #  콘솔 스크립트로 도달 불가했다. 진입점을 이 그룹으로 바꾸고, 인자 없는 호출은
+    #  chat으로 위임해 기존 사용감을 유지한다.)
+    if ctx.invoked_subcommand is None:
+        ctx.invoke(chat)
 
 
 @cli.command()
