@@ -3760,3 +3760,25 @@ FABLE5가 nova CLI를 정밀 진단(B-1~B-8)하고 5-Phase 수정계획 작성 �
 - **범위 제외/후속**: Phase 2(B-1 ASK 게이트+permission_mode 실배선)는 웹 경로 계약 확인 선행 필요 →
   Solar 대기기간에 별도. Phase 3~5(Solar bring-up→A/B→강원대 H200×4)는 2번째 B200 확보 후. 보안 스캔 기능은
   강원대 설계 뒤로 유보. **다음 사용자 확인 항목: 수동 REPL 1회로 "먼저"로 시작하는 답변이 보이는지**(B-3 핵심).
+
+**FABLE5 진단 → Opus 실행: CLI Phase 2 — B-1 ASK 확인 게이트 (2026-07-29).** Phase 1(관측 정직화)에
+이어, 권한 실행 경로에 사용자 확인(ASK)을 배선. 계획의 "무회귀 원칙"을 소스 감사로 먼저 검증하고 실행.
+- **웹 경로 감사(선행)**: 웹은 `web/app.py:676`에서 요청마다 자체 ToolUseContext를 만들고 `base_options`
+  (569-602)는 `ask_handler`·`permission_pipeline`조차 없는 독립 dict → 웹 ASK는 통과 유지가 자동 보장.
+  CLI는 `bootstrap.py:678` QueryEngine이 `components["tool_use_context"]`와 **동일 객체**를 공유하므로
+  repl이 `.options["ask_handler"]`를 주입하면 executor가 봄. 두 표면이 구조적으로 분리돼 무회귀.
+- **executor(커밋 9bc55ef)**: `perm_result.behavior=="ask"` 분기 추가 — 핸들러 있으면 `await handler
+  (tool, msg)`→False면 `<tool_use_error>사용자 거부</tool_use_error>` 차단, 없으면 종전대로 통과+도구별
+  1회 경고(`_ASK_PASSTHROUGH_WARNED`). bash_tool.py 상단 허위 주석("항상 사용자 확인") 교정.
+- **repl(커밋 1b0efc8)**: `_bootstrap`에서 고아 메서드 `prompt_permission`을 `ask_handler`로 주입
+  (auto/bypass/trust는 자동 허용이라 주입 생략 — 에이전트 자율 루프가 매번 안 멈추게). 스피너 상태를
+  인스턴스 필드(`_status_ctx/_status_active`)로 승격 + `_suspend_spinner()` — 스트리밍 중 executor 깊은
+  곳에서 호출되는 프롬프트가 스피너와 겹쳐 화면 깨지던 것 방지(계획 step 5). 배너·/config 권한모드 라벨을
+  "(표시 전용)"→"(도구 ASK: 자동 허용/실행 전 확인)"으로 교정 — permission_mode가 이제 확인 동작을 실제 좌우.
+- **검증**: ASK 게이트 테스트 3건(거부→차단·미실행 / 무핸들러→통과·실행 / 허용→실행) + repl 스피너·프롬프트
+  3건 신설, `pytest tests/unit` **1,599 passed**(hwpx 환경이슈 1 무관). ruff clean. 커밋 2개, push 대기.
+- **효과·범위**: CLI 대화형(default/plan)에서 Bash 등 ASK 도구 실행 전 Y/N 확인 실동작(Y/N/A). 이로써
+  Phase 4 A/B를 `--permission-mode auto`로 무중단 자동화 가능(자율 루프가 안 멈춤). **실서버 확인 항목**:
+  B200 복귀 후 CLI에서 Bash 요청 시 Y/N 프롬프트 실동작 1회. **명시 제외(후속)**: mode별 정책 강제(plan→쓰기
+  DENY 등) 완전 배선은 여전히 미완 — executor 간소화 경로는 deny/ask만 처리. Phase 3~5(Solar·강원대)는 2번째
+  B200 확보 후. 보안 스캔 기능은 강원대 설계 뒤로 유보.
