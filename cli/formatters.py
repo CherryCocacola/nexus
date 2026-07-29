@@ -92,26 +92,34 @@ class OutputFormatter:
 
     # ─── 텍스트 델타 ───
 
-    def format_text_delta(self, text: str) -> str:
+    def format_text_delta(self, text: str) -> str | Text:
         """
         모델이 흘려보내는 텍스트 조각(delta) 하나를 받아, 화면에 실제로 보여줄
-        문자열로 가공해 반환한다.
+        Rich Text(또는 숨김을 뜻하는 빈 문자열)로 가공해 반환한다.
 
         [배경] Qwen 3.5는 응답 앞부분에 사고 과정(thinking)을 먼저 출력하는데,
         이건 사용자에게 그대로 보이면 지저분하다. 그래서 여기서 사고 부분을
         감지해 걸러내고, 실제 답변만 통과시킨다. (사고는 한 줄 요약만 흐리게 표시)
 
+        [왜 str이 아니라 Text를 반환하나 — B-4]
+        호출자는 반환값을 `console.print(out, end="")`로 출력한다. 만약 답변 본문을
+        raw str로 넘기면 Rich가 본문 속 대괄호(`[INFO]`, `list[int]`, `[링크](url)`)를
+        콘솔 markup으로 오해해 글자를 먹거나 MarkupError로 스트림이 끊긴다. Rich
+        `Text`는 내용을 리터럴로 담아 markup 해석을 하지 않으므로, 답변 본문은 항상
+        `Text`로 감싸 반환한다. thinking 한 줄 요약처럼 의도한 스타일만 style 인자로 준다.
+
         [핵심 흐름]
           1) '</think>' 태그가 보이면 → 사고 구간이 끝난 것. 태그 뒤의 실제 답변만 반환.
           2) 아직 아무것도 못 봤는데 조각이 사고처럼 시작하면 → 사고 시작으로 판단해 버퍼링.
           3) 사고 구간 중이면 → 화면에 내보내지 않고 버퍼에만 쌓음(빈 문자열 반환).
-          4) 사고와 무관한 일반 텍스트면 → 그대로 반환.
+          4) 사고와 무관한 일반 텍스트면 → Text로 감싸 그대로 반환.
 
         Args:
             text: 모델이 보낸 텍스트 조각 하나(스트리밍의 한 delta).
 
         Returns:
-            화면에 출력할 문자열. 사고 구간처럼 숨겨야 하면 빈 문자열("")을 반환한다.
+            화면에 출력할 Rich Text. 사고 구간처럼 숨겨야 하면 빈 문자열("")을 반환한다
+            (호출자의 `if out:` 가드에서 falsy로 걸러지도록 str "" 을 그대로 쓴다).
         """
         # (1) '</think>' 감지 — 사고 구간이 여기서 종료된다.
         if "</think>" in text:
@@ -124,13 +132,16 @@ class OutputFormatter:
                 # 그동안 쌓아둔 사고 내용을 앞 80자만 잘라 한 줄로 요약한다.
                 short = self._thinking_buffer[:80].replace("\n", " ")
                 self._thinking_buffer = ""
-                # 요약에 실제 내용이 있을 때만 흐린 이탤릭체 'thinking:' 한 줄을 앞에 붙인다.
-                prefix = (
-                    f"[dim italic]  thinking: {short}...[/dim italic]\n"
-                    if short.strip() else ""
-                )
-                return prefix + after
-            return after
+                if short.strip():
+                    # 흐린 이탤릭 'thinking:' 요약 한 줄 + 리터럴 답변 본문.
+                    # Text.assemble: (str, style) 튜플은 스타일 적용, 맨 뒤 str(after)은
+                    # markup 해석 없이 리터럴로 붙는다(대괄호 안전).
+                    return Text.assemble(
+                        (f"  thinking: {short}...\n", "dim italic"),
+                        after,
+                    )
+            # 요약이 없으면 답변 본문만 리터럴 Text로 반환.
+            return Text(after)
 
         # (2) 스트림 맨 앞에서 리터럴 '<think>' 태그로 시작할 때만 사고 구간으로 진입한다.
         #     [변경 근거] 과거에는 "먼저"·"분석"·"사용자가"·"let me" 같은 접두어로
@@ -149,8 +160,8 @@ class OutputFormatter:
             self._thinking_buffer += text
             return ""
 
-        # (4) 사고와 무관한 평범한 답변 조각 → 그대로 화면에 흘려보낸다.
-        return text
+        # (4) 사고와 무관한 평범한 답변 조각 → 리터럴 Text로 감싸 흘려보낸다(markup 안전).
+        return Text(text)
 
     # ─── 도구 사용 ───
 
