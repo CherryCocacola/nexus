@@ -3735,3 +3735,28 @@ exus-b200인데 분석
   전체 1,580 passed(hwpx 환경이슈 1 무관). REPL 전체 인스턴스화는 콘솔버퍼 필요라 스텁 우회.
 - **효과**: 창 닫아도 `nexus sessions`로 ID 확인 → `chat --resume <ID>`로 이전 대화 이어가기 가능
   (기존엔 맥락 리셋). Claude Code의 --continue/--resume에 대응. 커밋 365b538, push 대기.
+
+**FABLE5 진단 → Opus 실행: CLI 저위험 결함 Phase 1 (2026-07-29).** OpenAI Codex Security 조사와 함께
+FABLE5가 nova CLI를 정밀 진단(B-1~B-8)하고 5-Phase 수정계획 작성 → Opus가 Phase 1(저위험, 서비스영향 0)을
+소스 재검증 후 실행. 실행 순서는 사용자 결정(**CLI 먼저, 그다음 Solar**): CLI가 Solar A/B의 측정 도구이고,
+관측 오염(B-3·B-7)을 먼저 없애야 A/B가 오염되지 않기 때문.
+- **B-2 진입점(커밋 b0d8cf9)**: `pyproject.toml` 콘솔 진입점이 `cli.repl:main`(단일 REPL)이라 `ask`·`version`
+  등 서브커맨드·옵션에 도달 불가였음 → `cli.commands:cli`(click 그룹, `invoke_without_command`로 무인자 시 chat 위임).
+- **B-3 thinking 필터(커밋 9d71370)**: 접두어 추측("먼저"·"분석"·"let me")이 한국어 정상 응답을 통째로 삼키고
+  스트림 간 상태 미리셋으로 연쇄 삼킴 → 리터럴 `<think>` 태그 기반 + `reset_stream_state()`(매 응답 진입 시 호출).
+  **이게 "가끔 nova가 아무것도 안 보임"의 실제 원인**이자 Solar A/B를 오염시킬 관측 결함이었음.
+- **B-7 ask 종료코드(커밋 8be92da)**: ERROR 이벤트 무시 → 서버 다운으로 무출력이어도 exit 0(성공 오인).
+  ERROR→stderr `[에러]`+실패플래그, 에러/빈응답 시 exit 1, 끝 개행, TEXT_DELTA를 포매터 경유. **server-down
+  e2e를 재생성 중 B200(다운)으로 실서버 확인**(ERROR→stderr, exit 1). CI·자동화 A/B의 선행조건.
+- **B-4 markup 안전(커밋 74ef96f)**: `format_text_delta`가 raw str 반환 → `console.print`가 답변 속
+  대괄호(`[INFO]`·`list[int]`·`arr[/unclosed`)를 Rich markup으로 오해해 글자 먹거나 MarkupError로 스트림 중단
+  → 답변 본문을 리터럴 `rich.text.Text`로 반환(thinking 요약만 style 부여, 숨김은 falsy "" 유지).
+- **B-5/B-6 장식옵션(커밋 278f2ba)**: 수신만 하고 엔진 미배선인 옵션 정직화. `ask --model` 삭제,
+  `chat --model` help/docstring "(표시용)" 교정, `/model` 표시전용(config.routing 실모델 표), 배너·/config
+  권한모드에 "(표시 전용 — 강제는 Phase 2)" 접미(--permission-mode는 Phase 2 배선 예정이라 유지).
+  부수 B-8 1줄: 배너 힌트 `/thinking` 추가, `_shutdown` summary 인덱싱 `.get(k,0)`.
+- **검증**: cli 단위테스트 16건 신설(formatters 8·ask 5·repl 3) 전부 통과, ruff clean, `pytest tests/unit`
+  **1,596 passed**(hwpx `No module named 'hwpx.builder'` 환경이슈 1건은 사전존재·무관). 커밋 5개, push 대기.
+- **범위 제외/후속**: Phase 2(B-1 ASK 게이트+permission_mode 실배선)는 웹 경로 계약 확인 선행 필요 →
+  Solar 대기기간에 별도. Phase 3~5(Solar bring-up→A/B→강원대 H200×4)는 2번째 B200 확보 후. 보안 스캔 기능은
+  강원대 설계 뒤로 유보. **다음 사용자 확인 항목: 수동 REPL 1회로 "먼저"로 시작하는 답변이 보이는지**(B-3 핵심).
