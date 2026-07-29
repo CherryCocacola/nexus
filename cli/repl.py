@@ -443,7 +443,10 @@ class NexusREPL:
 
         # 세션 컨텍스트 — 현재 권한 모드와, 새 세션인지/이어받은 세션인지 표시.
         info.append("세션\n", style="bold white")
-        info.append(f"  권한 모드   {self._permission_mode}\n", style="dim")
+        info.append(
+            f"  권한 모드   {self._permission_mode} (표시 전용 — 강제는 Phase 2)\n",
+            style="dim",
+        )
         if self._resume_session_id:
             info.append(f"  복원 세션   {self._resume_session_id}\n", style="dim")
         else:
@@ -477,6 +480,7 @@ class NexusREPL:
             "[cyan]/model[/cyan][dim] · [/dim]"
             "[cyan]/config[/cyan][dim] · [/dim]"
             "[cyan]/session[/cyan][dim] · [/dim]"
+            "[cyan]/thinking[/cyan][dim] · [/dim]"
             "[cyan]/clear[/cyan][dim] · [/dim]"
             "[cyan]/exit[/cyan]"
         )
@@ -758,7 +762,7 @@ class NexusREPL:
             ("/help", "이 도움말을 표시한다"),
             ("/clear", "화면을 지운다"),
             ("/exit", "세션을 종료한다"),
-            ("/model [name]", "현재 모델을 표시하거나 변경한다"),
+            ("/model", "현재 라우팅 모델을 표시한다"),
             ("/config", "현재 설정을 표시한다"),
             ("/session", "세션 정보를 표시한다"),
             ("/thinking", "thinking 표시를 토글한다"),
@@ -778,21 +782,39 @@ class NexusREPL:
         self._running = False
 
     async def _cmd_model(self, args: list[str]) -> None:
-        """/model [name] — 인자가 없으면 현재 모델을, 있으면 모델을 변경한다."""
-        if args:
-            # 인자가 주어졌으면 모델 변경 시도. 첫 번째 토큰만 사용한다.
-            new_model = args[0]
-            # 허용된 별칭(primary/auxiliary)만 받는다(fail-closed 검증).
-            if new_model in ("primary", "auxiliary"):
-                self._model = new_model
-                self.console.print(f"[green]모델이 '{new_model}'로 변경되었습니다.[/green]")
-            else:
-                self.console.print(
-                    "[red]유효하지 않은 모델입니다. 'primary' 또는 'auxiliary'를 사용하세요.[/red]"
-                )
+        """/model — 라우팅이 질의 유형별로 쓰는 실제 모델을 표로 표시한다(표시 전용).
+
+        [왜 표시 전용인가] 모델 선택은 라우팅 config(CHAT/KNOWLEDGE/TOOL)가 질의
+        유형에 따라 자동으로 결정한다. 과거 이 명령은 인자로 모델을 "변경"하는 것처럼
+        보였지만, self._model은 배너·표시에만 쓰일 뿐 엔진에 배선되지 않아 실제로는
+        아무것도 바꾸지 못했다(장식용). 혼동을 없애기 위해 변경 기능을 제거하고,
+        배너(_render_welcome)와 같은 소스인 config.routing에서 실모델명만 보여준다.
+        """
+        # 배너와 동일한 방어적 getattr 패턴으로 라우팅 설정을 꺼낸다.
+        routing = getattr(getattr(self._state, "config", None), "routing", None)
+        table = Table(title="모델 라우팅 (질의별 자동 분기)", border_style="blue")
+        table.add_column("질의 유형", style="cyan")
+        table.add_column("모델", style="white")
+        if routing is not None and getattr(routing, "enabled", False):
+            # 라우팅 활성 — 질의 유형별 실제 모델을 표시한다.
+            table.add_row(
+                "CHAT", getattr(getattr(routing, "chat_mode", None), "model", "?")
+            )
+            table.add_row(
+                "KNOWLEDGE",
+                getattr(getattr(routing, "knowledge_mode", None), "model", "?"),
+            )
+            table.add_row(
+                "TOOL", getattr(getattr(routing, "tool_mode", None), "model", "?")
+            )
         else:
-            # 인자가 없으면 현재 선택된 모델을 알려준다.
-            self.console.print(f"현재 모델: [bold]{self._model}[/bold]")
+            # 라우팅 비활성 — primary/auxiliary 두 모델만 표시한다.
+            model_cfg = getattr(
+                getattr(self._state, "config", None), "model", None
+            )
+            table.add_row("Primary", getattr(model_cfg, "primary_model", self._model))
+            table.add_row("Auxiliary", getattr(model_cfg, "auxiliary_model", "-"))
+        self.console.print(table)
 
     async def _cmd_config(self, args: list[str]) -> None:
         """/config — 현재 로딩된 주요 설정값을 표로 보여준다."""
@@ -806,7 +828,7 @@ class NexusREPL:
             table.add_row("에어갭 모드", str(config.air_gap_mode))
             table.add_row("로그 레벨", config.log_level)
             table.add_row("모델", self._model)
-            table.add_row("권한 모드", self._permission_mode)
+            table.add_row("권한 모드", f"{self._permission_mode} (표시 전용 — 강제는 Phase 2)")
             self.console.print(table)
         else:
             # 부트스트랩 실패 등으로 설정이 없으면 안내만 한다.
@@ -845,10 +867,10 @@ class NexusREPL:
             summary = self._state.get_session_summary()
             self.console.print(
                 Panel(
-                    f"턴: {summary['turns']} | "
-                    f"입력 토큰: {summary['total_input_tokens']:,} | "
-                    f"출력 토큰: {summary['total_output_tokens']:,} | "
-                    f"도구 호출: {summary['total_tool_calls']}",
+                    f"턴: {summary.get('turns', 0)} | "
+                    f"입력 토큰: {summary.get('total_input_tokens', 0):,} | "
+                    f"출력 토큰: {summary.get('total_output_tokens', 0):,} | "
+                    f"도구 호출: {summary.get('total_tool_calls', 0)}",
                     title="[bold]세션 요약[/bold]",
                     border_style="dim",
                 )

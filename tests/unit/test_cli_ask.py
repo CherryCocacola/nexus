@@ -87,3 +87,10 @@ def test_ask_text_then_error_exits_one():
     result = _invoke_ask([_text("부분 답변"), _error("중간에 연결 끊김")])
     assert result.exit_code == 1
     assert "중간에 연결 끊김" in result.stderr
+
+
+def test_ask_model_option_removed():
+    """장식용이던 ask --model 옵션은 제거됐다(B-5). 넘기면 usage 에러로 거부된다."""
+    result = CliRunner().invoke(cli, ["ask", "--model", "primary", "질문"])
+    assert result.exit_code == 2  # click usage 에러
+    assert "no such option" in result.output.lower()

@@ -57,7 +57,7 @@ def cli(ctx):
     "--model",
     default="primary",
     type=click.Choice(["primary", "auxiliary"]),
-    help="사용할 모델 (primary: Qwen 3.5 27B, auxiliary: ExaOne 7.8B)",
+    help="(표시용) 실제 모델은 라우팅 config가 질의 유형별로 결정한다",
 )
 @click.option(
     "--permission-mode",
@@ -95,7 +95,8 @@ def chat(
         실제 화면 렌더링·입력 처리·에이전트 루프는 cli.repl.NexusREPL 이 담당한다.
 
     매개변수(모두 위의 @click.option / 인자에서 주입됨):
-        model           : 사용할 모델. "primary"(Qwen 3.5 27B) 또는 "auxiliary"(ExaOne 7.8B).
+        model           : (표시용) 실제 모델은 라우팅 config가 질의 유형별로 결정한다.
+                          엔진에 배선되지 않으며 배너·/config 표시에만 쓰인다.
         permission_mode : 권한 모드. default/auto/plan/trust/bypass 중 하나.
                           도구 실행을 얼마나 자동 허용할지를 결정한다.
         resume          : 이어서 진행할 이전 세션 ID. None이면 새 세션으로 시작한다.
@@ -243,12 +244,6 @@ def sessions(limit: int, plain: bool) -> None:
 @cli.command()
 @click.argument("query")
 @click.option(
-    "--model",
-    default="primary",
-    type=click.Choice(["primary", "auxiliary"]),
-    help="사용할 모델",
-)
-@click.option(
     "--log-level",
     default="WARNING",
     type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"]),
@@ -257,7 +252,7 @@ def sessions(limit: int, plain: bool) -> None:
         "섞이면 파이프·스크립트에서 파싱이 깨지므로 기본값을 조용하게 둔다."
     ),
 )
-def ask(query: str, model: str, log_level: str) -> None:
+def ask(query: str, log_level: str) -> None:
     """
     단일 질문을 보낸다 — 비대화형 1회성 모드 (`nexus ask "<질문>"`).
 
@@ -268,7 +263,7 @@ def ask(query: str, model: str, log_level: str) -> None:
 
     매개변수:
         query : 사용자가 넘긴 질문 문자열 (@click.argument 로 위치 인자).
-        model : 사용할 모델 별칭("primary"/"auxiliary").
+                (모델 선택은 라우팅 config가 질의 유형별로 결정하므로 별도 옵션이 없다.)
 
     흐름:
         부트스트랩(init → init_phase2)으로 엔진을 준비 → submit_message()가 내보내는
