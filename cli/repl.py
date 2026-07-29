@@ -147,6 +147,12 @@ class NexusREPL:
         # 메인 while 루프의 실행 여부 플래그. /exit가 False로 바꿔 루프를 끝낸다.
         self._running = False
 
+        # 진행 스피너 상태 — _process_message가 스트리밍 중 열고 닫는다. 인스턴스
+        # 필드로 두는 이유는 권한 확인 프롬프트가 스피너를 닫을 수 있어야 하기
+        # 때문(_suspend_spinner 참고). 초기값은 스피너 없음.
+        self._status_ctx: Any = None
+        self._status_active: bool = False
+
         # prompt-toolkit 세션 — 방향키로 이전 입력 재호출(히스토리)과
         # 멀티라인 편집을 지원한다. InMemoryHistory라 프로세스 종료 시 사라진다.
         self._prompt_session: PromptSession = PromptSession(
@@ -274,6 +280,16 @@ class NexusREPL:
             # 반환은 컴포넌트 dict이며, 이 중 query_engine만 REPL이 직접 쓴다.
             components = await init_phase2(self._state)
             self._query_engine = components.get("query_engine")
+
+            # B-1: ASK 확인 핸들러 배선. Bash 등 ASK 판정 도구를 실행하기 전에
+            # executor가 이 핸들러로 사용자에게 Y/N을 묻는다(고아였던 prompt_permission
+            # 실사용화). 단 자동 허용 모드(auto/bypass/trust)에서는 주입하지 않아
+            # executor가 통과시키게 한다 — 에이전트 자율 루프가 매번 멈추지 않도록.
+            # 핸들러 부재 시 executor는 종전대로 통과(웹·비대화형과 동일, 무회귀).
+            auto_allow_modes = {"auto", "bypass", "trust"}
+            tool_ctx = components.get("tool_use_context")
+            if tool_ctx is not None and self._permission_mode not in auto_allow_modes:
+                tool_ctx.options["ask_handler"] = self.prompt_permission
 
             # 복원된 이전 대화를 엔진 메시지 히스토리로 얹는다(있을 때만).
             if resumed_messages and self._query_engine is not None:
@@ -443,8 +459,13 @@ class NexusREPL:
 
         # 세션 컨텍스트 — 현재 권한 모드와, 새 세션인지/이어받은 세션인지 표시.
         info.append("세션\n", style="bold white")
+        _ask_note = (
+            "자동 허용"
+            if self._permission_mode in {"auto", "bypass", "trust"}
+            else "실행 전 확인"
+        )
         info.append(
-            f"  권한 모드   {self._permission_mode} (표시 전용 — 강제는 Phase 2)\n",
+            f"  권한 모드   {self._permission_mode} (도구 ASK: {_ask_note})\n",
             style="dim",
         )
         if self._resume_session_id:
@@ -538,11 +559,15 @@ class NexusREPL:
         # status_ctx는 컨텍스트 매니저지만, `async for` 도중 동적으로 열고 닫아야 해서
         # with 문 대신 __enter__/__exit__를 직접 호출하며 status_active 플래그로
         # "지금 스피너가 떠 있는가"를 추적한다.
-        status_ctx = self.console.status(
+        # 스피너 상태는 인스턴스 필드로 둔다(지역변수 아님). 이유: 스트리밍 도중
+        # 권한 확인(prompt_permission)이 executor 깊은 곳에서 호출되는데, 그때 입력
+        # 프롬프트가 스피너와 겹치면 화면이 깨진다. 핸들러가 _suspend_spinner()로
+        # 스피너를 닫으려면 이 상태에 접근할 수 있어야 하므로 self._status_* 로 공유한다.
+        self._status_ctx = self.console.status(
             "[cyan]요청 분석 중...[/cyan]", spinner="dots"
         )
-        status_ctx.__enter__()
-        status_active = True
+        self._status_ctx.__enter__()
+        self._status_active = True
         try:
             async for event in self._query_engine.submit_message(user_input):
                 # 이 이벤트를 근거로 스피너를 어떻게 할지 결정한다.
@@ -550,49 +575,53 @@ class NexusREPL:
                 next_label = self._stage_label_for(event)
                 if next_label == "_TEXT_":
                     # 첫 본문 토큰 도착 → 스피너를 닫고 텍스트 출력 모드로 전환.
-                    if status_active:
-                        status_ctx.__exit__(None, None, None)
-                        status_active = False
+                    self._suspend_spinner()
                 elif next_label == "_TOOL_DONE_":
                     # 도구 실행 완료 → 곧 도구 결과 Panel을 출력해야 하므로 스피너를 닫는다.
                     # (스피너와 Panel이 동시에 활성이면 화면이 겹쳐 Panel이 깨져 보인다.)
                     # 다음 이벤트(다음 LLM 응답·다음 도구 호출)가 오면 아래
                     # `elif next_label is not None` 분기가 스피너를 자동으로 다시 연다.
-                    if status_active:
-                        status_ctx.__exit__(None, None, None)
-                        status_active = False
+                    self._suspend_spinner()
                 elif next_label is not None:
                     # 스피너 문구를 갱신해야 하는 단계 이벤트(TURN_START/TOOL_USE_START 등).
-                    if status_active:
+                    if self._status_active:
                         # 이미 스피너가 떠 있으면 문구만 바꾼다.
-                        status_ctx.update(next_label)
+                        self._status_ctx.update(next_label)
                     else:
-                        # 스피너가 닫혀 있었다면(예: 본문 출력 뒤 도구 호출 시작) 새로 연다.
-                        status_ctx = self.console.status(
+                        # 스피너가 닫혀 있었다면(예: 본문 출력·권한 프롬프트 뒤 도구 호출
+                        # 시작) 새로 연다.
+                        self._status_ctx = self.console.status(
                             next_label, spinner="dots"
                         )
-                        status_ctx.__enter__()
-                        status_active = True
+                        self._status_ctx.__enter__()
+                        self._status_active = True
 
                 # 스피너 상태 판단과 별개로, 이벤트 자체는 항상 화면에 그린다.
                 self.display_stream_event(event)
         except asyncio.CancelledError:
             # Ctrl+C 등으로 스트림이 취소된 경우. 스피너를 닫고 취소 안내를 남긴다.
-            if status_active:
-                status_ctx.__exit__(None, None, None)
-                status_active = False
+            self._suspend_spinner()
             self.console.print("[yellow]요청이 취소되었습니다.[/yellow]")
         except Exception as e:
             # 그 밖의 예외는 포매터를 통해 사용자 친화적 에러 메시지로 출력한다.
-            if status_active:
-                status_ctx.__exit__(None, None, None)
-                status_active = False
+            self._suspend_spinner()
             self.console.print(self._formatter.format_error(str(e)))
         finally:
             # 어떤 경로로 끝나든(정상/취소/예외) 스피너가 남아있지 않도록 최종 안전 장치.
             # 예: TEXT_DELTA가 한 번도 안 와서 스피너가 계속 떠 있는 상태로 끝난 경우.
-            if status_active:
-                status_ctx.__exit__(None, None, None)
+            self._suspend_spinner()
+
+    def _suspend_spinner(self) -> None:
+        """진행 스피너가 떠 있으면 닫는다(멱등). 없으면 아무것도 하지 않는다.
+
+        [왜 필요한가] 스트리밍 도중 권한 확인 프롬프트(prompt_permission)가
+        executor 깊은 곳에서 호출된다. 스피너가 돌고 있는 상태에서 prompt-toolkit
+        입력을 받으면 화면이 겹쳐 깨진다. 프롬프트 직전 이 메서드로 스피너를 닫고,
+        스피너 재개는 다음 단계 이벤트에서 _process_message 루프가 자동 처리한다.
+        """
+        if getattr(self, "_status_active", False) and self._status_ctx is not None:
+            self._status_ctx.__exit__(None, None, None)
+            self._status_active = False
 
     def _stage_label_for(self, event: Any) -> str | None:
         """이벤트 종류를 보고 "스피너를 어떻게 할지"를 문자열/None으로 알려준다.
@@ -699,6 +728,10 @@ class NexusREPL:
         Returns:
             True면 실행 허용, False면 거부. Ctrl+C/Ctrl+D로 취소해도 안전하게 거부(False).
         """
+        # 스트리밍 중 스피너가 떠 있으면 입력 프롬프트와 겹쳐 화면이 깨진다.
+        # 프롬프트 전에 스피너를 닫는다(재개는 다음 단계 이벤트에서 루프가 처리).
+        self._suspend_spinner()
+
         # 무엇을 승인할지 노란 경고 패널로 강조해서 보여준다.
         self.console.print(
             Panel(
@@ -828,7 +861,12 @@ class NexusREPL:
             table.add_row("에어갭 모드", str(config.air_gap_mode))
             table.add_row("로그 레벨", config.log_level)
             table.add_row("모델", self._model)
-            table.add_row("권한 모드", f"{self._permission_mode} (표시 전용 — 강제는 Phase 2)")
+            _ask_note = (
+                "자동 허용"
+                if self._permission_mode in {"auto", "bypass", "trust"}
+                else "실행 전 확인"
+            )
+            table.add_row("권한 모드", f"{self._permission_mode} (도구 ASK: {_ask_note})")
             self.console.print(table)
         else:
             # 부트스트랩 실패 등으로 설정이 없으면 안내만 한다.

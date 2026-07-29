@@ -82,3 +82,58 @@ def test_cmd_model_routing_disabled_shows_primary_auxiliary():
     out = buf.getvalue()
     assert "qwen-primary" in out
     assert "exaone-aux" in out
+
+
+class _RecordingSpinner:
+    """__exit__ 호출 여부를 기록하는 가짜 스피너(스트리밍 status_ctx 대역)."""
+
+    def __init__(self) -> None:
+        self.exited = False
+
+    def __exit__(self, *args) -> None:
+        self.exited = True
+
+
+def _bare_repl() -> NexusREPL:
+    """PromptSession 없이 REPL 껍데기만 만든다(_suspend_spinner/prompt_permission 검증용)."""
+    repl = NexusREPL.__new__(NexusREPL)
+    repl.console = Console(file=io.StringIO(), force_terminal=False, width=200)
+    repl._status_ctx = None
+    repl._status_active = False
+    return repl
+
+
+def test_suspend_spinner_idempotent_when_none():
+    """스피너가 없을 때 _suspend_spinner()는 안전하게 아무것도 하지 않는다."""
+    repl = _bare_repl()
+    repl._suspend_spinner()  # 예외 없이 통과해야 한다
+    assert repl._status_active is False
+
+
+def test_suspend_spinner_closes_active_spinner():
+    """스피너가 떠 있으면 _suspend_spinner()가 닫고 플래그를 내린다(B-1 화면 겹침 방지)."""
+    repl = _bare_repl()
+    spinner = _RecordingSpinner()
+    repl._status_ctx = spinner
+    repl._status_active = True
+
+    repl._suspend_spinner()
+
+    assert spinner.exited is True
+    assert repl._status_active is False
+
+
+def test_prompt_permission_suspends_spinner_and_denies_on_n():
+    """권한 프롬프트는 먼저 스피너를 닫고, 'N' 입력 시 거부(False)를 반환한다."""
+    repl = _bare_repl()
+    spinner = _RecordingSpinner()
+    repl._status_ctx = spinner
+    repl._status_active = True
+    # 실제 콘솔 입력 대신 'N'을 반환하는 가짜 prompt 세션을 주입한다.
+    repl._prompt_session = SimpleNamespace(prompt=lambda *a, **k: "N")
+
+    approved = asyncio.run(repl.prompt_permission("Bash", "rm -rf 실행?"))
+
+    assert approved is False  # N → 거부
+    assert spinner.exited is True  # 프롬프트 전 스피너를 닫았다
+    assert repl._status_active is False
