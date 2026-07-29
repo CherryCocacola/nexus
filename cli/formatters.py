@@ -73,16 +73,24 @@ class OutputFormatter:
         """
         # 내부 보관 필드. 외부에서는 show_thinking 프로퍼티(getter/setter)로 접근한다.
         self._show_thinking = show_thinking
+        # thinking 필터링 상태 — 반드시 인스턴스 필드로 둔다(클래스 변수로 두면
+        # 스트림 간 상태가 누출된다). _in_thinking: 사고 구간 통과 중 여부,
+        # _thinking_buffer: 사고 구간 동안 누적한 텍스트(요약용).
+        self._in_thinking = False
+        self._thinking_buffer = ""
+
+    def reset_stream_state(self) -> None:
+        """새 응답 스트림 시작 시 thinking 필터 상태를 초기화한다.
+
+        [왜 필요한가] 포매터 인스턴스는 REPL 전체 수명 동안 재사용된다. 만약 한
+        응답이 사고 구간을 닫지 못한 채 끝나면(_in_thinking=True로 남으면), 리셋이
+        없을 경우 다음 턴의 정상 응답까지 계속 삼켜 버린다. 매 응답 시작 시 이
+        메서드를 호출해 상태를 깨끗이 비운다(repl._process_message 진입부에서 호출).
+        """
+        self._in_thinking = False
+        self._thinking_buffer = ""
 
     # ─── 텍스트 델타 ───
-
-    # Qwen 3.5 계열 모델은 실제 답변을 내놓기 전에 "생각(thinking)"을 먼저 뱉는다.
-    # 그 생각 텍스트를 걸러내기 위한 상태 값들이다(클래스 변수로 선언되어 있으나
-    # 아래 메서드에서 self.로 갱신되어 인스턴스 상태처럼 쓰인다).
-    #   _in_thinking     : 지금 thinking 구간을 지나는 중인지 여부
-    #   _thinking_buffer : thinking 구간 동안 누적한 텍스트(요약용)
-    _in_thinking: bool = False
-    _thinking_buffer: str = ""
 
     def format_text_delta(self, text: str) -> str:
         """
@@ -117,20 +125,20 @@ class OutputFormatter:
                 short = self._thinking_buffer[:80].replace("\n", " ")
                 self._thinking_buffer = ""
                 # 요약에 실제 내용이 있을 때만 흐린 이탤릭체 'thinking:' 한 줄을 앞에 붙인다.
-                prefix = f"[dim italic]  thinking: {short}...[/dim italic]\n" if short.strip() else ""
+                prefix = (
+                    f"[dim italic]  thinking: {short}...[/dim italic]\n"
+                    if short.strip() else ""
+                )
                 return prefix + after
             return after
 
-        # (2) 아직 사고 구간도 아니고 버퍼도 비어 있다면 = 스트림의 맨 앞부분.
-        #     이 첫 조각이 사고처럼 시작하는지(대소문자/한영 다양한 표현) 확인한다.
+        # (2) 스트림 맨 앞에서 리터럴 '<think>' 태그로 시작할 때만 사고 구간으로 진입한다.
+        #     [변경 근거] 과거에는 "먼저"·"분석"·"사용자가"·"let me" 같은 접두어로
+        #     사고 시작을 추측했으나, 이는 한국어 정상 응답(대부분 "먼저 …"로 시작)을
+        #     통째로 삼키는 심각한 버그였다. 태그 기반은 태그가 실제로 나타날 때만
+        #     작동하므로 정상 응답 오탐이 0이다.
         if not self._in_thinking and not self._thinking_buffer:
-            lower = text.lower().strip()
-            # 아래 접두어 중 하나로 시작하면 '사고 시작'으로 간주한다.
-            # (모델이 </think> 태그 없이 사고를 흘리는 경우까지 대비한 휴리스틱)
-            if any(lower.startswith(p) for p in [
-                "thinking", "the user", "i need to", "let me", "i should",
-                "분석", "사용자가", "먼저",
-            ]):
+            if text.lstrip().startswith("<think>"):
                 self._in_thinking = True
                 self._thinking_buffer = text
                 # 사고는 화면에 바로 내보내지 않는다.

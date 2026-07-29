@@ -518,6 +518,10 @@ class NexusREPL:
             )
             return
 
+        # 새 응답 스트림 시작 — thinking 필터 상태를 초기화한다. 이전 응답이 사고
+        # 구간을 닫지 못한 채 끝났더라도, 여기서 리셋해 다음 응답이 삼켜지지 않게 한다.
+        self._formatter.reset_stream_state()
+
         # ── 스트리밍 + 진행 스피너 ──
         # QueryEngine.submit_message()는 AsyncGenerator로 이벤트를 하나씩 흘려준다.
         # v0.14.8부터 Console.status() 스피너로 "지금 무슨 단계인지"를 시각화한다.
