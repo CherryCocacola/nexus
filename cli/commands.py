@@ -318,18 +318,40 @@ def ask(query: str, model: str, log_level: str) -> None:
 
         # 3) QueryEngine에 메시지를 보내고 텍스트 응답을 출력한다.
         #    submit_message()는 4-Tier 체인을 통과하며 StreamEvent를 순차적으로 yield한다.
+        #    비대화형(파이프·CI) 모드이므로 다음을 지킨다:
+        #      - ERROR 이벤트는 stderr로 보내고 실패로 표시한다(성공으로 오인 방지).
+        #      - 사고(thinking) 텍스트는 포매터로 걸러 답변만 stdout에 흘린다.
+        #      - 답변이 하나도 없이 끝나거나 에러가 있었으면 종료 코드 1로 나간다.
+        from cli.formatters import OutputFormatter
         from core.message import StreamEvent, StreamEventType
 
+        fmt = OutputFormatter(show_thinking=False)
+        fmt.reset_stream_state()
+        saw_text = False   # 답변 텍스트(TEXT_DELTA)를 한 조각이라도 받았는가
+        had_error = False  # 스트림 도중 ERROR 이벤트가 있었는가
+
         async for event in engine.submit_message(query):
-            # 여러 종류의 StreamEvent 중, 실제 답변 텍스트 조각(TEXT_DELTA)만 골라 출력한다.
-            # 도구 실행/사고 과정 등 다른 이벤트는 비대화형 모드에서 화면에 찍지 않는다.
-            if (
-                isinstance(event, StreamEvent)
-                and event.type == StreamEventType.TEXT_DELTA
-                and event.text
-            ):
-                # end="" 로 개행 없이 조각들을 이어붙여, 스트리밍이 자연스럽게 흐르도록 한다.
-                console.print(event.text, end="")
+            if not isinstance(event, StreamEvent):
+                continue
+            if event.type == StreamEventType.ERROR:
+                had_error = True
+                msg = getattr(event, "message", None) or getattr(event, "error_code", None) \
+                    or "스트림 오류"
+                click.echo(f"[에러] {msg}", err=True)  # stderr로 — stdout(답변)과 분리
+                continue
+            if event.type == StreamEventType.TEXT_DELTA and event.text:
+                saw_text = True
+                out = fmt.format_text_delta(event.text)
+                if out:
+                    # end="" 로 조각을 이어붙여 스트리밍이 자연스럽게 흐르도록 한다.
+                    console.print(out, end="")
+
+        if saw_text:
+            console.print()  # 마지막 개행 — 파이프·터미널 모두에서 줄이 끊기지 않게
+
+        # 실패(연결·컨텍스트 초과 등)나 빈 응답을 성공(exit 0)으로 오인하면 CI가 무너진다.
+        if had_error or not saw_text:
+            sys.exit(1)
 
     # 위 코루틴을 이벤트 루프에서 실행한다.
     asyncio.run(_run_ask())
