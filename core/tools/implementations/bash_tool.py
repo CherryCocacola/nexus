@@ -9,8 +9,11 @@ LLM(모델)이 명령어 실행을 요청하면, 이 도구가 실제 운영체�
 
 이 도구가 특별히 조심스러운 이유:
   - 셸 명령어는 파일 삭제·시스템 변경 등 되돌릴 수 없는 일을 할 수 있다.
-    그래서 is_destructive=True, requires_confirmation=True로 두어
-    실행 전에 항상 사용자 확인(ASK)을 거치도록 만든다 (fail-closed 원칙).
+    그래서 is_destructive=True, requires_confirmation=True로 두고
+    check_permissions가 항상 ASK를 반환한다 (fail-closed 원칙).
+    이 ASK가 실제 확인 프롬프트로 이어지는지는 실행 표면에 달렸다(B-1):
+    CLI 대화형(default/plan)은 확인 핸들러가 배선돼 Y/N을 묻고, 웹·비대화형
+    (nexus ask)·자동 허용 모드(auto/bypass/trust)는 프롬프트 없이 통과한다.
   - 에어갭(폐쇄망) 환경이므로 curl·wget 같은 외부 네트워크 호출은
     이 도구가 아니라 그 앞단의 권한 파이프라인(Layer 2)에서 차단된다.
 

@@ -54,6 +54,12 @@ from core.tools.base import (
 # 모듈 전용 로거. 프로젝트 규칙상 "nexus.{모듈경로}" 네임스페이스를 사용한다.
 logger = logging.getLogger("nexus.tools.executor")
 
+# ASK 판정인데 확인 핸들러(ask_handler)가 주입되지 않아 통과시킨 도구 이름을
+# 기록해 둔다. 웹·비대화형 경로에서는 대화형 프롬프트가 불가능해 통과가 정상이지만,
+# 배선 누락을 조용히 넘기지 않도록 도구별로 딱 1회만 경고 로그를 남기기 위한 집합.
+# (매 Bash 호출마다 경고하면 웹 로그가 도배되므로 프로세스 수명 동안 도구당 1회.)
+_ASK_PASSTHROUGH_WARNED: set[str] = set()
+
 
 async def _emit_tool_result(
     tool_use_id: str,
@@ -294,6 +300,31 @@ async def run_tool_use(
             ):
                 yield _ev
             return
+        # behavior가 "ask"면 사용자 확인이 필요하다(예: Bash는 항상 ASK). 대화형
+        # 확인 핸들러(ask_handler)가 options에 주입돼 있으면(CLI REPL) 사용자에게 물어
+        # 거부 시 차단한다. 핸들러가 없으면(웹·비대화형 nexus ask·기존 테스트) 대화형
+        # 프롬프트가 불가능하므로 종전대로 통과시킨다(무회귀 조건). — B-1
+        if perm_result.behavior.value == "ask":
+            ask_handler = context.options.get("ask_handler")
+            if ask_handler is not None:
+                # 핸들러는 (tool_name, message) -> bool 코루틴. True=허용, False=거부.
+                approved = await ask_handler(tool.name, perm_result.message or "")
+                if not approved:
+                    async for _ev in _emit_tool_result(
+                        tool_use_id,
+                        "<tool_use_error>사용자가 도구 실행을 거부했습니다.</tool_use_error>",
+                        is_error=True,
+                    ):
+                        yield _ev
+                    return
+            elif tool.name not in _ASK_PASSTHROUGH_WARNED:
+                # 핸들러 부재 — 통과시키되, 배선 누락을 도구별 1회만 경고로 남긴다.
+                _ASK_PASSTHROUGH_WARNED.add(tool.name)
+                logger.warning(
+                    "[permission ask] 도구=%s ASK 확인 핸들러 미배선 — 통과"
+                    "(웹/비대화형). CLI 확인 프롬프트 없음.",
+                    tool.name,
+                )
     except Exception as e:
         # 권한 확인 자체가 예외로 실패하면 fail-closed 원칙에 따라 실행을 막는다.
         # (안전 판단을 못 했으니 통과시키지 않는다.)
