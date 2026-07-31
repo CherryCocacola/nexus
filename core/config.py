@@ -77,11 +77,11 @@ class GPUServerConfig(BaseModel):
     # 부하/모델을 분리하려고 포트를 따로 둔다(8003). 실제 운영값은 yaml에서 주입.
     image_url: str = "http://127.0.0.1:8003"
     # 비전(이미지 이해) 전용 vLLM 서버 — AnalyzeImage 도구가 여기로 OpenAI 비전
-    # 형식 POST /v1/chat/completions 요청을 보낸다. Qwen2.5-VL 을 서빙하며,
+    # 형식 POST /v1/chat/completions 요청을 보낸다. Gemma 계열 VLM을 서빙하며,
     # 다른 서버들과 부하/모델을 분리하려고 포트를 따로 둔다(8004). 운영값은 yaml에서 주입.
     vision_url: str = "http://127.0.0.1:8004"
     # 비전 서버의 served-model-name — AnalyzeImage 요청 body의 "model" 값으로 쓰인다.
-    # vLLM이 Qwen2.5-VL 을 이 이름으로 서빙한다고 본다(운영값은 yaml에서 오버라이드).
+    # 기본은 Gemma VLM(운영값은 yaml에서 오버라이드 — 배포별 실제 서빙명과 일치시킨다).
     vision_model: str = "gemma-4-12b"
     # HTTP 요청 1건의 최대 대기 시간(초). 27B 모델의 긴 생성도 끊기지 않도록
     # 넉넉히 120초로 둔다(짧게 잡으면 정상 추론이 타임아웃으로 끊긴다).
@@ -181,14 +181,16 @@ class ModelConfig(BaseModel):
     (질의 타입별 세부 분기는 RoutingConfig가 따로 담당한다.)
     """
 
-    # 주 추론 모델 — 27B Qwen. 일반 대화/도구 호출의 기본.
-    primary_model: str = "qwen3.5-27b"
+    # 주 추론 모델 — A.X-4.0(현행 배포 기본). 일반 대화/도구 호출의 기본.
+    # (폴백 default — 실제 운영값은 config/nexus_config.*.yaml에서 오버라이드한다.)
+    primary_model: str = "ax-4.0"
     # 보조 모델 — 한국어 특화 ExaOne. 한국어 품질이 중요한 경로에서 보조로 쓴다.
     auxiliary_model: str = "exaone-7.8b"
     # 임베딩 모델 — 다국어 e5-large. RAG 벡터 검색용 임베딩 생성에 사용.
     embedding_model: str = "multilingual-e5-large"
-    # 컨텍스트 윈도우 상한(토큰). RTX 5090(32GB) 제약상 보수적으로 4096.
-    # (운영 라우팅에서는 프로필별로 별도 max_tokens를 두기도 한다.)
+    # 컨텍스트 윈도우 상한(토큰). 보수적 폴백 default로 4096을 둔다.
+    # 실제 운영값은 yaml(model.max_context_tokens)에서 하드웨어에 맞춰 크게 올린다
+    # (예: B200 배포는 49152). 운영 라우팅에서는 프로필별 max_tokens도 따로 둔다.
     max_context_tokens: int = 4096
     # 기본 샘플링 온도. 라우팅 프로필이 없을 때의 폴백 값(0.7=다소 창의적).
     default_temperature: float = 0.7

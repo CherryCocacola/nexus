@@ -59,14 +59,14 @@ class TestNexusConfig:
     def test_default_values(self):
         """아무 인자 없이 만든 설정이 운영 기본값과 일치하는지 확인한다.
 
-        에어갭 모드 ON, 로그 INFO, 디버그 OFF, 기본 모델 qwen3.5-27b가
+        에어갭 모드 ON, 로그 INFO, 디버그 OFF, 기본 모델 ax-4.0(현행 배포 기본)가
         '안전하고 운영에 적합한' 출발점이다. 누가 기본값을 바꾸면 이 테스트가 잡는다.
         """
         config = NexusConfig()
         assert config.air_gap_mode is True
         assert config.log_level == "INFO"
         assert config.debug is False
-        assert config.model.primary_model == "qwen3.5-27b"
+        assert config.model.primary_model == "ax-4.0"
 
     def test_redis_property_accessors(self):
         """config.redis_host / redis_port 단축 property가 중첩 설정을 그대로 비추는지 본다.
