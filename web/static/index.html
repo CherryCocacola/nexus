@@ -1406,6 +1406,8 @@ function removeFile(index) {
 async function readFileContents() {
   // 바이너리 파일 확장자 — 서버에 업로드하여 Scout 서브에이전트가 분석
   const binaryExts = ['.docx', '.doc', '.xlsx', '.xls', '.pdf', '.hwp', '.pptx'];
+  // 이미지 확장자 — 서버 업로드 후 AnalyzeImage(비전)로 분석한다.
+  const imageExts = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'];
   // 텍스트 파일 최대 문자 수
   const MAX_CHARS = 12000;
 
@@ -1413,17 +1415,20 @@ async function readFileContents() {
   for (const file of attachedFiles) {
     const ext = '.' + file.name.split('.').pop().toLowerCase();
 
-    if (binaryExts.includes(ext)) {
-      // 바이너리 파일 → 서버 업로드 후 "서버 경로"만 전달한다. 도구 라우팅(직접
-      // DocumentProcess vs Scout 위임)은 티어별 시스템 프롬프트가 결정한다 — 여기서
-      // scout를 강제하지 않는다(TIER_M/L은 Worker가 직접 처리하는 게 정상 경로).
+    if (binaryExts.includes(ext) || imageExts.includes(ext)) {
+      // 바이너리/이미지 파일 → 서버 업로드 후 "서버 경로"만 전달한다. 티어별 시스템
+      // 프롬프트가 이미지는 AnalyzeImage(비전), 문서는 DocumentProcess로 라우팅한다.
+      // (이미지를 file.text()로 읽으면 JFIF 바이너리가 깨진 텍스트로 들어가고 서버
+      //  업로드가 안 돼, 모델이 원본 파일명을 도구에 넘겨 "업로드 디렉토리 권한 거부"가
+      //  났던 버그를 수정 — 이미지도 업로드 경로를 넘긴다.)
       const uploadPath = await uploadFileToServer(file);
       if (uploadPath) {
+        const isImage = imageExts.includes(ext);
         contents.push(
-          `사용자가 문서 파일을 업로드했습니다.\n` +
+          (isImage ? `사용자가 이미지 파일을 업로드했습니다.\n` : `사용자가 문서 파일을 업로드했습니다.\n`) +
           `파일명: ${file.name}\n` +
           `서버 경로: ${uploadPath}\n` +
-          `위 서버 경로의 문서를 분석해 주세요.`
+          (isImage ? `위 서버 경로의 이미지를 분석해 주세요.` : `위 서버 경로의 문서를 분석해 주세요.`)
         );
       } else {
         contents.push(`[첨부파일 업로드 실패: ${file.name}]`);

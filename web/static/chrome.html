@@ -1089,21 +1089,27 @@ function removeFile(index) {
  */
 async function readFileContents() {
   const binaryExts = ['.docx', '.doc', '.xlsx', '.xls', '.pdf', '.hwp', '.pptx'];
+  // 이미지 확장자 — 서버 업로드 후 AnalyzeImage(비전)로 분석한다.
+  const imageExts = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'];
   const MAX_CHARS = 12000;
 
   const contents = [];
   for (const file of attachedFiles) {
     const ext = '.' + file.name.split('.').pop().toLowerCase();
 
-    if (binaryExts.includes(ext)) {
-      // 바이너리 파일 → 서버에 업로드하고 경로를 전달
+    if (binaryExts.includes(ext) || imageExts.includes(ext)) {
+      // 바이너리/이미지 파일 → 서버에 업로드하고 경로를 전달. 이미지를 file.text()로
+      // 읽으면 JFIF 바이너리가 깨진 텍스트로 들어가고 서버 업로드가 안 돼, 모델이 원본
+      // 파일명을 도구에 넘겨 "업로드 디렉토리 권한 거부"가 났던 버그를 수정.
       const uploadPath = await uploadFileToServer(file);
       if (uploadPath) {
+        const isImage = imageExts.includes(ext);
         contents.push(
-          '사용자가 문서 파일을 업로드했습니다.\n' +
+          (isImage ? '사용자가 이미지 파일을 업로드했습니다.\n' : '사용자가 문서 파일을 업로드했습니다.\n') +
           '파일명: ' + file.name + '\n' +
           '서버 경로: ' + uploadPath + '\n' +
-          'DocumentProcess 도구를 사용하여 이 파일의 내용을 분석해 주세요.'
+          (isImage ? 'AnalyzeImage 도구로 위 서버 경로의 이미지를 분석해 주세요.'
+                   : 'DocumentProcess 도구를 사용하여 이 파일의 내용을 분석해 주세요.')
         );
       } else {
         contents.push('[첨부파일 업로드 실패: ' + file.name + ']');
