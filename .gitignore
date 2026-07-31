@@ -79,3 +79,12 @@ config/ssl/
 nova.bat
 nova-resume.ps1
 nova-resume.bat
+
+# SSH 개인키 — 절대 커밋 금지(유출 방지)
+user_mig/nova_key
+user_mig/nexus_key
+*_key
+*.pem
+# OMC 운영 상태 아티팩트
+.omc/
+**/.omc/
