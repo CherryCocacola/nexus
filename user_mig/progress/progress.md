@@ -3782,3 +3782,26 @@ FABLE5가 nova CLI를 정밀 진단(B-1~B-8)하고 5-Phase 수정계획 작성 �
   B200 복귀 후 CLI에서 Bash 요청 시 Y/N 프롬프트 실동작 1회. **명시 제외(후속)**: mode별 정책 강제(plan→쓰기
   DENY 등) 완전 배선은 여전히 미완 — executor 간소화 경로는 deny/ask만 처리. Phase 3~5(Solar·강원대)는 2번째
   B200 확보 후. 보안 스캔 기능은 강원대 설계 뒤로 유보.
+
+**새 2×B200 재구축 + 분리형 아키텍처 + 비전/이미지 배포 (2026-07-30).** NHN B200을 2 GPU로 재생성 후 백지 볼륨에서 전체 스택 재프로비저닝 완료. 상세 핸드오프: `user_mig/B200_DEPLOYMENT_HANDOFF_2026-07-30.md`.
+- **모델 결정**: A.X-4.0 유지 확정(2×B200=TP=2 하드상한). Nemotron-253B/550B·A.X K1·Mistral Large 2 전수검토 후 기각(4 GPU 필요 or 한국어 열세 or 볼륨초과). 비전/이미지=상업안전 최고(Gemma 3 27B·SD3.5 Large; Pixtral Large/FLUX.2-dev는 비상업이라 배제).
+- **재프로비저닝**: 컨테이너 삭제 시 볼륨 소실 확인 → env·venv·코드(git archive+scp)·vLLM 0.26(torch2.11/CUDA13, Blackwell) → A.X-4.0 다운로드(138GB, health200 한국어정상) → 임베딩+리랭커(GPU1:8002) → PG17+pgvector0.8.5(5440)·Redis(6340) → 112 백업(onprem_nexus.dump 6.1GB)를 PC중개(paramiko cat스트리밍→scp)로 복원(tb_knowledge 1,067,978+tb_memories 285,656행) → ivfflat idx_knowledge_embed 수동 재빌드(maintenance_work_mem 부족 실패→4GB로 재빌드, 8.3GB) → 지식 RAG e2e 1.25초.
+- **분리형 전환(요청)**: 웹·PG는 112 유지, B200=GPU백엔드. `nexus-b200-tunnel.service` 키를 nova_key로 교체(paramiko+sudo)·바스티온 동일·18001/18003/18004 포워드. 112 config(`/home/idino/nexus-config/nexus_config.112.yaml`) image_url→18003·vision_url=18004·vision_model→gemma-3-27b·`docker restart nexus-web`. 112웹 e2e 통과("1더하기1은2").
+- **비전/이미지(요청)**: HF 게이트라 사용자 IDINOAi 토큰 로그인 → **Gemma 3 27B**(vLLM GPU1:8004, `run_vision.sh`, 빨간원→일본국기 정확분석) + **SD 3.5 Large**(diffusers 커스텀 `scripts/image_server.py` GPU1:8003, 1.4MB PNG생성). 112웹→A.X-4.0→ImageGenerate→SD3.5 도구 e2e 통과. `start_all.sh`에 반영(5서비스 8001~8004·8443 전부 200).
+- **CLI(요청)**: `/NHNHOME/nexus/nova ask/chat` 래퍼(env 자동로드), `nova ask "1+1"` exit0 확인.
+- **복구 함정(재발방지)**: hf download는 HF_HUB_DISABLE_XET=1+tmux / gcsudo는 `bash -lic` / Git Bash는 MSYS_NO_PATHCONV=1 / pg_restore ivfflat은 maintenance_work_mem 4GB / vLLM 0.26 --limit-mm-per-prompt는 JSON.
+- **다음(요청 #3, 미착수)**: 제품화 — 웹/DB분리·Nuitka 내부패키지(코드유출방지)·설치설정 GUI·CLI. 별도 상세설계 예정. **잔여**: GitHub PAT 회전 권고(remote URL 평문노출).
+
+**stale 설정/문서 정합화 (2026-07-31).** 사용자가 `ModelConfig` default가 현 상황과 안 맞는다고 지적 → 조사 결과 **런타임은 안 깨짐**(운영 yaml이 전부 오버라이드). 즉 버그 아닌 정직성 드리프트. grep ~15곳 중 대부분은 정상(RoutingProfile default=`qwen3.5-27b`/`nexus-phase3`는 v7.0 테넌트 LoRA 라우팅 설계 fixture+테스트 4곳 고정, ContextBudget 5090 주석은 무회귀 근거 설명)이라 **명백히 틀린 것만 수술적 수정**.
+- **`core/config.py`**: `primary_model` default `qwen3.5-27b`→**`ax-4.0`**(+폴백 주석), `max_context_tokens` 주석 "RTX 5090 32GB 제약 4096"→하드웨어 근거 제거(값 4096 폴백 유지), `vision_model` 주석 "Qwen2.5-VL"→"Gemma VLM"(default 값 gemma-4-12b와 일치화). `test_config.py:69` 고정 assert 동반 수정.
+- **`CLAUDE.md`**: 기술스택 모델 A.X-4.0 72B FP8(primary)+Gemma VLM+SD3.5로, GPU 2×B200(현행)+5090 개발베이스라인/H200·GB10 확장으로 갱신. 상단 설명도 A.X-4.0 중심으로.
+- **`.env.example`**: 현행 분리형 배포값 미러링(GPU `127.0.0.1:18001` 터널, Redis `112:6340`, PG `112:5440/idino_ai/idino_user`, primary `ax-4.0`). 값은 `nexus_config.112.yaml` 실값 미러(추측 없음).
+- 검증: 97 passed, ruff clean. **의도적 미변경**: RoutingProfile default·ScoutConfig(버킷 C, 죽은코드 조사 대기)·사양서 v6.1 포인터·progress/사양서(역사 기록).
+
+**히스토리 채널 격리 — web/cli/api 진입점별 분리 (2026-07-31).** 사용자 요청: web 사이드바에 web 세션만 보이게, cli/api 기록은 web에서 조회 불가. 결정=**네임스페이스 프리픽스**(사용자 "db 분리가 더 정확?" 질문에 정직 답변 — 격리 정확도는 동등, db 분리는 G2 db7 충돌+클라이언트 다중화+tool_cache 중복이라 프리픽스 권장, 채택됨). PG 장기기억(tb_memories)=**글로벌 유지**(히스토리 아닌 지식 풀, recall이 session/tenant/channel 무필터 확인). API 기록=api 채널 저장.
+- **설계**: `channel`(web/cli/api) 옵션 파라미터. `None`=기존 flat 스킴(하위호환, 레거시 세션·테스트 무영향), 값 있으면 채널 세그먼트. Redis 키 `session:{channel}:{id}:context`, transcript `{sessions_dir}/{channel}/{id}/`. scan은 id 파트 콜론 유무로 flat↔채널 **상호 비침범** 보장.
+- **저장 계층**: `short_term.py`(`_context_key` 헬퍼+get/save/clear/list에 channel, tool_cache는 채널무관 공유 유지), `transcript.py`(`_session_dir` 헬퍼+기록기/목록/읽기/삭제에 channel, 삭제는 경로탈출 방어를 루트 기준 유지).
+- **계약 전파**: `manager.on_turn_end`→save에 channel, `query_engine` `__init__`이 `context.options["channel"]` 읽어 `self._channel`, `bind_request`에 channel(override), `_finalize_turn`이 on_turn_end에 전파.
+- **진입점 배선**: web `/v1/chat`·`/stream`→`channel="web"`(bind_request+transcript+복원/저장), OpenAI API `_inject_openai_context`→`"api"`(양 api 엔드포인트 경유), `/v1/sessions*`(목록/메시지/삭제)→`"web"` 필터. cli는 repl `_bootstrap`에서 bind_request `channel="cli"`(비-resume 포함, 엔진이 bootstrap 공용 컨텍스트라 런타임 주입), resume 읽기·`nexus sessions`도 `"cli"`.
+- **효과**: 레거시 flat 세션은 채널 필터 조회에서 자연 제외(클린 컷, 마이그레이션 없음). 같은 session_id라도 채널 다르면 미충돌.
+- **검증**: 신규 `test_channel_isolation.py` 9건(short_term 5+transcript 4: 동일id 격리·오채널 빈응답·목록필터·flat 상호비침범·clear/read/delete 채널스코프) + `test_cli_session_resume.py` fixture를 cli 채널 경로로 갱신. **전체 1,611 passed**(hwpx 환경이슈 1 무관). ruff clean(web/app.py 기존 E402·S110 제외). 커밋·push 미실행(요청 대기).
