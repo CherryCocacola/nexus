@@ -23,7 +23,7 @@
                 · Gemma 3 27B 비전   :8004 (GPU1)   ← 터널 18004→8004
 ```
 
-- **웹·DB는 112**(프로덕션 정본), **B200은 순수 GPU 백엔드**. (B200에도 web8443·PG·Redis·embed가 떠 있으나 이는 **CLI/직접접속용 잉여**로, 112 프로덕션은 안 씀.)
+- **웹·DB는 112**(프로덕션 정본), **B200은 순수 GPU 백엔드**. (B200의 web8443은 2026-07-31 중단. PG·Redis·embed는 B200 CLI 지원용으로 유지, 112 프로덕션은 안 씀.)
 - 112 config(라이브)=`/home/idino/nexus-config/nexus_config.112.yaml` (nexus-web 컨테이너에 마운트). 값: `url=127.0.0.1:18001`, `image_url=127.0.0.1:18003`, `vision_url=127.0.0.1:18004`, `vision_model=gemma-3-27b`, `embedding_url=192.168.21.112:8002`(로컬).
 
 ## 2. 접속 정보
@@ -39,7 +39,9 @@
 ## 3. B200 운영 (핵심)
 
 - **코드/데이터 루트**: `/NHNHOME/nexus` (800GB 영구 xfs 볼륨. `/`는 휘발성 overlay). venv=`/NHNHOME/nexus/venv`.
-- **전체 기동(컨테이너 rerun 후)**: `bash /NHNHOME/nexus/start_all.sh` — 멱등. PG→Redis→임베딩(8002)→A.X-4.0(8001)→비전(8004)→이미지(8003)→웹(8443) 순.
+- **전체 기동(컨테이너 rerun 후)**: `bash /NHNHOME/nexus/start_all.sh` — 멱등. PG→Redis→임베딩(8002)→A.X-4.0(8001)→비전(8004)→이미지(8003) + **watchdog 자동기동**.
+- **자동복구 watchdog (2026-07-31 안정화)**: `watchdog.sh`(tmux `watchdog`)가 60초마다 `start_all.sh`를 멱등 재실행 → **죽은 서비스만 자동 재기동**(실증: 임베딩 강제종료→60초 내 복구). 로그=`/NHNHOME/nexus/watchdog.log`. tmux 세션명이 중복기동을 막음. 컨테이너 rerun 시엔 `/`가 휘발성이라 `start_all.sh` 1회 수동 실행 필요(그 뒤 watchdog가 상시 유지).
+- **정리(2026-07-31)**: 잉여 **web(8443) 중단**(웹 정본은 112). B200엔 GPU백엔드(8001·8003·8004)+CLI지원(embed 8002·PG·Redis)만 유지.
 - **상태 확인**: `tmux ls` / `for p in 8001 8002 8003 8004 8443; do curl -s -o /dev/null -w "$p:%{http_code} " 127.0.0.1:$p/health; done`
 - **개별 런처**: `run_vllm_fp8.sh`(A.X-4.0), `run_vision.sh`(Gemma 비전), `scripts/image_server.py`(SD3.5), `scripts/embed_server.py`(임베딩). PG=`pg_ctl -D /NHNHOME/nexus/pgdata`.
 - **GPU 배치**: GPU0=A.X-4.0(FP8, ~168GB). GPU1=임베딩+Gemma27B+SD3.5(~116GB). CPU 72·RAM 2.2TB.
