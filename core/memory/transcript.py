@@ -21,8 +21,12 @@ Session Management 참고)
   - 웹/프론트엔드가 세션 목록·복원·삭제 API를 통해 나머지 함수를 사용.
 
 [디스크 경로 규약]
-  {sessions_dir}/{session_id}/transcript.jsonl
-  (세션마다 전용 폴더를 하나씩 두고 그 안에 파일 하나를 둔다)
+  flat(레거시)  : {sessions_dir}/{session_id}/transcript.jsonl
+  채널 격리      : {sessions_dir}/{channel}/{session_id}/transcript.jsonl
+  (진입점 channel=web/cli/api을 주면 채널 하위 폴더로 세션을 분리해, 서로의
+   대화를 조회·복원·삭제하지 못하게 한다. channel=None이면 예전 flat 경로를
+   그대로 써 하위호환을 유지한다. 레거시 flat 세션은 채널 폴더가 직속
+   transcript.jsonl을 갖지 않으므로 채널 필터 조회에서 자연히 제외된다.)
 
 [한 줄(JSON 객체) 형식 예시]
   {"ts": ISO-8601, "role": "user"|"assistant", "content": "...",
@@ -52,6 +56,31 @@ from typing import Any
 logger = logging.getLogger("nexus.memory.transcript")
 
 
+def _session_dir(
+    sessions_dir: str | Path, session_id: str, channel: str | None = None
+) -> Path:
+    """
+    세션 폴더 경로를 만든다 — 채널별 히스토리 격리의 단일 지점.
+
+    channel 이 지정되면 진입점(web/cli/api)별 하위 폴더로 세션을 분리하고,
+    None 이면 예전 flat 경로({sessions_dir}/{session_id})를 그대로 쓴다.
+    기록기·목록·읽기·삭제가 모두 이 함수로 경로를 계산해 규약을 한 곳에서 지킨다.
+
+    Args:
+        sessions_dir: 모든 세션 폴더가 모이는 최상위 디렉토리.
+        session_id: 세션 식별자.
+        channel: "web"/"cli"/"api" 등 진입점 채널. None이면 flat 경로.
+
+    Returns:
+        channel 있으면 {sessions_dir}/{channel}/{session_id}, 없으면
+        {sessions_dir}/{session_id} (Path).
+    """
+    root = Path(sessions_dir)
+    if channel:
+        return root / channel / session_id
+    return root / session_id
+
+
 class SessionTranscript:
     """세션 하나에 대응하는 JSONL 트랜스크립트 "기록기(writer)".
 
@@ -76,6 +105,7 @@ class SessionTranscript:
         sessions_dir: str | Path,
         session_id: str,
         enabled: bool = True,
+        channel: str | None = None,
     ) -> None:
         """기록기를 초기화하고 세션 폴더를 준비한다.
 
@@ -83,6 +113,8 @@ class SessionTranscript:
           sessions_dir : 모든 세션 폴더가 모여 있는 최상위 디렉토리.
           session_id   : 이 기록기가 담당할 세션 식별자(폴더/파일 경로에 사용).
           enabled      : False면 이 기록기는 어떤 파일 I/O도 하지 않는다.
+          channel      : 진입점 채널(web/cli/api). 주면 {sessions_dir}/{channel}/
+                         하위로 세션을 격리한다. None이면 flat 경로(하위호환).
 
         동작:
           경로(self._base, self._path)를 계산해 두고, enabled일 때에 한해
@@ -92,8 +124,10 @@ class SessionTranscript:
         # 외부에서 어떤 값이 와도 명확한 bool로 정규화(예: None, 0 등 방어).
         self._enabled = bool(enabled)
         self._session_id = session_id
+        self._channel = channel
         # 세션 전용 폴더 경로와 그 안의 트랜스크립트 파일 경로를 미리 계산.
-        self._base = Path(sessions_dir) / session_id
+        # 경로 규약(채널 격리 포함)은 _session_dir 한 곳에서 관장한다.
+        self._base = _session_dir(sessions_dir, session_id, channel)
         self._path = self._base / "transcript.jsonl"
         if self._enabled:
             try:
@@ -171,18 +205,25 @@ class SessionTranscript:
 def list_transcript_sessions(
     sessions_dir: str | Path,
     limit: int = 50,
+    channel: str | None = None,
 ) -> list[dict[str, Any]]:
     """
-    트랜스크립트 최상위 디렉토리를 훑어 최근 세션 목록을 만들어 반환한다.
+    트랜스크립트 디렉토리를 훑어 최근 세션 목록을 만들어 반환한다.
 
     [용도]
     웹 사이드바에 "지난 대화 목록"을 뿌리기 위한 함수. 각 세션 폴더 안의
     transcript.jsonl을 찾아 메타데이터(수정 시각·줄 수·미리보기 제목)를 뽑는다.
 
+    [채널 격리]
+      - channel 지정 → {sessions_dir}/{channel}/ 아래만 훑어 그 채널 세션만 반환.
+      - channel None → {sessions_dir}/ 최상위만 훑는다. 채널 하위 폴더(web/cli/api)는
+        직속 transcript.jsonl이 없어 자동으로 건너뛰므로, 레거시 flat 세션만 잡힌다
+        (상호 비침범 — 채널 세션이 flat 목록에 새지 않는다).
+
     [정렬/필터]
       - 각 세션의 파일 최종 수정 시각(mtime) 기준 내림차순(최신이 위).
       - 최대 limit개까지만 반환.
-      - 최상위 디렉토리가 없거나 디렉토리가 아니면 빈 리스트.
+      - 대상 디렉토리가 없거나 디렉토리가 아니면 빈 리스트.
 
     반환 예시:
       [
@@ -191,8 +232,9 @@ def list_transcript_sessions(
         ...
       ]
     """
-    base = Path(sessions_dir)
-    # 최상위 폴더 자체가 없으면 보여줄 세션도 없으므로 빈 목록 반환.
+    # 채널이 지정되면 그 하위 폴더를, 아니면 최상위를 스캔 기준으로 삼는다.
+    base = Path(sessions_dir) / channel if channel else Path(sessions_dir)
+    # 대상 폴더 자체가 없으면 보여줄 세션도 없으므로 빈 목록 반환.
     if not base.exists() or not base.is_dir():
         return []
 
@@ -265,6 +307,7 @@ def read_transcript_messages(
     *,
     roles: tuple[str, ...] = ("user", "assistant"),
     limit: int | None = None,
+    channel: str | None = None,
 ) -> list[dict[str, Any]]:
     """
     특정 세션의 트랜스크립트(JSONL)를 읽어 메시지 리스트로 복원해 반환한다.
@@ -278,6 +321,7 @@ def read_transcript_messages(
       session_id   : 읽어올 세션 식별자.
       roles        : 반환에 포함할 역할 집합(키워드 전용 인자).
       limit        : 최근 N개만 원할 때 지정(None이면 전체).
+      channel      : 진입점 채널(web/cli/api). 기록 때와 같은 값을 넘겨야 그 세션을 읽는다.
 
     필터 규칙:
       - roles에 포함된 역할만 반환(기본은 user/assistant). system 에러
@@ -296,7 +340,7 @@ def read_transcript_messages(
 
     파일이 없으면 빈 리스트.
     """
-    base = Path(sessions_dir) / session_id
+    base = _session_dir(sessions_dir, session_id, channel)
     tfile = base / "transcript.jsonl"
     # 해당 세션 파일이 없으면 복원할 대화도 없다.
     if not tfile.exists():
@@ -348,6 +392,7 @@ def read_transcript_messages(
 def delete_transcript_session(
     sessions_dir: str | Path,
     session_id: str,
+    channel: str | None = None,
 ) -> bool:
     """
     특정 세션의 트랜스크립트 디렉토리를 통째로 삭제한다.
@@ -373,12 +418,14 @@ def delete_transcript_session(
     if not session_id or any(ch in session_id for ch in ("/", "\\", "..", "\x00")):
         raise ValueError(f"invalid session_id: {session_id!r}")
 
-    # 기준 폴더와 삭제 대상 경로를 각각 절대경로로 정규화(심볼릭 링크 등 해석).
+    # 기준 폴더(sessions_dir 루트)와 삭제 대상 경로를 절대경로로 정규화.
+    # 대상은 채널 격리 규약(_session_dir)으로 만들되, 방어 검사는 항상 루트 기준.
     base = Path(sessions_dir).resolve()
-    target = (base / session_id).resolve()
+    target = _session_dir(sessions_dir, session_id, channel).resolve()
 
-    # [방어 2] 정규화한 target이 정말 base의 하위인지 확인. 바깥을 가리키면
-    # relative_to가 ValueError를 내며, 이를 명확한 메시지로 다시 던진다.
+    # [방어 2] 정규화한 target이 정말 base(루트)의 하위인지 확인. 채널이 붙어도
+    # 결국 sessions_dir 안에 있어야 한다. 바깥을 가리키면 relative_to가
+    # ValueError를 내며, 이를 명확한 메시지로 다시 던진다.
     try:
         target.relative_to(base)
     except ValueError as e:

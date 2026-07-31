@@ -179,6 +179,7 @@ class MemoryManager:
         session_id: str,
         messages: list[Message],
         tool_results: list[str] | None = None,
+        channel: str | None = None,
     ) -> None:
         """
         턴 종료 시 호출된다. 이번 턴의 대화를 단기 메모리에 저장하고, 그중 중요한
@@ -199,11 +200,16 @@ class MemoryManager:
             session_id: 현재 세션 ID(저장 키·태그·메타데이터에 사용)
             messages: 이번 턴에서 오간 Message 목록
             tool_results: 이번 턴의 도구 실행 결과 텍스트 목록(없으면 None)
+            channel: 진입점 채널(web/cli/api). 단기 메모리 키를 채널별로 격리한다.
+                None이면 flat 키(하위호환). 장기 메모리(tb_memories)는 채널 무관 글로벌 유지.
         """
         # 1. 이번 턴 메시지를 dict로 직렬화해 단기 메모리에 통째로 저장한다.
         #    (직렬화 규칙은 _serialize_message 참고 — content를 평문으로 통일한다.)
+        #    channel을 넘겨 web/cli/api 히스토리를 Redis 키 네임스페이스로 분리한다.
         serialized = [self._serialize_message(m) for m in messages]
-        await self._short_term.save_conversation_context(session_id, serialized)
+        await self._short_term.save_conversation_context(
+            session_id, serialized, channel=channel
+        )
 
         # 2. assistant 메시지만 골라 중요 내용을 추출·평가한다.
         for msg in messages:

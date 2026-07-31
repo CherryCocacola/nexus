@@ -212,6 +212,12 @@ class QueryEngine:
         # 세션 ID — ToolUseContext에서 가져오거나 새로 생성
         self._session_id = context.session_id or str(uuid.uuid4())
 
+        # 진입점 채널(web/cli/api) — 히스토리 저장을 채널별로 격리하기 위한 태그.
+        # 진입점이 context.options["channel"]에 심어둔 값을 읽는다(없으면 None=flat).
+        # 요청마다 다를 수 있어 bind_request에서 덮어쓸 수 있다.
+        _opts = getattr(context, "options", None)
+        self._channel: str | None = _opts.get("channel") if isinstance(_opts, dict) else None
+
         logger.info(
             "QueryEngine 초기화: session=%s, tools=%d개, max_turns=%d",
             self._session_id,
@@ -444,6 +450,7 @@ class QueryEngine:
                 await self._memory_manager.on_turn_end(
                     session_id=self._session_id,
                     messages=self._messages,
+                    channel=self._channel,
                 )
             except Exception as e:
                 # 메모리 저장 실패는 치명적이지 않다 — 로그만 남기고 진행
@@ -564,6 +571,7 @@ class QueryEngine:
         tenant: Any | None = None,
         transcript: Any | None = None,
         restore_messages: list[Message] | None = None,
+        channel: str | None = None,
     ) -> None:
         """
         한 HTTP 요청이 도착했을 때 QueryEngine을 해당 요청에 바인딩한다.
@@ -584,8 +592,12 @@ class QueryEngine:
             transcript: SessionTranscript 인스턴스 또는 None (세션별 동적 주입)
             restore_messages: 이 요청 시작 시 초기 메시지로 얹을 히스토리.
                 None이면 기존 messages를 유지, [] 이면 clear.
+            channel: 진입점 채널(web/cli/api). 지정되면 이 요청의 히스토리 저장을
+                해당 채널로 격리한다(None이면 기존 채널 유지 — 덮어쓰지 않음).
         """
         self._session_id = session_id
+        if channel is not None:
+            self._channel = channel
         if tenant is not None and self._context is not None:
             self._context.options["tenant"] = tenant
             logger.debug(

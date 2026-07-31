@@ -202,7 +202,8 @@ def sessions(limit: int, plain: bool) -> None:
         from core.memory.transcript import list_transcript_sessions
 
         config = load_and_validate_config()
-        rows = list_transcript_sessions(config.sessions_dir, limit=limit)
+        # cli 채널 세션만 나열한다(web/api 히스토리는 여기서 조회하지 않는다 — 진입점 격리).
+        rows = list_transcript_sessions(config.sessions_dir, limit=limit, channel="cli")
     except Exception as e:
         if not plain:
             console.print(f"[red]세션 목록을 불러오지 못했습니다: {e}[/red]")

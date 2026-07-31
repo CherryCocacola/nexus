@@ -19,7 +19,9 @@ from cli.repl import NexusREPL
 
 
 def _write_transcript(sessions_dir: Path, session_id: str, entries: list[dict]) -> None:
-    base = sessions_dir / session_id
+    # CLI 세션은 'cli' 채널로 격리 저장된다({sessions_dir}/cli/{id}/). _load_resume_messages도
+    # channel="cli"로 읽으므로 fixture를 같은 채널 경로에 둔다(진입점별 히스토리 격리).
+    base = sessions_dir / "cli" / session_id
     base.mkdir(parents=True, exist_ok=True)
     (base / "transcript.jsonl").write_text(
         "\n".join(json.dumps(e, ensure_ascii=False) for e in entries) + "\n",

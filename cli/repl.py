@@ -291,17 +291,23 @@ class NexusREPL:
             if tool_ctx is not None and self._permission_mode not in auto_allow_modes:
                 tool_ctx.options["ask_handler"] = self.prompt_permission
 
-            # 복원된 이전 대화를 엔진 메시지 히스토리로 얹는다(있을 때만).
-            if resumed_messages and self._query_engine is not None:
+            # 진입점 채널을 'cli'로 고정 — 이 세션의 히스토리 저장(Redis 키·transcript
+            # 폴더)을 cli 채널로 격리해 web/api 히스토리와 서로 안 보이게 한다. 엔진은
+            # __init__ 때 채널을 context.options에서 읽지만, bootstrap 공용 컨텍스트를
+            # 공유하므로 여기서 bind_request로 명시 주입한다. resume면 복원 메시지도 함께
+            # 얹는다(빈 리스트는 None으로 넘겨 기존 히스토리를 지우지 않는다 — 무회귀).
+            if self._query_engine is not None:
                 self._query_engine.bind_request(
                     session_id=self._state.session_id,
-                    restore_messages=resumed_messages,
+                    restore_messages=resumed_messages or None,
+                    channel="cli",
                 )
-                logger.info(
-                    "세션 복원: %d개 메시지 로드 (session=%s)",
-                    len(resumed_messages),
-                    self._resume_session_id,
-                )
+                if resumed_messages:
+                    logger.info(
+                        "세션 복원: %d개 메시지 로드 (session=%s)",
+                        len(resumed_messages),
+                        self._resume_session_id,
+                    )
             logger.info("REPL 부트스트랩 완료 (Phase 1 + 2)")
         except Exception as e:
             # 구체 예외를 특정하기 어려운 최상위 초기화 단계라 광범위하게 잡되,
@@ -333,7 +339,10 @@ class NexusREPL:
             from core.message import Message
 
             sessions_dir = self._state.config.sessions_dir
-            raw = read_transcript_messages(sessions_dir, self._resume_session_id)
+            # cli 채널로 격리 저장된 세션에서 복원한다(web/api 세션은 대상 아님).
+            raw = read_transcript_messages(
+                sessions_dir, self._resume_session_id, channel="cli"
+            )
             if not raw:
                 logger.warning(
                     "복원할 세션을 찾지 못했습니다: %s — 새 세션으로 시작",

@@ -390,11 +390,12 @@ def _resolve_tenant(
     return found
 
 
-def _build_transcript(session_id: str) -> Any:
+def _build_transcript(session_id: str, channel: str | None = None) -> Any:
     """세션 ID별 SessionTranscript 인스턴스를 만든다. config 실패 시 None 반환.
 
     /v1/chat과 /v1/chat/stream 두 핸들러에서 중복되던 로직을 한 지점으로 모음
-    (2026-04-21 리팩토링).
+    (2026-04-21 리팩토링). channel(web/api)을 주면 트랜스크립트를 채널 하위
+    폴더로 격리해 진입점별 히스토리가 서로 안 보이게 한다.
     """
     try:
         from core.memory.transcript import SessionTranscript as _Trans
@@ -406,6 +407,7 @@ def _build_transcript(session_id: str) -> Any:
             sessions_dir=sessions_dir,
             session_id=session_id,
             enabled=transcript_enabled,
+            channel=channel,
         )
     except Exception as e:
         logger.warning("트랜스크립트 생성 실패 (%s): %s", session_id, e)
@@ -1288,11 +1290,12 @@ async def chat(
     session_lock = _get_session_lock(session_id)
     async with session_lock:
         # Ch 16 + 리팩토링 2: 세션/tenant/transcript를 공식 bind_request로 한 번에 주입
-        transcript = _build_transcript(session_id)
+        transcript = _build_transcript(session_id, channel="web")
         engine.bind_request(
             session_id=session_id,
             tenant=tenant,
             transcript=transcript,
+            channel="web",
         )
         if tenant is not None:
             logger.info(
@@ -1306,7 +1309,9 @@ async def chat(
         if memory_manager is not None:
             try:
                 engine.clear_messages()
-                saved = await memory_manager.short_term.get_conversation_context(session_id)
+                saved = await memory_manager.short_term.get_conversation_context(
+                    session_id, channel="web"
+                )
                 engine._messages.extend(_restore_messages_from_saved(saved, session_id))
             except Exception as e:
                 logger.warning("비스트리밍 세션 복원 실패 (%s): %s", session_id, e)
@@ -1466,7 +1471,9 @@ async def chat_stream(
             histories[session_id] = []
             if memory_manager is not None:
                 try:
-                    saved = await memory_manager.short_term.get_conversation_context(session_id)
+                    saved = await memory_manager.short_term.get_conversation_context(
+                        session_id, channel="web"
+                    )
                     restored = _restore_messages_from_saved(saved, session_id)
                     histories[session_id].extend(restored)
                     if restored:
@@ -1493,6 +1500,7 @@ async def chat_stream(
                 sessions_dir=sessions_dir,
                 session_id=session_id,
                 enabled=transcript_enabled,
+                channel="web",
             )
         except Exception as e:
             logger.warning("트랜스크립트 주입 실패 (%s): %s", session_id, e)
@@ -1500,11 +1508,12 @@ async def chat_stream(
 
         # 리팩토링 2: 세션/tenant/transcript를 공식 bind_request로 주입
         # (이전엔 engine._session_id 등 비공개 필드를 직접 치환 — race condition 위험)
-        transcript = _build_transcript(session_id)
+        transcript = _build_transcript(session_id, channel="web")
         engine.bind_request(
             session_id=session_id,
             tenant=tenant,
             transcript=transcript,
+            channel="web",
         )
         if tenant is not None:
             logger.info("tenant 해석: %s (sources=%s)", tenant.id, tenant.allowed_knowledge_sources)
@@ -1778,7 +1787,7 @@ async def chat_stream(
                     if text:
                         serialized.append({"role": role, "content": text})
                 await memory_manager.short_term.save_conversation_context(
-                    session_id, serialized, ttl=86400
+                    session_id, serialized, ttl=86400, channel="web"
                 )
             except Exception as e:
                 logger.warning("세션 Redis 저장 실패 (%s): %s", session_id, e)
@@ -1870,8 +1879,11 @@ def _inject_openai_context(
         engine.update_system_prompt(base_prompt + "\n\n[사용자 지시]\n" + system_content)
 
     # 세션/tenant/transcript 를 공식 bind_request 로 주입(기존 핸들러와 동일 계약).
-    transcript = _build_transcript(session_id)
-    engine.bind_request(session_id=session_id, tenant=tenant, transcript=transcript)
+    # OpenAI 호환 API 경로이므로 channel="api"로 격리(web 히스토리 목록에 안 섞인다).
+    transcript = _build_transcript(session_id, channel="api")
+    engine.bind_request(
+        session_id=session_id, tenant=tenant, transcript=transcript, channel="api"
+    )
 
     # 무상태: 요청이 보낸 히스토리만 그대로 얹는다(Redis 복원 안 함).
     engine.clear_messages()
@@ -2253,8 +2265,8 @@ async def list_sessions() -> dict[str, Any]:
     cfg = _app_state.get("config")
     sessions_dir = cfg.session.sessions_dir if cfg else ".nexus/sessions"
 
-    # 1) 파일 트랜스크립트 기반 세션 (상세 정보 포함)
-    disk_sessions = list_transcript_sessions(sessions_dir, limit=100)
+    # 1) 파일 트랜스크립트 기반 세션 (상세 정보 포함) — web 채널만(진입점 격리)
+    disk_sessions = list_transcript_sessions(sessions_dir, limit=100, channel="web")
 
     # 2) Redis 단기 캐시 기반 세션 (session_id만) — 트랜스크립트에 없는 것만 추가
     memory_manager = _app_state.get("memory_manager")
@@ -2262,7 +2274,7 @@ async def list_sessions() -> dict[str, Any]:
     redis_only: list[dict[str, Any]] = []
     if memory_manager is not None:
         try:
-            for sid in await memory_manager.short_term.list_sessions(limit=100):
+            for sid in await memory_manager.short_term.list_sessions(limit=100, channel="web"):
                 if sid not in known_ids:
                     redis_only.append(
                         {
@@ -2317,7 +2329,9 @@ async def get_session_messages(session_id: str) -> dict[str, Any]:
     memory_manager = _app_state.get("memory_manager")
     if memory_manager is not None:
         try:
-            redis_msgs = await memory_manager.short_term.get_conversation_context(session_id)
+            redis_msgs = await memory_manager.short_term.get_conversation_context(
+                session_id, channel="web"
+            )
             if redis_msgs:
                 normalized: list[dict[str, Any]] = []
                 for m in redis_msgs:
@@ -2348,7 +2362,7 @@ async def get_session_messages(session_id: str) -> dict[str, Any]:
 
     cfg = _app_state.get("config")
     sessions_dir = cfg.session.sessions_dir if cfg else ".nexus/sessions"
-    disk_msgs = read_transcript_messages(sessions_dir, session_id)
+    disk_msgs = read_transcript_messages(sessions_dir, session_id, channel="web")
     if disk_msgs:
         # ts/turn 포함 그대로 반환 (헬퍼가 이미 user/assistant만 필터)
         return {
@@ -2401,9 +2415,11 @@ async def delete_session(session_id: str) -> dict[str, Any]:
     memory_manager = _app_state.get("memory_manager")
     if memory_manager is not None:
         try:
-            existing = await memory_manager.short_term.get_conversation_context(session_id)
+            existing = await memory_manager.short_term.get_conversation_context(
+                session_id, channel="web"
+            )
             if existing:
-                await memory_manager.short_term.clear_session(session_id)
+                await memory_manager.short_term.clear_session(session_id, channel="web")
                 deleted_redis = True
         except Exception as e:
             # Redis 장애는 치명적 아님 — 디스크 삭제는 독립적으로 시도
@@ -2423,7 +2439,7 @@ async def delete_session(session_id: str) -> dict[str, Any]:
     cfg = _app_state.get("config")
     sessions_dir = cfg.session.sessions_dir if cfg else ".nexus/sessions"
     try:
-        deleted_disk = delete_transcript_session(sessions_dir, session_id)
+        deleted_disk = delete_transcript_session(sessions_dir, session_id, channel="web")
     except ValueError:
         # delete_transcript_session의 경로 검증 실패 — 이미 위에서 400 처리했지만
         # 방어적으로 한 번 더

@@ -9,7 +9,11 @@ Nexus의 "단기 기억"을 담당하는 모듈이다. 사람으로 치면 방�
 
 [무엇을 저장하나]
   - 대화 컨텍스트   : session:{session_id}:context   (세션 재접속 시 대화 복원용)
+      · 채널(web/cli/api) 지정 시 session:{channel}:{session_id}:context 로 격리한다.
+        진입점별 히스토리를 서로 조회 못 하게 하기 위함(같은 Redis db 안, 키 네임스페이스만 분리).
+        channel=None(미지정)이면 기존 flat 키를 그대로 써 하위호환을 유지한다.
   - 도구 결과 캐시  : tool_cache:{tool_name}:{input_hash} (같은 입력 재실행 방지)
+      · 도구 결과는 채널 무관(같은 입력=같은 결과)이라 채널 격리 대상이 아니다 — 공유 유지.
   - 임시 키-값 데이터: get/set/delete 로 다루는 범용 저장
 
 [핵심 클래스]
@@ -171,7 +175,31 @@ class ShortTermMemory:
 
     # ─── 대화 컨텍스트 ───
 
-    async def get_conversation_context(self, session_id: str) -> list[dict]:
+    @staticmethod
+    def _context_key(session_id: str, channel: str | None = None) -> str:
+        """
+        대화 컨텍스트 Redis 키를 만든다 — 채널별 히스토리 격리의 단일 지점.
+
+        channel 이 지정되면 진입점(web/cli/api)별로 키 네임스페이스를 나눠
+        서로의 세션을 조회하지 못하게 한다. channel 이 None 이면 예전 flat 키를
+        그대로 써서, channel 을 넘기지 않는 기존 호출·테스트·레거시 세션이
+        1비트도 바뀌지 않게 한다(하위호환).
+
+        Args:
+            session_id: 세션 식별자(콜론 없는 uuid)
+            channel: "web"/"cli"/"api" 등 진입점 채널. None이면 flat 키.
+
+        Returns:
+            channel 있으면 "session:{channel}:{id}:context",
+            없으면 "session:{id}:context".
+        """
+        if channel:
+            return f"session:{channel}:{session_id}:context"
+        return f"session:{session_id}:context"
+
+    async def get_conversation_context(
+        self, session_id: str, channel: str | None = None
+    ) -> list[dict]:
         """
         세션의 대화 컨텍스트(메시지 목록)를 복원한다.
 
@@ -182,12 +210,13 @@ class ShortTermMemory:
 
         Args:
             session_id: 세션 식별자
+            channel: 진입점 채널(web/cli/api). 저장 때와 같은 값을 넘겨야 매칭된다.
 
         Returns:
             메시지 딕셔너리 목록. 데이터가 없거나 손상됐으면 빈 리스트.
         """
-        # 저장 시 사용한 것과 동일한 키 규칙으로 조회한다.
-        key = f"session:{session_id}:context"
+        # 저장 시 사용한 것과 동일한 키 규칙(채널 포함)으로 조회한다.
+        key = self._context_key(session_id, channel)
         raw = await self.get(key)
 
         # 저장된 컨텍스트가 아예 없는 신규/만료 세션이면 빈 대화로 시작한다.
@@ -211,6 +240,7 @@ class ShortTermMemory:
         session_id: str,
         messages: list[dict],
         ttl: int = 86400,
+        channel: str | None = None,
     ) -> None:
         """
         세션의 대화 컨텍스트(메시지 목록)를 JSON으로 직렬화해 저장한다.
@@ -225,9 +255,10 @@ class ShortTermMemory:
             session_id: 세션 식별자
             messages: 저장할 메시지 딕셔너리 목록
             ttl: 만료 시간(초). 기본 24시간(86400초)
+            channel: 진입점 채널(web/cli/api). 복원 때 같은 값으로 조회해야 매칭된다.
         """
-        # 복원 때와 동일한 키 규칙을 사용한다.
-        key = f"session:{session_id}:context"
+        # 복원 때와 동일한 키 규칙(채널 포함)을 사용한다.
+        key = self._context_key(session_id, channel)
         try:
             # 한글 보존(ensure_ascii=False) + 비직렬화 객체 방어(default=str).
             raw = json.dumps(messages, ensure_ascii=False, default=str)
@@ -286,7 +317,7 @@ class ShortTermMemory:
 
     # ─── 유틸리티 ───
 
-    async def clear_session(self, session_id: str) -> None:
+    async def clear_session(self, session_id: str, channel: str | None = None) -> None:
         """
         세션 관련 데이터를 삭제한다.
 
@@ -296,36 +327,53 @@ class ShortTermMemory:
 
         Args:
             session_id: 정리할 세션 식별자
+            channel: 진입점 채널(web/cli/api). 저장 때와 같은 값을 넘겨야 그 세션이 지워진다.
         """
-        # 대화 컨텍스트 키를 저장 때와 같은 규칙으로 만들어 삭제한다.
-        context_key = f"session:{session_id}:context"
+        # 대화 컨텍스트 키를 저장 때와 같은 규칙(채널 포함)으로 만들어 삭제한다.
+        context_key = self._context_key(session_id, channel)
         await self.delete(context_key)
-        logger.info("세션 데이터 정리 완료: %s", session_id)
+        logger.info("세션 데이터 정리 완료: %s (channel=%s)", session_id, channel or "flat")
 
-    async def list_sessions(self, limit: int = 100) -> list[str]:
+    async def list_sessions(
+        self, limit: int = 100, channel: str | None = None
+    ) -> list[str]:
         """
         저장된 세션 ID 목록을 반환한다.
 
-        Redis에서는 SCAN 커서로 `session:*:context` 패턴을 순회하여 키를 모으고,
+        Redis에서는 SCAN 커서로 세션 컨텍스트 키 패턴을 순회하여 키를 모으고,
         접두/접미를 잘라 session_id를 돌려준다. 인메모리 폴백 모드에서는 내부
         딕셔너리 키를 같은 방식으로 필터링한다.
 
+        채널 격리:
+          - channel 지정 → `session:{channel}:*:context` 만 스캔 → 그 채널 세션만.
+          - channel None → `session:*:context` 스캔하되, 가운데에 콜론이 있는
+            (=채널 세그먼트가 붙은) 키는 걸러내 **레거시 flat 세션만** 돌려준다.
+          두 경로가 서로의 키를 절대 집지 않도록(상호 비침범) id 파트에 콜론이
+          없을 때만 채택한다. session_id(uuid)에는 콜론이 없다는 성질을 이용한다.
+
         Args:
             limit: 최대 반환 건수 (Redis SCAN의 페이지 크기와 별개의 상한)
+            channel: 진입점 채널(web/cli/api). None이면 레거시 flat 세션만.
 
         Returns:
             세션 ID 문자열 리스트 (정렬되지 않음 — 호출자가 필요 시 정렬)
         """
-        # 세션 컨텍스트 키는 "session:{id}:context" 형태다. 앞뒤 고정 부분을
-        # 상수로 두고, 그 사이의 실제 session_id 만 잘라내기 위한 기준으로 쓴다.
-        prefix = "session:"
+        # 채널 유무에 따라 스캔 패턴과 접두를 다르게 잡는다. 접미는 공통(:context).
         suffix = ":context"
+        if channel:
+            prefix = f"session:{channel}:"
+            match = f"session:{channel}:*:context"
+        else:
+            prefix = "session:"
+            match = "session:*:context"
 
         def _extract(key: str) -> str | None:
-            # 키가 정확히 session:...:context 패턴일 때만 가운데 id를 잘라 반환한다.
-            # 그 외 형태(다른 종류의 키)는 세션이 아니므로 None 을 돌려 걸러낸다.
+            # 접두/접미가 맞을 때만 가운데를 잘라낸다. 가운데(id)에 콜론이 있으면
+            # (channel 모드가 아닌데 채널 키를 만났거나, 형식이 다른 키) 세션이
+            # 아니므로 None으로 걸러 상호 비침범을 보장한다.
             if key.startswith(prefix) and key.endswith(suffix):
-                return key[len(prefix): -len(suffix)]
+                mid = key[len(prefix): -len(suffix)]
+                return mid if mid and ":" not in mid else None
             return None
 
         sessions: list[str] = []
@@ -335,7 +383,7 @@ class ShortTermMemory:
         if self._redis is not None:
             try:
                 # redis.asyncio의 scan_iter는 async generator를 반환한다.
-                async for raw_key in self._redis.scan_iter(match="session:*:context"):
+                async for raw_key in self._redis.scan_iter(match=match):
                     # Redis 키가 bytes로 올 수 있으므로 문자열로 통일한다.
                     key = (
                         raw_key.decode("utf-8")
