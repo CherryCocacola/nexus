@@ -108,6 +108,7 @@ from pydantic import BaseModel, Field
 # 순환 없음). 이 파일의 다른 import처럼 코드 뒤에 오므로(E402는 파일 전반의 기존
 # 사항) noqa로 표기해 신규 lint를 만들지 않는다.
 from core.message import KnowledgeCitation  # noqa: E402
+from core.system_prompt.compose import compose_system_prompt  # noqa: E402
 from web.middleware import ApiKeyAuthMiddleware, CORSConfig, RequestLoggingMiddleware
 
 logger = logging.getLogger("nexus.web.app")
@@ -1516,10 +1517,15 @@ async def chat(
         # 커스텀 인스트럭션(테넌트) + 프로젝트 인스트럭션을 덧붙인다(P2-2/P3-3, 비스트리밍).
         _instruction = _read_custom_instruction(getattr(tenant, "id", "default"))
         _proj_instr = _project.get("instruction", "") if _project else ""
-        _combined = "\n\n".join(x for x in (_instruction, _proj_instr) if x and x.strip())
-        if _combined.strip():
+        if (_instruction or "").strip() or (_proj_instr or "").strip():
+            # 문자열 덧붙이기 대신 base에서 재조립한다(멱등). 순서·형식이 세 진입점에서
+            # 같아지고, 스타일 같은 섹션이 늘어도 헬퍼 한 곳만 고치면 된다.
             engine.update_system_prompt(
-                engine.system_prompt + "\n\n[사용자 지시]\n" + _combined
+                compose_system_prompt(
+                    engine.system_prompt,
+                    user_instruction=_instruction,
+                    project_instruction=_proj_instr,
+                )
             )
 
         # Ch 16: Redis에서 해당 세션의 이전 히스토리 복원
@@ -1759,10 +1765,13 @@ async def chat_stream(
         # 엔진은 요청마다 새로 조립되므로 base 프롬프트에 1회만 덧붙어 누적되지 않는다.
         _instruction = _read_custom_instruction(getattr(_eff_tenant, "id", "default"))
         _proj_instr = _project.get("instruction", "") if _project else ""
-        _combined = "\n\n".join(x for x in (_instruction, _proj_instr) if x and x.strip())
-        if _combined.strip():
+        if (_instruction or "").strip() or (_proj_instr or "").strip():
             engine.update_system_prompt(
-                engine.system_prompt + "\n\n[사용자 지시]\n" + _combined
+                compose_system_prompt(
+                    engine.system_prompt,
+                    user_instruction=_instruction,
+                    project_instruction=_proj_instr,
+                )
             )
 
         # QueryEngine의 messages를 해당 세션의 히스토리로 교체
@@ -2122,8 +2131,10 @@ def _inject_openai_context(
     """
     # system 지시문 반영 — 기본 프롬프트 원본을 먼저 보관 후 뒤에 덧붙인다.
     if system_content:
-        base_prompt = engine.system_prompt
-        engine.update_system_prompt(base_prompt + "\n\n[사용자 지시]\n" + system_content)
+        # OpenAI 소비자가 보낸 system 메시지는 "이번 요청 한정" 지시로 취급한다.
+        engine.update_system_prompt(
+            compose_system_prompt(engine.system_prompt, session_instruction=system_content)
+        )
 
     # 세션/tenant/transcript 를 공식 bind_request 로 주입(기존 핸들러와 동일 계약).
     # OpenAI 호환 API 경로이므로 channel="api"로 격리(web 히스토리 목록에 안 섞인다).
