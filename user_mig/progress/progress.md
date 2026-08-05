@@ -4030,3 +4030,11 @@ FABLE5가 nova CLI를 정밀 진단(B-1~B-8)하고 5-Phase 수정계획 작성 �
   - 회고 집계(운영 transcript 55개): LaTeX 흔적 2건, mermaid 0건 — 실사용 질의 자체가 드물다.
 - **③ 배포② 1단계 완료**(커밋 49b0663): `core/system_prompt/compose.py` 신설 — `compose_system_prompt(base, style, user, project, session)`가 **base에서 전체 재조립(멱등)**. 순서 고정(base 맨 앞 = prefix cache 적중), 빈 섹션 생략, 본문 strip. 웹 3지점의 문자열 덧붙이기를 전부 치환(OpenAI system 메시지는 session_instruction으로 분리). 테스트 7건. **전체 unit 1825 passed**, 신규 파일 ruff clean.
 - **다음**: W1 응답 스타일(헬퍼의 style 슬롯에 얹기, 프리셋은 config YAML로 CLI와 공유) → W5 KaTeX 렌더러(`\[ \]`·`\( \)` 처리, 금액 `$100` 오인 방지, 스트리밍 미완성 수식은 완료 후 렌더). W4는 보류(프롬프트 규약 후 재측정).
+
+**W1 응답 스타일 완료 (2026-08-05, 커밋 1d1ed62 · 이미지 nexus-web:w1style-20260805).** 배포② 2단계.
+- **프리셋**: `config/response_styles.yaml` — normal(빈 문구=기본)·concise·explanatory·formal. **문구를 YAML에 두는 이유**: 말투 조정은 코드 변경이 아니라 운영 튜닝이고, 웹·CLI가 같은 파일을 읽어야 표면마다 말투가 갈리지 않는다.
+- **로더** `core/system_prompt/styles.py`: mtime 캐시(운영 중 YAML 수정 → 재기동 없이 다음 요청부터 반영), 파일 부재·문법오류 전부 fail-soft(스타일 때문에 대화가 막히면 안 됨). `resolve_style_prompt(style_id, custom)` — **사용자 custom이 프리셋보다 우선**.
+- **★무회귀 설계**: normal의 prompt가 빈 문자열 → `compose_system_prompt`가 [응답 스타일] 섹션을 통째로 생략 → **아무 설정 안 하면 기존 프롬프트와 1비트도 다르지 않다**. 테스트로 고정(`test_normal_style_keeps_prompt_identical`).
+- **API**: `GET/PUT /v1/response-style` — 테넌트 단위 저장(`_instructions/{tid}.style.json`, 커스텀 인스트럭션과 같은 저장 규약). 모르는 프리셋 id는 기본값으로 강등(임의 문자열 저장 방지). 3경로(비스트림·스트림·OpenAI) 모두 주입.
+- **검증**: 단위 11건 + 전체 **1836 passed**, 신규 ruff clean. **실서버**: 같은 질문("클로저가 뭔지")에 normal 1,421자 → **concise 820자(42% 감소)**, formal 정상, 프리셋 목록 API 노출 확인. 배포는 import 그래프 전체(web/app.py + compose.py + styles.py + YAML) 동시 반영 후 부트스트랩 로그 확인(교훈 적용).
+- **미완(다음)**: ①**프론트 UI 미연결** — 설정 모달에 스타일 드롭다운 추가 필요(현재는 API로만 변경 가능) ②CLI 연동(같은 YAML을 읽어 `/style` 명령) ③W5 KaTeX 렌더러(게이트 GO, `\[ \]`·`\( \)` 형식 처리).
