@@ -197,3 +197,36 @@ def test_cancel_during_prompt_denies() -> None:
 
     assert result["approved"] is False
     assert result["feedback"] == ""
+
+
+# ─── ⑤ 변경 미리보기 (B2) ───
+
+
+def test_file_write_shows_diff_before_prompt(tmp_path) -> None:
+    """파일 수정 승인 요청에는 diff 미리보기가 함께 표시된다.
+
+    경로만 보고 승인하는 것과 실제 변경을 보고 승인하는 것은 다르다.
+    """
+    f = tmp_path / "a.txt"
+    f.write_text("before\n", encoding="utf-8")
+    repl, buf, _ = _make_repl("default", answers=["1"])
+
+    result = asyncio.run(
+        repl.prompt_permission_v2(
+            "Write", "파일 쓰기", {"file_path": str(f), "content": "after\n"}
+        )
+    )
+
+    out = buf.getvalue()
+    assert result["approved"] is True
+    assert "-before" in out and "+after" in out  # diff 본문
+    assert "diff:" in out  # 미리보기 패널 제목
+
+
+def test_bash_has_no_diff_preview() -> None:
+    """파일을 바꾸지 않는 도구에는 미리보기를 붙이지 않는다."""
+    repl, buf, _ = _make_repl("default", answers=["1"])
+
+    asyncio.run(repl.prompt_permission_v2("Bash", "명령 실행", {"command": "ls -la"}))
+
+    assert "diff:" not in buf.getvalue()

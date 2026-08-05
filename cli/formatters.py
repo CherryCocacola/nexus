@@ -436,3 +436,180 @@ class OutputFormatter:
 
         # 위에서 걸리지 않은 그 외 이벤트(내부용 등)는 화면에 표시할 필요가 없으므로 None.
         return None
+
+
+# ─────────────────────────────────────────────
+# 파일 수정 diff 미리보기 (B1, 2026-08-05)
+# ─────────────────────────────────────────────
+# 왜 필요한가:
+#   권한 프롬프트가 "Write: /path/to/file"처럼 경로만 보여 주면, 사용자는 무엇이
+#   어떻게 바뀌는지 모른 채 승인해야 한다. 승인 전에 실제 변경 내용을 보여 주는
+#   것이 이 함수들의 목적이다.
+#
+# 상한을 두는 이유:
+#   거대한 파일이나 바이너리를 그대로 diff로 만들면 터미널이 마비되고, 승인
+#   결정에도 도움이 되지 않는다. 그래서 크기·줄수 상한을 두고 초과분은 요약한다.
+
+# 원본 파일이 이보다 크면 diff를 만들지 않고 경로·크기만 알린다.
+DIFF_MAX_FILE_BYTES = 256 * 1024
+# diff 출력이 이보다 길면 잘라내고 남은 줄 수를 알린다.
+DIFF_MAX_LINES = 200
+
+
+def looks_binary(text: str) -> bool:
+    """텍스트에 NULL 문자가 있으면 바이너리로 간주한다(간이 판정)."""
+    return "\x00" in text
+
+
+def read_text_for_diff(path: str) -> tuple[str | None, str | None]:
+    """diff용으로 파일을 읽는다.
+
+    Returns:
+        (내용, 사유). 읽을 수 있으면 (내용, None), 아니면 (None, 사유 문자열).
+        파일이 없으면 (None, "신규")로 돌려주어 호출부가 "새 파일"임을 알 수 있다.
+    """
+    from pathlib import Path
+
+    p = Path(path)
+    if not p.exists():
+        return None, "신규"
+    if not p.is_file():
+        return None, "파일이 아님"
+    try:
+        size = p.stat().st_size
+    except OSError as e:
+        return None, f"크기 확인 실패: {e}"
+    if size > DIFF_MAX_FILE_BYTES:
+        return None, f"파일이 큼({size / 1024:.0f}KB) — diff 생략"
+    try:
+        content = p.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return None, "바이너리(UTF-8 아님)"
+    except OSError as e:
+        return None, f"읽기 실패: {e}"
+    if looks_binary(content):
+        return None, "바이너리"
+    return content, None
+
+
+def format_diff(path: str, old: str, new: str) -> Any:
+    """old→new 변경을 unified diff Panel로 만든다.
+
+    Args:
+        path: 표시용 파일 경로(패널 제목).
+        old: 변경 전 내용(신규 파일이면 빈 문자열).
+        new: 변경 후 내용.
+
+    Returns:
+        Rich 렌더러블(Panel). 변경이 없으면 그 사실을 알리는 Panel.
+    """
+    import difflib
+
+    diff_lines = list(
+        difflib.unified_diff(
+            old.splitlines(),
+            new.splitlines(),
+            fromfile="변경 전",
+            tofile="변경 후",
+            lineterm="",
+            n=3,
+        )
+    )
+    if not diff_lines:
+        return Panel("[dim]변경 내용 없음[/dim]", title=f"diff: {path}", border_style="yellow")
+
+    truncated = 0
+    if len(diff_lines) > DIFF_MAX_LINES:
+        truncated = len(diff_lines) - DIFF_MAX_LINES
+        diff_lines = diff_lines[:DIFF_MAX_LINES]
+
+    body = "\n".join(diff_lines)
+    if truncated:
+        body += f"\n… 외 {truncated}줄"
+    # Syntax("diff")가 +/- 를 색으로 구분해 준다(추가=녹색, 삭제=적색).
+    return Panel(
+        Syntax(body, "diff", theme="ansi_dark", word_wrap=False),
+        title=f"diff: {path}",
+        border_style="yellow",
+    )
+
+
+def format_change_preview(tool_name: str, tool_input: dict[str, Any]) -> Any | None:
+    """도구 입력을 보고 변경 미리보기(diff)를 만든다. 만들 수 없으면 None.
+
+    지원 도구:
+      - Write     : 기존 파일 대비 전체 교체(파일이 없으면 신규 생성 diff)
+      - Edit      : old_string → new_string 치환 결과를 파일에 적용해 비교
+      - MultiEdit : 같은 파일에 대한 편집들을 메모리에서 순차 적용해 단일 diff
+    그 외 도구는 미리보기 대상이 아니므로 None을 돌려준다.
+    """
+    name = (tool_name or "").lower()
+    try:
+        if name == "write":
+            path = str(tool_input.get("file_path", ""))
+            new = str(tool_input.get("content", ""))
+            old, reason = read_text_for_diff(path)
+            if old is None:
+                if reason == "신규":
+                    return format_diff(path, "", new)
+                return Panel(
+                    f"[dim]{reason}[/dim]\n{path}", title="변경 미리보기", border_style="yellow"
+                )
+            return format_diff(path, old, new)
+
+        if name == "edit":
+            path = str(tool_input.get("file_path", ""))
+            old_s = str(tool_input.get("old_string", ""))
+            new_s = str(tool_input.get("new_string", ""))
+            old, reason = read_text_for_diff(path)
+            if old is None:
+                return Panel(
+                    f"[dim]{reason or '읽을 수 없음'}[/dim]\n{path}",
+                    title="변경 미리보기",
+                    border_style="yellow",
+                )
+            if old_s and old_s in old:
+                replace_all = bool(tool_input.get("replace_all", False))
+                new_content = (
+                    old.replace(old_s, new_s)
+                    if replace_all
+                    else old.replace(old_s, new_s, 1)
+                )
+                return format_diff(path, old, new_content)
+            # 정확 매칭이 안 되면(도구의 공백 정규화 폴백이 처리할 수 있다) 무엇을
+            # 무엇으로 바꾸려는지라도 보여 준다.
+            return format_diff(path, old_s, new_s)
+
+        if name == "multiedit":
+            edits = tool_input.get("edits") or []
+            if not edits:
+                return None
+            # 첫 파일만 미리 본다(여러 파일이면 그 사실을 제목에 알린다).
+            first_path = str(edits[0].get("file_path", ""))
+            old, reason = read_text_for_diff(first_path)
+            if old is None:
+                return Panel(
+                    f"[dim]{reason or '읽을 수 없음'}[/dim]\n{first_path}",
+                    title="변경 미리보기",
+                    border_style="yellow",
+                )
+            working = old
+            applied = 0
+            for e in edits:
+                if str(e.get("file_path", "")) != first_path:
+                    continue
+                o, n = str(e.get("old_string", "")), str(e.get("new_string", ""))
+                if o and o in working:
+                    working = working.replace(o, n, 1)
+                    applied += 1
+            if applied == 0:
+                return None
+            others = {str(e.get("file_path", "")) for e in edits} - {first_path}
+            panel = format_diff(first_path, old, working)
+            if others:
+                panel.title = f"{panel.title}  (외 파일 {len(others)}개)"
+            return panel
+    except Exception as e:  # noqa: BLE001 — 미리보기 실패가 승인 흐름을 막으면 안 된다
+        logger.warning("변경 미리보기 생성 실패(무시): %s", e)
+        return None
+    return None

@@ -50,7 +50,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from cli.formatters import OutputFormatter
+from cli.formatters import OutputFormatter, format_change_preview
 from core.message import StreamEvent, StreamEventType
 
 # 모듈 전용 로거. 프로젝트 규칙상 "nexus.{모듈경로}" 네임스페이스를 사용한다.
@@ -1060,6 +1060,13 @@ class NexusREPL:
                 border_style="yellow",
             )
         )
+        # ③-b 파일을 바꾸는 도구면 변경 내용을 diff로 먼저 보여 준다(B2).
+        #     경로만 보고 승인하는 것과 실제 변경을 보고 승인하는 것은 다르다.
+        #     미리보기 생성이 실패해도(None) 승인 흐름은 그대로 진행한다.
+        if category == ToolCategory.FILE_WRITE and tool_input:
+            preview = format_change_preview(tool_name, tool_input)
+            if preview is not None:
+                self.console.print(preview)
 
         try:
             # prompt()는 블로킹이므로 run_in_executor로 별도 스레드에서 대기시킨다.
