@@ -4005,3 +4005,11 @@ FABLE5가 nova CLI를 정밀 진단(B-1~B-8)하고 5-Phase 수정계획 작성 �
 - **커밋**: `[cli] 도구 표시 축약 + /verbose·자동완성·멀티라인 (C1, D8~D10)` e220705. 세션 누적 커밋 16개.
 - **Stage 1 완료 목록**: A1/A3(accept-edits+ask_handler v2) · A2(런타임 전환) · A4(Bash allow-list) · B1/B2(diff 미리보기) · C1/D8~D10(표시·입력 UX). `REMAINING_ISSUES_2026-08-05.md`의 P1 CLI 항목을 완료 처리하고 **Stage 2 목록**(C2 상태줄·C3 중단힌트·D1 `!`bash·D2 `/compact`·D3 `/resume`·D4 `/diff`·D5 `/cost`·D6 `/copy`·D7 `/save`)으로 갱신.
 - **P1 잔여**: Devstral 라우팅 통합(파서·config coder_url·라우팅 규칙·루프 비교) / 플러그인 적용 확인 / A.X 모델 한계(근본책).
+
+**Devstral 코딩 서브모델 라우팅 통합 완료 (2026-08-05, P1).** 8005 서빙만 돼 있고 NOVA가 안 쓰던 상태를 실제 라우팅까지 배선.
+- **문제 2건 실측·해결**: ①**tool_calls null** — 파서 미설정이라 `[TOOL_CALLS]Read{...}`가 텍스트로 나옴 → `--enable-auto-tool-choice --tool-call-parser mistral` 추가(vLLM 0.26.0, mistral 파서 지원 확인). ②**전 요청 400** — `--tokenizer-mode mistral`을 켰더니 `chat_template is not supported for Mistral tokenizers`. 원인은 NOVA가 thinking 제어용 `chat_template_kwargs`를 payload에 넣는 것. **토크나이저 모드는 빼고**(HF 토크나이저+mistral 파서 조합으로 [TOOL_CALLS] 정상 파싱) + `LocalModelProvider(supports_chat_template_kwargs=False)` 플래그로 코딩 프로바이더만 해당 키 생략.
+- **배선**: config `gpu_server.coder_url`(3본, 빈 값이면 비활성)·`coder_model` + `routing.coder_enabled`(**기본 False**)·`coder_keywords`(리팩터링·디버깅·스택트레이스 등 좁게). `RoutingDecision.use_coder` + `_detect_coder_query()`. `QueryEngine(coder_provider=)`가 코딩 턴에만 프로바이더 교체 — dispatcher는 `route(provider_override=)`, 폴백은 `model_provider=`. bootstrap이 coder_url 있을 때만 프로바이더 생성.
+- **기본 비활성 근거(정직)**: 실측상 코딩 모델이 항상 낫지 않다. 원샷 랜딩 생성은 A.X가 완결성 우위(Devstral은 레이아웃 붕괴), 코드 정리·리팩터링은 Devstral이 2.3배 빠르고 정확. 그래서 자동 전환은 운영자가 켤 때만.
+- **검증**: 단위 8건(기본 비활성·키워드 판정·대소문자·커스텀 키워드·라우팅 off 일관성·config 기본값) + **전체 1792 passed**, ruff clean. **실서버**: 한국어 생성 정상(176자), 도구 호출 1건 정상 파싱, 라우팅 판정(리팩터링→coder / 일반대화→primary) 확인, "코딩 전용 모델로 전환" 로그 확인.
+- **사용법**: `routing.coder_enabled: true`로 켜면 코딩 키워드 질의가 Devstral로 간다. 끄면 기존과 100% 동일. **원복**: `run_coder.sh.bak-noparser` 복원 또는 coder 세션 종료 + `start_all.sh` coder 줄 제거 + `run_vllm_fp8.sh.bak-util092` 복원.
+- **P1 잔여**: 플러그인 적용 확인(사용자 세션) / A.X 모델 한계 근본책(LoRA — 데이터 축적 후).
