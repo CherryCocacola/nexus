@@ -40,15 +40,21 @@ A1·A2·A3·A4·B1·B2·C1·D8·D9·D10 모두 구현·검증·커밋 완료. �
 **Stage 2(후속)**: C2 상태줄(bottom_toolbar) · C3 중단 힌트 · D1 `!` bash 패스스루 ·
 D2 `/compact` · D3 `/resume` 재바인드 · D4 `/diff` · D5 `/cost` · D6 `/copy` · D7 `/save`.
 
-### 4. Devstral 코딩 서브모델 통합 미완
-B200 8005에 서빙 중이나 **NOVA가 아직 사용하지 않는다**(수동 호출만 가능).
+### 4. ~~Devstral 코딩 서브모델 통합~~ — **완료 (2026-08-05, 커밋 8a32e19)**
+config `coder_url`/`coder_model` + `routing.coder_enabled`(**기본 False**)/`coder_keywords`,
+`RoutingDecision.use_coder`, `QueryEngine(coder_provider=)`가 코딩 턴에만 프로바이더 교체.
+서버는 `--tool-call-parser mistral`(파서 없으면 `[TOOL_CALLS]`가 텍스트로 나옴),
+`--tokenizer-mode mistral`은 금지(chat_template 400의 원인),
+`LocalModelProvider(supports_chat_template_kwargs=False)`로 회피. 실서버 검증 완료.
 
-- mistral tool-call 파서 검증(`--tokenizer-mode mistral` / `--tool-call-parser mistral` 필요 여부)
-- `config/nexus_config.*.yaml`에 `coder_url`(112=18005 터널 / B200=8005) 추가
-- 라우팅에 "코드 작업 → devstral-small" 규칙(기존 routing 프로필 확장)
-- 에이전트 루프 실전 비교: A.X가 붕괴했던 조건에서 Devstral이 완주하는지
-- **원복 절차**: coder tmux 세션 kill → `start_all.sh`의 coder 줄 제거 →
-  `run_vllm_fp8.sh.bak-util092` 복원 → vllm 재기동(util 0.92)
+**켜는 법**: `routing.coder_enabled: true`. 기본이 꺼진 이유는 실측상 코딩 모델이 항상
+낫지 않기 때문(원샷 UI는 primary 우위, 코드 정리·리팩터링만 Devstral 우위).
+
+**남은 실험(선택)**: 에이전트 루프 실전 비교 — A.X가 degeneration으로 붕괴했던
+장컨텍스트 조건에서 Devstral이 완주하는지.
+
+**원복 절차**: coder tmux 세션 kill → `start_all.sh`의 coder 줄 제거 →
+`run_vllm_fp8.sh.bak-util092` 복원 → vllm 재기동(util 0.92).
 
 ### 5. A.X-4.0 모델 한계 3종 (근본 원인)
 완화책은 적용했으나 근본 해결은 모델 교체/LoRA.
