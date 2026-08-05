@@ -4045,3 +4045,11 @@ FABLE5가 nova CLI를 정밀 진단(B-1~B-8)하고 5-Phase 수정계획 작성 �
 - **브라우저 실검증**: 모달 열기 → 프리셋 4종 로드 확인 → concise 선택·저장 → `/v1/response-style` 재조회로 서버 반영 확인 → 화면 눈검증 → normal 원상복구 → 탭 정리. 정적 파일이라 docker cp만으로 반영(재시작 불필요), 이후 `docker commit`으로 영속화.
 - **배포② 현황**: 1단계 프롬프트 조립기 ✅ · 2단계 W1 응답스타일(백엔드+API+UI) ✅ · 3단계 **W5 KaTeX 렌더러 남음**(게이트 GO, `\[ \]`·`\( \)` 형식). W4 Mermaid는 NO-GO로 보류(프롬프트 규약 후 재측정).
 - **CLI 연동 후보**: 같은 `config/response_styles.yaml`을 읽는 `/style` 명령(웹·CLI 말투 통일).
+
+**W5 KaTeX — 벤더·배선 완료, 조판 문제로 기본 비활성 (2026-08-05, 커밋 c0c9c75 · 이미지 nexus-web:katex-vendor-20260805).**
+- **완료**: 벤더 로컬 번들 600KB(katex.min.js/css + auto-render + woff2 20종, 에어갭이라 CDN 불가 — highlight.js와 동일 방식). **구분자를 게이트 실측에 맞춤** — `\[ \]`(블록)·`\( \)`(인라인). **`$` 단일 구분자는 쓰지 않음**(가격 $100 오인 방지). 코드블록 내 수식 미렌더(ignoredTags). 스트리밍 중이 아닌 finalize/append 1회 호출(깜빡임 방지).
+- **브라우저 검증 통과분**: 인라인 수식 렌더 O · 금액 `$1,200`/`$100` 원문 유지 O · 코드블록 내 `rac` 미렌더 O · 원문 잔여 없음 O.
+- **★남은 문제(그래서 잠금)**: **분수·루트가 세로로 눌려 잘린다**(mfrac 높이 20px — 분자+선+분모면 40px 이상 필요). 진단한 것 — 폰트 20종 HTTP 200·`document.fonts`에 로드됨, 색상 정상(rgb(232,230,227)), DOM 구조 정상(.vlist display:table-cell, 자식 position:relative+top), `.katex *` line-height 보정은 **원인이 아님**(끄면 오히려 39px로 악화), display:true/false 무관하게 동일. 기존 index.html CSS와의 충돌로 추정되나 특정 실패.
+- **조치**: `renderMath` 진입부에 `NOVA_MATH_ENABLED` 플래그(기본 false). **꺼진 상태에서는 원문 LaTeX가 그대로 보여 도입 전과 동일**(무회귀). 재개 시 콘솔 `window.NOVA_MATH_ENABLED = true`로 즉시 실험 가능.
+- **다음 세션 착수점**: KaTeX CSS 충돌 특정 — ①`katex.min.css`가 실제로 전부 적용되는지(.vlist-t/.vlist-r 규칙 존재 확인) ②`.message-body` 계열의 상속 규칙을 하나씩 비활성화하며 이분 탐색 ③최후 수단으로 `.katex` 하위를 `all: revert` 후 KaTeX CSS만 재적용.
+- **배포② 현황**: 1단계 조립기 ✅ · 2단계 W1(백엔드·API·UI) ✅ · 3단계 W5 **부분완료(잠금)**. W4 Mermaid는 NO-GO 보류.
