@@ -194,7 +194,9 @@ def _sha256_file(path: Path) -> str | None:
         return None
 
 
-async def _record_artifacts(downloads: list, tenant: Any, session_id: str | None) -> None:
+async def _record_artifacts(
+    downloads: list, tenant: Any, session_id: str | None, turn: int | None = None
+) -> None:
     """생성물(다운로드 확정분)의 메타데이터를 tb_artifacts에 fail-soft로 기록한다.
 
     [왜 web 계층에서 기록하는가]
@@ -264,7 +266,90 @@ async def _record_artifacts(downloads: list, tenant: Any, session_id: str | None
             mime=mime,
             size_bytes=size_bytes,
             sha256=sha256,
+            turn=turn,
         )
+
+
+async def _attach_session_artifacts(
+    messages: list[dict[str, Any]], session_id: str
+) -> list[dict[str, Any]]:
+    """히스토리 복원 시 세션 생성물(이미지·문서)을 각 assistant 메시지에 되붙인다.
+
+    [왜 필요한가]
+      스트리밍 중에는 download 프레임으로 이미지 썸네일·다운로드 버튼을 그리지만,
+      그 프레임은 트랜스크립트에 남지 않는다(assistant 텍스트만 저장). 그래서
+      세션을 다시 열거나 새로고침하면 생성물이 사라진다. 여기서 tb_artifacts에
+      기록해 둔 생성물을 세션 기준으로 끌어와, turn 값으로 정확한 메시지에 매칭해
+      `downloads` 필드로 실어 준다(프론트가 라이브 때와 동일하게 렌더).
+
+    [매칭 규칙]
+      - turn이 일치하는 assistant 메시지에 붙인다(라이브 기록과 같은 turn 값).
+      - turn이 없는(레거시) 생성물이나 매칭 실패분은 마지막 assistant 메시지에
+        모아 붙인다(가용성 우선 — 하나도 잃지 않는다).
+
+    fail-soft: pg_pool이 없거나 생성물이 없으면 messages를 그대로 돌려준다.
+    """
+    pool = _app_state.get("pg_pool")
+    if not messages:
+        return messages
+    from core.memory.transcript import read_session_meta
+    from core.storage.artifacts import list_session_artifacts
+
+    # 이 세션이 직접 만든 생성물(tb_artifacts, session_id 기준).
+    arts: list[dict[str, Any]] = []
+    if pool is not None:
+        arts = list(await list_session_artifacts(pool, session_id))
+    # fork로 상속받은 생성물 — tb_artifacts는 원본 session_id 기준이라 분기 세션엔
+    # 레코드가 없다(filename UNIQUE라 재삽입 불가). 그래서 fork 시 원본 생성물 목록을
+    # meta.json(inherited_artifacts)에 저장해 두고 여기서 병합한다(T3-1c 한계 해소).
+    cfg = _app_state.get("config")
+    sessions_dir = cfg.session.sessions_dir if cfg else ".nexus/sessions"
+    inherited = read_session_meta(sessions_dir, session_id, channel="web").get(
+        "inherited_artifacts"
+    ) or []
+    for a in inherited:
+        if isinstance(a, dict) and a.get("filename"):
+            arts.append(
+                {"filename": a["filename"], "mime": a.get("mime"), "turn": a.get("turn")}
+            )
+    if not arts:
+        return messages
+
+    def _to_download(a: dict[str, Any]) -> dict[str, str]:
+        # 라이브 download 프레임과 동일한 형식({url, filename, format})으로 맞춘다.
+        # format은 확장자에서 뽑는다(이미지 판별·배지용). 문서 미리보기 content는
+        # tb_artifacts에 없으므로 생략 — 다운로드 버튼·이미지 썸네일은 정상 동작한다.
+        fn = a["filename"]
+        ext = fn.rsplit(".", 1)[-1].lower() if "." in fn else ""
+        return {"url": f"/v1/download/{fn}", "filename": fn, "format": ext}
+
+    # 생성물을 turn별로 묶고, turn이 없는 것은 레거시 버킷에 모은다(생성순 보존).
+    by_turn: dict[int, list[dict[str, str]]] = {}
+    leftovers: list[dict[str, str]] = []
+    for a in arts:
+        t = a.get("turn")
+        if t is None:
+            leftovers.append(_to_download(a))
+        else:
+            by_turn.setdefault(t, []).append(_to_download(a))
+
+    assistant_msgs = [m for m in messages if m.get("role") == "assistant"]
+    matched: set[int] = set()
+    for m in assistant_msgs:
+        t = m.get("turn")
+        if t is not None and t in by_turn:
+            m["downloads"] = by_turn[t]
+            matched.add(t)
+
+    # 매칭 실패한 turn 버킷은 레거시와 함께 마지막 assistant에 모아 붙인다.
+    for t, dls in by_turn.items():
+        if t not in matched:
+            leftovers.extend(dls)
+    if leftovers and assistant_msgs:
+        last = assistant_msgs[-1]
+        last["downloads"] = list(last.get("downloads", [])) + leftovers
+
+    return messages
 
 
 def _build_todo_update_frame(engine: Any, session_id: str) -> dict[str, Any] | None:
@@ -350,6 +435,119 @@ def _compute_tool_desc(tool_use: Any) -> str | None:
         # subagent_type 없이 ad-hoc description만 준 하위 호환 경로.
         return description
     return None
+
+
+# ─────────────────────────────────────────────
+# 진입점 채널 해석 헬퍼 (히스토리 격리, 2026-08-05)
+# ─────────────────────────────────────────────
+# 왜 필요한가:
+#   /v1/chat·/v1/chat/stream 은 웹 UI 전용으로 만들어져 channel="web"이 하드코딩돼
+#   있었다. 그런데 외부 소비자(VSCode 플러그인 등)가 API 키로 이 엔드포인트를 쓰면
+#   그 대화가 웹 사용자 히스토리 목록에 그대로 섞여 보인다(2026-08-05 실측).
+#   클라이언트가 자기 채널을 선언하면 그 채널로 격리해 이 혼입을 막는다.
+#
+# 정책(사용자 요구):
+#   - web / app  → 같은 "web" 채널. 브라우저와 앱 사용자는 대화 이력을 공유한다.
+#   - cli / api  → 각자 독립 채널. 웹 목록·검색·삭제에서 보이지 않는다.
+#   - 헤더 없음/모르는 값 → "web" (종전 동작 그대로 = 무회귀).
+#
+# 보안(중요):
+#   channel 값은 그대로 디렉토리 이름({sessions_dir}/{channel}/...)과 Redis 키
+#   네임스페이스가 된다. 임의 문자열을 허용하면 "../" 같은 값으로 경로를 벗어날 수
+#   있으므로, 반드시 아래 화이트리스트에 있는 값만 통과시킨다(fail-closed).
+_CHANNEL_ALIASES: dict[str, str] = {
+    "web": "web",
+    "app": "web",  # 앱은 웹과 이력을 공유한다(요구사항)
+    "cli": "cli",
+    "api": "api",
+}
+
+
+def _resolve_channel(header_channel: str | None) -> str:
+    """X-Client-Channel 헤더를 검증된 저장 채널로 변환한다.
+
+    Args:
+        header_channel: 클라이언트가 선언한 채널("web"/"app"/"cli"/"api").
+            None이거나 화이트리스트에 없으면 기본값 "web"으로 떨어진다.
+            문자열이 아닌 값(FastAPI 의존성 주입을 거치지 않고 핸들러를 직접
+            호출하는 테스트에서는 Header 객체가 그대로 들어온다)도 "web"으로
+            안전하게 처리한다.
+
+    Returns:
+        "web" | "cli" | "api" 중 하나. 이 값만 경로·키에 쓰이므로 순회가 불가능하다.
+    """
+    if not header_channel or not isinstance(header_channel, str):
+        return "web"
+    return _CHANNEL_ALIASES.get(header_channel.strip().lower(), "web")
+
+
+def _sanitize_client_id(raw: Any) -> str | None:
+    """X-Client-Id 헤더를 안전한 식별자로 정규화한다 (2026-08-05).
+
+    왜 필요한가:
+      api 채널에는 여러 외부 소비자(VSCode 플러그인·AgentHub 등)의 대화가 함께
+      쌓여 어느 것이 누구 것인지 구분할 수 없었다. 클라이언트가 자기 이름을
+      선언하면 세션 메타에 남겨 나중에 골라볼 수 있게 한다.
+
+    안전 규칙:
+      메타 파일에 그대로 기록되므로 영문자·숫자·`-`·`_`만 남기고 32자로 자른다.
+      (경로로 쓰이지는 않지만, 제어문자·개행이 로그와 JSON을 오염시키지 않도록.)
+
+    Returns:
+        정규화된 식별자. 값이 없거나 남는 문자가 없으면 None.
+    """
+    if not raw or not isinstance(raw, str):
+        return None
+    cleaned = "".join(ch for ch in raw.strip() if ch.isalnum() or ch in "-_")
+    return cleaned[:32] or None
+
+
+def _record_client_meta(
+    session_id: str, channel: str, client_id: str, tenant: Any = None
+) -> None:
+    """세션 메타(meta.json)에 어느 클라이언트가 만든 세션인지 남긴다 (fail-soft).
+
+    api 채널에는 VSCode 플러그인·AgentHub 등 여러 소비자의 대화가 함께 쌓인다.
+    테넌트(API 키)로는 구별되지만 저장소에서는 구분이 없어, 나중에 "플러그인
+    대화만" 골라내거나 정리할 수 없었다. 이 값이 그 구분자다.
+
+    메타 기록 실패가 대화 자체를 막아서는 안 되므로 예외는 삼키고 로그만 남긴다.
+    """
+    try:
+        from core.memory.transcript import write_session_meta
+
+        cfg = _app_state.get("config")
+        sessions_dir = cfg.session.sessions_dir if cfg else ".nexus/sessions"
+        write_session_meta(
+            sessions_dir,
+            session_id,
+            {"client": client_id, "tenant": getattr(tenant, "id", None)},
+            channel=channel,
+        )
+    except Exception as e:  # noqa: BLE001 — 부가 기능이므로 절대 요청을 깨뜨리지 않는다
+        logger.debug("클라이언트 메타 기록 실패(무시): %s", e)
+
+
+def _map_finish_reason(stop_reason: Any) -> str:
+    """내부 StopReason을 OpenAI finish_reason으로 변환한다 (2026-08-05).
+
+    왜 필요한가:
+      기존 OpenAI 호환 응답은 finish_reason을 항상 "stop"으로 하드코딩했다. 그래서
+      모델이 출력 토큰 한도에 걸려 **응답이 중간에 잘려도** 클라이언트는 완결된
+      응답으로 오해했다(실측: VSCode 플러그인이 잘린 JSON을 받고 파싱 실패).
+      OpenAI 규격대로 한도 초과는 "length"로 정직하게 알려, 클라이언트가 재시도·
+      분할 요청 같은 대응을 할 수 있게 한다.
+
+    Args:
+        stop_reason: core.message.StopReason 또는 그 문자열 값. None이면 "stop".
+
+    Returns:
+        "length"(토큰 한도로 잘림) 또는 "stop"(그 외 정상 종료).
+    """
+    if stop_reason is None:
+        return "stop"
+    value = getattr(stop_reason, "value", None) or str(stop_reason)
+    return "length" if value == "max_tokens" else "stop"
 
 
 # ─────────────────────────────────────────────
@@ -1233,6 +1431,8 @@ async def chat(
     request: ChatRequest,
     x_tenant_id: str | None = Header(default=None, alias="X-Tenant-ID"),
     authorization: str | None = Header(default=None),
+    x_client_channel: str | None = Header(default=None, alias="X-Client-Channel"),
+    x_client_id: str | None = Header(default=None, alias="X-Client-Id"),
 ) -> ChatResponse:
     """비스트리밍 채팅 엔드포인트 (POST /v1/chat).
 
@@ -1254,6 +1454,12 @@ async def chat(
     # 세션 ID 생성 또는 재사용
     session_id = request.session_id or str(uuid.uuid4())
     tenant = _resolve_tenant(request.tenant_id, x_tenant_id, authorization)
+    # 저장 채널 — 헤더 미지정이면 "web"(종전과 동일). 외부 소비자가 자기 채널을
+    # 선언하면 그 채널로 격리돼 웹 사용자 히스토리에 섞이지 않는다.
+    channel = _resolve_channel(x_client_channel)
+    _client_id = _sanitize_client_id(x_client_id)
+    if _client_id and channel != "web":
+        _record_client_meta(session_id, channel, _client_id, tenant)
 
     # 동시성 수정(#5): 요청/세션별 격리 엔진을 얻는다(프로덕션). parts가 없으면
     # 기존 싱글톤/placeholder 경로로 폴백(무회귀).
@@ -1289,13 +1495,16 @@ async def chat(
     # 크립트 기록 순서를 안정화하기 위해 세션 단위로 감싼다(전역 처리량은 안 죽음).
     session_lock = _get_session_lock(session_id)
     async with session_lock:
+        # 프로젝트(폴더=프로젝트명)가 있으면 지식소스를 narrow한 tenant로 교체(P3-3).
+        _project = _resolve_project_for_session(getattr(tenant, "id", "default"), session_id)
+        tenant = _narrow_tenant_for_project(tenant, _project)
         # Ch 16 + 리팩토링 2: 세션/tenant/transcript를 공식 bind_request로 한 번에 주입
-        transcript = _build_transcript(session_id, channel="web")
+        transcript = _build_transcript(session_id, channel=channel)
         engine.bind_request(
             session_id=session_id,
             tenant=tenant,
             transcript=transcript,
-            channel="web",
+            channel=channel,
         )
         if tenant is not None:
             logger.info(
@@ -1304,13 +1513,22 @@ async def chat(
                 tenant.allowed_knowledge_sources,
             )
 
+        # 커스텀 인스트럭션(테넌트) + 프로젝트 인스트럭션을 덧붙인다(P2-2/P3-3, 비스트리밍).
+        _instruction = _read_custom_instruction(getattr(tenant, "id", "default"))
+        _proj_instr = _project.get("instruction", "") if _project else ""
+        _combined = "\n\n".join(x for x in (_instruction, _proj_instr) if x and x.strip())
+        if _combined.strip():
+            engine.update_system_prompt(
+                engine.system_prompt + "\n\n[사용자 지시]\n" + _combined
+            )
+
         # Ch 16: Redis에서 해당 세션의 이전 히스토리 복원
         memory_manager = _app_state.get("memory_manager")
         if memory_manager is not None:
             try:
                 engine.clear_messages()
                 saved = await memory_manager.short_term.get_conversation_context(
-                    session_id, channel="web"
+                    session_id, channel=channel
                 )
                 engine._messages.extend(_restore_messages_from_saved(saved, session_id))
             except Exception as e:
@@ -1380,7 +1598,9 @@ async def chat(
         response_session_id = engine.session_id
 
         # 생성물 메타데이터를 tb_artifacts에 fail-soft 기록(pg 없으면 조용히 스킵).
-        await _record_artifacts(downloads, tenant, response_session_id)
+        await _record_artifacts(
+            downloads, tenant, response_session_id, turn=getattr(engine, "total_turns", None)
+        )
 
     # 등장 순서대로 ToolCallInfo 목록을 만든다.
     tool_calls_info: list[ToolCallInfo] = [tool_calls_by_id[tid] for tid in tool_calls_order]
@@ -1416,6 +1636,8 @@ async def chat_stream(
     request: ChatRequest,
     x_tenant_id: str | None = Header(default=None, alias="X-Tenant-ID"),
     authorization: str | None = Header(default=None),
+    x_client_channel: str | None = Header(default=None, alias="X-Client-Channel"),
+    x_client_id: str | None = Header(default=None, alias="X-Client-Id"),
 ) -> StreamingResponse:
     """
     SSE 스트리밍 채팅.
@@ -1425,6 +1647,12 @@ async def chat_stream(
     """
     session_id = request.session_id or str(uuid.uuid4())
     tenant = _resolve_tenant(request.tenant_id, x_tenant_id, authorization)
+    # 저장 채널 — 헤더 미지정이면 "web"(무회귀). 아래 중첩 제너레이터들은 이 값을
+    # 읽기만 하므로(재대입 없음) 클로저 캡처가 안전하다.
+    channel = _resolve_channel(x_client_channel)
+    _client_id = _sanitize_client_id(x_client_id)
+    if _client_id and channel != "web":
+        _record_client_meta(session_id, channel, _client_id, tenant)
 
     async def _locked_generate() -> AsyncGenerator[str, None]:
         """세션별 격리 엔진 획득 + 세션 락으로 감싼 뒤 실제 스트림을 위임한다.
@@ -1472,7 +1700,7 @@ async def chat_stream(
             if memory_manager is not None:
                 try:
                     saved = await memory_manager.short_term.get_conversation_context(
-                        session_id, channel="web"
+                        session_id, channel=channel
                     )
                     restored = _restore_messages_from_saved(saved, session_id)
                     histories[session_id].extend(restored)
@@ -1500,23 +1728,42 @@ async def chat_stream(
                 sessions_dir=sessions_dir,
                 session_id=session_id,
                 enabled=transcript_enabled,
-                channel="web",
+                channel=channel,
             )
         except Exception as e:
             logger.warning("트랜스크립트 주입 실패 (%s): %s", session_id, e)
             engine._transcript = None
 
+        # 프로젝트(폴더=프로젝트명)가 있으면 지식소스를 narrow한 tenant 사본을 쓴다(P3-3).
+        # ★tenant 자체를 재대입하면 이 중첩 함수에서 tenant가 지역변수로 잡혀
+        #   UnboundLocalError가 나므로, 별도 변수(_eff_tenant)에 담는다.
+        _project = _resolve_project_for_session(getattr(tenant, "id", "default"), session_id)
+        _eff_tenant = _narrow_tenant_for_project(tenant, _project)
         # 리팩토링 2: 세션/tenant/transcript를 공식 bind_request로 주입
         # (이전엔 engine._session_id 등 비공개 필드를 직접 치환 — race condition 위험)
-        transcript = _build_transcript(session_id, channel="web")
+        transcript = _build_transcript(session_id, channel=channel)
         engine.bind_request(
             session_id=session_id,
-            tenant=tenant,
+            tenant=_eff_tenant,
             transcript=transcript,
-            channel="web",
+            channel=channel,
         )
-        if tenant is not None:
-            logger.info("tenant 해석: %s (sources=%s)", tenant.id, tenant.allowed_knowledge_sources)
+        if _eff_tenant is not None:
+            logger.info(
+                "tenant 해석: %s (sources=%s)",
+                _eff_tenant.id,
+                _eff_tenant.allowed_knowledge_sources,
+            )
+
+        # 커스텀 인스트럭션(테넌트) + 프로젝트 인스트럭션을 시스템 프롬프트에 덧붙인다(P2-2/P3-3).
+        # 엔진은 요청마다 새로 조립되므로 base 프롬프트에 1회만 덧붙어 누적되지 않는다.
+        _instruction = _read_custom_instruction(getattr(_eff_tenant, "id", "default"))
+        _proj_instr = _project.get("instruction", "") if _project else ""
+        _combined = "\n\n".join(x for x in (_instruction, _proj_instr) if x and x.strip())
+        if _combined.strip():
+            engine.update_system_prompt(
+                engine.system_prompt + "\n\n[사용자 지시]\n" + _combined
+            )
 
         # QueryEngine의 messages를 해당 세션의 히스토리로 교체
         # 도구 호출/결과 메시지는 토큰을 많이 차지하므로 제외하고,
@@ -1743,7 +1990,7 @@ async def chat_stream(
         #   이벤트로 바로 download 프레임을 내보내고 이 사후 스캔을 제거한다.
         _dls = _collect_downloads(engine._messages[dl_start_idx:])
         # 생성물 메타데이터를 tb_artifacts에 fail-soft 기록(pg 없으면 조용히 스킵).
-        await _record_artifacts(_dls, tenant, session_id)
+        await _record_artifacts(_dls, tenant, session_id, turn=getattr(engine, "total_turns", None))
         for _dl in _dls:
             yield f"data: {json.dumps({'type': 'download', **_dl}, ensure_ascii=False)}\n\n"
 
@@ -1787,7 +2034,7 @@ async def chat_stream(
                     if text:
                         serialized.append({"role": role, "content": text})
                 await memory_manager.short_term.save_conversation_context(
-                    session_id, serialized, ttl=86400, channel="web"
+                    session_id, serialized, ttl=86400, channel=channel
                 )
             except Exception as e:
                 logger.warning("세션 Redis 저장 실패 (%s): %s", session_id, e)
@@ -2018,6 +2265,7 @@ async def chat_completions(
     request: OpenAIChatCompletionRequest,
     x_tenant_id: str | None = Header(default=None, alias="X-Tenant-ID"),
     authorization: str | None = Header(default=None),
+    x_client_id: str | None = Header(default=None, alias="X-Client-Id"),
 ) -> Any:
     """OpenAI 호환 채팅 완성 엔드포인트.
 
@@ -2037,6 +2285,11 @@ async def chat_completions(
 
     # OpenAI 에는 session_id 개념이 없다 → 요청마다 임시 세션으로 무상태 처리.
     session_id = str(uuid.uuid4())
+    # 소비자 식별(2026-08-05) — api 채널에는 여러 외부 클라이언트의 대화가 함께
+    # 쌓여 구분이 불가능했다. 헤더를 준 클라이언트만 메타에 남긴다(선택 사항).
+    _client_id = _sanitize_client_id(x_client_id)
+    if _client_id:
+        _record_client_meta(session_id, "api", _client_id, tenant)
     # 응답에 반향할 모델명(요청값 우선, 없으면 기본값).
     model_name = request.model or "ax-4.0"
 
@@ -2051,6 +2304,7 @@ async def chat_completions(
                 prior_messages=prior_messages,
                 last_user_text=last_user_text,
                 structured_output=structured_output,
+                max_tokens=request.max_tokens,
             ),
             media_type="text/event-stream",
             headers={
@@ -2084,10 +2338,17 @@ async def chat_completions(
 
     response_text_parts: list[str] = []
     usage = OpenAIUsage()
+    # 마지막 종료 이유 — 토큰 한도로 잘렸는지(finish_reason="length") 판정에 쓴다.
+    last_stop_reason: Any = None
 
     # 4-Tier 체인 우회 금지: submit_message 가 yield 하는 StreamEvent 만 소비한다.
+    # 요청의 max_tokens를 엔진까지 전달한다(2026-08-05). 이전에는 무시되어
+    # 클라이언트가 출력 크기를 제어할 수 없었다. 0 이하는 무시(None 폴백).
+    _max_tokens_req = request.max_tokens if (request.max_tokens or 0) > 0 else None
     async for event in engine.submit_message(
-        last_user_text, structured_output=structured_output
+        last_user_text,
+        structured_output=structured_output,
+        max_tokens_override=_max_tokens_req,
     ):
         if not isinstance(event, StreamEvent):
             continue
@@ -2099,16 +2360,43 @@ async def chat_completions(
                 completion_tokens=event.usage.output_tokens,
                 total_tokens=event.usage.total_tokens,
             )
+        elif event.type == StreamEventType.MESSAGE_STOP and event.stop_reason:
+            # 턴마다 갱신 — 마지막 값이 이 응답의 최종 종료 이유다.
+            last_stop_reason = event.stop_reason
         # tool_use/tool_result/thinking 등은 OpenAI 표준 content 에 없으므로 무시한다.
 
     # 문서 생성 다운로드를 이 턴 메시지에서 추출(기존 헬퍼 재사용).
     downloads = _collect_downloads(engine._messages[dl_start_idx:])
     # 생성물 메타데이터를 tb_artifacts에 fail-soft 기록(pg 없으면 조용히 스킵).
-    await _record_artifacts(downloads, tenant, session_id)
+    await _record_artifacts(
+        downloads, tenant, session_id, turn=getattr(engine, "total_turns", None)
+    )
 
     content = "".join(response_text_parts)
     # 표준 클라이언트도 링크를 볼 수 있게 content 끝에 마크다운으로 덧붙인다.
     content += _downloads_markdown(downloads)
+
+    # 토큰 한도로 잘렸으면 "length"로 정직하게 알린다(하드코딩 "stop" 제거).
+    finish_reason = _map_finish_reason(last_stop_reason)
+
+    # 구조화 출력(JSON) 요청이면 서버가 먼저 파싱해 본다. 깨진 JSON을 그대로
+    # 200으로 흘려보내면 클라이언트는 원인을 알 수 없다(실측: 플러그인 파싱 실패).
+    # 실패 원인 대부분은 "잘림"이므로 finish_reason과 함께 경고를 남긴다.
+    if structured_output is not None and content:
+        try:
+            json.loads(content)
+        except (ValueError, TypeError):
+            logger.warning(
+                "[structured_output] 응답이 유효한 JSON이 아닙니다 "
+                "(finish_reason=%s, len=%d). 잘림이면 max_tokens를 늘리거나 "
+                "요청을 분할해야 합니다. session=%s",
+                finish_reason,
+                len(content),
+                session_id,
+            )
+            # 잘림이 아닌데도 깨졌다면 클라이언트가 구분할 수 있도록 신호를 준다.
+            if finish_reason == "stop":
+                finish_reason = "content_filter"
 
     return OpenAIChatCompletionResponse(
         id=f"chatcmpl-{uuid.uuid4().hex}",
@@ -2117,7 +2405,7 @@ async def chat_completions(
         choices=[
             OpenAIChoice(
                 message=OpenAIResponseMessage(content=content),
-                finish_reason="stop",
+                finish_reason=finish_reason,
             )
         ],
         usage=usage,
@@ -2133,6 +2421,7 @@ async def _openai_stream_generate(
     prior_messages: list[Any],
     last_user_text: str,
     structured_output: Any = None,
+    max_tokens: int | None = None,
 ) -> AsyncGenerator[str, None]:
     """OpenAI `chat.completion.chunk` SSE 프레임을 생성한다.
 
@@ -2184,7 +2473,9 @@ async def _openai_stream_generate(
         """submit_message 스트림을 큐로 옮긴다(에러 포함)."""
         try:
             async for ev in engine.submit_message(
-                last_user_text, structured_output=structured_output
+                last_user_text,
+                structured_output=structured_output,
+                max_tokens_override=(max_tokens if (max_tokens or 0) > 0 else None),
             ):
                 await event_queue.put(("event", ev))
         except BaseException as e:  # noqa: BLE001 — 모든 예외를 에러 프레임/종료로 수렴
@@ -2194,6 +2485,8 @@ async def _openai_stream_generate(
 
     producer_task = asyncio.create_task(_producer())
     stream_abort_error: BaseException | None = None
+    # 마지막 종료 이유 — 토큰 한도로 잘리면 종료 프레임에 finish_reason="length"를 싣는다.
+    stream_stop_reason: Any = None
     try:
         while True:
             try:
@@ -2217,6 +2510,9 @@ async def _openai_stream_generate(
                 # 텍스트 조각만 delta.content 로 흘린다. 나머지 이벤트는 무시.
                 if event.type == StreamEventType.TEXT_DELTA and event.text:
                     yield _chunk({"content": event.text})
+                elif event.type == StreamEventType.MESSAGE_STOP and event.stop_reason:
+                    # 턴마다 갱신 — 마지막 값이 이 응답의 최종 종료 이유다.
+                    stream_stop_reason = event.stop_reason
     finally:
         # 클라이언트가 연결을 끊는 등으로 제너레이터가 닫히면 producer 를 취소한다.
         if not producer_task.done():
@@ -2236,13 +2532,16 @@ async def _openai_stream_generate(
     # 이 턴에 생성된 문서 다운로드 링크를 마지막 content 청크로 덧붙인다.
     downloads = _collect_downloads(engine._messages[dl_start_idx:])
     # 생성물 메타데이터를 tb_artifacts에 fail-soft 기록(pg 없으면 조용히 스킵).
-    await _record_artifacts(downloads, tenant, session_id)
+    await _record_artifacts(
+        downloads, tenant, session_id, turn=getattr(engine, "total_turns", None)
+    )
     dl_md = _downloads_markdown(downloads)
     if dl_md:
         yield _chunk({"content": dl_md})
 
-    # 종료 프레임 → OpenAI 관례상 빈 delta + finish_reason='stop', 이어서 [DONE].
-    yield _chunk({}, finish="stop")
+    # 종료 프레임 → OpenAI 관례상 빈 delta + finish_reason, 이어서 [DONE].
+    # 토큰 한도로 잘렸으면 "length"를 실어 클라이언트가 미완결을 알 수 있게 한다.
+    yield _chunk({}, finish=_map_finish_reason(stream_stop_reason))
     yield "data: [DONE]\n\n"
 
 
@@ -2295,6 +2594,97 @@ async def list_sessions() -> dict[str, Any]:
     }
 
 
+@app.get("/v1/sessions/search")
+async def search_sessions(q: str = "") -> dict[str, Any]:
+    """세션 대화를 질의어로 검색한다(사이드바 검색창).
+
+    web 채널 트랜스크립트만 스캔(진입점 격리). 질의어가 2자 미만이면 빈 결과.
+    반환: {"query", "results":[{session_id, last_modified, snippets:[...]}], "total"}.
+    """
+    from core.memory.transcript import search_transcript_sessions
+
+    cfg = _app_state.get("config")
+    sessions_dir = cfg.session.sessions_dir if cfg else ".nexus/sessions"
+    results = search_transcript_sessions(sessions_dir, q, channel="web")
+    return {"query": q, "results": results, "total": len(results)}
+
+
+async def _load_session_messages(
+    session_id: str,
+) -> tuple[list[dict[str, Any]], str] | None:
+    """세션 메시지를 Redis→트랜스크립트 순으로 로드한다. (messages, source) 또는 None.
+
+    messages는 [{role, content, turn, ts}] (user/assistant만). 생성물 링크는 붙이지
+    않은 원본이며, 호출부가 필요에 따라 _attach_session_artifacts로 보강한다. 조회/
+    내보내기(messages 엔드포인트·export)가 이 헬퍼를 공유해 로직 중복을 없앤다.
+    channel="web" 고정(진입점 격리). 어느 저장소에도 없으면 None.
+    """
+    memory_manager = _app_state.get("memory_manager")
+    if memory_manager is not None:
+        try:
+            redis_msgs = await memory_manager.short_term.get_conversation_context(
+                session_id, channel="web"
+            )
+            if redis_msgs:
+                normalized = [
+                    {
+                        "role": m.get("role"),
+                        "content": m.get("content"),
+                        "turn": m.get("turn"),
+                        "ts": m.get("ts"),
+                    }
+                    for m in redis_msgs
+                    if m.get("role") in ("user", "assistant") and m.get("content")
+                ]
+                if normalized:
+                    return normalized, "redis"
+        except Exception as e:
+            logger.debug("_load_session_messages Redis 조회 실패 (%s): %s", session_id, e)
+
+    from core.memory.transcript import read_transcript_messages
+
+    cfg = _app_state.get("config")
+    sessions_dir = cfg.session.sessions_dir if cfg else ".nexus/sessions"
+    disk_msgs = read_transcript_messages(sessions_dir, session_id, channel="web")
+    if disk_msgs:
+        out = [
+            {
+                "role": m["role"],
+                "content": m["content"],
+                "turn": m.get("turn"),
+                "ts": m.get("ts"),
+            }
+            for m in disk_msgs
+        ]
+        return out, "transcript"
+    return None
+
+
+def _render_session_export(
+    title: str, messages: list[dict[str, Any]], fmt: str
+) -> str:
+    """세션 대화를 내보내기용 텍스트로 렌더한다(md 또는 txt).
+
+    md: 제목 헤더 + `## 사용자`/`## IDINO NOVA` 교대 섹션(본문은 마크다운 그대로).
+    txt: `[사용자]`/`[IDINO NOVA]` 라벨 + 평문. 어느 쪽도 외부 의존 없이 순수 조립.
+    """
+    from datetime import UTC, datetime
+
+    stamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
+    parts: list[str] = []
+    if fmt == "md":
+        parts.append(f"# {title}\n\n_{stamp}_\n")
+        for m in messages:
+            who = "사용자" if m.get("role") == "user" else "IDINO NOVA"
+            parts.append(f"## {who}\n\n{m.get('content', '')}\n")
+    else:  # txt
+        parts.append(f"{title}\n{stamp}\n{'=' * 40}\n")
+        for m in messages:
+            who = "사용자" if m.get("role") == "user" else "IDINO NOVA"
+            parts.append(f"[{who}]\n{m.get('content', '')}\n")
+    return "\n".join(parts)
+
+
 @app.get("/v1/sessions/{session_id}/messages")
 async def get_session_messages(session_id: str) -> dict[str, Any]:
     """
@@ -2325,63 +2715,620 @@ async def get_session_messages(session_id: str) -> dict[str, Any]:
     if not session_id or any(ch in session_id for ch in ("/", "\\", "..", "\x00")):
         raise HTTPException(status_code=400, detail="invalid session_id")
 
-    # 1) Redis 우선 (가장 최신 상태)
-    memory_manager = _app_state.get("memory_manager")
-    if memory_manager is not None:
-        try:
-            redis_msgs = await memory_manager.short_term.get_conversation_context(
-                session_id, channel="web"
-            )
-            if redis_msgs:
-                normalized: list[dict[str, Any]] = []
-                for m in redis_msgs:
-                    role = m.get("role")
-                    content = m.get("content")
-                    if role in ("user", "assistant") and content:
-                        normalized.append(
-                            {
-                                "role": role,
-                                "content": content,
-                                "turn": m.get("turn"),
-                                "ts": m.get("ts"),
-                            }
-                        )
-                if normalized:
-                    return {
-                        "session_id": session_id,
-                        "source": "redis",
-                        "messages": normalized,
-                        "total": len(normalized),
-                    }
-        except Exception as e:
-            # Redis 장애는 치명적 아님 — 트랜스크립트 폴백 시도
-            logger.debug("get_session_messages Redis 조회 실패 (%s): %s", session_id, e)
+    # Redis→트랜스크립트 순으로 로드(공용 헬퍼). 어느 쪽에도 없으면 404.
+    loaded = await _load_session_messages(session_id)
+    if loaded is None:
+        raise HTTPException(status_code=404, detail=f"session not found: {session_id}")
+    messages, source = loaded
+    # 생성물(이미지·문서) 링크를 각 assistant 메시지에 되붙인다.
+    messages = await _attach_session_artifacts(messages, session_id)
+    return {
+        "session_id": session_id,
+        "source": source,
+        "messages": messages,
+        "total": len(messages),
+    }
 
-    # 2) JSONL 트랜스크립트 폴백
-    from core.memory.transcript import read_transcript_messages
+
+@app.get("/v1/sessions/{session_id}/export")
+async def export_session(session_id: str, fmt: str = "md"):
+    """세션 대화를 md 또는 txt 파일로 내보낸다(첨부 다운로드).
+
+    사이드바의 "내보내기" 버튼이 호출. 메시지는 get_session_messages와 같은
+    로더(_load_session_messages, Redis→트랜스크립트)를 공유하고, 제목은 meta.json
+    사용자 지정 제목을 우선한다. channel="web" 고정(진입점 격리).
+
+    쿼리: fmt=md|txt (기본 md). 응답은 Content-Disposition 첨부 + UTF-8 파일명.
+    """
+    from urllib.parse import quote
+
+    from fastapi import HTTPException
+    from fastapi.responses import PlainTextResponse
+
+    if not session_id or any(ch in session_id for ch in ("/", "\\", "..", "\x00")):
+        raise HTTPException(status_code=400, detail="invalid session_id")
+    fmt = (fmt or "md").lower()
+    if fmt not in ("md", "txt"):
+        raise HTTPException(status_code=400, detail="fmt must be 'md' or 'txt'")
+
+    loaded = await _load_session_messages(session_id)
+    if loaded is None:
+        raise HTTPException(status_code=404, detail=f"session not found: {session_id}")
+    messages, _source = loaded
+
+    from core.memory.transcript import read_session_meta
 
     cfg = _app_state.get("config")
     sessions_dir = cfg.session.sessions_dir if cfg else ".nexus/sessions"
-    disk_msgs = read_transcript_messages(sessions_dir, session_id, channel="web")
-    if disk_msgs:
-        # ts/turn 포함 그대로 반환 (헬퍼가 이미 user/assistant만 필터)
-        return {
-            "session_id": session_id,
-            "source": "transcript",
-            "messages": [
-                {
-                    "role": m["role"],
-                    "content": m["content"],
-                    "turn": m.get("turn"),
-                    "ts": m.get("ts"),
-                }
-                for m in disk_msgs
-            ],
-            "total": len(disk_msgs),
-        }
+    meta = read_session_meta(sessions_dir, session_id, channel="web")
+    title = meta.get("title") or f"대화 {session_id[:8]}"
 
-    # 어느 쪽에도 없음
-    raise HTTPException(status_code=404, detail=f"session not found: {session_id}")
+    body = _render_session_export(title, messages, fmt)
+
+    # 파일명 — 제목에서 경로/제어문자를 제거해 안전화한 뒤 확장자. 한글은 UTF-8 헤더로.
+    safe = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", title).strip()[:60] or "conversation"
+    filename = f"{safe}.{fmt}"
+    media = "text/markdown" if fmt == "md" else "text/plain"
+    return PlainTextResponse(
+        body,
+        media_type=f"{media}; charset=utf-8",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"},
+    )
+
+
+@app.post("/v1/sessions/{session_id}/truncate")
+async def truncate_last_exchange(session_id: str) -> dict[str, Any]:
+    """마지막 (user, assistant) 교환을 히스토리에서 제거한다(재생성용).
+
+    프론트 "재생성" 버튼이 호출한다. 마지막 assistant 응답과 그 직전 user 메시지를
+    chat_histories(인메모리 dict) + Redis 양쪽에서 제거하고, 제거된 user 메시지
+    텍스트를 돌려준다. 프론트는 그 텍스트를 다시 전송해 새 응답을 받는다.
+
+    [★왜 인메모리 dict까지 지우나 — Fable5 경고 지점]
+      스트리밍 채팅은 요청마다 engine을 새로 조립하고 chat_histories[session_id]에서
+      대화를 복원한다. Redis만 지우고 이 dict를 안 지우면 다음 요청이 인메모리 낡은
+      이력을 그대로 써 "지운 메시지가 되살아나는" 버그가 난다. 그래서 둘 다 절단한다.
+
+    channel="web" 고정. 세션 락으로 진행 중 생성과 직렬화한다(레이스 방지).
+    """
+    from fastapi import HTTPException
+
+    if not session_id or any(ch in session_id for ch in ("/", "\\", "..", "\x00")):
+        raise HTTPException(status_code=400, detail="invalid session_id")
+
+    def _role(m: Any) -> str:
+        return m.role if isinstance(m.role, str) else m.role.value
+
+    def _text(m: Any) -> str:
+        return m.text_content if hasattr(m, "text_content") else str(m.content)
+
+    async with _get_session_lock(session_id):
+        histories = _app_state.setdefault("chat_histories", {})
+        hist = histories.get(session_id)
+        memory_manager = _app_state.get("memory_manager")
+        # 인메모리에 없으면 Redis에서 복원(서버 재기동/최초 접근 대비).
+        if hist is None:
+            saved = None
+            if memory_manager is not None:
+                try:
+                    saved = await memory_manager.short_term.get_conversation_context(
+                        session_id, channel="web"
+                    )
+                except Exception as e:
+                    logger.debug("truncate Redis 조회 실패 (%s): %s", session_id, e)
+            hist = _restore_messages_from_saved(saved, session_id)
+            histories[session_id] = hist
+
+        # 히스토리가 아예 없으면 없는 세션으로 보고 404(fork/export와 API 일관성).
+        if not hist:
+            raise HTTPException(status_code=404, detail=f"session not found: {session_id}")
+
+        # 마지막 assistant와 그 직전 user를 찾아 그 지점부터 잘라낸다.
+        last_asst = next(
+            (i for i in range(len(hist) - 1, -1, -1) if _role(hist[i]) == "assistant"),
+            None,
+        )
+        if last_asst is None:
+            return {"session_id": session_id, "removed": 0, "last_user": None}
+        last_user = next(
+            (i for i in range(last_asst - 1, -1, -1) if _role(hist[i]) == "user"),
+            None,
+        )
+        removed_user_text = _text(hist[last_user]) if last_user is not None else None
+        cut = last_user if last_user is not None else last_asst
+        removed = len(hist) - cut
+        del hist[cut:]
+
+        # Redis write-through(절단 반영) — 저장 형식은 스트리밍 경로와 동일.
+        if memory_manager is not None:
+            try:
+                serialized = [
+                    {"role": _role(m), "content": _text(m)}
+                    for m in hist
+                    if _role(m) in ("user", "assistant") and _text(m)
+                ]
+                await memory_manager.short_term.save_conversation_context(
+                    session_id, serialized, ttl=86400, channel="web"
+                )
+            except Exception as e:
+                logger.warning("truncate Redis 저장 실패 (%s): %s", session_id, e)
+
+    return {"session_id": session_id, "removed": removed, "last_user": removed_user_text}
+
+
+class ForkRequest(BaseModel):
+    """대화 분기(fork) 요청 — at_index개의 앞 메시지를 새 세션에 복사한다."""
+
+    at_index: int = 0
+
+
+@app.post("/v1/sessions/{session_id}/fork")
+async def fork_session(session_id: str, body: ForkRequest) -> dict[str, Any]:
+    """대화를 특정 지점까지 복사한 새 세션(분기)을 만든다(메시지 편집·분기용).
+
+    at_index개의 앞 메시지를 새 session_id로 복사한다(chat_histories + Redis +
+    트랜스크립트). 원본은 그대로 두고 새 세션을 반환하므로 append-only 트랜스크립트와
+    충돌하지 않고 원본이 보존된다(Fable5 설계). 프론트는 새 세션으로 전환한 뒤 편집한
+    메시지를 전송해 분기를 이어간다. channel="web" 고정.
+    """
+    from fastapi import HTTPException
+
+    from core.message import Message
+
+    if not session_id or any(ch in session_id for ch in ("/", "\\", "..", "\x00")):
+        raise HTTPException(status_code=400, detail="invalid session_id")
+
+    loaded = await _load_session_messages(session_id)
+    if loaded is None:
+        raise HTTPException(status_code=404, detail=f"session not found: {session_id}")
+    messages, _source = loaded
+    at = max(0, min(body.at_index, len(messages)))
+    prefix = messages[:at]
+
+    new_id = str(uuid.uuid4())
+    msg_objs: list[Any] = []
+    for m in prefix:
+        if m.get("role") == "user":
+            msg_objs.append(Message.user(m.get("content", "")))
+        elif m.get("role") == "assistant":
+            msg_objs.append(Message.assistant(m.get("content", "")))
+
+    async with _get_session_lock(new_id):
+        histories = _app_state.setdefault("chat_histories", {})
+        histories[new_id] = list(msg_objs)
+        memory_manager = _app_state.get("memory_manager")
+        if memory_manager is not None:
+            try:
+                serialized = [
+                    {"role": m["role"], "content": m["content"]}
+                    for m in prefix
+                    if m.get("role") in ("user", "assistant") and m.get("content")
+                ]
+                await memory_manager.short_term.save_conversation_context(
+                    new_id, serialized, ttl=86400, channel="web"
+                )
+            except Exception as e:
+                logger.warning("fork Redis 저장 실패 (%s): %s", new_id, e)
+        # 트랜스크립트에도 접두부를 남긴다(Redis TTL 이후에도 복원되도록).
+        try:
+            trans = _build_transcript(new_id, channel="web")
+            if trans is not None:
+                for m in prefix:
+                    if m.get("role") in ("user", "assistant") and m.get("content"):
+                        trans.append_entry(role=m["role"], content=m["content"], turn=0)
+        except Exception as e:
+            logger.warning("fork 트랜스크립트 기록 실패 (%s): %s", new_id, e)
+
+    # 원본의 폴더·제목을 새 세션 메타에 상속(제목엔 '(분기)' 표시).
+    from core.memory.transcript import read_session_meta, write_session_meta
+
+    cfg = _app_state.get("config")
+    sessions_dir = cfg.session.sessions_dir if cfg else ".nexus/sessions"
+    src_meta = read_session_meta(sessions_dir, session_id, channel="web")
+    new_meta: dict[str, Any] = {}
+    if src_meta.get("folder"):
+        new_meta["folder"] = src_meta["folder"]
+    if src_meta.get("title"):
+        new_meta["title"] = (str(src_meta["title"]) + " (분기)")[:200]
+
+    # 원본의 생성물(이미지·문서)을 분기에 물려준다(T3-1c — tb_artifacts는 원본 session_id
+    # 기준이라 그냥은 소실됨). 원본이 직접 만든 것 + 원본이 또 상속받은 것(연쇄 fork)을 합치되,
+    # fork 지점(접두부 최대 turn) 이후에 생긴 생성물은 제외한다.
+    from core.storage.artifacts import list_session_artifacts
+
+    pool = _app_state.get("pg_pool")
+    src_arts: list[dict[str, Any]] = []
+    if pool is not None:
+        src_arts = list(await list_session_artifacts(pool, session_id))
+    src_arts += [a for a in (src_meta.get("inherited_artifacts") or []) if isinstance(a, dict)]
+    prefix_turns = [m.get("turn") for m in prefix if isinstance(m.get("turn"), int)]
+    max_turn = max(prefix_turns) if prefix_turns else None
+    inherited: list[dict[str, Any]] = []
+    seen_fn: set[str] = set()
+    for a in src_arts:
+        fn = a.get("filename")
+        if not fn or fn in seen_fn:
+            continue
+        t = a.get("turn")
+        if max_turn is not None and isinstance(t, int) and t > max_turn:
+            continue  # fork 지점 이후 생성물은 분기에 넣지 않는다
+        seen_fn.add(fn)
+        inherited.append({"filename": fn, "mime": a.get("mime"), "turn": t})
+    if inherited:
+        new_meta["inherited_artifacts"] = inherited
+
+    if new_meta:
+        try:
+            write_session_meta(sessions_dir, new_id, new_meta, channel="web")
+        except ValueError:
+            pass
+
+    return {
+        "new_session_id": new_id,
+        "copied": len(prefix),
+        "messages": prefix,
+        "folder": new_meta.get("folder", ""),
+        "title": new_meta.get("title"),
+    }
+
+
+# ─────────────────────────────────────────────
+# 커스텀 인스트럭션 (테넌트 단위 시스템 프롬프트 추가) — P2-2
+# ─────────────────────────────────────────────
+# 최대 길이 — 시스템 프롬프트에 덧붙이는 사용자 지시문의 상한(과도한 프롬프트 방지).
+_INSTRUCTION_MAX_CHARS = 4000
+
+
+def _instructions_dir() -> Path:
+    """커스텀 인스트럭션 파일이 저장되는 디렉토리(세션 디렉토리 하위 _instructions).
+
+    세션 디렉토리는 배포에서 bind-mount로 영속화되므로 여기에 두면 재기동/재생성
+    후에도 유지된다. 채널 세션 폴더(web/cli/api)와 이름이 겹치지 않고, transcript.jsonl이
+    없어 세션 목록 스캔에도 잡히지 않는다.
+    """
+    cfg = _app_state.get("config")
+    sessions_dir = cfg.session.sessions_dir if cfg else ".nexus/sessions"
+    return Path(sessions_dir) / "_instructions"
+
+
+def _read_custom_instruction(tenant_id: str | None) -> str:
+    """테넌트의 커스텀 인스트럭션 텍스트를 읽는다(없거나 오류 시 빈 문자열)."""
+    tid = re.sub(r"[^\w.-]", "_", tenant_id or "default")
+    try:
+        f = _instructions_dir() / f"{tid}.txt"
+        if f.is_file():
+            return f.read_text(encoding="utf-8")
+    except OSError as e:
+        logger.debug("커스텀 인스트럭션 읽기 실패 (%s): %s", tid, e)
+    return ""
+
+
+def _write_custom_instruction(tenant_id: str | None, text: str) -> bool:
+    """테넌트의 커스텀 인스트럭션을 저장한다(성공 True, fail-soft)."""
+    tid = re.sub(r"[^\w.-]", "_", tenant_id or "default")
+    try:
+        d = _instructions_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{tid}.txt").write_text(text, encoding="utf-8")
+        return True
+    except OSError as e:
+        logger.warning("커스텀 인스트럭션 저장 실패 (%s): %s", tid, e)
+        return False
+
+
+class InstructionUpdate(BaseModel):
+    """커스텀 인스트럭션 갱신 바디 — 시스템 프롬프트에 덧붙일 사용자 지시문."""
+
+    text: str = ""
+
+
+@app.get("/v1/instructions")
+async def get_instructions(
+    x_tenant_id: str | None = Header(default=None, alias="X-Tenant-ID"),
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """현재 테넌트의 커스텀 인스트럭션을 반환한다(설정 화면 로드용)."""
+    tenant = _resolve_tenant(None, x_tenant_id, authorization)
+    tid = getattr(tenant, "id", "default")
+    return {"tenant_id": tid, "text": _read_custom_instruction(tid)}
+
+
+@app.put("/v1/instructions")
+async def put_instructions(
+    body: InstructionUpdate,
+    x_tenant_id: str | None = Header(default=None, alias="X-Tenant-ID"),
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """현재 테넌트의 커스텀 인스트럭션을 저장한다. 저장분은 이후 채팅 시스템
+    프롬프트에 '[사용자 지시]'로 덧붙는다. 길이는 상한으로 자른다."""
+    tenant = _resolve_tenant(None, x_tenant_id, authorization)
+    tid = getattr(tenant, "id", "default")
+    text = (body.text or "")[:_INSTRUCTION_MAX_CHARS]
+    ok = _write_custom_instruction(tid, text)
+    return {"tenant_id": tid, "ok": ok, "text": text}
+
+
+# ─────────────────────────────────────────────
+# 프롬프트 템플릿 (테넌트 단위 JSON) — P2-6
+# ─────────────────────────────────────────────
+_PROMPT_MAX_COUNT = 50           # 테넌트당 저장 가능한 템플릿 최대 개수
+_PROMPT_TITLE_MAX = 60           # 제목 최대 길이
+_PROMPT_TEXT_MAX = 2000          # 본문 최대 길이
+
+
+def _prompts_dir() -> Path:
+    """프롬프트 템플릿 파일 디렉토리(세션 디렉토리 하위 _prompts, bind-mount 영속)."""
+    cfg = _app_state.get("config")
+    sessions_dir = cfg.session.sessions_dir if cfg else ".nexus/sessions"
+    return Path(sessions_dir) / "_prompts"
+
+
+def _read_prompts(tenant_id: str | None) -> list[dict[str, str]]:
+    """테넌트의 프롬프트 템플릿 목록을 읽는다([{title, text}], 없거나 오류 시 빈 목록)."""
+    tid = re.sub(r"[^\w.-]", "_", tenant_id or "default")
+    try:
+        f = _prompts_dir() / f"{tid}.json"
+        if f.is_file():
+            data = json.loads(f.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return [
+                    {"title": str(p.get("title", "")), "text": str(p.get("text", ""))}
+                    for p in data
+                    if isinstance(p, dict)
+                ]
+    except (OSError, json.JSONDecodeError) as e:
+        logger.debug("프롬프트 템플릿 읽기 실패 (%s): %s", tid, e)
+    return []
+
+
+def _write_prompts(tenant_id: str | None, prompts: list[dict[str, str]]) -> bool:
+    """테넌트의 프롬프트 템플릿 목록을 저장한다(성공 True, fail-soft)."""
+    tid = re.sub(r"[^\w.-]", "_", tenant_id or "default")
+    try:
+        d = _prompts_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{tid}.json").write_text(
+            json.dumps(prompts, ensure_ascii=False), encoding="utf-8"
+        )
+        return True
+    except OSError as e:
+        logger.warning("프롬프트 템플릿 저장 실패 (%s): %s", tid, e)
+        return False
+
+
+class PromptItem(BaseModel):
+    """프롬프트 템플릿 1건 — 제목 + 본문."""
+
+    title: str = ""
+    text: str = ""
+
+
+class PromptsUpdate(BaseModel):
+    """프롬프트 템플릿 전체 목록 갱신 바디(목록 통째로 교체)."""
+
+    prompts: list[PromptItem] = []
+
+
+@app.get("/v1/prompts")
+async def get_prompts(
+    x_tenant_id: str | None = Header(default=None, alias="X-Tenant-ID"),
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """현재 테넌트의 프롬프트 템플릿 목록을 반환한다."""
+    tenant = _resolve_tenant(None, x_tenant_id, authorization)
+    tid = getattr(tenant, "id", "default")
+    return {"tenant_id": tid, "prompts": _read_prompts(tid)}
+
+
+@app.put("/v1/prompts")
+async def put_prompts(
+    body: PromptsUpdate,
+    x_tenant_id: str | None = Header(default=None, alias="X-Tenant-ID"),
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """현재 테넌트의 프롬프트 템플릿 목록을 통째로 교체 저장한다.
+    본문이 빈 항목은 버리고, 개수·길이는 상한으로 자른다."""
+    tenant = _resolve_tenant(None, x_tenant_id, authorization)
+    tid = getattr(tenant, "id", "default")
+    items = [
+        {"title": p.title.strip()[:_PROMPT_TITLE_MAX], "text": p.text[:_PROMPT_TEXT_MAX]}
+        for p in body.prompts[:_PROMPT_MAX_COUNT]
+        if p.text.strip()
+    ]
+    ok = _write_prompts(tid, items)
+    return {"tenant_id": tid, "ok": ok, "prompts": items}
+
+
+# ─────────────────────────────────────────────
+# 프로젝트 (폴더 + 인스트럭션 + 지식소스 서브셋) — P3-3
+# ─────────────────────────────────────────────
+# 프로젝트는 "폴더명 = 프로젝트명"으로 세션에 연결된다(P2-3 폴더 재사용). 세션의 folder가
+# 정의된 프로젝트명과 같으면 그 프로젝트의 인스트럭션·지식소스가 채팅에 적용된다.
+_PROJECT_MAX_COUNT = 50
+
+
+def _projects_dir() -> Path:
+    cfg = _app_state.get("config")
+    sessions_dir = cfg.session.sessions_dir if cfg else ".nexus/sessions"
+    return Path(sessions_dir) / "_projects"
+
+
+def _read_projects(tenant_id: str | None) -> list[dict[str, Any]]:
+    """테넌트의 프로젝트 목록을 읽는다([{name, instruction, sources}], 없으면 빈 목록)."""
+    tid = re.sub(r"[^\w.-]", "_", tenant_id or "default")
+    try:
+        f = _projects_dir() / f"{tid}.json"
+        if f.is_file():
+            data = json.loads(f.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return [
+                    {
+                        "name": str(p.get("name", "")),
+                        "instruction": str(p.get("instruction", "")),
+                        "sources": [str(x) for x in p.get("sources", []) if x],
+                    }
+                    for p in data
+                    if isinstance(p, dict) and p.get("name")
+                ]
+    except (OSError, json.JSONDecodeError) as e:
+        logger.debug("프로젝트 읽기 실패 (%s): %s", tid, e)
+    return []
+
+
+def _write_projects(tenant_id: str | None, projects: list[dict[str, Any]]) -> bool:
+    tid = re.sub(r"[^\w.-]", "_", tenant_id or "default")
+    try:
+        d = _projects_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{tid}.json").write_text(
+            json.dumps(projects, ensure_ascii=False), encoding="utf-8"
+        )
+        return True
+    except OSError as e:
+        logger.warning("프로젝트 저장 실패 (%s): %s", tid, e)
+        return False
+
+
+def _resolve_project_for_session(
+    tenant_id: str | None, session_id: str
+) -> dict[str, Any] | None:
+    """세션의 folder(meta)와 이름이 같은 프로젝트를 찾는다(없으면 None)."""
+    cfg = _app_state.get("config")
+    sessions_dir = cfg.session.sessions_dir if cfg else ".nexus/sessions"
+    from core.memory.transcript import read_session_meta
+
+    folder = (
+        read_session_meta(sessions_dir, session_id, channel="web").get("folder") or ""
+    ).strip()
+    if not folder:
+        return None
+    for p in _read_projects(tenant_id):
+        if p.get("name") == folder:
+            return p
+    return None
+
+
+def _narrow_tenant_for_project(tenant: Any, project: dict[str, Any] | None) -> Any:
+    """프로젝트가 지식소스를 지정했으면 tenant를 narrow한 사본으로 바꿔 돌려준다.
+    프로젝트는 테넌트 허용범위를 넓힐 수 없다(보안 — 교집합만). 아니면 원본 반환."""
+    if not project:
+        return tenant
+    srcs = project.get("sources") or []
+    if srcs and tenant is not None:
+        base = list(getattr(tenant, "allowed_knowledge_sources", []) or [])
+        narrowed = [s for s in srcs if (not base or s in base)]
+        try:
+            return tenant.model_copy(update={"allowed_knowledge_sources": narrowed})
+        except Exception as e:  # noqa: BLE001 — 실패 시 원본 유지(무회귀)
+            logger.warning("프로젝트 소스 제한 실패(무시): %s", e)
+    return tenant
+
+
+class ProjectItem(BaseModel):
+    """프로젝트 1건 — 이름 + 인스트럭션 + 지식소스 서브셋."""
+
+    name: str = ""
+    instruction: str = ""
+    sources: list[str] = Field(default_factory=list)
+
+
+class ProjectsUpdate(BaseModel):
+    """프로젝트 전체 목록 갱신 바디."""
+
+    projects: list[ProjectItem] = []
+
+
+@app.get("/v1/projects")
+async def get_projects(
+    x_tenant_id: str | None = Header(default=None, alias="X-Tenant-ID"),
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """현재 테넌트의 프로젝트 목록 + 선택 가능한 지식소스 풀을 반환한다."""
+    tenant = _resolve_tenant(None, x_tenant_id, authorization)
+    tid = getattr(tenant, "id", "default")
+    return {
+        "tenant_id": tid,
+        "projects": _read_projects(tid),
+        "available_sources": list(getattr(tenant, "allowed_knowledge_sources", []) or []),
+    }
+
+
+@app.put("/v1/projects")
+async def put_projects(
+    body: ProjectsUpdate,
+    x_tenant_id: str | None = Header(default=None, alias="X-Tenant-ID"),
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """현재 테넌트의 프로젝트 목록을 통째로 교체 저장한다. 이름 없는 항목은 버린다."""
+    tenant = _resolve_tenant(None, x_tenant_id, authorization)
+    tid = getattr(tenant, "id", "default")
+    items = [
+        {
+            "name": p.name.strip()[:60],
+            "instruction": p.instruction[:_INSTRUCTION_MAX_CHARS],
+            "sources": [s.strip() for s in p.sources if s.strip()][:20],
+        }
+        for p in body.projects[:_PROJECT_MAX_COUNT]
+        if p.name.strip()
+    ]
+    ok = _write_projects(tid, items)
+    return {"tenant_id": tid, "ok": ok, "projects": items}
+
+
+class SessionMetaUpdate(BaseModel):
+    """세션 메타 갱신 요청 바디 — 제목(수동)·핀 여부·폴더. 미지정(None)은 변경 안 함.
+
+    folder는 빈 문자열("")로 보내면 '폴더 없음(미분류)'으로 되돌린다.
+    """
+
+    title: str | None = None
+    pinned: bool | None = None
+    folder: str | None = None
+
+
+@app.patch("/v1/sessions/{session_id}")
+async def update_session_meta(session_id: str, body: SessionMetaUpdate) -> dict[str, Any]:
+    """세션의 메타데이터(사용자 지정 제목·핀 여부)를 갱신한다(meta.json 사이드카).
+
+    사이드바의 "이름 변경"·"핀 고정"이 호출하는 엔드포인트. 트랜스크립트 본문은
+    건드리지 않고 meta.json만 병합 갱신한다(부분 갱신 — 준 필드만 반영).
+
+    channel="web" 고정 — cli/api 세션 메타에 닿지 않게 격리(fail-closed).
+    title은 strip 후 200자로 제한(XSS는 프론트 렌더에서 escapeHtml로 방어).
+    """
+    from fastapi import HTTPException
+
+    if not session_id or any(ch in session_id for ch in ("/", "\\", "..", "\x00")):
+        raise HTTPException(status_code=400, detail="invalid session_id")
+
+    # 갱신할 필드만 추린다(둘 다 None이면 요청 무의미 → 400).
+    meta_update: dict[str, Any] = {}
+    if body.title is not None:
+        meta_update["title"] = body.title.strip()[:200]
+    if body.pinned is not None:
+        meta_update["pinned"] = bool(body.pinned)
+    if body.folder is not None:
+        # 폴더명(빈 문자열이면 '미분류'로 되돌림). 60자 제한.
+        meta_update["folder"] = body.folder.strip()[:60]
+    if not meta_update:
+        raise HTTPException(status_code=400, detail="no fields to update")
+
+    from core.memory.transcript import read_session_meta, write_session_meta
+
+    cfg = _app_state.get("config")
+    sessions_dir = cfg.session.sessions_dir if cfg else ".nexus/sessions"
+    try:
+        ok = write_session_meta(sessions_dir, session_id, meta_update, channel="web")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid session_id") from None
+    meta = read_session_meta(sessions_dir, session_id, channel="web")
+    return {
+        "session_id": session_id,
+        "ok": ok,
+        "title": meta.get("title"),
+        "pinned": bool(meta.get("pinned")),
+        "folder": meta.get("folder") or "",
+    }
 
 
 @app.delete("/v1/sessions/{session_id}")

@@ -229,6 +229,7 @@ class QueryEngine:
         self,
         user_input: str,
         structured_output: StructuredOutputSpec | None = None,
+        max_tokens_override: int | None = None,
     ) -> AsyncGenerator[StreamEvent | Message, None]:
         """
         사용자 메시지를 제출하고 스트리밍 응답을 반환한다.
@@ -247,6 +248,12 @@ class QueryEngine:
 
         Args:
             user_input: 사용자 입력 텍스트
+            max_tokens_override: 이번 호출의 출력 토큰 상한(선택, 2026-08-05).
+                OpenAI 호환 API의 `max_tokens`를 실제로 반영하기 위한 통로다.
+                이전에는 이 값이 어디에도 전달되지 않아 클라이언트가 출력 크기를
+                제어할 수 없었고(실측: max_tokens=16 요청에 1086토큰 생성),
+                큰 출력이 엔진 기본 예산에서 잘려도 원인을 알 수 없었다.
+                None이면 종전대로 라우팅 결정값(decision.max_tokens_cap)을 쓴다.
             structured_output: 구조화 출력(guided decoding) 스펙(선택). 지정되면
                 이번 호출의 응답이 지정 JSON Schema를 강제로 따른다. 세션 상태가
                 아니라 "호출 단위 인자"로 받는다 — 세션에 붙이면 다음 턴까지 스키마가
@@ -328,7 +335,8 @@ class QueryEngine:
                 on_turn_complete=_on_turn_complete,
                 model_override=decision.model_override,
                 temperature=decision.temperature,
-                max_tokens_cap=decision.max_tokens_cap,
+                # 호출 단위 override(OpenAI max_tokens)가 있으면 우선한다.
+                max_tokens_cap=max_tokens_override or decision.max_tokens_cap,
                 enable_thinking=decision.enable_thinking,
                 # 라우팅이 결정한 샘플링 파라미터를 dispatcher 경로로 전달.
                 top_p=decision.top_p,
@@ -358,7 +366,8 @@ class QueryEngine:
                 on_turn_complete=_on_turn_complete,
                 model_override=decision.model_override,
                 temperature=decision.temperature,
-                max_tokens_cap=decision.max_tokens_cap,
+                # 호출 단위 override(OpenAI max_tokens)가 있으면 우선한다.
+                max_tokens_cap=max_tokens_override or decision.max_tokens_cap,
                 enable_thinking=decision.enable_thinking,
                 # 라우팅이 결정한 샘플링 파라미터를 query_loop 폴백 경로로 전달.
                 top_p=decision.top_p,

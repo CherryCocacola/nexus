@@ -266,9 +266,12 @@ class _FakeOpenAIEngine:
         self._messages.clear()
 
     async def submit_message(
-        self, message: str, structured_output: Any = None
+        self, message: str, structured_output: Any = None, max_tokens_override: Any = None
     ):
+        # max_tokens_override: OpenAI 요청의 max_tokens를 엔진까지 전달하는 통로
+        # (2026-08-05 신설). 여기서는 받기만 하고 검증은 별도 테스트에서 한다.
         self.received_structured_output = structured_output
+        self.received_max_tokens = max_tokens_override
         # 텍스트를 흘려 200 응답이 구성되게 한다.
         yield StreamEvent(type=StreamEventType.TEXT_DELTA, text="{}")
 
