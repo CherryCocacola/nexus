@@ -51,6 +51,11 @@ _MODE_VALUE_TO_PERMISSION_MODE: dict[PermissionModeValue, PermissionMode] = {
     # default → DEFAULT
     #   둘 다 "읽기만 자동 허용, 나머지는 물어봄"이라는 기본 정책이라 그대로 대응.
     PermissionModeValue.DEFAULT: PermissionMode.DEFAULT,
+    # accept_edits → ACCEPT_EDITS
+    #   둘 다 "파일 수정(FILE_WRITE)은 자동 허용, Bash 등 나머지는 확인" 정책이라
+    #   이름·의미가 그대로 대응한다. (CLI Stage 1 A1에서 세션 값이 신설되어
+    #   기존에 도달 불가였던 파이프라인 ACCEPT_EDITS로 가는 경로가 열렸다.)
+    PermissionModeValue.ACCEPT_EDITS: PermissionMode.ACCEPT_EDITS,
     # auto → AUTO
     #   둘 다 "대부분 허용하되 위험한 것만 물어봄" 정책이라 그대로 대응.
     PermissionModeValue.AUTO: PermissionMode.AUTO,

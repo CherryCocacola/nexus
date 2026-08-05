@@ -301,13 +301,54 @@ async def run_tool_use(
                 yield _ev
             return
         # behavior가 "ask"면 사용자 확인이 필요하다(예: Bash는 항상 ASK). 대화형
-        # 확인 핸들러(ask_handler)가 options에 주입돼 있으면(CLI REPL) 사용자에게 물어
+        # 확인 핸들러가 options에 주입돼 있으면(CLI REPL) 사용자에게 물어
         # 거부 시 차단한다. 핸들러가 없으면(웹·비대화형 nexus ask·기존 테스트) 대화형
         # 프롬프트가 불가능하므로 종전대로 통과시킨다(무회귀 조건). — B-1
+        #
+        # 핸들러 계약 2가지 (CLI Stage 1 A3 — v2 우선, 구 계약 폴백):
+        #   v2: options["ask_handler_v2"] = (tool_name, message, tool_input) -> dict
+        #       응답 dict 키: approved(bool) · feedback(str, 거부 사유/지시)
+        #       · always_allow(bool, 세션 항상 허용 — 저장은 핸들러 쪽 책임).
+        #       거부 시 feedback이 있으면 일반 tool_use_error 대신 피드백을 담아
+        #       모델이 다음 턴에 사용자 의도를 반영해 재시도할 수 있게 한다.
+        #   v1: options["ask_handler"] = (tool_name, message) -> bool (기존 계약).
+        #       웹·headless·기존 테스트 무회귀를 위해 그대로 지원한다.
         if perm_result.behavior.value == "ask":
+            ask_handler_v2 = context.options.get("ask_handler_v2")
             ask_handler = context.options.get("ask_handler")
-            if ask_handler is not None:
-                # 핸들러는 (tool_name, message) -> bool 코루틴. True=허용, False=거부.
+            if ask_handler_v2 is not None:
+                # v2 계약 — tool_input까지 넘겨 핸들러가 diff 미리보기 등
+                # 입력 기반 표시를 할 수 있게 한다(Phase B에서 활용).
+                response = await ask_handler_v2(tool.name, perm_result.message or "", tool_input)
+                # 방어적 파싱: dict가 아니면(잘못 구현된 핸들러) bool로 근사한다.
+                if isinstance(response, dict):
+                    approved = bool(response.get("approved"))
+                    feedback = str(response.get("feedback") or "").strip()
+                else:
+                    approved = bool(response)
+                    feedback = ""
+                if not approved:
+                    # 피드백이 있으면 오류문 안에 함께 실어 모델에 전달한다.
+                    # (모델은 다음 턴에 이 지시를 반영해 계획을 수정할 수 있다.)
+                    if feedback:
+                        deny_content = (
+                            "<tool_use_error>사용자가 도구 실행을 거부했습니다. "
+                            f"사용자 피드백: {feedback}</tool_use_error>"
+                        )
+                    else:
+                        deny_content = (
+                            "<tool_use_error>사용자가 도구 실행을 거부했습니다."
+                            "</tool_use_error>"
+                        )
+                    async for _ev in _emit_tool_result(
+                        tool_use_id,
+                        deny_content,
+                        is_error=True,
+                    ):
+                        yield _ev
+                    return
+            elif ask_handler is not None:
+                # v1 계약(폴백) — (tool_name, message) -> bool. True=허용, False=거부.
                 approved = await ask_handler(tool.name, perm_result.message or "")
                 if not approved:
                     async for _ev in _emit_tool_result(

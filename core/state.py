@@ -67,16 +67,18 @@ class PermissionModeValue(str, Enum):
       다뤄져 편리합니다.
 
     각 모드 의미(요약):
-      - DEFAULT  : 기본. 위험한 작업은 사용자에게 확인을 요청
-      - AUTO     : 자동 진행 위주
-      - PLAN     : 계획만 세우고 실제 쓰기 작업은 막음
-      - TRUST    : 신뢰 모드(확인 완화)
-      - BYPASS   : 권한 확인 우회
-      - HEADLESS : 사용자 상호작용이 없는 무인 실행 환경
-      - DENY_ALL : 전부 거부(가장 제한적)
+      - DEFAULT      : 기본. 위험한 작업은 사용자에게 확인을 요청
+      - ACCEPT_EDITS : 파일 수정(Write/Edit 등)은 자동 승인, Bash 등은 여전히 확인
+      - AUTO         : 자동 진행 위주
+      - PLAN         : 계획만 세우고 실제 쓰기 작업은 막음
+      - TRUST        : 신뢰 모드(확인 완화)
+      - BYPASS       : 권한 확인 우회
+      - HEADLESS     : 사용자 상호작용이 없는 무인 실행 환경
+      - DENY_ALL     : 전부 거부(가장 제한적)
     """
 
     DEFAULT = "default"
+    ACCEPT_EDITS = "accept_edits"
     AUTO = "auto"
     PLAN = "plan"
     TRUST = "trust"

@@ -123,8 +123,9 @@ class NexusREPL:
         생성자를 가볍게 유지해야 테스트에서 인스턴스를 쉽게 만들 수 있다.
 
         Args:
-            permission_mode: 권한 모드 (default, auto, plan, trust, bypass).
+            permission_mode: 권한 모드 (default, accept_edits, auto, plan, trust, bypass).
                 도구 실행을 얼마나 자동 허용할지를 결정한다. 배너/세션 표시용으로도 쓰인다.
+                accept_edits는 파일 수정(Write/Edit 등)만 자동 승인하고 Bash 등은 확인한다.
             model: 사용할 모델 별칭 (primary, auxiliary). /model 명령으로 바꿀 수 있다.
             resume_session_id: 이어서 할 세션 ID (None이면 새 세션으로 시작).
             log_level: 채팅 화면에 표시할 nexus.* 로그 레벨 (v0.14.12에서 추가).
@@ -144,6 +145,11 @@ class NexusREPL:
         self._model = model
         self._resume_session_id = resume_session_id
         self._log_level = log_level
+        # "이 세션 항상 허용"으로 승인한 도구 이름 집합(numbered 프롬프트 2번).
+        # 세션 한정 메모리 저장 — 프로세스가 끝나면 사라진다(영속화 안 함).
+        # Bash·DANGEROUS 부류는 등록 대상에서 제외한다(fail-closed).
+        # TODO(nexus): A4에서 Bash 명령 프리픽스 단위·경로 정규화로 확장.
+        self._session_allow: set[str] = set()
         # 메인 while 루프의 실행 여부 플래그. /exit가 False로 바꿔 루프를 끝낸다.
         self._running = False
 
@@ -281,15 +287,17 @@ class NexusREPL:
             components = await init_phase2(self._state)
             self._query_engine = components.get("query_engine")
 
-            # B-1: ASK 확인 핸들러 배선. Bash 등 ASK 판정 도구를 실행하기 전에
-            # executor가 이 핸들러로 사용자에게 Y/N을 묻는다(고아였던 prompt_permission
-            # 실사용화). 단 자동 허용 모드(auto/bypass/trust)에서는 주입하지 않아
-            # executor가 통과시키게 한다 — 에이전트 자율 루프가 매번 멈추지 않도록.
-            # 핸들러 부재 시 executor는 종전대로 통과(웹·비대화형과 동일, 무회귀).
+            # A1/A3: ASK 확인 핸들러 배선 — v2 계약(numbered 프롬프트 + 피드백 +
+            # accept-edits 모드 인지)을 주입한다. executor는 v2를 우선 사용하고,
+            # v2가 없으면 구 ask_handler(bool)로 폴백한다(웹·비대화형 무회귀).
+            # 자동 허용 모드(auto/bypass/trust)에서는 주입하지 않아 executor가
+            # 통과시키게 한다 — 에이전트 자율 루프가 매번 멈추지 않도록.
+            # accept_edits는 자동 허용 모드가 아니다 — 핸들러 "안"에서 파일 수정
+            # 부류만 선별 자동 승인하고 Bash 등은 종전대로 묻는다(모드 인지형).
             auto_allow_modes = {"auto", "bypass", "trust"}
             tool_ctx = components.get("tool_use_context")
             if tool_ctx is not None and self._permission_mode not in auto_allow_modes:
-                tool_ctx.options["ask_handler"] = self.prompt_permission
+                tool_ctx.options["ask_handler_v2"] = self.prompt_permission_v2
 
             # 진입점 채널을 'cli'로 고정 — 이 세션의 히스토리 저장(Redis 키·transcript
             # 폴더)을 cli 채널로 격리해 web/api 히스토리와 서로 안 보이게 한다. 엔진은
@@ -769,6 +777,106 @@ class NexusREPL:
         except (KeyboardInterrupt, EOFError):
             # 확인 도중 취소하면 안전한 쪽(거부)으로 처리한다.
             return False
+
+    async def prompt_permission_v2(
+        self,
+        tool_name: str,
+        message: str,
+        tool_input: dict | None = None,
+    ) -> dict:
+        """
+        ask_handler v2 계약 구현 — 모드 인지형 numbered 권한 프롬프트 (A1/A3).
+
+        구 prompt_permission(Y/N/A → bool)과의 차이:
+          1) 모드 인지: accept_edits 모드에서 파일 수정(FILE_WRITE) 부류 도구는
+             프롬프트 없이 즉시 승인하고 1줄 안내만 남긴다. Bash 등은 종전대로 묻는다.
+          2) numbered 선택: 1) 예  2) 예(이 세션 항상 허용)  3) 아니오+피드백.
+          3) 거부 피드백: 3번 선택 시 이유/지시를 입력받아 executor가 모델에
+             다음 턴으로 전달한다(모델이 사용자 의도를 반영해 재시도 가능).
+
+        Args:
+            tool_name: 실행하려는 도구 이름.
+            message: 왜 이 도구를 실행하려는지 설명하는 메시지.
+            tool_input: 도구 입력(dict). 지금은 미사용 — Phase B에서 diff
+                미리보기 렌더링에 쓰기 위해 계약에 미리 포함해 둔다.
+
+        Returns:
+            dict: {"approved": bool, "feedback": str, "always_allow": bool}.
+            취소(Ctrl+C/Ctrl+D)는 안전한 쪽(거부, 피드백 없음)으로 처리한다.
+        """
+        # 분류는 core의 공개 함수를 재사용한다(CLI에 분류표 복제 금지 — 드리프트 방지).
+        # lazy import: repl 기동 시 core.permission을 미리 끌고 오지 않기 위함.
+        from core.permission.pipeline import categorize_tool_name
+        from core.permission.types import ToolCategory
+
+        category = categorize_tool_name(tool_name)
+
+        # ① accept_edits 모드 — 파일 수정 부류만 자동 승인.
+        #    categorize_tool_name이 None(미지의 도구)이면 자동 승인하지 않는다
+        #    (fail-closed — 모르는 도구를 쓰기로 간주해 무확인 통과시키면 위험).
+        if self._permission_mode == "accept_edits" and category == ToolCategory.FILE_WRITE:
+            self.console.print(f"[dim]⏺ 자동 승인(accept edits): {tool_name}[/dim]")
+            return {"approved": True, "feedback": "", "always_allow": False}
+
+        # ② "이 세션 항상 허용"으로 이미 등록된 도구면 즉시 승인.
+        if tool_name in self._session_allow:
+            self.console.print(f"[dim]⏺ 자동 승인(세션 항상 허용): {tool_name}[/dim]")
+            return {"approved": True, "feedback": "", "always_allow": False}
+
+        # ③ numbered 프롬프트 — 스피너가 떠 있으면 입력과 겹치므로 먼저 닫는다.
+        self._suspend_spinner()
+        self.console.print(
+            Panel(
+                f"[yellow]{message}[/yellow]",
+                title=f"[bold yellow]권한 요청: {tool_name}[/bold yellow]",
+                border_style="yellow",
+            )
+        )
+
+        try:
+            # prompt()는 블로킹이므로 run_in_executor로 별도 스레드에서 대기시킨다.
+            response = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self._prompt_session.prompt(
+                    "1) 예  2) 예(이 세션 항상 허용)  3) 아니오(피드백 입력): "
+                ),
+            )
+            choice = response.strip().lower()
+
+            # 1번(예) — 이번 한 번만 허용. 구 습관(y/yes)도 받아준다.
+            if choice in ("1", "y", "yes"):
+                return {"approved": True, "feedback": "", "always_allow": False}
+
+            # 2번(항상 허용) — 세션 allow 목록에 등록 후 허용. 구 습관(a/always) 겸용.
+            if choice in ("2", "a", "always"):
+                # Bash·DANGEROUS 부류는 "항상 허용" 등록 금지(fail-closed) —
+                # 명령 내용이 매번 다른데 도구명 단위로 풀면 위험 명령까지 통과된다.
+                # 미지의 도구(None)도 같은 이유로 등록하지 않는다. 이번 1회만 허용.
+                if category in (ToolCategory.BASH, ToolCategory.DANGEROUS) or category is None:
+                    self.console.print(
+                        f"[dim]{tool_name}은(는) 항상 허용 대상이 아니라 "
+                        "이번 한 번만 허용합니다.[/dim]"
+                    )
+                    return {"approved": True, "feedback": "", "always_allow": False}
+                self._session_allow.add(tool_name)
+                self.console.print(f"[dim]⏺ 이 세션 동안 {tool_name}을(를) 항상 허용합니다.[/dim]")
+                return {"approved": True, "feedback": "", "always_allow": True}
+
+            # 그 외(3 포함) — 거부. 이유/지시를 한 줄 받아 모델에 전달한다(선택 입력).
+            feedback = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self._prompt_session.prompt(
+                    "거부 이유/지시 (모델에 전달, 비워도 됨): "
+                ),
+            )
+            return {
+                "approved": False,
+                "feedback": feedback.strip(),
+                "always_allow": False,
+            }
+        except (KeyboardInterrupt, EOFError):
+            # 확인 도중 취소하면 안전한 쪽(거부)으로 처리한다.
+            return {"approved": False, "feedback": "", "always_allow": False}
 
     # ─── 도구 결과 포맷 ───
 

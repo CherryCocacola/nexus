@@ -69,6 +69,83 @@ if TYPE_CHECKING:
 logger = logging.getLogger("nexus.permission")
 
 
+# ─────────────────────────────────────────────
+# 이름 기반 도구 분류 테이블 (공개)
+# ─────────────────────────────────────────────
+# 왜 모듈 레벨 공개 함수로 뺐나 (CLI Stage 1 A1):
+#   CLI의 accept-edits 모드는 "이 도구가 파일 수정(FILE_WRITE) 부류인가"를 알아야
+#   자동 승인 여부를 정할 수 있다. 분류표를 CLI에 복붙하면 여기와 어긋나는
+#   드리프트가 생기므로, 파이프라인 내부에서만 쓰던 이름 매칭 로직을 공개 함수
+#   categorize_tool_name()으로 추출해 CLI가 재사용한다.
+#   (behavior flag 기반 2단계·FILE_WRITE 폴백 3단계는 tool 객체가 필요하므로
+#    종전대로 _categorize_tool 안에 남긴다 — 판정 결과는 기존과 100% 동일.)
+_READONLY_TOOL_NAMES = {
+    "read",
+    "glob",
+    "grep",
+    "ls",
+    "cat",
+    "head",
+    "tail",
+    "taskget",
+    "tasklist",
+    # TodoRead/TodoWrite: 세션 내부의 계획 메타데이터만 갱신하며
+    # 파일·프로세스·네트워크 등 외부 부작용이 전혀 없다.
+    # PLAN 모드에서도 계획 수립 자체는 허용되어야 하므로 READONLY로 취급한다
+    # (READONLY 열은 MODE_BEHAVIOR_MAP에서 항상 ALLOW). 도구 자체의
+    # is_read_only 플래그는 정직하게 유지된다(TodoWrite=False) — executor의
+    # 동시성 파티셔닝은 플래그를, 권한 카테고리는 이 집합을 본다.
+    # Layer 1(deny rule)·Layer 4(hook)는 그대로 적용되므로 운영자가
+    # permission_rules.yaml에서 여전히 차단할 수 있다(anti-pattern #11 준수).
+    "todoread",
+    "todowrite",
+}
+# MultiEdit 포함 — 종전 표에 빠져 있었으나 flag 폴백(3단계)으로 어차피
+# FILE_WRITE 판정이었다. 이름 표에 명시해 CLI(accept-edits 자동 승인)에서도
+# 같은 분류를 받도록 한다(판정 변화 없음, 도달 경로만 1단계로 앞당김).
+# ScaffoldWeb(2026-08-05): 검증 템플릿을 대상 폴더로 복사하는 파일 쓰기 도구 —
+# Write/Edit과 같은 정책(accept_edits 자동 승인 대상)으로 분류한다.
+_FILE_WRITE_TOOL_NAMES = {"write", "edit", "multiedit", "notebookedit", "scaffoldweb"}
+_BASH_TOOL_NAMES = {"bash"}
+_NETWORK_TOOL_NAMES = {"webfetch", "websearch"}
+_AGENT_TOOL_NAMES = {"agent", "taskcreate", "taskstop"}
+
+
+def categorize_tool_name(tool_name: str) -> ToolCategory | None:
+    """
+    도구 "이름"만으로 보안 카테고리를 분류한다 (분류표의 단일 공식 출처).
+
+    파이프라인 _categorize_tool()의 1단계(이름 매칭)와 CLI의 accept-edits
+    자동 승인 판정이 모두 이 함수를 쓴다 — 분류 규칙이 한 군데에만 있어야
+    두 사용처가 어긋나지 않는다(드리프트 방지).
+
+    Args:
+        tool_name: 도구 이름(대소문자 무관 — 내부에서 소문자로 통일).
+
+    Returns:
+        이름으로 확정 가능한 ToolCategory. 표에 없는 이름이면 None.
+        None의 의미는 호출처마다 다르다:
+          - 파이프라인: behavior flag → FILE_WRITE 폴백으로 이어감(fail-closed).
+          - CLI 자동 승인: "모르는 도구는 자동 승인하지 않음"(fail-closed —
+            여기서 FILE_WRITE로 근사하면 미지의 도구가 무확인 통과하므로 금지).
+    """
+    name = tool_name.lower()
+    if name in _READONLY_TOOL_NAMES:
+        return ToolCategory.READONLY
+    if name in _FILE_WRITE_TOOL_NAMES:
+        return ToolCategory.FILE_WRITE
+    if name in _BASH_TOOL_NAMES:
+        return ToolCategory.BASH
+    if name in _NETWORK_TOOL_NAMES:
+        return ToolCategory.NETWORK
+    if name in _AGENT_TOOL_NAMES:
+        return ToolCategory.AGENT
+    # MCP 외부 도구는 이름이 "mcp__"로 시작하도록 규약돼 있어 접두사로 판별한다.
+    if name.startswith("mcp__"):
+        return ToolCategory.MCP
+    return None
+
+
 class PermissionPipeline:
     """
     5계층 권한 파이프라인의 본체 클래스.
@@ -236,54 +313,14 @@ class PermissionPipeline:
 
         분류 순서(위에서 먼저 매칭되는 것을 채택):
         1. 도구 이름으로 매칭 — 우리가 아는 표준 도구는 이름만 보고 확정한다.
+           (분류표는 모듈 레벨 공개 함수 categorize_tool_name()에 있다 — CLI와 공유.)
         2. behavior flag로 매칭 — 이름을 모르는 도구는 읽기전용/파괴적 플래그로 본다.
         3. 그래도 못 정하면 FILE_WRITE로 간주 — "읽기 전용이 아니면 쓰기" (fail-closed).
         """
-        # 대소문자 차이로 매칭이 어긋나지 않도록 소문자로 통일해서 비교한다.
-        name = tool.name.lower()
-
-        # 이름 기반 분류 — 우리가 아는 표준 도구 집합을 카테고리별로 나열한다.
-        readonly_tools = {
-            "read",
-            "glob",
-            "grep",
-            "ls",
-            "cat",
-            "head",
-            "tail",
-            "taskget",
-            "tasklist",
-            # TodoRead/TodoWrite: 세션 내부의 계획 메타데이터만 갱신하며
-            # 파일·프로세스·네트워크 등 외부 부작용이 전혀 없다.
-            # PLAN 모드에서도 계획 수립 자체는 허용되어야 하므로 READONLY로 취급한다
-            # (READONLY 열은 MODE_BEHAVIOR_MAP에서 항상 ALLOW). 도구 자체의
-            # is_read_only 플래그는 정직하게 유지된다(TodoWrite=False) — executor의
-            # 동시성 파티셔닝은 플래그를, 권한 카테고리는 이 집합을 본다.
-            # Layer 1(deny rule)·Layer 4(hook)는 그대로 적용되므로 운영자가
-            # permission_rules.yaml에서 여전히 차단할 수 있다(anti-pattern #11 준수).
-            "todoread",
-            "todowrite",
-        }
-        file_write_tools = {"write", "edit", "notebookedit"}
-        bash_tools = {"bash"}
-        network_tools = {"webfetch", "websearch"}
-        agent_tools = {"agent", "taskcreate", "taskstop"}
-        # MCP 도구는 이름에 "mcp__" 접두사가 붙는다 (아래에서 startswith로 검사)
-
-        # 1단계: 이름 매칭 — 위에서 정의한 집합에 이름이 들어 있으면 즉시 확정.
-        if name in readonly_tools:
-            return ToolCategory.READONLY
-        if name in file_write_tools:
-            return ToolCategory.FILE_WRITE
-        if name in bash_tools:
-            return ToolCategory.BASH
-        if name in network_tools:
-            return ToolCategory.NETWORK
-        if name in agent_tools:
-            return ToolCategory.AGENT
-        # MCP 외부 도구는 이름이 "mcp__"로 시작하도록 규약돼 있어 접두사로 판별한다.
-        if name.startswith("mcp__"):
-            return ToolCategory.MCP
+        # 1단계: 이름 매칭 — 공개 분류 함수에 위임(단일 출처, CLI와 드리프트 방지).
+        by_name = categorize_tool_name(tool.name)
+        if by_name is not None:
+            return by_name
 
         # 2단계: behavior flag 기반 분류 — 이름을 모르는 도구(플러그인 등)에 대비.
         # 읽기 전용이면 READONLY, 파괴적이면 가장 위험한 DANGEROUS로 본다.

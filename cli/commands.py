@@ -62,7 +62,7 @@ def cli(ctx):
 @click.option(
     "--permission-mode",
     default="default",
-    type=click.Choice(["default", "auto", "plan", "trust", "bypass"]),
+    type=click.Choice(["default", "accept_edits", "auto", "plan", "trust", "bypass"]),
     help="권한 모드",
 )
 @click.option(
@@ -97,8 +97,9 @@ def chat(
     매개변수(모두 위의 @click.option / 인자에서 주입됨):
         model           : (표시용) 실제 모델은 라우팅 config가 질의 유형별로 결정한다.
                           엔진에 배선되지 않으며 배너·/config 표시에만 쓰인다.
-        permission_mode : 권한 모드. default/auto/plan/trust/bypass 중 하나.
+        permission_mode : 권한 모드. default/accept_edits/auto/plan/trust/bypass 중 하나.
                           도구 실행을 얼마나 자동 허용할지를 결정한다.
+                          accept_edits는 파일 수정만 자동 승인(Bash 등은 확인 유지).
         resume          : 이어서 진행할 이전 세션 ID. None이면 새 세션으로 시작한다.
         log_level       : 채팅 화면에 노출할 nexus.* 로그의 최소 레벨(임계값).
 

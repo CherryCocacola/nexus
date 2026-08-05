@@ -70,6 +70,26 @@ async def _drain(tool, context):
     return saw_error
 
 
+async def _drain_collect_contents(tool, context) -> list[str]:
+    """run_tool_use를 끝까지 소비하며 문자열 content들을 수집한다(피드백 검증용)."""
+    contents: list[str] = []
+    async for item in run_tool_use(
+        {"id": "toolu_x", "name": "FakeAsk", "input": {"x": 1}},
+        [tool],
+        context,
+    ):
+        content = getattr(item, "content", None)
+        if isinstance(content, str):
+            contents.append(content)
+        # Message.tool_result의 content가 블록 리스트인 경우도 방어적으로 편평화.
+        elif isinstance(content, list):
+            for block in content:
+                text = getattr(block, "content", None) or getattr(block, "text", None)
+                if isinstance(text, str):
+                    contents.append(text)
+    return contents
+
+
 @pytest.mark.asyncio
 async def test_executor_ask_handler_deny_blocks():
     """확인 핸들러가 False(거부)를 반환하면 도구를 실행하지 않고 오류로 막는다."""
@@ -116,3 +136,87 @@ async def test_executor_ask_handler_allow_runs():
 
     assert tool.called is True  # 허용 → 실행됨
     assert calls == ["FakeAsk"]  # 핸들러가 호출됨
+
+
+# ─── ask_handler v2 계약 (CLI Stage 1 A3) ───
+
+
+@pytest.mark.asyncio
+async def test_executor_ask_handler_v2_approve_runs():
+    """v2 핸들러가 approved=True를 반환하면 도구를 정상 실행한다."""
+    calls = []
+
+    async def v2_allow(name, message, tool_input):
+        calls.append((name, message, tool_input))
+        return {"approved": True, "feedback": "", "always_allow": False}
+
+    tool = _FakeAskTool()
+    ctx = ToolUseContext(cwd=".", options={"ask_handler_v2": v2_allow})
+
+    await _drain(tool, ctx)
+
+    assert tool.called is True  # 허용 → 실행됨
+    # v2는 tool_input까지 전달받는다(diff 미리보기 등 입력 기반 표시용 계약).
+    assert calls == [("FakeAsk", "확인 필요", {})]
+
+
+@pytest.mark.asyncio
+async def test_executor_ask_handler_v2_deny_feedback_forwarded():
+    """v2 핸들러가 거부+피드백을 반환하면 차단하고 피드백을 결과에 실어 전달한다."""
+
+    async def v2_deny(name, message, tool_input):
+        return {"approved": False, "feedback": "지금은 하지 마", "always_allow": False}
+
+    tool = _FakeAskTool()
+    ctx = ToolUseContext(cwd=".", options={"ask_handler_v2": v2_deny})
+
+    contents = await _drain_collect_contents(tool, ctx)
+
+    assert tool.called is False  # 실행 차단됨
+    # 거부 사실 + 사용자 피드백이 모델에 전달될 결과 안에 함께 담겨야 한다.
+    joined = "\n".join(contents)
+    assert "사용자가 도구 실행을 거부" in joined
+    assert "지금은 하지 마" in joined
+
+
+@pytest.mark.asyncio
+async def test_executor_ask_handler_v2_preferred_over_v1():
+    """v2와 v1이 모두 주입되면 v2만 호출한다(v2 우선, v1은 폴백 전용)."""
+    v1_calls = []
+    v2_calls = []
+
+    async def v1_handler(name, message):
+        v1_calls.append(name)
+        return False  # v1이 불리면 차단될 것 — 불리지 않아야 한다
+
+    async def v2_handler(name, message, tool_input):
+        v2_calls.append(name)
+        return {"approved": True, "feedback": "", "always_allow": False}
+
+    tool = _FakeAskTool()
+    ctx = ToolUseContext(
+        cwd=".",
+        options={"ask_handler": v1_handler, "ask_handler_v2": v2_handler},
+    )
+
+    await _drain(tool, ctx)
+
+    assert tool.called is True  # v2가 허용 → 실행됨
+    assert v2_calls == ["FakeAsk"]  # v2 호출됨
+    assert v1_calls == []  # v1은 호출되지 않음
+
+
+@pytest.mark.asyncio
+async def test_executor_ask_handler_v2_non_dict_bool_fallback():
+    """v2 핸들러가 dict 대신 bool을 반환해도(잘못 구현) 안전하게 근사 처리한다."""
+
+    async def v2_bool_deny(name, message, tool_input):
+        return False  # 계약 위반 반환 — bool로 근사되어 거부 처리돼야 한다
+
+    tool = _FakeAskTool()
+    ctx = ToolUseContext(cwd=".", options={"ask_handler_v2": v2_bool_deny})
+
+    saw_error = await _drain(tool, ctx)
+
+    assert tool.called is False  # 거부로 근사 → 차단
+    assert saw_error is True

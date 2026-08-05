@@ -5,7 +5,7 @@ core/permission/mode_mapping.py 단위 테스트.
     세션 모드(PermissionModeValue, 소문자 문자열 값)를 파이프라인 모드
     (PermissionMode)로 옮기는 "단일 공식 변환점"인 map_mode_value_to_permission_mode를
     검증한다. 이 변환은 권한 배선(커밋 20f5e7c/cbd48e4)의 진입 계약이므로,
-    7개 값의 매핑과 fail-closed(미지값→DEFAULT) 동작이 절대 흔들리면 안 된다.
+    8개 값의 매핑과 fail-closed(미지값→DEFAULT) 동작이 절대 흔들리면 안 된다.
 
 왜 중요한가:
     누군가 매핑 테이블을 실수로 바꾸면(예: trust를 DEFAULT로) 배포 환경의 권한
@@ -20,11 +20,12 @@ from core.permission.mode_mapping import map_mode_value_to_permission_mode
 from core.permission.types import PermissionMode
 from core.state import PermissionModeValue
 
-# 7개 세션 모드 → 파이프라인 모드의 "정답표".
-# (구현 사실: default→DEFAULT, auto→AUTO, plan→PLAN, trust/bypass→BYPASS_PERMISSIONS,
-#  headless/deny_all→DONT_ASK)
+# 8개 세션 모드 → 파이프라인 모드의 "정답표".
+# (구현 사실: default→DEFAULT, accept_edits→ACCEPT_EDITS(CLI Stage 1 A1 신설),
+#  auto→AUTO, plan→PLAN, trust/bypass→BYPASS_PERMISSIONS, headless/deny_all→DONT_ASK)
 _EXPECTED: dict[PermissionModeValue, PermissionMode] = {
     PermissionModeValue.DEFAULT: PermissionMode.DEFAULT,
+    PermissionModeValue.ACCEPT_EDITS: PermissionMode.ACCEPT_EDITS,
     PermissionModeValue.AUTO: PermissionMode.AUTO,
     PermissionModeValue.PLAN: PermissionMode.PLAN,
     PermissionModeValue.TRUST: PermissionMode.BYPASS_PERMISSIONS,
@@ -35,7 +36,7 @@ _EXPECTED: dict[PermissionModeValue, PermissionMode] = {
 
 
 class TestModeMappingEnumInput:
-    """enum(PermissionModeValue)을 직접 넣었을 때의 7개 매핑을 고정한다."""
+    """enum(PermissionModeValue)을 직접 넣었을 때의 8개 매핑을 고정한다."""
 
     @pytest.mark.parametrize(("value", "expected"), list(_EXPECTED.items()))
     def test_enum_value_maps_to_expected_permission_mode(
