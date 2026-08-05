@@ -1364,6 +1364,17 @@ body.resizing { cursor: col-resize; user-select: none; }
       <button class="modal-close" onclick="closeSettings()" aria-label="닫기">&times;</button>
     </div>
     <div class="modal-body">
+      <!-- 응답 스타일(W1) — 프리셋 선택 + 직접 입력. 직접 입력이 프리셋보다 우선한다. -->
+      <div class="settings-section-title">응답 스타일 <span class="settings-hint">답변의 길이와 어투를 정합니다</span></div>
+      <select id="responseStyle" onchange="updateStyleDesc()"
+              style="width:100%;padding:8px 10px;border-radius:8px;border:1px solid var(--line,#3a3a3a);background:var(--surface,#1e1e1e);color:inherit;font:inherit;">
+        <option value="normal">기본</option>
+      </select>
+      <p class="modal-desc" id="responseStyleDesc" style="margin-top:6px;"></p>
+      <textarea id="responseStyleCustom" class="instruction-textarea" style="min-height:56px;height:56px;"
+                placeholder="직접 지정(선택) — 입력하면 위 프리셋 대신 이 문구가 적용됩니다." maxlength="2000"></textarea>
+
+      <div class="settings-divider"></div>
       <div class="settings-section-title">커스텀 인스트럭션</div>
       <p class="modal-desc">모든 대화의 시스템 프롬프트에 덧붙일 지시문입니다. (예: 답변은 항상 존댓말로, 코드에는 한글 주석을 달아줘)</p>
       <textarea id="instructionText" class="instruction-textarea"
@@ -1636,6 +1647,15 @@ async function exportSession(id, fmt) {
 // ─── 설정: 커스텀 인스트럭션(P2-2) + 프롬프트 템플릿(P2-6) ───
 let _promptTemplates = [];   // [{title, text}] — / 삽입 팝업이 참조하는 캐시
 
+// 선택한 스타일의 설명을 드롭다운 아래에 보여준다(서버가 준 description 사용).
+function updateStyleDesc() {
+  const sel = document.getElementById('responseStyle');
+  const desc = document.getElementById('responseStyleDesc');
+  if (!sel || !desc) return;
+  const opt = sel.options[sel.selectedIndex];
+  desc.textContent = opt && opt.dataset ? (opt.dataset.desc || '') : '';
+}
+
 async function openSettings() {
   const overlay = document.getElementById('settingsOverlay');
   const ta = document.getElementById('instructionText');
@@ -1647,6 +1667,26 @@ async function openSettings() {
   if (plist) plist.innerHTML = '';
   if (projlist) projlist.innerHTML = '';
   if (overlay) overlay.hidden = false;
+  // 응답 스타일 로드 — 프리셋 목록을 서버에서 받아 드롭다운을 채운다(문구는 서버 YAML이 단일 소스).
+  try {
+    const resp = await fetch('/v1/response-style');
+    if (resp.ok) {
+      const d = await resp.json();
+      const sel = document.getElementById('responseStyle');
+      const cus = document.getElementById('responseStyleCustom');
+      if (sel) {
+        sel.innerHTML = '';
+        (d.available || []).forEach(s => {
+          const o = document.createElement('option');
+          o.value = s.id; o.textContent = s.label; o.dataset.desc = s.description || '';
+          sel.appendChild(o);
+        });
+        sel.value = d.style || 'normal';
+        updateStyleDesc();
+      }
+      if (cus) cus.value = d.custom || '';
+    }
+  } catch (e) { void e; }
   // 커스텀 인스트럭션 로드
   try {
     const resp = await fetch('/v1/instructions');
@@ -1749,13 +1789,17 @@ async function saveSettings() {
   const instruction = ta ? ta.value : '';
   const prompts = collectPrompts();
   const projects = collectProjects();
+  const styleSel = document.getElementById('responseStyle');
+  const styleCus = document.getElementById('responseStyleCustom');
   try {
-    const [r1, r2, r3] = await Promise.all([
+    const [r1, r2, r3, r4] = await Promise.all([
       fetch('/v1/instructions', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text: instruction }) }),
       fetch('/v1/prompts', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ prompts }) }),
       fetch('/v1/projects', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ projects }) }),
+      fetch('/v1/response-style', { method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ style: styleSel ? styleSel.value : 'normal', custom: styleCus ? styleCus.value : '' }) }),
     ]);
-    if (r1.ok && r2.ok && r3.ok) {
+    if (r1.ok && r2.ok && r3.ok && r4.ok) {
       _promptTemplates = prompts;   // / 팝업 캐시 갱신
       if (status) { status.textContent = '저장되었습니다.'; status.className = 'instruction-status ok'; }
       setTimeout(closeSettings, 800);
