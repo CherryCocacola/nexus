@@ -1517,12 +1517,14 @@ async def chat(
         # 커스텀 인스트럭션(테넌트) + 프로젝트 인스트럭션을 덧붙인다(P2-2/P3-3, 비스트리밍).
         _instruction = _read_custom_instruction(getattr(tenant, "id", "default"))
         _proj_instr = _project.get("instruction", "") if _project else ""
-        if (_instruction or "").strip() or (_proj_instr or "").strip():
+        _style = _resolve_style_prompt_for(getattr(tenant, "id", "default"))
+        if (_instruction or "").strip() or (_proj_instr or "").strip() or _style:
             # 문자열 덧붙이기 대신 base에서 재조립한다(멱등). 순서·형식이 세 진입점에서
             # 같아지고, 스타일 같은 섹션이 늘어도 헬퍼 한 곳만 고치면 된다.
             engine.update_system_prompt(
                 compose_system_prompt(
                     engine.system_prompt,
+                    style=_style,
                     user_instruction=_instruction,
                     project_instruction=_proj_instr,
                 )
@@ -1765,10 +1767,12 @@ async def chat_stream(
         # 엔진은 요청마다 새로 조립되므로 base 프롬프트에 1회만 덧붙어 누적되지 않는다.
         _instruction = _read_custom_instruction(getattr(_eff_tenant, "id", "default"))
         _proj_instr = _project.get("instruction", "") if _project else ""
-        if (_instruction or "").strip() or (_proj_instr or "").strip():
+        _style = _resolve_style_prompt_for(getattr(_eff_tenant, "id", "default"))
+        if (_instruction or "").strip() or (_proj_instr or "").strip() or _style:
             engine.update_system_prompt(
                 compose_system_prompt(
                     engine.system_prompt,
+                    style=_style,
                     user_instruction=_instruction,
                     project_instruction=_proj_instr,
                 )
@@ -2130,10 +2134,15 @@ def _inject_openai_context(
       (무상태). clear 후 요청의 이전 user/assistant 만 순서대로 얹는다.
     """
     # system 지시문 반영 — 기본 프롬프트 원본을 먼저 보관 후 뒤에 덧붙인다.
-    if system_content:
+    _style = _resolve_style_prompt_for(getattr(tenant, "id", "default"))
+    if system_content or _style:
         # OpenAI 소비자가 보낸 system 메시지는 "이번 요청 한정" 지시로 취급한다.
         engine.update_system_prompt(
-            compose_system_prompt(engine.system_prompt, session_instruction=system_content)
+            compose_system_prompt(
+                engine.system_prompt,
+                style=_style,
+                session_instruction=system_content,
+            )
         )
 
     # 세션/tenant/transcript 를 공식 bind_request 로 주입(기존 핸들러와 동일 계약).
@@ -3031,6 +3040,101 @@ class InstructionUpdate(BaseModel):
     """커스텀 인스트럭션 갱신 바디 — 시스템 프롬프트에 덧붙일 사용자 지시문."""
 
     text: str = ""
+
+
+# ─────────────────────────────────────────────
+# 응답 스타일 (W1, 2026-08-05)
+# ─────────────────────────────────────────────
+# 인스트럭션과 같은 저장 규약을 쓴다(_instructions/{tid}.style.json). 별도 저장소를
+# 만들지 않는 이유: 테넌트 단위 개인화라는 성격이 같고, 백업·정리 대상도 같기 때문.
+_STYLE_CUSTOM_MAX_CHARS = 2000
+
+
+def _read_response_style(tenant_id: str | None) -> dict[str, str]:
+    """테넌트의 응답 스타일 설정을 읽는다(없으면 기본값, fail-soft)."""
+    from core.system_prompt.styles import default_style_id
+
+    tid = re.sub(r"[^\w.-]", "_", tenant_id or "default")
+    try:
+        f = _instructions_dir() / f"{tid}.style.json"
+        if f.is_file():
+            data = json.loads(f.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return {
+                    "style": str(data.get("style") or default_style_id()),
+                    "custom": str(data.get("custom") or ""),
+                }
+    except (OSError, ValueError) as e:
+        logger.debug("응답 스타일 읽기 실패 (%s): %s", tid, e)
+    return {"style": default_style_id(), "custom": ""}
+
+
+def _write_response_style(tenant_id: str | None, style: str, custom: str) -> bool:
+    """테넌트의 응답 스타일을 저장한다(성공 True, fail-soft)."""
+    tid = re.sub(r"[^\w.-]", "_", tenant_id or "default")
+    try:
+        d = _instructions_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{tid}.style.json").write_text(
+            json.dumps({"style": style, "custom": custom}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return True
+    except OSError as e:
+        logger.warning("응답 스타일 저장 실패 (%s): %s", tid, e)
+        return False
+
+
+def _resolve_style_prompt_for(tenant_id: str | None) -> str:
+    """테넌트 설정을 실제 [응답 스타일] 문구로 바꾼다(없으면 빈 문자열=무회귀)."""
+    try:
+        from core.system_prompt.styles import resolve_style_prompt
+
+        cfg = _read_response_style(tenant_id)
+        return resolve_style_prompt(cfg.get("style"), cfg.get("custom"))
+    except Exception as e:  # noqa: BLE001 — 스타일은 부가 기능, 대화를 막지 않는다
+        logger.debug("응답 스타일 해석 실패(무시): %s", e)
+        return ""
+
+
+class ResponseStyleUpdate(BaseModel):
+    """응답 스타일 갱신 바디. custom이 있으면 프리셋 대신 그것을 쓴다."""
+
+    style: str = ""
+    custom: str = ""
+
+
+@app.get("/v1/response-style")
+async def get_response_style(
+    x_tenant_id: str | None = Header(default=None, alias="X-Tenant-ID"),
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """현재 테넌트의 응답 스타일과 선택 가능한 프리셋 목록을 반환한다."""
+    from core.system_prompt.styles import list_styles
+
+    tenant = _resolve_tenant(None, x_tenant_id, authorization)
+    tid = getattr(tenant, "id", "default")
+    cfg = _read_response_style(tid)
+    return {"tenant_id": tid, **cfg, "available": list_styles()}
+
+
+@app.put("/v1/response-style")
+async def put_response_style(
+    body: ResponseStyleUpdate,
+    x_tenant_id: str | None = Header(default=None, alias="X-Tenant-ID"),
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """응답 스타일을 저장한다. 이후 채팅의 시스템 프롬프트에 [응답 스타일]로 붙는다."""
+    from core.system_prompt.styles import default_style_id, list_styles
+
+    tenant = _resolve_tenant(None, x_tenant_id, authorization)
+    tid = getattr(tenant, "id", "default")
+    valid = {s["id"] for s in list_styles()}
+    # 모르는 프리셋 id는 기본값으로 떨어뜨린다(임의 문자열이 저장되지 않게).
+    style = body.style if body.style in valid else default_style_id()
+    custom = (body.custom or "")[:_STYLE_CUSTOM_MAX_CHARS]
+    ok = _write_response_style(tid, style, custom)
+    return {"tenant_id": tid, "ok": ok, "style": style, "custom": custom}
 
 
 @app.get("/v1/instructions")
