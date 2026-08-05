@@ -216,6 +216,10 @@ class NexusREPL:
         self._prompt_session: PromptSession = PromptSession(
             history=InMemoryHistory(),
             key_bindings=_kb,
+            # 하단 상태줄(C2) — 권한 모드·토큰·세션을 항상 보이게 한다.
+            # Rich Live 대신 prompt_toolkit의 bottom_toolbar를 쓰는 이유:
+            # Live는 타자기처럼 흘리는 본문 출력과 화면 갱신이 서로 간섭한다.
+            bottom_toolbar=self._bottom_toolbar,
             # `/`로 시작하면 슬래시 명령을 제안한다(D9).
             completer=SlashCommandCompleter(lambda: sorted(self._session_commands)),
             complete_while_typing=True,
@@ -291,6 +295,12 @@ class NexusREPL:
 
                 # 공백만 입력한 경우는 아무 것도 하지 않고 다음 입력을 기다린다.
                 if not user_input.strip():
+                    continue
+
+                # `!`로 시작하면 셸 명령 패스스루(D1). 슬래시 명령 판정보다 먼저
+                # 처리해 명령 이름과 충돌할 여지를 없앤다.
+                if user_input.lstrip().startswith("!"):
+                    await self._run_bash_passthrough(user_input.lstrip()[1:])
                     continue
 
                 # 입력의 첫 토큰(공백 기준 첫 단어)을 소문자로 만들어 명령어인지 확인.
@@ -653,7 +663,7 @@ class NexusREPL:
         # 프롬프트가 스피너와 겹치면 화면이 깨진다. 핸들러가 _suspend_spinner()로
         # 스피너를 닫으려면 이 상태에 접근할 수 있어야 하므로 self._status_* 로 공유한다.
         self._status_ctx = self.console.status(
-            "[cyan]요청 분석 중...[/cyan]", spinner="dots"
+            "[cyan]요청 분석 중...[/cyan] [dim](Ctrl+C로 중단)[/dim]", spinner="dots"
         )
         self._status_ctx.__enter__()
         self._status_active = True
@@ -1222,6 +1232,7 @@ class NexusREPL:
             ("/save", "대화를 Markdown 파일로 저장한다"),
             ("/diff", "작업 트리의 git 변경사항을 보여준다"),
             ("/copy", "마지막 응답을 클립보드로 복사한다"),
+            ("!<명령>", "셸 명령을 실행한다(표시 전용 — 대화 맥락에 미포함)"),
         ]
         for cmd, desc in commands:
             table.add_row(cmd, desc)
@@ -1324,6 +1335,123 @@ class NexusREPL:
             self.console.print(table)
         else:
             self.console.print("[yellow]세션이 초기화되지 않았습니다.[/yellow]")
+
+    # ─── 하단 상태줄 (C2) ───
+
+    def _bottom_toolbar(self) -> str:
+        """프롬프트 하단에 항상 보이는 한 줄 상태를 만든다 (C2).
+
+        보여 주는 것: 권한 모드 · 누적 토큰(in/out) · 세션 ID 앞 8자.
+        부트스트랩 전이거나 값을 못 읽어도 절대 예외를 내지 않는다 — 이 함수가
+        실패하면 프롬프트 자체가 뜨지 않기 때문이다(입력 불가 상태가 된다).
+        """
+        try:
+            mode = self._permission_mode
+            if self._state is None:
+                return f" 모드 {mode} · 초기화 중"
+            s = self._state.get_session_summary()
+            tin = s.get("total_input_tokens", 0)
+            tout = s.get("total_output_tokens", 0)
+            sid = str(s.get("session_id", ""))[:8]
+            return f" 모드 {mode} · 토큰 {tin:,}/{tout:,} · 세션 {sid}"
+        except Exception:  # noqa: BLE001 — 상태줄 실패로 입력을 막지 않는다
+            return " "
+
+    # ─── `!` bash 패스스루 (D1) ───
+
+    async def _run_bash_passthrough(self, command: str) -> None:
+        """`!<명령>` 입력을 셸 명령으로 직접 실행한다 (D1).
+
+        [안전 규칙 — 모두 fail-closed]
+          1. plan / deny_all 모드에서는 아예 실행하지 않는다(그 모드의 의미가
+             "부작용 금지"이므로 우회 통로를 열어 주면 안 된다).
+          2. 권한 파이프라인이 쓰는 것과 **같은 CommandFilter**로 먼저 검사한다.
+             위험 판정이면 실행하지 않는다.
+          3. 실행 여부와 무관하게 감사 로그(JSONL)에 남긴다.
+          4. **v1은 표시 전용** — 결과를 대화 컨텍스트에 넣지 않는다. 모델이
+             보지 못하므로 "방금 그 결과 봐줘"는 동작하지 않는다(문서화된 한계).
+        """
+        command = (command or "").strip()
+        if not command:
+            self.console.print("[yellow]실행할 명령이 없습니다. 예: !git status[/yellow]")
+            return
+
+        # ① 모드 게이트
+        if self._permission_mode in ("plan", "deny_all"):
+            self.console.print(
+                f"[yellow]{self._permission_mode} 모드에서는 `!` 명령을 실행하지 않습니다.[/yellow]"
+            )
+            self._audit_bash(command, allowed=False, reason=f"mode:{self._permission_mode}")
+            return
+
+        # ② 위험 명령 필터(권한 파이프라인과 같은 규칙)
+        try:
+            safe, severity, reason = self._command_filter().check_command(command)
+        except Exception as e:  # noqa: BLE001 — 판정 실패는 차단으로 흡수(fail-closed)
+            logger.warning("`!` 명령 안전성 판정 실패(차단): %s", e)
+            safe, severity, reason = False, "unknown", str(e)
+        if not safe:
+            self.console.print(
+                Text(f"차단됨({severity}): {reason}", style="red")
+            )
+            self._audit_bash(command, allowed=False, reason=f"{severity}:{reason}")
+            return
+
+        # ③ 실행 — async 루프를 막지 않도록 비동기 서브프로세스로 돌린다.
+        self._audit_bash(command, allowed=True, reason="")
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                cwd=self._state.cwd if self._state else None,
+            )
+            out_b, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
+        except TimeoutError:
+            self.console.print("[red]명령 시간 초과(60초)[/red]")
+            return
+        except OSError as e:
+            self.console.print(Text(f"실행 실패: {e}", style="red"))
+            return
+
+        out = out_b.decode("utf-8", "replace").rstrip()
+        # 외부 출력은 반드시 Text로 감싼다(대괄호가 Rich markup으로 해석되는 것 방지).
+        body = Text(out or "(출력 없음)")
+        self.console.print(
+            Panel(
+                body,
+                title=f"$ {command[:60]}",
+                subtitle=f"exit={proc.returncode}",
+                border_style="green" if proc.returncode == 0 else "red",
+                expand=False,
+            )
+        )
+        self.console.print("[dim]※ 이 결과는 대화 맥락에 포함되지 않습니다(표시 전용).[/dim]")
+
+    def _audit_bash(self, command: str, allowed: bool, reason: str) -> None:
+        """`!` 명령 실행 시도를 감사 로그에 남긴다(실패해도 흐름을 막지 않는다)."""
+        try:
+            tool_ctx = self._tool_ctx
+            audit = tool_ctx.options.get("audit_logger") if tool_ctx else None
+            if audit is None:
+                return
+            from core.permission.types import PermissionAuditEntry
+
+            audit.log_decision(
+                PermissionAuditEntry(
+                    session_id=self._state.session_id if self._state else "",
+                    tool_name="!bash",
+                    tool_category="bash",
+                    tool_input_summary=command[:200],
+                    decision="allow" if allowed else "deny",
+                    reason=reason,
+                    source="cli_passthrough",
+                    mode=self._permission_mode,
+                    message="CLI `!` 패스스루",
+                )
+            )
+        except Exception as e:  # noqa: BLE001 — 감사 실패가 명령 실행을 막지 않는다
+            logger.debug("`!` 감사 기록 실패(무시): %s", e)
 
     async def _cmd_cost(self, args: list[str]) -> None:
         """/cost — 이 세션의 누적 토큰 사용량을 보여준다 (D5).
