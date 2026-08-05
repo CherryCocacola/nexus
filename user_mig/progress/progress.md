@@ -4021,3 +4021,12 @@ FABLE5가 nova CLI를 정밀 진단(B-1~B-8)하고 5-Phase 수정계획 작성 �
 - **검증**: 신규 단위 26건(슬래시 8 + !bash·상태줄 10 + compact·resume 8). **전체 unit 1818 passed**, ruff clean. **실서버 8/8**(상태줄·/cost·/compact 강제압축 실행·!bash 실행·`rm -rf /` 차단·plan 모드 차단·/diff·/resume 목록).
 - **CLI 최종 상태**: 슬래시 명령 16개(기존 7 → +9), 단축키 4종(Shift+Tab·Alt+Enter·Ctrl+R·자동완성), 권한 UX(모드 전환·numbered 프롬프트·allow-list·diff 미리보기), 표시(축약/verbose·상태줄). 세션 누적 커밋 25개.
 - **남은 CLI 후보(선택)**: `/rewind`(diff before-image 재사용) · `!` v2(결과를 맥락에 주입) · `@파일` 자동완성 · `#` 메모리 단축.
+
+**1·2·3 순차 진행 (2026-08-05).**
+- **① 112 동기화 완료**: Devstral 라우팅 커밋 이후 배포본이 리포보다 뒤처져 있었다(core 5종 해시 불일치, 마운트 config에 coder_url 없음). core 6종(bootstrap·query_engine·routing·model_dispatcher·inference·config) + `nexus_config.112.yaml` 배포 → 재시작 → **부트스트랩 완료 로그 + 인증 엔드포인트 200 확인**(오늘 401 사고 교훈 반영, health 200만으로 판정하지 않음) → `docker commit nexus-web:coderouting-20260805`(=latest)로 영속화.
+- **② W4/W5 방출 게이트 실측 완료** — 계획서 기준(방출률 ≥70% AND 파싱 ≥80%):
+  - **W5 KaTeX = GO**: 방출 10/10(100%), 파싱 10/10(100%). A.X-4.0이 수식 질의에 항상 LaTeX로 답한다. **중요: 구분자가 `$$`가 아니라 `\[ … \]`(display) / `\( … \)`(inline)** — 렌더러 구현 시 이 형식을 처리해야 한다.
+  - **W4 Mermaid = NO-GO**: 방출 2/10(20%). 다이어그램 요청 대부분을 텍스트 설명으로 답한다. 계획서 단서대로 "base 프롬프트에 출력규약 1줄 추가 후 재측정"이 선행돼야 한다.
+  - 회고 집계(운영 transcript 55개): LaTeX 흔적 2건, mermaid 0건 — 실사용 질의 자체가 드물다.
+- **③ 배포② 1단계 완료**(커밋 49b0663): `core/system_prompt/compose.py` 신설 — `compose_system_prompt(base, style, user, project, session)`가 **base에서 전체 재조립(멱등)**. 순서 고정(base 맨 앞 = prefix cache 적중), 빈 섹션 생략, 본문 strip. 웹 3지점의 문자열 덧붙이기를 전부 치환(OpenAI system 메시지는 session_instruction으로 분리). 테스트 7건. **전체 unit 1825 passed**, 신규 파일 ruff clean.
+- **다음**: W1 응답 스타일(헬퍼의 style 슬롯에 얹기, 프리셋은 config YAML로 CLI와 공유) → W5 KaTeX 렌더러(`\[ \]`·`\( \)` 처리, 금액 `$100` 오인 방지, 스트리밍 미완성 수식은 완료 후 렌더). W4는 보류(프롬프트 규약 후 재측정).
