@@ -232,11 +232,37 @@ class MultiEditTool(BaseTool):
                 error_count += 1
                 continue
 
-            # (3) old_string이 몇 번 등장하는지 센다. 0번이면 바꿀 대상이 없어 실패.
+            # (3) old_string이 몇 번 등장하는지 센다. 0번이면 폴백을 시도한다.
             count = content.count(old_string)
             if count == 0:
-                results.append(f"[{i}] 실패 — old_string을 찾을 수 없음: {file_path}")
-                error_count += 1
+                # 정확 매칭 실패 — Edit과 동일한 "공백 정규화 매칭" 폴백(공용 헬퍼).
+                # 유일 매치일 때만 적용되고, 모호하면 None이 온다(fail-closed).
+                # lazy import — 같은 패키지 내 형제 모듈 참조(순환 없음).
+                from core.tools.implementations.edit_tool import (
+                    find_whitespace_fuzzy_span,
+                )
+
+                span = find_whitespace_fuzzy_span(content, old_string)
+                if span is None:
+                    results.append(
+                        f"[{i}] 실패 — old_string을 찾을 수 없음: {file_path} "
+                        "(팁: Read로 파일을 다시 읽고 정확한 원문을 쓰거나, "
+                        "Write로 전체를 재작성하세요)"
+                    )
+                    error_count += 1
+                    continue
+                start, end = span
+                new_content = content[:start] + new_string + content[end:]
+                try:
+                    _atomic_write(path, new_content)
+                except OSError as e:
+                    results.append(f"[{i}] 실패 — 쓰기 오류: {file_path}: {e}")
+                    error_count += 1
+                    continue
+                results.append(
+                    f"[{i}] 성공 — {file_path} (1건 교체, 공백 정규화 매칭)"
+                )
+                success_count += 1
                 continue
 
             # replace_all이 아닌데 2번 이상 등장하면, 어느 것을 바꿀지 모호하므로

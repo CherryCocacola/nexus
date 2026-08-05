@@ -30,6 +30,7 @@ Edit 도구 — 파일 안의 특정 문자열을 정확히 찾아 다른 문자
 
 from __future__ import annotations
 
+import difflib
 import logging
 import os
 import tempfile
@@ -209,11 +210,38 @@ class EditTool(BaseTool):
         # 2단계: old_string 이 파일 안에 몇 번 등장하는지 센다.
         count = content.count(old_string)
         if count == 0:
-            # 한 번도 없으면 교체할 대상이 없다. 공백/들여쓰기까지 정확히
-            # 일치해야 하므로, 흔한 실수(들여쓰기 누락)를 안내한다.
+            # 정확 매칭 실패 — 폴백으로 "공백 정규화 매칭"을 시도한다.
+            # (실측 배경: A.X-4.0이 들여쓰기·공백을 정확히 재현하지 못해
+            #  Edit이 연속 실패하고 작업을 포기하는 사례가 관찰됐다. 줄 단위로
+            #  공백을 정규화해 비교하면 이런 실수를 흡수할 수 있다.
+            #  단, 정규화 매치가 "정확히 1곳"일 때만 적용한다 — 2곳 이상이면
+            #  어디를 바꿀지 모호하므로 실패로 처리한다(fail-closed).)
+            span = find_whitespace_fuzzy_span(content, old_string)
+            if span is not None:
+                start, end = span
+                new_content = content[:start] + new_string + content[end:]
+                try:
+                    _atomic_write(path, new_content)
+                except OSError as e:
+                    return ToolResult.error(f"파일 쓰기에 실패했습니다: {e}")
+                logger.info("Edit %s: 1 replacement (fuzzy whitespace)", file_path)
+                return ToolResult.success(
+                    f"편집 완료: {file_path} (1건 교체 — 공백 정규화 매칭. "
+                    "old_string의 들여쓰기/공백이 파일과 달랐지만 내용이 유일하게 "
+                    "일치해 해당 부분을 교체했습니다)",
+                    file_path=file_path,
+                    replacements=1,
+                    fuzzy=True,
+                )
+            # 폴백도 실패 — 가장 비슷한 부분을 힌트로 실어, 모델이 다음 시도에서
+            # old_string을 바로잡거나 Write 전체 재작성으로 전환하도록 돕는다.
+            hint = closest_match_hint(content, old_string)
             return ToolResult.error(
                 "old_string을 파일에서 찾을 수 없습니다. "
                 "정확한 문자열(공백, 들여쓰기 포함)을 확인해주세요."
+                + (f"\n[가장 비슷한 부분]\n{hint}" if hint else "")
+                + "\n(팁: Edit이 반복 실패하면 Read로 파일을 다시 읽고, "
+                "Write로 파일 전체를 재작성하세요.)"
             )
 
         # 3단계: 유일성 검증 — replace_all 이 아닌데 2회 이상이면 모호하다.
@@ -265,6 +293,98 @@ class EditTool(BaseTool):
 # ─────────────────────────────────────────────
 # 유틸리티 함수
 # ─────────────────────────────────────────────
+def _norm_line(line: str) -> str:
+    """줄 하나의 공백을 정규화한다 — 앞뒤 공백 제거 + 내부 연속 공백을 1칸으로.
+
+    "들여쓰기 4칸 vs 2칸", "탭 vs 스페이스", "줄 끝 공백" 같은 차이를 전부
+    흡수해 "내용이 같은 줄"인지만 비교할 수 있게 만든다.
+    """
+    return " ".join(line.split())
+
+
+def find_whitespace_fuzzy_span(content: str, old_string: str) -> tuple[int, int] | None:
+    """공백 정규화 기준으로 old_string과 일치하는 유일한 구간의 원본 오프셋을 찾는다.
+
+    동작 방식(줄 단위 슬라이딩 윈도우):
+      1. content와 old_string을 줄로 나누고 각 줄을 _norm_line으로 정규화한다.
+      2. old_string의 줄 수만큼의 윈도우를 content 위에서 한 줄씩 밀며,
+         정규화된 줄들이 전부 일치하는 위치를 찾는다.
+      3. 일치 위치가 "정확히 1곳"일 때만 그 구간의 (시작, 끝) 문자 오프셋을
+         반환한다. 0곳이거나 2곳 이상(모호)이면 None — fail-closed.
+
+    반환 오프셋 규약: 시작은 첫 줄의 시작 위치, 끝은 마지막 줄의 개행 "직전"
+    위치다. 즉 교체 시 개행 구조는 그대로 보존된다.
+
+    Edit(정확 매칭 실패 시 폴백)과 MultiEdit이 공유하는 공용 헬퍼다.
+    """
+    old_lines = [_norm_line(line) for line in old_string.splitlines()]
+    # 정규화 결과가 전부 빈 줄이면(공백뿐인 old_string) 오매칭 위험만 크므로 포기.
+    if not old_lines or all(not line for line in old_lines):
+        return None
+
+    # content를 줄로 나누되, 각 줄의 시작 오프셋을 함께 기록한다(교체 위치 계산용).
+    lines: list[str] = content.splitlines()
+    offsets: list[int] = []
+    pos = 0
+    for line in lines:
+        offsets.append(pos)
+        pos += len(line) + 1  # +1 = 개행 문자(\n). 마지막 줄은 개행이 없어도 무해.
+
+    norm_lines = [_norm_line(line) for line in lines]
+    window = len(old_lines)
+
+    matches: list[int] = []  # 일치하는 윈도우의 시작 줄 번호들
+    for i in range(len(lines) - window + 1):
+        if norm_lines[i : i + window] == old_lines:
+            matches.append(i)
+            if len(matches) > 1:
+                return None  # 2곳 이상 — 모호하므로 즉시 포기(fail-closed)
+
+    if len(matches) != 1:
+        return None
+
+    start_line = matches[0]
+    end_line = start_line + window - 1
+    start = offsets[start_line]
+    end = offsets[end_line] + len(lines[end_line])  # 마지막 줄 개행 직전까지
+    return (start, end)
+
+
+def closest_match_hint(
+    content: str, old_string: str, context_lines: int = 3, max_chars: int = 500
+) -> str:
+    """old_string과 가장 비슷한 파일 부분을 찾아 힌트 문자열로 만든다.
+
+    왜 필요한가: "찾을 수 없습니다"만 돌려주면 모델이 같은 실수를 반복하다
+    포기한다(실측). 실제 파일에서 가장 근접한 원문을 보여주면 다음 시도에서
+    old_string을 바로잡을 수 있다.
+
+    구현: old_string의 첫 번째 비어있지 않은(정규화) 줄을 앵커로 삼아,
+    difflib.get_close_matches로 가장 비슷한 파일 줄을 찾고 그 주변
+    ±context_lines 줄의 "원문"(공백 그대로)을 돌려준다. 못 찾으면 빈 문자열.
+    """
+    anchor = next(
+        (line for line in (_norm_line(x) for x in old_string.splitlines()) if line),
+        "",
+    )
+    if not anchor:
+        return ""
+
+    lines = content.splitlines()
+    norm_lines = [_norm_line(line) for line in lines]
+    close = difflib.get_close_matches(anchor, norm_lines, n=1, cutoff=0.5)
+    if not close:
+        return ""
+
+    idx = norm_lines.index(close[0])
+    lo = max(0, idx - context_lines)
+    hi = min(len(lines), idx + context_lines + 1)
+    snippet = "\n".join(lines[lo:hi])
+    if len(snippet) > max_chars:
+        snippet = snippet[:max_chars] + "…"
+    return snippet
+
+
 def _atomic_write(path: Path, content: str) -> None:
     """
     파일을 "원자적으로" 안전하게 덮어쓰는 헬퍼.
