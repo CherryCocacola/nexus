@@ -149,6 +149,10 @@ class NexusREPL:
         # 도구 실행 컨텍스트 — _bootstrap이 채운다. 런타임 모드 전환(A2)이 이
         # 객체의 options·permission_mode를 갱신하므로 인스턴스에 보관한다.
         self._tool_ctx: Any = None
+        # Bash "항상 허용" 명령 프리픽스 집합(A4). 도구명 단위로 Bash를 통째로
+        # 풀면 이후 어떤 명령이든 통과하므로, 첫 토큰(예: "git", "ls") 단위로만
+        # 등록한다. 등록·사용 시점 양쪽에서 CommandFilter 검사를 다시 통과해야 한다.
+        self._bash_allow_prefixes: set[str] = set()
         # "이 세션 항상 허용"으로 승인한 도구 이름 집합(numbered 프롬프트 2번).
         # 세션 한정 메모리 저장 — 프로세스가 끝나면 사라진다(영속화 안 함).
         # Bash·DANGEROUS 부류는 등록 대상에서 제외한다(fail-closed).
@@ -929,6 +933,71 @@ class NexusREPL:
                 target = self._MODE_CYCLE[0]
         self._apply_mode_change(target)
 
+    # ─── Bash 세션 allow-list (A4) ───
+
+    # 프리픽스만으로 안전을 보장할 수 없게 만드는 셸 메타문자.
+    # 예) "git status && rm -rf /" 는 첫 토큰이 git이지만 뒤에 위험 명령이 붙는다.
+    # 이런 명령은 등록도, 자동 승인도 하지 않는다(fail-closed).
+    _SHELL_METACHARS = (";", "|", "&", "`", "$(", ">", "<", "\n", "\r")
+
+    def _command_filter(self) -> Any:
+        """위험 명령 판정기를 얻는다(파이프라인 것을 재사용, 없으면 새로 생성).
+
+        파이프라인이 쓰는 것과 같은 필터를 쓰는 이유: 규칙이 두 벌이 되면
+        "권한 검사는 막는데 allow-list는 통과" 같은 불일치가 생긴다.
+        """
+        tool_ctx = self._tool_ctx
+        if tool_ctx is not None:
+            pipeline = tool_ctx.options.get("permission_pipeline")
+            existing = getattr(pipeline, "_command_filter", None)
+            if existing is not None:
+                return existing
+        from core.security.command_filter import CommandFilter
+
+        return CommandFilter()
+
+    def _bash_prefix_if_registrable(self, command: str) -> str | None:
+        """Bash 명령에서 "항상 허용"으로 등록 가능한 프리픽스(첫 토큰)를 뽑는다.
+
+        등록 거부 조건(하나라도 걸리면 None):
+          - 셸 메타문자 포함 — 프리픽스만으로는 뒤에 붙는 명령을 통제할 수 없다
+          - CommandFilter가 안전하다고 판정하지 않음(위험 패턴·미지 명령)
+          - 첫 토큰이 비었거나 경로 구분자를 포함(`./x`, `/bin/x` 같은 우회)
+
+        Returns:
+            등록 가능한 프리픽스 문자열, 불가하면 None.
+        """
+        if not command or not isinstance(command, str):
+            return None
+        if any(ch in command for ch in self._SHELL_METACHARS):
+            return None
+        tokens = command.split()
+        if not tokens:
+            return None
+        prefix = tokens[0]
+        # 경로가 섞인 실행(./script, /usr/bin/x)은 이름만으로 동일성을 보장할 수
+        # 없으므로 등록 대상에서 제외한다.
+        if "/" in prefix or "\\" in prefix:
+            return None
+        try:
+            safe, _severity, _reason = self._command_filter().check_command(command)
+        except Exception as e:  # noqa: BLE001 — 판정 실패는 등록 거부로 흡수
+            logger.warning("명령 안전성 판정 실패(등록 거부): %s", e)
+            return None
+        return prefix if safe else None
+
+    def _is_bash_autoallowed(self, command: str) -> bool:
+        """이미 등록된 프리픽스로 자동 승인할 수 있는 명령인지 판단한다.
+
+        등록 여부만 보지 않고 **매 호출마다** 메타문자·위험 패턴을 다시 검사한다.
+        등록 시점에 안전했던 프리픽스라도 이번 명령이 안전하다는 보장은 없기 때문이다
+        (예: `git status`로 등록 → `git push --force` 호출).
+        """
+        if not self._bash_allow_prefixes:
+            return False
+        prefix = self._bash_prefix_if_registrable(command)
+        return prefix is not None and prefix in self._bash_allow_prefixes
+
     async def prompt_permission_v2(
         self,
         tool_name: str,
@@ -974,6 +1043,14 @@ class NexusREPL:
             self.console.print(f"[dim]⏺ 자동 승인(세션 항상 허용): {tool_name}[/dim]")
             return {"approved": True, "feedback": "", "always_allow": False}
 
+        # ②-b Bash는 도구가 아니라 "명령 프리픽스" 단위로 등록된다(A4).
+        #     등록 여부와 별개로 이번 명령의 안전성을 매번 다시 검사한다.
+        _command = str((tool_input or {}).get("command", ""))
+        if category == ToolCategory.BASH and self._is_bash_autoallowed(_command):
+            _prefix = _command.split()[0]
+            self.console.print(f"[dim]⏺ 자동 승인(세션 항상 허용): {_prefix} …[/dim]")
+            return {"approved": True, "feedback": "", "always_allow": False}
+
         # ③ numbered 프롬프트 — 스피너가 떠 있으면 입력과 겹치므로 먼저 닫는다.
         self._suspend_spinner()
         self.console.print(
@@ -1000,10 +1077,26 @@ class NexusREPL:
 
             # 2번(항상 허용) — 세션 allow 목록에 등록 후 허용. 구 습관(a/always) 겸용.
             if choice in ("2", "a", "always"):
-                # Bash·DANGEROUS 부류는 "항상 허용" 등록 금지(fail-closed) —
-                # 명령 내용이 매번 다른데 도구명 단위로 풀면 위험 명령까지 통과된다.
-                # 미지의 도구(None)도 같은 이유로 등록하지 않는다. 이번 1회만 허용.
-                if category in (ToolCategory.BASH, ToolCategory.DANGEROUS) or category is None:
+                # Bash는 도구명이 아니라 **명령 프리픽스**로 등록한다(A4).
+                # 셸 메타문자가 있거나 CommandFilter가 안전하다고 보지 않으면
+                # 등록하지 않고 이번 1회만 허용한다(fail-closed).
+                if category == ToolCategory.BASH:
+                    prefix = self._bash_prefix_if_registrable(_command)
+                    if prefix is None:
+                        self.console.print(
+                            "[dim]이 명령은 프리픽스 단위로 안전하게 등록할 수 없어 "
+                            "이번 한 번만 허용합니다.[/dim]"
+                        )
+                        return {"approved": True, "feedback": "", "always_allow": False}
+                    self._bash_allow_prefixes.add(prefix)
+                    self.console.print(
+                        f"[dim]⏺ 이 세션 동안 `{prefix}` 명령을 항상 허용합니다"
+                        "(위험 패턴·복합 명령은 매번 다시 확인).[/dim]"
+                    )
+                    return {"approved": True, "feedback": "", "always_allow": True}
+
+                # DANGEROUS·미지의 도구는 등록 금지(fail-closed). 이번 1회만 허용.
+                if category == ToolCategory.DANGEROUS or category is None:
                     self.console.print(
                         f"[dim]{tool_name}은(는) 항상 허용 대상이 아니라 "
                         "이번 한 번만 허용합니다.[/dim]"
@@ -1136,6 +1229,15 @@ class NexusREPL:
                 else "실행 전 확인"
             )
             table.add_row("권한 모드", f"{self._permission_mode} (도구 ASK: {_ask_note})")
+            # 세션 allow-list 현황(A4) — 무엇이 확인 없이 통과하는지 사용자가 볼 수
+            # 있어야 한다. 등록된 것이 없으면 행을 만들지 않는다.
+            if self._session_allow:
+                table.add_row("항상 허용(도구)", ", ".join(sorted(self._session_allow)))
+            if self._bash_allow_prefixes:
+                table.add_row(
+                    "항상 허용(명령)",
+                    ", ".join(f"`{p}`" for p in sorted(self._bash_allow_prefixes)),
+                )
             self.console.print(table)
         else:
             # 부트스트랩 실패 등으로 설정이 없으면 안내만 한다.

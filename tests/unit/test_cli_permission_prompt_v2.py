@@ -43,6 +43,9 @@ def _make_repl(mode: str, answers: list[str] | None = None):
     repl = NexusREPL.__new__(NexusREPL)
     repl._permission_mode = mode
     repl._session_allow = set()
+    # A4(2026-08-05): Bash는 도구명이 아니라 명령 프리픽스로 등록된다.
+    repl._bash_allow_prefixes = set()
+    repl._tool_ctx = None  # CommandFilter를 자체 생성하는 경로를 태운다
     buf = io.StringIO()
     repl.console = Console(file=buf, force_terminal=False, width=200)
     fake_session = _FakePromptSession(answers or [])
@@ -136,18 +139,45 @@ def test_choice_2_registers_session_allow_and_skips_next_prompt() -> None:
     assert len(session.prompts_shown) == 1  # 두 번째는 프롬프트 없이 통과
 
 
-def test_choice_2_bash_not_registered() -> None:
-    """Bash는 2번을 선택해도 allow 목록에 등록되지 않는다(이번 1회만 허용)."""
-    repl, _, session = _make_repl("default", answers=["2", "1"])
+def test_choice_2_bash_registers_command_prefix() -> None:
+    """Bash는 2번 선택 시 도구명이 아니라 **명령 프리픽스**로 등록된다(A4).
 
-    first = asyncio.run(repl.prompt_permission_v2("Bash", "명령 실행", {}))
-    # 두 번째 호출 — 등록되지 않았으므로 다시 프롬프트가 떠야 한다(아래 횟수로 검증).
-    asyncio.run(repl.prompt_permission_v2("Bash", "명령 실행", {}))
+    등록 후 같은 계열의 안전한 명령은 프롬프트 없이 통과하고, 도구명(Bash)은
+    allow 목록에 들어가지 않는다 — 도구 단위로 풀면 모든 명령이 통과하기 때문.
+    """
+    repl, _, session = _make_repl("default", answers=["2"])
+
+    first = asyncio.run(
+        repl.prompt_permission_v2("Bash", "명령 실행", {"command": "git status"})
+    )
+    second = asyncio.run(
+        repl.prompt_permission_v2("Bash", "명령 실행", {"command": "git diff HEAD"})
+    )
 
     assert first["approved"] is True
-    assert first["always_allow"] is False  # 등록 안 됨 — 1회성 허용
-    assert "Bash" not in repl._session_allow
-    assert len(session.prompts_shown) == 2  # 두 번째도 다시 물어봄
+    assert first["always_allow"] is True
+    assert "git" in repl._bash_allow_prefixes
+    assert "Bash" not in repl._session_allow  # 도구 단위 등록은 여전히 금지
+    assert second["approved"] is True
+    assert len(session.prompts_shown) == 1  # 두 번째는 자동 승인
+
+
+def test_choice_2_bash_unsafe_command_not_registered() -> None:
+    """복합·위험 명령은 2번을 선택해도 등록되지 않고 1회성 허용에 그친다."""
+    repl, _, session = _make_repl("default", answers=["2", "1"])
+
+    first = asyncio.run(
+        repl.prompt_permission_v2("Bash", "명령 실행", {"command": "git status && rm -rf /"})
+    )
+    # 등록되지 않았으므로 두 번째도 다시 물어본다.
+    asyncio.run(
+        repl.prompt_permission_v2("Bash", "명령 실행", {"command": "git status && rm -rf /"})
+    )
+
+    assert first["approved"] is True
+    assert first["always_allow"] is False
+    assert repl._bash_allow_prefixes == set()
+    assert len(session.prompts_shown) == 2
 
 
 # ─── ④ 취소 안전 처리 ───
