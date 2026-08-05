@@ -43,6 +43,7 @@ from typing import Any
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import InMemoryHistory
+from prompt_toolkit.key_binding import KeyBindings
 from rich.box import ROUNDED
 from rich.console import Console
 from rich.panel import Panel
@@ -145,6 +146,9 @@ class NexusREPL:
         self._model = model
         self._resume_session_id = resume_session_id
         self._log_level = log_level
+        # 도구 실행 컨텍스트 — _bootstrap이 채운다. 런타임 모드 전환(A2)이 이
+        # 객체의 options·permission_mode를 갱신하므로 인스턴스에 보관한다.
+        self._tool_ctx: Any = None
         # "이 세션 항상 허용"으로 승인한 도구 이름 집합(numbered 프롬프트 2번).
         # 세션 한정 메모리 저장 — 프로세스가 끝나면 사라진다(영속화 안 함).
         # Bash·DANGEROUS 부류는 등록 대상에서 제외한다(fail-closed).
@@ -161,8 +165,22 @@ class NexusREPL:
 
         # prompt-toolkit 세션 — 방향키로 이전 입력 재호출(히스토리)과
         # 멀티라인 편집을 지원한다. InMemoryHistory라 프로세스 종료 시 사라진다.
+        # Shift+Tab으로 권한 모드를 순환한다(A2). 키 콜백이 상태를 직접 바꾸지 않고
+        # 입력 버퍼에 `/mode next`를 넣어 제출하는 이유: 전환을 메인 루프의 명령
+        # 처리 경로 하나로 모아, 스트리밍 중 상태가 바뀌는 경합을 원천 차단하기 위함.
+        # 터미널이 Shift+Tab을 보내지 못해도 `/mode next`를 직접 입력하면 동일하다.
+        _kb = KeyBindings()
+
+        @_kb.add("s-tab")
+        def _cycle_permission_mode(event: Any) -> None:
+            buf = event.app.current_buffer
+            buf.text = "/mode next"
+            buf.cursor_position = len(buf.text)
+            buf.validate_and_handle()
+
         self._prompt_session: PromptSession = PromptSession(
             history=InMemoryHistory(),
+            key_bindings=_kb,
         )
 
         # 세션 명령어 맵 — "/로 시작하는 입력"을 어떤 핸들러로 보낼지 정의한다.
@@ -172,6 +190,7 @@ class NexusREPL:
             "/clear": self._cmd_clear,
             "/exit": self._cmd_exit,
             "/model": self._cmd_model,
+            "/mode": self._cmd_mode,
             "/config": self._cmd_config,
             "/session": self._cmd_session,
             "/thinking": self._cmd_thinking,
@@ -294,10 +313,13 @@ class NexusREPL:
             # 통과시키게 한다 — 에이전트 자율 루프가 매번 멈추지 않도록.
             # accept_edits는 자동 허용 모드가 아니다 — 핸들러 "안"에서 파일 수정
             # 부류만 선별 자동 승인하고 Bash 등은 종전대로 묻는다(모드 인지형).
-            auto_allow_modes = {"auto", "bypass", "trust"}
-            tool_ctx = components.get("tool_use_context")
-            if tool_ctx is not None and self._permission_mode not in auto_allow_modes:
-                tool_ctx.options["ask_handler_v2"] = self.prompt_permission_v2
+            #
+            # A2(2026-08-05): 배선을 _apply_mode_change 한 곳으로 모았다. 기동 시에도
+            # 같은 헬퍼를 태워, CLI 인자로 받은 모드가 파이프라인·도구 컨텍스트·
+            # GlobalState까지 실제로 반영되게 한다(이전에는 self._permission_mode만
+            # 바뀌고 GlobalState는 기본값 그대로인 미동기 상태였다).
+            self._tool_ctx = components.get("tool_use_context")
+            self._apply_mode_change(self._permission_mode, announce=False)
 
             # 진입점 채널을 'cli'로 고정 — 이 세션의 히스토리 저장(Redis 키·transcript
             # 폴더)을 cli 채널로 격리해 web/api 히스토리와 서로 안 보이게 한다. 엔진은
@@ -778,6 +800,135 @@ class NexusREPL:
             # 확인 도중 취소하면 안전한 쪽(거부)으로 처리한다.
             return False
 
+    # ─── 권한 모드 런타임 전환 (A2) ───
+
+    # /mode 인자로 받을 수 있는 값 — core의 세션 모드(PermissionModeValue)와 일치.
+    _MODE_CHOICES = ("default", "accept_edits", "auto", "plan", "trust", "bypass")
+    # Shift+Tab 순환 순서 — 실제로 자주 오가는 3단만 돈다(나머지는 /mode로 지정).
+    _MODE_CYCLE = ("default", "accept_edits", "plan")
+    # 확인 프롬프트를 아예 띄우지 않는 자동 허용 모드 — 핸들러를 주입하지 않는다.
+    _AUTO_ALLOW_MODES = frozenset({"auto", "bypass", "trust"})
+
+    def _apply_mode_change(self, new_mode: str, announce: bool = True) -> bool:
+        """권한 모드를 바꾸고 관련 4개 지점을 한 번에 갱신한다.
+
+        [왜 헬퍼 하나로 모으나]
+          모드는 서로 다른 네 곳이 각자 들고 있다. 한 곳만 바꾸면 화면에 보이는
+          모드와 실제 판정이 어긋난다(실제로 기동 시 GlobalState가 갱신되지 않아
+          CLI 인자와 어긋나 있었다). 그래서 전환 경로를 이 함수 하나로 고정한다.
+
+          ① 권한 파이프라인의 PermissionContext.mode (실제 5계층 판정 기준)
+          ② tool_use_context.options["ask_handler_v2"] (확인 프롬프트 주입 여부)
+          ③ tool_use_context.permission_mode (도구가 읽는 문자열 모드)
+          ④ GlobalState.permission_mode + self._permission_mode (배너·/config 표시)
+
+        [언제 호출되나]
+          기동 직후(_bootstrap)와 `/mode` 명령 처리 시점뿐이다. 두 경우 모두
+          "턴과 턴 사이"라, 스트리밍 중 모드가 바뀌어 판정이 뒤섞일 여지가 없다.
+
+        Args:
+            new_mode: 바꿀 모드 문자열. _MODE_CHOICES 밖의 값이면 거부한다.
+            announce: True면 변경 결과를 화면에 한 줄로 알린다.
+
+        Returns:
+            변경(또는 초기 배선)에 성공하면 True, 모르는 모드면 False.
+        """
+        if new_mode not in self._MODE_CHOICES:
+            if announce:
+                self.console.print(
+                    f"[red]알 수 없는 권한 모드: {new_mode}[/red] "
+                    f"(가능: {', '.join(self._MODE_CHOICES)})"
+                )
+            return False
+
+        # ④-a REPL 표시용 상태 — 아래 핸들러 주입 판단에도 쓰이므로 먼저 갱신한다.
+        self._permission_mode = new_mode
+
+        # ① 파이프라인 컨텍스트: frozen이라 model_copy로 mode만 갈아끼운다.
+        #    (working_directory·session_id 등 나머지 필드는 그대로 보존)
+        tool_ctx = self._tool_ctx
+        if tool_ctx is not None:
+            pipeline = tool_ctx.options.get("permission_pipeline")
+            if pipeline is not None:
+                try:
+                    from core.permission.mode_mapping import (
+                        map_mode_value_to_permission_mode,
+                    )
+
+                    pipeline.update_context(
+                        pipeline.context.model_copy(
+                            update={"mode": map_mode_value_to_permission_mode(new_mode)}
+                        )
+                    )
+                except Exception as e:  # noqa: BLE001 — 표시 모드는 이미 바뀌었으므로 계속
+                    logger.warning("권한 파이프라인 모드 갱신 실패: %s", e)
+
+            # ② 확인 핸들러: 자동 허용 모드에서는 제거해 프롬프트가 뜨지 않게 한다.
+            #    (accept_edits는 자동 허용이 아니다 — 핸들러 안에서 선별 승인한다)
+            if new_mode in self._AUTO_ALLOW_MODES:
+                tool_ctx.options.pop("ask_handler_v2", None)
+            else:
+                tool_ctx.options["ask_handler_v2"] = self.prompt_permission_v2
+
+            # ③ 도구가 읽는 문자열 모드
+            tool_ctx.permission_mode = new_mode
+
+        # ④-b 전역 상태 — 배너·/config·요약이 같은 값을 보게 한다.
+        if self._state is not None:
+            try:
+                from core.state import PermissionModeValue
+
+                self._state.permission_mode = PermissionModeValue(new_mode)
+            except ValueError:
+                logger.warning("GlobalState 권한 모드 변환 실패: %s", new_mode)
+
+        if announce:
+            _note = (
+                "자동 허용"
+                if new_mode in self._AUTO_ALLOW_MODES
+                else ("파일 수정 자동 승인" if new_mode == "accept_edits" else "실행 전 확인")
+            )
+            self.console.print(f"[green]권한 모드 → {new_mode}[/green] [dim]({_note})[/dim]")
+        return True
+
+    async def _cmd_mode(self, args: list[str]) -> None:
+        """`/mode [모드|next]` — 권한 모드를 확인하거나 바꾼다.
+
+        인자 없이 부르면 현재 모드와 선택지를 보여준다. `next`는 Shift+Tab과
+        같은 순환(기본 → 편집 자동승인 → 계획)을 한 칸 돌린다.
+        """
+        if not args:
+            table = Table(title="권한 모드", box=ROUNDED, show_header=True)
+            table.add_column("모드", style="cyan")
+            table.add_column("동작")
+            table.add_column("현재", justify="center")
+            descriptions = {
+                "default": "쓰기·실행 전 확인",
+                "accept_edits": "파일 수정 자동 승인, Bash 등은 확인",
+                "auto": "대부분 자동 진행",
+                "plan": "읽기·계획만, 쓰기 거부",
+                "trust": "확인 없이 진행",
+                "bypass": "권한 확인 우회",
+            }
+            for m in self._MODE_CHOICES:
+                table.add_row(m, descriptions[m], "●" if m == self._permission_mode else "")
+            self.console.print(table)
+            self.console.print(
+                "[dim]사용법: /mode <모드>  ·  Shift+Tab으로 "
+                f"{' → '.join(self._MODE_CYCLE)} 순환[/dim]"
+            )
+            return
+
+        target = args[0].strip().lower()
+        if target == "next":
+            # 순환 목록에 없는 모드에서 눌렀다면 첫 칸으로 보낸다.
+            try:
+                idx = self._MODE_CYCLE.index(self._permission_mode)
+                target = self._MODE_CYCLE[(idx + 1) % len(self._MODE_CYCLE)]
+            except ValueError:
+                target = self._MODE_CYCLE[0]
+        self._apply_mode_change(target)
+
     async def prompt_permission_v2(
         self,
         tool_name: str,
@@ -913,6 +1064,7 @@ class NexusREPL:
             ("/clear", "화면을 지운다"),
             ("/exit", "세션을 종료한다"),
             ("/model", "현재 라우팅 모델을 표시한다"),
+            ("/mode", "권한 모드 확인·변경 (Shift+Tab으로 순환)"),
             ("/config", "현재 설정을 표시한다"),
             ("/session", "세션 정보를 표시한다"),
             ("/thinking", "thinking 표시를 토글한다"),
