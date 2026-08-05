@@ -3984,3 +3984,9 @@ FABLE5가 nova CLI를 정밀 진단(B-1~B-8)하고 5-Phase 수정계획 작성 �
 - **저장소 청소**: ①112 세션 475개(앞서) ②로컬 `.nexus/sessions` **231개 삭제**(245→14개, 1.2M→135K, 자체 도구 `cleanup_sessions.py`로 실행해 도구 동작도 재검증) ③테스트 임시 산출물 `.tmp_nova_homepage{,_v2,_v3}` 3개 삭제(517KB 백업 후). 모든 삭제는 백업 선행.
 - **미해결 과제 문서화**: `user_mig/design/REMAINING_ISSUES_2026-08-05.md` 신설 — P0(리포 미커밋·이미지 정합성) / P1(CLI Stage1 나머지 A2·A4·B·C1·D8~10, Devstral 통합 미완, A.X 모델한계 3종, 플러그인 적용확인) / P2(템플릿 커버리지·색상슬롯 SITE 이전, 렌더루프 종료조건) / P3(API 세션 구조, web/app.py 기존 lint 7건). 각 항목에 착수 지점·주의사항·원복 절차 포함.
 - **다음 세션 착수 순서 제안**: ①커밋 정리(논리 단위 7개 분리) ②CLI Stage1 A2 ③Devstral 라우팅 통합.
+
+**커밋 정리 + CLI Stage 1 A2 완료 (2026-08-05).**
+- **커밋 9개로 정리**(feature/b200-bakeoff, push 미실행): ①`[core/permission]` CLI accept-edits+ask_handler v2 ②`[core/tools]` Edit/MultiEdit 공백정규화 폴백 ③`[core/tools]` 템플릿 스캐폴드+렌더 자가검증(도구 26개) ④`[web]` Phase1~3 웹기능 잔여분(이전 세션 미커밋분 — transcript 채널격리·artifacts·image_generate·프론트 확장) ⑤`[web]` 채널분리+finish_reason+max_tokens ⑥`[scripts]` 세션 정리도구 ⑦`[config]` pc vision_model ⑧`[docs]` 문서 ⑨`[cli]` A2 모드전환. 미커밋 잔여=개인설정(.claude/settings*)·사용자 자료파일(docx/png 등)만.
+- **A2 런타임 권한 모드 전환 완료**: `_apply_mode_change()` 단일 헬퍼가 4지점 원자 갱신(①파이프라인 PermissionContext.mode — frozen이라 model_copy, working_directory/session_id 보존 ②ask_handler_v2 주입/제거 ③tool_ctx.permission_mode ④GlobalState+REPL 표시). **기동 시에도 같은 헬퍼를 태워 기존 미동기 버그 해소**(CLI 인자가 GlobalState에 반영 안 되던 문제). `/mode`(표 표시·직접지정·next 순환) + Shift+Tab(버퍼에 `/mode next` 주입 후 제출 — 전환을 메인 루프 한 경로로 모아 경합 차단). /help 갱신.
+- **검증**: 단위 12건(4지점 갱신·필드보존·자동허용 핸들러제거/재주입·미지모드 거부·컨텍스트 부재 안전·순환) + **실서버 부트스트랩 5/5**(기동 동기화 accept_edits, next→plan, bypass→핸들러제거, default→재주입, 잘못된 모드 거부). 전체 unit **1726 passed**, ruff clean. 작업 중 pipeline.context property 중복 추가를 F811로 발견·제거.
+- **다음(P1 잔여)**: A4(allow-list Bash 프리픽스·realpath/NFC) → B1~B2(diff 미리보기) → C1(도구표시 축약) → D8~D10 / Devstral 라우팅 통합 / 플러그인 적용 확인.
