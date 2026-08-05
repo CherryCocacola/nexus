@@ -246,6 +246,8 @@ class NexusREPL:
             "/save": self._cmd_save,
             "/diff": self._cmd_diff,
             "/copy": self._cmd_copy,
+            "/compact": self._cmd_compact,
+            "/resume": self._cmd_resume,
         }
 
         # ── 부트스트랩 후에 채워지는 상태 변수 ──
@@ -1232,6 +1234,8 @@ class NexusREPL:
             ("/save", "대화를 Markdown 파일로 저장한다"),
             ("/diff", "작업 트리의 git 변경사항을 보여준다"),
             ("/copy", "마지막 응답을 클립보드로 복사한다"),
+            ("/compact", "대화 맥락을 강제로 압축한다"),
+            ("/resume", "이전 세션 목록을 보고 이어받는다"),
             ("!<명령>", "셸 명령을 실행한다(표시 전용 — 대화 맥락에 미포함)"),
         ]
         for cmd, desc in commands:
@@ -1452,6 +1456,130 @@ class NexusREPL:
             )
         except Exception as e:  # noqa: BLE001 — 감사 실패가 명령 실행을 막지 않는다
             logger.debug("`!` 감사 기록 실패(무시): %s", e)
+
+    async def _cmd_compact(self, args: list[str]) -> None:
+        """/compact — 지금 대화 맥락을 강제로 압축한다 (D2).
+
+        평소에는 임계치를 넘을 때만 자동 압축되지만, 긴 작업 뒤에 맥락을 미리
+        정리하고 싶을 때가 있다. ContextManager의 강제 압축 경로(force=True)를
+        그대로 쓰며, 전/후 토큰 추정치를 보여 준다.
+        """
+        engine = self._query_engine
+        if engine is None:
+            self.console.print("[yellow]세션이 초기화되지 않았습니다.[/yellow]")
+            return
+        cm = getattr(engine, "_context_manager", None)
+        if cm is None:
+            self.console.print("[yellow]컨텍스트 관리자가 없어 압축할 수 없습니다.[/yellow]")
+            return
+        messages = getattr(engine, "_messages", None)
+        if not messages:
+            self.console.print("[dim]압축할 대화가 없습니다.[/dim]")
+            return
+
+        before_msgs = len(messages)
+        before_tokens = cm._estimate_tokens(messages)
+        try:
+            compacted = await cm.auto_compact_if_needed(messages, force=True)
+        except Exception as e:  # noqa: BLE001 — 압축 실패가 세션을 끊으면 안 된다
+            self.console.print(Text(f"압축 실패: {e}", style="red"))
+            return
+
+        # 엔진의 실제 히스토리를 압축 결과로 교체한다(같은 리스트 객체를 유지해
+        # 다른 곳이 들고 있는 참조가 어긋나지 않게 in-place로 바꾼다).
+        messages[:] = compacted
+        after_tokens = cm._estimate_tokens(messages)
+        saved = max(0, before_tokens - after_tokens)
+        table = Table(title="컨텍스트 압축", border_style="blue", box=ROUNDED)
+        table.add_column("항목", style="cyan")
+        table.add_column("이전", justify="right")
+        table.add_column("이후", justify="right")
+        table.add_row("메시지", f"{before_msgs:,}", f"{len(messages):,}")
+        table.add_row("토큰(추정)", f"{before_tokens:,}", f"{after_tokens:,}")
+        self.console.print(table)
+        self.console.print(f"[green]약 {saved:,} 토큰을 절약했습니다.[/green]")
+
+    async def _cmd_resume(self, args: list[str]) -> None:
+        """/resume [번호] — 이전 CLI 세션을 골라 이어서 대화한다 (D3).
+
+        [왜 session_id까지 재바인드하나]
+          메시지만 복원하고 세션 ID를 그대로 두면, 이어서 한 대화가 "새 세션"
+          트랜스크립트에 쌓여 원본과 갈라진다. 그래서 엔진의 세션 ID를 선택한
+          세션으로 갈아끼워 같은 기록에 이어 쓰게 한다.
+        """
+        if not self._state or self._query_engine is None:
+            self.console.print("[yellow]세션이 초기화되지 않았습니다.[/yellow]")
+            return
+        try:
+            from core.memory.transcript import (
+                list_transcript_sessions,
+                read_transcript_messages,
+            )
+
+            sessions_dir = self._state.config.sessions_dir
+            rows = list_transcript_sessions(sessions_dir, limit=20, channel="cli")
+        except Exception as e:  # noqa: BLE001
+            self.console.print(Text(f"세션 목록을 읽을 수 없습니다: {e}", style="red"))
+            return
+
+        # 지금 세션은 이어받을 대상이 아니므로 목록에서 뺀다.
+        rows = [r for r in rows if r.get("session_id") != self._state.session_id]
+        if not rows:
+            self.console.print("[dim]이어받을 이전 세션이 없습니다.[/dim]")
+            return
+
+        # 인자가 없으면 목록만 보여 준다(번호를 보고 다시 부르게).
+        if not args:
+            table = Table(title="이전 CLI 세션", border_style="blue", box=ROUNDED)
+            table.add_column("#", justify="right", style="cyan")
+            table.add_column("세션 ID")
+            table.add_column("최근 수정")
+            table.add_column("제목/첫 메시지")
+            for i, r in enumerate(rows, 1):
+                table.add_row(
+                    str(i),
+                    str(r.get("session_id", ""))[:8],
+                    str(r.get("modified", ""))[:19],
+                    str(r.get("title_hint", ""))[:40],
+                )
+            self.console.print(table)
+            self.console.print("[dim]이어받기: /resume <번호>[/dim]")
+            return
+
+        try:
+            idx = int(args[0])
+            target = rows[idx - 1]
+        except (ValueError, IndexError):
+            self.console.print(f"[yellow]1~{len(rows)} 사이의 번호를 지정하세요.[/yellow]")
+            return
+
+        session_id = str(target.get("session_id", ""))
+        try:
+            raw = read_transcript_messages(sessions_dir, session_id, channel="cli")
+            from core.message import Message
+
+            restored: list = []
+            for entry in raw:
+                role, content = entry.get("role"), (entry.get("content") or "")
+                if role == "user":
+                    restored.append(Message.user(content))
+                elif role == "assistant":
+                    restored.append(Message.assistant(text=content))
+            # 세션 ID까지 갈아끼워 같은 트랜스크립트에 이어 쓰게 한다.
+            self._state.session_id = session_id
+            self._query_engine.bind_request(
+                session_id=session_id,
+                restore_messages=restored or None,
+                channel="cli",
+            )
+        except Exception as e:  # noqa: BLE001
+            self.console.print(Text(f"세션 복원 실패: {e}", style="red"))
+            return
+
+        self.console.print(
+            f"[green]세션을 이어받았습니다:[/green] {session_id[:8]} "
+            f"[dim]({len(restored)}개 메시지)[/dim]"
+        )
 
     async def _cmd_cost(self, args: list[str]) -> None:
         """/cost — 이 세션의 누적 토큰 사용량을 보여준다 (D5).
