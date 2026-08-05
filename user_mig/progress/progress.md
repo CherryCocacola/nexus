@@ -4013,3 +4013,11 @@ FABLE5가 nova CLI를 정밀 진단(B-1~B-8)하고 5-Phase 수정계획 작성 �
 - **검증**: 단위 8건(기본 비활성·키워드 판정·대소문자·커스텀 키워드·라우팅 off 일관성·config 기본값) + **전체 1792 passed**, ruff clean. **실서버**: 한국어 생성 정상(176자), 도구 호출 1건 정상 파싱, 라우팅 판정(리팩터링→coder / 일반대화→primary) 확인, "코딩 전용 모델로 전환" 로그 확인.
 - **사용법**: `routing.coder_enabled: true`로 켜면 코딩 키워드 질의가 Devstral로 간다. 끄면 기존과 100% 동일. **원복**: `run_coder.sh.bak-noparser` 복원 또는 coder 세션 종료 + `start_all.sh` coder 줄 제거 + `run_vllm_fp8.sh.bak-util092` 복원.
 - **P1 잔여**: 플러그인 적용 확인(사용자 세션) / A.X 모델 한계 근본책(LoRA — 데이터 축적 후).
+
+**★ CLI Stage 2 전체 완료 (2026-08-05).** Stage 1에 이어 9개 항목(C2·C3·D1~D7) 구현·검증·커밋. **CLI 이식 계획서 전 범위 종료.**
+- **배치1 슬래시 4종**(커밋 70ec21e): `/cost`(누적 토큰·턴·도구호출, 온프레미스라 과금 아님 명시) · `/save`(트랜스크립트→Markdown, 역할 라벨) · `/diff`(로컬 git diff --stat) · `/copy`(pyperclip→**OSC52 폴백**으로 원격 SSH에서도 로컬 클립보드 복사, TEXT_DELTA 원문을 턴 단위 누적). **결함 2건 자체 발견·수정**: ①`/diff`가 blocking `subprocess.run`이라 async 루프를 멈춤 → `create_subprocess_exec` 전환(ruff ASYNC221이 지적) ②git 출력의 대괄호가 Rich markup으로 해석돼 **MarkupError 크래시** → 외부 문자열은 항상 `Text()`로 감쌈(테스트가 잡음).
+- **배치2**(커밋 fb2f8c6): **C2 상태줄** — prompt_toolkit `bottom_toolbar`에 모드·토큰·세션 상시 표시(Rich Live는 타자기 출력과 간섭해 회피). 이 콜백은 **어떤 예외도 내지 않는다**(실패 시 프롬프트 자체가 안 떠 입력 불가). **C3** 스피너에 "Ctrl+C로 중단" 병기. **D1 `!` bash 패스스루** — 모델을 거치지 않는 통로라 4중 게이트: ①plan/deny_all 모드 차단 ②파이프라인과 **같은 CommandFilter**로 위험명령 차단 ③허용·차단 무관 감사 JSONL 기록 ④**v1 표시 전용**(대화 맥락 미포함, 매번 고지). async 서브프로세스+60초 타임아웃.
+- **배치3**(커밋 2e5f5f7): **D2 `/compact`** — `auto_compact_if_needed(force=True)`가 **이미 존재**해 core 변경 없이 배선만(계획서의 "신규 필요"는 부정확). 결과를 히스토리 리스트에 **in-place 반영**(참조 어긋남 방지), 전/후 토큰 표. **D3 `/resume`** — 목록 표시→번호 선택, 메시지 복원 + **session_id 재바인드**(안 하면 이어쓴 대화가 새 세션에 쌓여 원본과 갈라짐), 현재 세션은 목록 제외.
+- **검증**: 신규 단위 26건(슬래시 8 + !bash·상태줄 10 + compact·resume 8). **전체 unit 1818 passed**, ruff clean. **실서버 8/8**(상태줄·/cost·/compact 강제압축 실행·!bash 실행·`rm -rf /` 차단·plan 모드 차단·/diff·/resume 목록).
+- **CLI 최종 상태**: 슬래시 명령 16개(기존 7 → +9), 단축키 4종(Shift+Tab·Alt+Enter·Ctrl+R·자동완성), 권한 UX(모드 전환·numbered 프롬프트·allow-list·diff 미리보기), 표시(축약/verbose·상태줄). 세션 누적 커밋 25개.
+- **남은 CLI 후보(선택)**: `/rewind`(diff before-image 재사용) · `!` v2(결과를 맥락에 주입) · `@파일` 자동완성 · `#` 메모리 단축.

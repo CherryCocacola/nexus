@@ -37,8 +37,13 @@ A1·A2·A3·A4·B1·B2·C1·D8·D9·D10 모두 구현·검증·커밋 완료. �
 - B1/B2 diff 미리보기(256KB·200줄·바이너리 상한) — 커밋 1b35aa6
 - C1/D8~D10 도구 표시 축약·`/verbose`·자동완성·Alt+Enter·`/help` — 커밋 e220705
 
-**Stage 2(후속)**: C2 상태줄(bottom_toolbar) · C3 중단 힌트 · D1 `!` bash 패스스루 ·
+**Stage 2 — 전체 완료 (2026-08-05)**: C2 상태줄 · C3 중단 힌트 · D1 `!` bash 패스스루 ·
 D2 `/compact` · D3 `/resume` 재바인드 · D4 `/diff` · D5 `/cost` · D6 `/copy` · D7 `/save`.
+커밋 70ec21e(슬래시 4종) · fb2f8c6(상태줄·힌트·!bash) · 2e5f5f7(/compact·/resume).
+실서버 검증 8/8. **CLI 이식 계획서의 Stage 1·2가 모두 끝났다.**
+
+남은 CLI 후보(계획서 밖·선택): `/rewind`(diff before-image 재사용) ·
+`!` 결과를 대화 맥락에 넣는 v2 · `@파일` 참조 자동완성 · `#` 메모리 단축.
 
 ### 4. ~~Devstral 코딩 서브모델 통합~~ — **완료 (2026-08-05, 커밋 8a32e19)**
 config `coder_url`/`coder_model` + `routing.coder_enabled`(**기본 False**)/`coder_keywords`,
