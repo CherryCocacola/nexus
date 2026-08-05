@@ -116,6 +116,10 @@ class QueryEngine:
         # 컨텍스트 예산(하드코딩 외부화, 2026-07-03). None이면 PromptAssembler·
         # query_loop이 각자 현행 상수로 폴백 → 기존 호출부(테스트 포함) 동작 불변.
         context_budgets: ContextBudgetConfig | None = None,
+        # 코딩 전용 모델 프로바이더(2026-08-05, 선택). 라우팅이 코딩 질의로 판정한
+        # 턴에서만 model_provider 대신 이것을 쓴다. None이면 항상 기본 프로바이더를
+        # 쓰므로 기존 동작과 동일하다(무회귀).
+        coder_provider: ModelProvider | None = None,
     ) -> None:
         """
         QueryEngine을 초기화한다.
@@ -139,6 +143,8 @@ class QueryEngine:
                 enabled=False면 분류 없이 항상 tool_mode 프로필 적용.
         """
         self._model_provider = model_provider
+        # 코딩 전용 프로바이더 — 없으면 코딩 라우팅 자체가 발생하지 않는다.
+        self._coder_provider = coder_provider
         self._tools = tools
         self._context = context
         self._system_prompt = system_prompt
@@ -328,8 +334,19 @@ class QueryEngine:
         #  - dispatcher 주입 X → 단일 Worker 폴백 경로(query_loop)
         # 어느 쪽이든 반환값 stream은 StreamEvent/Message를 내보내는
         # AsyncGenerator라서, 아래 소비 루프는 경로를 신경 쓰지 않아도 된다.
+        # 코딩 질의로 판정됐고 코딩 프로바이더가 배선돼 있으면 그것을 쓴다.
+        # 둘 중 하나라도 없으면 기본 프로바이더 — 즉 기본 동작은 변하지 않는다.
+        active_provider = self._model_provider
+        if decision.use_coder and self._coder_provider is not None:
+            active_provider = self._coder_provider
+            logger.info("라우팅: 코딩 전용 모델로 전환 (class=%s)", decision.query_class)
+
         if self._model_dispatcher is not None:
             stream = self._model_dispatcher.route(
+                # 코딩 턴에만 프로바이더를 갈아끼운다(None이면 dispatcher 기본 Worker).
+                provider_override=(
+                    active_provider if active_provider is not self._model_provider else None
+                ),
                 messages=self._messages,
                 system_prompt=effective_system_prompt,
                 on_turn_complete=_on_turn_complete,
@@ -358,7 +375,7 @@ class QueryEngine:
             stream = query_loop(
                 messages=self._messages,
                 system_prompt=effective_system_prompt,
-                model_provider=self._model_provider,
+                model_provider=active_provider,
                 tools=self._tools,
                 context=self._context,
                 context_manager=self._context_manager,

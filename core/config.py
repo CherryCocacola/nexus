@@ -83,6 +83,13 @@ class GPUServerConfig(BaseModel):
     # 비전 서버의 served-model-name — AnalyzeImage 요청 body의 "model" 값으로 쓰인다.
     # 기본은 Gemma VLM(운영값은 yaml에서 오버라이드 — 배포별 실제 서빙명과 일치시킨다).
     vision_model: str = "gemma-4-12b"
+    # 코딩 전용 서브모델 서버(2026-08-05) — 코드 작성·수정 질의를 primary 대신
+    # 이 서버로 보낼 때 쓴다. 빈 문자열이면 코딩 라우팅 자체가 비활성화된다
+    # (프로바이더를 만들지 않으므로 기존 동작과 100% 동일 — 무회귀).
+    # 배포 실측: B200 GPU0에 Devstral Small 2507을 8005로 co-serving(A.X와 공존).
+    coder_url: str = ""
+    # 코딩 서버의 served-model-name. 요청 body의 "model" 값으로 쓰인다.
+    coder_model: str = "devstral-small"
     # HTTP 요청 1건의 최대 대기 시간(초). 27B 모델의 긴 생성도 끊기지 않도록
     # 넉넉히 120초로 둔다(짧게 잡으면 정상 추론이 타임아웃으로 끊긴다).
     timeout_seconds: float = 120.0
@@ -591,6 +598,38 @@ class RoutingConfig(BaseModel):
     # 너무 길게 잡으면 일반 지식 질의가 잡담으로 오분류될 수 있어 보수적으로 30자.
     chat_max_length: int = 30
     chat_keywords: list[str] = Field(default_factory=lambda: list(_DEFAULT_CHAT_KEYWORDS))
+
+    # ── 코딩 서브모델 라우팅 (2026-08-05) ──────────────────────────────
+    # 코드 작성·수정 질의를 primary(A.X-4.0) 대신 코딩 특화 모델로 보낼지.
+    # **기본 False(fail-safe)**: 실측상 코딩 모델이 항상 더 낫지는 않았다
+    # (원샷 랜딩 페이지 생성은 오히려 A.X가 완결성이 높았고, Devstral은 레이아웃이
+    #  붕괴했다). 반면 코드 정리·리팩터링류는 코딩 모델이 빠르고 정확했다.
+    # 그래서 자동 전환은 운영자가 명시적으로 켤 때만 동작하게 한다.
+    # gpu_server.coder_url이 비어 있으면 이 값이 True여도 라우팅되지 않는다.
+    coder_enabled: bool = False
+    # 이 키워드가 포함되면 코딩 질의로 본다(coder_enabled=True일 때만 평가).
+    # 좁게 유지하는 이유: 일반 한국어 대화가 코딩으로 오분류되면 한국어가 약한
+    # 코딩 모델로 흘러가 품질이 떨어진다.
+    coder_keywords: list[str] = Field(
+        default_factory=lambda: [
+            "리팩터링",
+            "리팩토링",
+            "refactor",
+            "디버깅",
+            "debug",
+            "스택트레이스",
+            "traceback",
+            "컴파일",
+            "compile",
+            "테스트 코드",
+            "unit test",
+            "함수를 고쳐",
+            "코드를 고쳐",
+            "버그를 고쳐",
+            "코드 리뷰",
+            "code review",
+        ]
+    )
     knowledge_mode: RoutingProfile = Field(
         default_factory=lambda: RoutingProfile(
             model="qwen3.5-27b",

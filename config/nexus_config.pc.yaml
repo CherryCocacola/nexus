@@ -47,6 +47,8 @@ gpu_server:
   vision_model: "gemma-3-27b"              # 비전 요청 body의 served-model-name(vLLM --served-model-name과 일치)
                                            # 2026-08-04 수정: B200 재구축(07-30) 때 gemma-3-27b로 배포됐는데
                                            # 이 파일만 구값(gemma-4-12b)이라 404가 났다(실측).
+  coder_url: "http://127.0.0.1:18005"      # Devstral 코딩 서브모델(터널 로컬포트, 2026-08-05)
+  coder_model: "devstral-small"            # served-model-name과 일치
   timeout_seconds: 120.0     # 단일 요청 타임아웃 — 장문 생성 여유까지 고려한 값
   max_retries: 10            # with_retry(Tier 4) 최대 재시도 횟수 (콜드/일시장애 흡수)
   retry_base_delay: 0.5      # 지수 백오프 기준 지연(초) — 0.5→1→2…로 증가

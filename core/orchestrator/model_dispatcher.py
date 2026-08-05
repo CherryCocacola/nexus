@@ -152,6 +152,9 @@ class ModelDispatcher:
         system_prompt: str,
         on_turn_complete: Any | None = None,
         model_override: str | None = None,
+        # 이 턴에만 쓸 프로바이더(2026-08-05). 코딩 전용 모델처럼 "다른 서버"로
+        # 보내야 할 때 사용한다. None이면 기존 Worker 프로바이더를 그대로 쓴다.
+        provider_override: Any | None = None,
         temperature: float = 0.7,
         max_tokens_cap: int | None = None,
         enable_thinking: bool = False,
@@ -214,7 +217,8 @@ class ModelDispatcher:
         async for event in query_loop(
             messages=messages,
             system_prompt=system_prompt,
-            model_provider=self._worker_provider,
+            # provider_override가 있으면 이 턴만 다른 모델 서버로 보낸다(코딩 모델 등).
+            model_provider=provider_override or self._worker_provider,
             tools=self._worker_tools,
             context=self._context,
             max_turns=self._max_turns,

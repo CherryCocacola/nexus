@@ -172,6 +172,26 @@ async def init_phase2(state: GlobalState) -> dict:
     components["model_provider"] = provider
     logger.info("[Phase 2] ModelProvider 초기화: %s", config.gpu_server_url)
 
+    # ①-b 코딩 전용 서브모델 프로바이더(2026-08-05, 선택)
+    #     gpu_server.coder_url이 비어 있으면 만들지 않는다 → QueryEngine이 항상
+    #     기본 프로바이더를 쓰므로 기존 동작과 100% 동일하다(무회귀).
+    #     실제 전환은 routing.coder_enabled=True + 코딩 키워드일 때만 일어난다.
+    coder_provider = None
+    _coder_url = getattr(config.gpu_server, "coder_url", "") or ""
+    if _coder_url:
+        coder_provider = LocalModelProvider(
+            base_url=_coder_url,
+            model_id=getattr(config.gpu_server, "coder_model", "") or "devstral-small",
+            max_context_tokens=config.model.max_context_tokens,
+            max_output_tokens=config.model.default_max_tokens,
+            embedding_base_url=config.gpu_server.embedding_url,
+            structured_output_injection_mode=config.structured_output.injection_mode,
+            # Devstral 등 Mistral 계열은 chat_template_kwargs를 거부한다(400).
+            supports_chat_template_kwargs=False,
+        )
+        logger.info("[Phase 2] 코딩 ModelProvider 초기화: %s", _coder_url)
+    components["coder_provider"] = coder_provider
+
     # ② ToolRegistry — 23개 도구 등록 (실측: _create_tool_registry 등록 개수)
     registry = _create_tool_registry()
     components["tool_registry"] = registry
@@ -688,6 +708,8 @@ async def init_phase2(state: GlobalState) -> dict:
 
     engine = QueryEngine(
         model_provider=provider,
+        # 코딩 전용 프로바이더(없으면 None) — 라우팅이 코딩 질의로 판정한 턴에만 쓴다.
+        coder_provider=coder_provider,
         tools=cli_tools,
         context=context,
         # tier + 실제 도구 이름을 함께 넘겨 ⑧의 레지스트리 선택과 프롬프트를 일치시킨다.

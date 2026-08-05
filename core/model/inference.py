@@ -248,6 +248,10 @@ class LocalModelProvider(ModelProvider):
         connect_timeout: float = 10.0,
         read_timeout: float = 300.0,
         structured_output_injection_mode: str = "response_format",
+        # chat_template_kwargs 지원 여부(2026-08-05). Mistral 계열(Devstral 등)은
+        # vLLM이 "chat_template is not supported for Mistral tokenizers"로 400을
+        # 돌려주므로, 그런 서버용 프로바이더는 False로 만들어 이 키를 생략한다.
+        supports_chat_template_kwargs: bool = True,
     ):
         """
         vLLM 서버 연결 정보와 httpx 클라이언트를 준비한다.
@@ -276,6 +280,8 @@ class LocalModelProvider(ModelProvider):
         self._embedding_base_url = (
             embedding_base_url.rstrip("/") if embedding_base_url else self.base_url
         )
+        # chat_template_kwargs(=thinking 제어) 지원 여부. False면 payload에서 생략한다.
+        self._supports_chat_template_kwargs = supports_chat_template_kwargs
         # 구조화 출력 주입 형태 — _build_response_format()이 참조한다.
         # 기본 "response_format"은 Phase 0 실측(B200 vLLM 0.24)으로 확정된 값이며,
         # 실측에서 표준형이 거부되는 티어를 만나면 config로 "structured_outputs"로
@@ -392,8 +398,9 @@ class LocalModelProvider(ModelProvider):
             "frequency_penalty": frequency_penalty,
             "presence_penalty": presence_penalty,
         }
-        if enable_thinking is not None:
-            # bool(True/False)일 때만 명시적으로 주입 — None이면 완전 생략
+        if enable_thinking is not None and self._supports_chat_template_kwargs:
+            # bool(True/False)일 때만 명시적으로 주입 — None이면 완전 생략.
+            # 미지원 서버(Mistral 토크나이저)에서는 아예 넣지 않는다(400 방지).
             payload["chat_template_kwargs"] = {"enable_thinking": enable_thinking}
 
         # ── 자기일관성(Self-Consistency) 표본 수 (Point 4.3) ─────────────────
@@ -444,7 +451,8 @@ class LocalModelProvider(ModelProvider):
             # thinking 블록(<think>…</think>)은 JSON 문법을 위반하므로, 구조화 출력
             # 모드에서는 호출자가 넘긴 enable_thinking 값을 무시하고 무조건 끈다.
             # (위에서 이미 세팅됐을 수 있는 chat_template_kwargs를 여기서 덮어쓴다.)
-            payload["chat_template_kwargs"] = {"enable_thinking": False}
+            if self._supports_chat_template_kwargs:
+                payload["chat_template_kwargs"] = {"enable_thinking": False}
             logger.debug(
                 "구조화 출력 활성 — enable_thinking을 False로 강제 (mode=%s, name=%s)",
                 self._structured_output_injection_mode,

@@ -45,6 +45,8 @@ gpu_server:
   image_url: "http://192.168.21.112:8003"      # 112 로컬(현재 llama-server) — 텍스트 e2e에선 미사용
   vision_url: "http://192.168.21.112:8004"     # 112 로컬 비전(있으면) — 텍스트 e2e에선 미사용
   vision_model: "gemma-4-12b"              # 비전 요청 body의 served-model-name(vLLM --served-model-name과 일치)
+  coder_url: "http://127.0.0.1:18005"      # Devstral 코딩 서브모델(터널 로컬포트, 2026-08-05)
+  coder_model: "devstral-small"           # served-model-name과 일치
   timeout_seconds: 120.0     # 단일 요청 타임아웃 — 장문 생성 여유까지 고려한 값
   max_retries: 10            # with_retry(Tier 4) 최대 재시도 횟수 (콜드/일시장애 흡수)
   retry_base_delay: 0.5      # 지수 백오프 기준 지연(초) — 0.5→1→2…로 증가

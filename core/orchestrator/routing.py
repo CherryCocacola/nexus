@@ -271,6 +271,10 @@ class RoutingDecision:
     # 기본값은 전부 "비활성"(sc_n=1). 3중 게이트(G1~G3)를 모두 통과할 때만
     # RoutingResolver.resolve()가 sc_n=config.n으로 채운다. sc_n<=1이면 Tier2/Tier3가
     # SC 로직을 통째로 우회하므로 기존 동작이 1비트도 바뀌지 않는다(무회귀).
+    # ── 코딩 서브모델 라우팅 (2026-08-05) ────────────────────────────────
+    # True면 QueryEngine이 primary 대신 코딩 전용 프로바이더를 쓴다.
+    # 기본 False라 이 필드를 모르는 기존 경로는 종전과 동일하게 동작한다(무회귀).
+    use_coder: bool = False
     sc_n: int = 1                          # 1 = SC 비활성(하위 호환 기본값)
     sc_min_agreement: int = 2              # 최소 합의 표(N=3의 과반)
     sc_short_answer_max_chars: int = 80    # 이 이하면 exact majority, 초과 시 임베딩 클러스터
@@ -422,9 +426,15 @@ class RoutingResolver:
                 query_class, sc_n, temperature, max_tokens_cap,
             )
 
+        # 코딩 서브모델 판정 — 운영자가 명시적으로 켰을 때만(fail-safe) 평가한다.
+        # 좁은 키워드만 쓰는 이유: 일반 한국어 대화가 오분류되면 한국어가 약한
+        # 코딩 모델로 흘러가 오히려 품질이 떨어진다(실측).
+        use_coder = self._detect_coder_query(user_input)
+
         return RoutingDecision(
             query_class=query_class,
             model_override=model,
+            use_coder=use_coder,
             temperature=temperature,
             max_tokens_cap=max_tokens_cap,
             enable_thinking=profile.enable_thinking,
@@ -444,6 +454,24 @@ class RoutingResolver:
             sc_short_answer_max_chars=sc_short,
             sc_similarity_threshold=sc_sim,
         )
+
+    def _detect_coder_query(self, user_input: str) -> bool:
+        """코딩 전용 모델로 보낼 질의인지 판정한다 (2026-08-05).
+
+        [왜 기본이 꺼져 있나]
+          실측상 코딩 특화 모델이 항상 더 낫지는 않았다. 원샷 UI 생성은 오히려
+          primary(A.X-4.0)가 완결성이 높았고, 코드 정리·리팩터링류에서만 코딩
+          모델이 빨랐다. 그래서 자동 전환은 운영자가 config로 켤 때만 동작한다.
+
+        Returns:
+            코딩 질의로 판단되면 True. `routing.coder_enabled=False`(기본)이면
+            항상 False라 기존 라우팅이 1비트도 바뀌지 않는다.
+        """
+        if not getattr(self._routing, "coder_enabled", False):
+            return False
+        keywords = getattr(self._routing, "coder_keywords", None) or []
+        lowered = (user_input or "").lower()
+        return any(kw.lower() in lowered for kw in keywords)
 
     def _resolve_sc_gate(
         self, user_input: str, query_class: str
