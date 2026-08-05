@@ -3990,3 +3990,10 @@ FABLE5가 nova CLI를 정밀 진단(B-1~B-8)하고 5-Phase 수정계획 작성 �
 - **A2 런타임 권한 모드 전환 완료**: `_apply_mode_change()` 단일 헬퍼가 4지점 원자 갱신(①파이프라인 PermissionContext.mode — frozen이라 model_copy, working_directory/session_id 보존 ②ask_handler_v2 주입/제거 ③tool_ctx.permission_mode ④GlobalState+REPL 표시). **기동 시에도 같은 헬퍼를 태워 기존 미동기 버그 해소**(CLI 인자가 GlobalState에 반영 안 되던 문제). `/mode`(표 표시·직접지정·next 순환) + Shift+Tab(버퍼에 `/mode next` 주입 후 제출 — 전환을 메인 루프 한 경로로 모아 경합 차단). /help 갱신.
 - **검증**: 단위 12건(4지점 갱신·필드보존·자동허용 핸들러제거/재주입·미지모드 거부·컨텍스트 부재 안전·순환) + **실서버 부트스트랩 5/5**(기동 동기화 accept_edits, next→plan, bypass→핸들러제거, default→재주입, 잘못된 모드 거부). 전체 unit **1726 passed**, ruff clean. 작업 중 pipeline.context property 중복 추가를 F811로 발견·제거.
 - **다음(P1 잔여)**: A4(allow-list Bash 프리픽스·realpath/NFC) → B1~B2(diff 미리보기) → C1(도구표시 축약) → D8~D10 / Devstral 라우팅 통합 / 플러그인 적용 확인.
+
+**CLI Stage 1 — A4·B1·B2 완료 (2026-08-05).** A2에 이어 P1 계속 진행.
+- **A4 Bash 세션 allow-list**: "항상 허용"이 도구명 단위라 Bash는 등록 자체가 금지였다(도구 단위로 풀면 이후 모든 명령 통과). **명령 프리픽스 단위**로 좁혀 해결 — `_bash_prefix_if_registrable()`이 첫 토큰을 뽑되 **셸 메타문자(; | & ` $( > < 개행) 있으면 거부**(`git status && rm -rf /` 차단), 경로 섞인 실행(./x, /bin/x) 제외, 판정은 **파이프라인이 쓰는 CommandFilter 재사용**(규칙 두 벌 방지). `_is_bash_autoallowed()`는 등록 여부만 믿지 않고 **매 호출 재검사** — 등록된 프리픽스라도 이번 명령이 위험하면 확인 요구. `/config`에 allow-list 현황(도구/명령) 표시. DANGEROUS·미지 도구는 종전대로 등록 금지.
+- **B1 diff 렌더러**(`cli/formatters.py`): `format_diff()` difflib+Rich Syntax(diff 색상), `format_change_preview()` 도구별 — Write(기존 대비, 없으면 신규)·Edit(치환 실제 적용)·MultiEdit(같은 파일 순차 적용 단일 diff). **상한**: 원본 256KB 초과·바이너리(NULL/UTF-8 실패)는 diff 생략+사유, 출력 200줄 초과는 절단+잔여 줄수.
+- **B2 승인 훅**: `prompt_permission_v2`가 FILE_WRITE 부류에 한해 프롬프트 직전 미리보기 출력. 생성 실패는 None으로 흡수해 **승인 흐름을 막지 않음**.
+- **검증**: 신규 단위 37건(allow-list 24 + diff 13) + 기존 프롬프트 테스트 확장(2건 — diff 표시/Bash 미표시). A4로 계약이 바뀐 기존 테스트 2건은 새 계약으로 갱신(Bash 프리픽스 등록/위험명령 미등록). **전체 unit 1764 passed**, ruff clean.
+- **P1 잔여**: C1(도구표시 축약 ⏺/⎿) → D8~D10(/verbose·자동완성·멀티라인·Ctrl+R·/help) / Devstral 라우팅 통합 / 플러그인 적용 확인.
