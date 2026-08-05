@@ -42,6 +42,7 @@ import logging
 from typing import Any
 
 from prompt_toolkit import PromptSession
+from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
 from rich.box import ROUNDED
@@ -57,6 +58,27 @@ from core.message import StreamEvent, StreamEventType
 # 이렇게 하면 logging.getLogger("nexus")로 상위 레벨을 한 번에 조절할 수 있고,
 # 아래 _apply_log_level()이 바로 그 상위 로거의 레벨을 바꿔 하위에 전파시킨다.
 logger = logging.getLogger("nexus.cli.repl")
+
+
+class SlashCommandCompleter(Completer):
+    """`/`로 시작하는 입력에 슬래시 명령을 제안하는 자동완성기 (D9).
+
+    명령 목록을 인자로 "고정"하지 않고 콜러블로 받는 이유: REPL이 명령을
+    추가·제거해도 완성 목록이 자동으로 따라오게 하기 위함이다(손으로 두 벌
+    관리하면 반드시 어긋난다).
+    """
+
+    def __init__(self, list_commands: Any) -> None:
+        self._list_commands = list_commands
+
+    def get_completions(self, document: Any, complete_event: Any) -> Any:
+        text = document.text_before_cursor
+        # 첫 토큰이 슬래시로 시작할 때만 제안한다(일반 대화 입력을 방해하지 않도록).
+        if not text.startswith("/") or " " in text:
+            return
+        for command in self._list_commands():
+            if command.startswith(text):
+                yield Completion(command, start_position=-len(text))
 
 # ─── 버전 정보 ───
 # 배너와 세션 요약 등에 노출되는 REPL 버전 문자열. 릴리스 시 갱신한다.
@@ -182,9 +204,24 @@ class NexusREPL:
             buf.cursor_position = len(buf.text)
             buf.validate_and_handle()
 
+        # Alt+Enter로 줄바꿈(D9). Enter는 그대로 "전송"이라 기존 사용감을 지키면서,
+        # 코드·다단락을 여러 줄로 입력할 수 있다. 붙여넣기는 prompt_toolkit의
+        # bracketed paste가 기본 처리하므로 여러 줄이 그대로 들어온다.
+        @_kb.add("escape", "enter")
+        def _insert_newline(event: Any) -> None:
+            event.app.current_buffer.insert_text("\n")
+
         self._prompt_session: PromptSession = PromptSession(
             history=InMemoryHistory(),
             key_bindings=_kb,
+            # `/`로 시작하면 슬래시 명령을 제안한다(D9).
+            completer=SlashCommandCompleter(lambda: sorted(self._session_commands)),
+            complete_while_typing=True,
+            # 위/아래 화살표가 "입력한 접두어로 시작하는 과거 입력"을 찾게 한다.
+            # (Ctrl+R 역방향 검색은 prompt_toolkit 기본 emacs 바인딩으로 동작한다.)
+            enable_history_search=True,
+            # 여러 줄 입력을 화면에 그대로 보여 준다(Alt+Enter로 만든 줄 포함).
+            multiline=False,
         )
 
         # 세션 명령어 맵 — "/로 시작하는 입력"을 어떤 핸들러로 보낼지 정의한다.
@@ -198,6 +235,7 @@ class NexusREPL:
             "/config": self._cmd_config,
             "/session": self._cmd_session,
             "/thinking": self._cmd_thinking,
+            "/verbose": self._cmd_verbose,
         }
 
         # ── 부트스트랩 후에 채워지는 상태 변수 ──
@@ -1168,9 +1206,17 @@ class NexusREPL:
             ("/config", "현재 설정을 표시한다"),
             ("/session", "세션 정보를 표시한다"),
             ("/thinking", "thinking 표시를 토글한다"),
+            ("/verbose", "도구 표시를 축약↔전문으로 토글한다"),
         ]
         for cmd, desc in commands:
             table.add_row(cmd, desc)
+        # 키 단축키 안내(D9/D10) — 명령 표만 보면 알 수 없는 조작을 함께 알린다.
+        self.console.print(table)
+        self.console.print(
+            "[dim]단축키: Shift+Tab 권한 모드 순환 · Alt+Enter 줄바꿈 · "
+            "Ctrl+R 히스토리 검색 · `/` 입력 시 명령 자동완성 · Ctrl+C 요청 취소[/dim]"
+        )
+        return
 
         self.console.print(table)
 
@@ -1270,6 +1316,16 @@ class NexusREPL:
         self._formatter.show_thinking = not self._formatter.show_thinking
         status = "켜짐" if self._formatter.show_thinking else "꺼짐"
         self.console.print(f"[green]Thinking 표시: {status}[/green]")
+
+    async def _cmd_verbose(self, args: list[str]) -> None:
+        """/verbose — 도구 호출·결과를 한 줄 축약으로 볼지, 전문으로 볼지 토글한다 (D8).
+
+        평소에는 축약(⏺/⎿)이 대화 흐름을 해치지 않아 좋고, 도구가 정확히 어떤
+        인자로 불렸는지·결과 전문이 필요할 때만 켜면 된다.
+        """
+        self._formatter.verbose = not self._formatter.verbose
+        status = "전문(verbose)" if self._formatter.verbose else "축약"
+        self.console.print(f"[green]도구 표시: {status}[/green]")
 
     # ─── 종료 ───
 

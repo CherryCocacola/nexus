@@ -73,6 +73,9 @@ class OutputFormatter:
         """
         # 내부 보관 필드. 외부에서는 show_thinking 프로퍼티(getter/setter)로 접근한다.
         self._show_thinking = show_thinking
+        # 도구 표시 상세 모드(C1/D8). False면 한 줄로 축약하고, True면 종전처럼
+        # 입력 JSON·결과 전문을 패널로 보여 준다. `/verbose`로 토글한다.
+        self._verbose = False
         # thinking 필터링 상태 — 반드시 인스턴스 필드로 둔다(클래스 변수로 두면
         # 스트림 간 상태가 누출된다). _in_thinking: 사고 구간 통과 중 여부,
         # _thinking_buffer: 사고 구간 동안 누적한 텍스트(요약용).
@@ -165,20 +168,36 @@ class OutputFormatter:
 
     # ─── 도구 사용 ───
 
-    def format_tool_use(self, tool_name: str, input_data: dict[str, Any]) -> Panel:
-        """
-        도구 호출 정보(도구 이름 + 입력 인자)를 Rich Panel로 만들어 반환한다.
+    @property
+    def verbose(self) -> bool:
+        """도구 상세 표시 여부(`/verbose` 토글 대상)."""
+        return self._verbose
 
-        [왜] 모델이 어떤 도구를(tool_name) 어떤 인자로(input_data) 호출했는지
-        사용자가 한눈에 확인할 수 있게 JSON을 예쁘게(하이라이팅) 보여준다.
+    @verbose.setter
+    def verbose(self, value: bool) -> None:
+        self._verbose = bool(value)
+
+    def format_tool_use(self, tool_name: str, input_data: dict[str, Any]) -> Any:
+        """
+        도구 호출을 화면에 표시할 형태로 만든다.
+
+        [기본(축약)] `⏺ Read(config.yaml)` 한 줄. 대화 흐름을 끊지 않는 것이 목적이다.
+        [상세(/verbose)] 종전처럼 입력 인자 JSON을 패널로 보여 준다.
 
         Args:
             tool_name: 호출된 도구의 이름(예: "Read", "Bash").
             input_data: 도구에 전달된 입력 인자 딕셔너리.
 
         Returns:
-            시안(cyan) 테두리에 JSON 하이라이팅이 들어간 Rich Panel.
+            Rich 렌더러블(축약이면 Text, 상세면 Panel).
         """
+        if not self._verbose:
+            summary = summarize_tool_input(tool_name, input_data)
+            line = Text("⏺ ", style="cyan")
+            line.append(tool_name, style="bold cyan")
+            if summary:
+                line.append(f"({summary})", style="cyan")
+            return line
         # json은 이 메서드에서만 필요하므로 지역 import로 둔다.
         import json
 
@@ -200,7 +219,7 @@ class OutputFormatter:
 
     # ─── 도구 결과 ───
 
-    def format_tool_result(self, content: str, is_error: bool = False) -> Panel:
+    def format_tool_result(self, content: str, is_error: bool = False) -> Any:
         """
         도구 실행 결과를 Rich Panel로 만들어 반환한다.
 
@@ -216,12 +235,18 @@ class OutputFormatter:
         """
         if is_error:
             # 에러 결과: 빨간 글씨 + 빨간 테두리로 눈에 띄게 표시한다.
+            # 에러는 축약 모드에서도 전문을 보여 준다 — 원인을 봐야 대응할 수 있다.
             return Panel(
                 Text(content, style="red"),
                 title="[bold red]Error[/bold red]",
                 border_style="red",
                 expand=False,
             )
+
+        # 축약 모드(C1): 결과를 `⎿ 요약` 한 줄로 접는다. 첫 비어있지 않은 줄과
+        # 전체 줄 수만 보여 주고, 전문이 필요하면 `/verbose`로 켠다.
+        if not self._verbose:
+            return Text(f"  ⎿ {summarize_tool_output(content)}", style="dim green")
 
         # 정상 결과: 결과가 길면 잘라서 보여준다(터미널이 도배되는 것을 방지).
         # 화면에 남길 최대 줄 수. 이보다 길면 뒷부분을 잘라내고 생략 안내를 붙인다.
@@ -436,6 +461,93 @@ class OutputFormatter:
 
         # 위에서 걸리지 않은 그 외 이벤트(내부용 등)는 화면에 표시할 필요가 없으므로 None.
         return None
+
+
+# ─────────────────────────────────────────────
+# 도구 표시 축약 (C1, 2026-08-05)
+# ─────────────────────────────────────────────
+# 왜 필요한가:
+#   도구 호출마다 입력 JSON 전체를 패널로 띄우면 대화 흐름이 끊기고, 정작 중요한
+#   모델의 답변이 묻힌다. 평소에는 "무슨 도구를 어디에 썼는지" 한 줄이면 충분하고,
+#   전문이 필요할 때만 `/verbose`로 펼치면 된다.
+
+# 도구별로 "이것만 보면 무슨 일을 하는지 아는" 핵심 인자 키.
+# 목록에 없는 도구는 아래에서 첫 번째 스칼라 값으로 폴백한다.
+_TOOL_KEY_ARG: dict[str, str] = {
+    "read": "file_path",
+    "write": "file_path",
+    "edit": "file_path",
+    "notebookedit": "notebook_path",
+    "notebookread": "notebook_path",
+    "renderpreview": "file_path",
+    "analyzeimage": "image_path",
+    "scaffoldweb": "template",
+    "bash": "command",
+    "grep": "pattern",
+    "glob": "pattern",
+    "ls": "path",
+    "documentexport": "filename",
+    "imagegenerate": "prompt",
+    "knowledgeretrieve": "query",
+}
+
+# 한 줄 요약에 넣을 인자 최대 길이(넘으면 말줄임).
+_SUMMARY_MAX_CHARS = 60
+
+
+def _shorten(value: str, limit: int = _SUMMARY_MAX_CHARS) -> str:
+    """값을 한 줄 요약용으로 줄인다(개행은 공백으로, 길면 말줄임)."""
+    text = " ".join(str(value).split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def summarize_tool_input(tool_name: str, input_data: dict[str, Any]) -> str:
+    """도구 입력에서 한 줄 요약에 쓸 핵심 인자를 뽑는다.
+
+    경로는 파일명만 남겨 짧게 만든다(전체 경로는 `/verbose`에서 볼 수 있다).
+    MultiEdit처럼 인자가 목록이면 개수로 요약한다.
+
+    Returns:
+        요약 문자열. 뽑을 것이 없으면 빈 문자열.
+    """
+    if not isinstance(input_data, dict) or not input_data:
+        return ""
+    name = (tool_name or "").lower()
+
+    # MultiEdit은 편집 목록이라 개수가 가장 유용하다.
+    if name == "multiedit":
+        edits = input_data.get("edits") or []
+        return f"{len(edits)}건" if edits else ""
+
+    key = _TOOL_KEY_ARG.get(name)
+    value = input_data.get(key) if key else None
+    if value is None:
+        # 알 수 없는 도구 — 첫 번째 스칼라 값으로 폴백한다.
+        for v in input_data.values():
+            if isinstance(v, (str, int, float)):
+                value = v
+                break
+    if value is None:
+        return ""
+
+    text = str(value)
+    # 경로처럼 보이면 파일명만 남긴다(터미널 폭 절약).
+    if key in ("file_path", "notebook_path", "image_path", "path") and (
+        "/" in text or "\\" in text
+    ):
+        text = text.replace("\\", "/").rstrip("/").split("/")[-1] or text
+    return _shorten(text)
+
+
+def summarize_tool_output(content: str) -> str:
+    """도구 결과를 한 줄 요약으로 만든다(첫 내용 줄 + 전체 줄 수)."""
+    if not content:
+        return "(빈 결과)"
+    lines = content.splitlines()
+    first = next((line for line in lines if line.strip()), "")
+    total = len(lines)
+    head = _shorten(first)
+    return f"{head}  ({total}줄)" if total > 1 else (head or "(빈 결과)")
 
 
 # ─────────────────────────────────────────────
