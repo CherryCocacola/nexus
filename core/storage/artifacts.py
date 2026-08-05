@@ -71,6 +71,7 @@ CREATE TABLE IF NOT EXISTS tb_artifacts (
     tenant_id   TEXT,
     user_id     TEXT,
     session_id  TEXT,
+    turn        INT,
     mime        TEXT,
     size_bytes  BIGINT,
     sha256      TEXT,
@@ -78,11 +79,21 @@ CREATE TABLE IF NOT EXISTS tb_artifacts (
 );
 """
 
+# 기존(turn 컬럼 도입 전) 테이블을 위한 멱등 마이그레이션 — 이미 만들어진
+# tb_artifacts에도 turn 컬럼을 붙여, 히스토리 복원 시 생성물을 정확한
+# assistant 메시지(턴)에 매칭할 수 있게 한다. IF NOT EXISTS라 재실행 안전.
+_DDL_TB_ARTIFACTS_MIGRATIONS = [
+    "ALTER TABLE tb_artifacts ADD COLUMN IF NOT EXISTS turn INT",
+]
+
 # 보조 인덱스 — created_at은 retention 정리(cleanup_expired_artifacts)의
-# 만료 스캔을 가속한다. IF NOT EXISTS라 여러 번 실행해도 안전(멱등).
+# 만료 스캔을 가속한다. session_id는 히스토리 복원 시 세션별 생성물 조회
+# (list_session_artifacts)를 가속한다. IF NOT EXISTS라 재실행 안전(멱등).
 _DDL_TB_ARTIFACTS_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_artifacts_created_at "
     "ON tb_artifacts (created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_artifacts_session "
+    "ON tb_artifacts (session_id)",
 ]
 
 
@@ -105,6 +116,9 @@ async def ensure_artifacts_schema(pool: Any | None) -> None:
     try:
         async with pool.acquire() as conn:
             await conn.execute(_DDL_TB_ARTIFACTS)
+            # 기존 테이블에도 turn 컬럼을 멱등적으로 보강한 뒤 인덱스를 만든다.
+            for ddl in _DDL_TB_ARTIFACTS_MIGRATIONS:
+                await conn.execute(ddl)
             for ddl in _DDL_TB_ARTIFACTS_INDEXES:
                 await conn.execute(ddl)
         logger.info("tb_artifacts 스키마 확인/생성 완료")
@@ -124,6 +138,7 @@ async def record_artifact(
     size_bytes: int | None,
     sha256: str | None = None,
     user_id: str | None = None,
+    turn: int | None = None,
 ) -> None:
     """생성물 1건의 메타데이터를 tb_artifacts에 기록한다(멱등·fail-soft).
 
@@ -141,6 +156,8 @@ async def record_artifact(
       size_bytes — 파일 크기(바이트). stat 실패 시 None.
       sha256     — 파일 내용 해시(선택 — 큰 파일은 성능상 생략 가능).
       user_id    — 사용자 식별자(로그인 도입 전이라 보통 None).
+      turn       — 생성이 일어난 턴 번호. 히스토리 복원 시 이 생성물을 어느
+                   assistant 메시지에 붙일지 매칭하는 키다(없으면 None).
     """
     if pool is None:
         logger.debug("record_artifact 스킵 (pg_pool 없음): %s", filename)
@@ -150,20 +167,56 @@ async def record_artifact(
             await conn.execute(
                 """
                 INSERT INTO tb_artifacts
-                    (filename, tenant_id, user_id, session_id, mime, size_bytes, sha256)
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    (filename, tenant_id, user_id, session_id, turn,
+                     mime, size_bytes, sha256)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                 ON CONFLICT (filename) DO NOTHING
                 """,
                 filename,
                 tenant_id,
                 user_id,
                 session_id,
+                turn,
                 mime,
                 size_bytes,
                 sha256,
             )
     except Exception as e:  # noqa: BLE001 — fail-soft: 요청/도구를 깨지 않는다
         logger.warning("record_artifact 실패(무시): %s — %s", filename, e)
+
+
+async def list_session_artifacts(pool: Any | None, session_id: str) -> list[dict[str, Any]]:
+    """한 세션이 생성한 모든 생성물의 메타데이터를 생성순으로 반환한다(fail-soft).
+
+    [용도]
+      히스토리 복원 경로(/v1/sessions/{id}/messages)에서 사용한다. 스트리밍
+      중에는 download 프레임으로 이미지·다운로드 버튼을 그리지만, 그 프레임은
+      트랜스크립트에 남지 않는다. 그래서 세션을 다시 열거나 새로고침하면
+      생성물이 사라진다 — 이 함수로 세션의 생성물을 다시 끌어와 각 턴의
+      assistant 메시지에 되붙인다.
+
+    [반환]
+      created_at 오름차순 정렬된 리스트. 각 원소:
+        {"filename": str, "mime": str|None, "turn": int|None}
+      pool이 None이거나 조회가 실패하면 빈 리스트(가용성 우선 — 복원 실패가
+      세션 열람 자체를 막지 않는다).
+    """
+    if pool is None:
+        return []
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT filename, mime, turn FROM tb_artifacts "
+                "WHERE session_id = $1 ORDER BY created_at ASC",
+                session_id,
+            )
+        return [
+            {"filename": r["filename"], "mime": r["mime"], "turn": r["turn"]}
+            for r in rows
+        ]
+    except Exception as e:  # noqa: BLE001 — fail-soft: 복원 실패가 세션 열람을 막지 않는다
+        logger.warning("list_session_artifacts 실패(무시): %s — %s", session_id, e)
+        return []
 
 
 # ─────────────────────────────────────────────

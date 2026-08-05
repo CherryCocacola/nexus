@@ -9,6 +9,9 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <link rel="icon" type="image/png" href="/static/emblem.png">
+<!-- 코드 하이라이트 — 에어갭 로컬 vendor 번들(외부 CDN 금지). 파일 부재 시에도 복사·라벨은 동작. -->
+<link rel="stylesheet" href="/static/vendor/highlight/github.min.css">
+<script src="/static/vendor/highlight/highlight.min.js" defer></script>
 <style>
 /* ─── idino 컬러 팔레트 ─── */
 :root {
@@ -241,13 +244,253 @@ body.resizing { cursor: col-resize; user-select: none; }
   color: #ef4444;
 }
 
+/* 핀·이름변경·내보내기 버튼 — 삭제 버튼과 동일한 hover 노출 방식, 색만 다르게 */
+.session-pin-btn, .session-rename-btn, .session-folder-btn, .session-export-btn {
+  flex-shrink: 0;
+  width: 20px;
+  height: 22px;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  border-radius: 4px;
+  font-size: 12px;
+  line-height: 1;
+  opacity: 0;
+  transition: opacity 0.1s, background 0.1s, color 0.1s;
+}
+.session-item:hover .session-pin-btn,
+.session-item:hover .session-rename-btn,
+.session-item:hover .session-folder-btn,
+.session-item:hover .session-export-btn,
+.session-item.active .session-pin-btn,
+.session-item.active .session-rename-btn,
+.session-item.active .session-folder-btn,
+.session-item.active .session-export-btn {
+  opacity: 0.7;
+}
+.session-pin-btn:hover, .session-rename-btn:hover,
+.session-folder-btn:hover, .session-export-btn:hover {
+  opacity: 1 !important;
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+/* 폴더 그룹 — 접이식 헤더 + 항목 */
+.folder-group { margin-bottom: 2px; }
+.folder-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--text-secondary);
+  border-radius: 6px;
+  user-select: none;
+}
+.folder-header:hover { background: var(--bg-hover); }
+.folder-caret { flex-shrink: 0; font-size: 10px; color: var(--text-muted); }
+.folder-name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: 600; }
+.folder-count { flex-shrink: 0; font-size: 11px; color: var(--text-muted); }
+.folder-items { padding-left: 8px; }
+/* 핀 고정된 세션은 핀 버튼을 항상 살짝 보이게(고정 상태 시각화) */
+.session-item.pinned .session-pin-btn { opacity: 0.55; }
+/* 제목 앞 핀 마크(고정 표시) */
+.session-pin-mark { flex-shrink: 0; font-size: 11px; margin-right: 2px; }
+
+/* 사이드바 검색 */
+.sidebar-search { padding: 8px 12px 4px; }
+.session-search-input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-size: 13px;
+  outline: none;
+  transition: border-color 0.1s;
+}
+.session-search-input:focus { border-color: var(--accent-light, #6b8afd); }
+.session-search-input::placeholder { color: var(--text-muted); }
+
+/* 검색 결과 항목 — 제목 + 스니펫(매치어 강조) */
+.search-result-item { flex-direction: column; align-items: stretch; gap: 3px; }
+.search-result-title {
+  font-size: 13px;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.search-snippet {
+  font-size: 11px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.search-snippet mark {
+  background: rgba(255, 214, 0, 0.35);
+  color: inherit;
+  border-radius: 2px;
+  padding: 0 1px;
+}
+.search-empty { padding: 14px 16px; color: var(--text-muted); font-size: 13px; }
+
 .sidebar-footer {
-  padding: 12px 16px;
+  padding: 10px 16px;
   border-top: 1px solid var(--border);
   font-size: 11px;
   color: var(--text-muted);
-  text-align: center;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
 }
+.settings-btn {
+  border: 1px solid var(--border);
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  border-radius: 6px;
+  padding: 4px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.1s, color 0.1s;
+}
+.settings-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
+.footer-version { flex-shrink: 0; }
+
+/* ─── 설정 모달 ─── */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 50;
+  padding: 16px;
+}
+.modal-overlay[hidden] { display: none; }
+.modal {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  width: min(560px, 100%);
+  max-height: 85vh;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.25);
+}
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border);
+}
+.modal-title { font-size: 15px; font-weight: 600; color: var(--text-primary); }
+.modal-close {
+  border: none; background: transparent; color: var(--text-muted);
+  font-size: 22px; line-height: 1; cursor: pointer; padding: 0 4px;
+}
+.modal-close:hover { color: var(--text-primary); }
+.modal-body { padding: 16px 18px; overflow-y: auto; }
+.modal-desc { font-size: 12px; color: var(--text-secondary); margin-bottom: 10px; line-height: 1.5; }
+.instruction-textarea {
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 160px;
+  resize: vertical;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-input);
+  color: var(--text-primary);
+  font-size: 13px;
+  font-family: inherit;
+  line-height: 1.5;
+  outline: none;
+}
+.instruction-textarea:focus { border-color: var(--accent-light, #1a73e8); }
+.instruction-status { margin-top: 8px; font-size: 12px; min-height: 16px; }
+.instruction-status.ok { color: var(--success, #209445); }
+.instruction-status.err { color: var(--error, #DA017F); }
+.modal-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 18px;
+  border-top: 1px solid var(--border);
+}
+.modal-btn-primary, .modal-btn-secondary {
+  padding: 7px 16px;
+  border-radius: 8px;
+  font-size: 13px;
+  cursor: pointer;
+  border: 1px solid var(--border);
+}
+.modal-btn-secondary { background: var(--bg-secondary); color: var(--text-secondary); }
+.modal-btn-secondary:hover { background: var(--bg-hover); }
+.modal-btn-primary { background: var(--accent, #00479d); color: #fff; border-color: var(--accent, #00479d); }
+.modal-btn-primary:hover { background: var(--accent-hover, #003a80); }
+
+/* 설정 섹션 — 커스텀 인스트럭션 / 프롬프트 템플릿 */
+.settings-section-title { font-size: 13px; font-weight: 600; color: var(--text-primary); margin-bottom: 6px; }
+.settings-hint { font-size: 11px; font-weight: 400; color: var(--text-muted); margin-left: 6px; }
+.settings-divider { height: 1px; background: var(--border); margin: 18px 0 14px; }
+/* 프롬프트 템플릿 편집 목록 */
+.prompt-list { display: flex; flex-direction: column; gap: 8px; margin-bottom: 8px; }
+.prompt-row { display: flex; gap: 6px; align-items: flex-start; }
+.prompt-title-input {
+  flex-shrink: 0; width: 120px; box-sizing: border-box;
+  padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px;
+  background: var(--bg-input); color: var(--text-primary); font-size: 12px; outline: none;
+}
+.prompt-text-input {
+  flex: 1; min-width: 0; box-sizing: border-box; min-height: 38px; resize: vertical;
+  padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px;
+  background: var(--bg-input); color: var(--text-primary); font-size: 12px;
+  font-family: inherit; line-height: 1.4; outline: none;
+}
+.prompt-title-input:focus, .prompt-text-input:focus { border-color: var(--accent-light, #1a73e8); }
+.prompt-del-btn {
+  flex-shrink: 0; width: 26px; height: 30px; border: 1px solid var(--border);
+  background: var(--bg-secondary); color: var(--text-muted); border-radius: 6px;
+  cursor: pointer; font-size: 16px; line-height: 1;
+}
+.prompt-del-btn:hover { background: rgba(220,38,38,0.12); color: #ef4444; }
+.prompt-add-btn {
+  border: 1px dashed var(--border); background: transparent; color: var(--text-secondary);
+  border-radius: 6px; padding: 6px 12px; font-size: 12px; cursor: pointer;
+}
+.prompt-add-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
+
+/* 프롬프트 / 삽입 팝업 — 입력창 위로 뜨는 드롭다운 */
+.input-container { position: relative; }
+.prompt-popup {
+  position: absolute;
+  left: 0; right: 0; bottom: 100%;
+  margin-bottom: 8px;
+  max-height: 240px;
+  overflow-y: auto;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 6px 24px rgba(0,0,0,0.18);
+  z-index: 20;
+}
+.prompt-popup[hidden] { display: none; }
+.prompt-popup-item {
+  display: flex; flex-direction: column; gap: 2px;
+  padding: 8px 12px; cursor: pointer; border-bottom: 1px solid var(--border-light, var(--border));
+}
+.prompt-popup-item:last-child { border-bottom: none; }
+.prompt-popup-item.active, .prompt-popup-item:hover { background: var(--bg-hover); }
+.prompt-popup-title { font-size: 13px; color: var(--text-primary); font-weight: 600; }
+.prompt-popup-preview { font-size: 11px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 /* ─── 메인 영역 ─── */
 .main {
@@ -337,11 +580,17 @@ body.resizing { cursor: col-resize; user-select: none; }
   background: var(--bg-primary);
   border: 1px solid var(--border);
   border-radius: 8px;
-  padding: 12px 16px;
-  overflow-x: auto;
+  overflow: hidden;                 /* 헤더가 둥근 모서리 안에 깔끔히 들어가게 */
   margin: 8px 0;
   font-size: 13px;
   font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+}
+/* 코드 본문 — pre가 아니라 code가 패딩·가로스크롤을 담당(헤더 유무와 무관하게 일관) */
+.message-body pre > code {
+  display: block;
+  padding: 12px 16px;
+  overflow-x: auto;
+  background: none;
 }
 
 .message-body code {
@@ -352,7 +601,74 @@ body.resizing { cursor: col-resize; user-select: none; }
   font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
 }
 
-.message-body pre code { background: none; padding: 0; }
+/* 코드블록 헤더 — 언어 라벨 + 복사 버튼 (enhanceCodeBlocks가 삽입) */
+.code-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 5px 12px;
+  background: var(--bg-hover);
+  border-bottom: 1px solid var(--border);
+  font-size: 11px;
+}
+.code-lang { color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; }
+.code-copy-btn {
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  transition: background 0.1s, color 0.1s;
+}
+.code-copy-btn:hover { background: var(--bg-tertiary); color: var(--text-primary); }
+/* HTML/SVG 미리보기 버튼 — 코드 헤더에 복사 버튼과 나란히 */
+.code-preview-btn {
+  border: none; background: transparent; color: var(--accent-light, #1a73e8);
+  cursor: pointer; font-size: 11px; padding: 2px 8px; border-radius: 4px;
+  margin-right: 4px; transition: background 0.1s, color 0.1s;
+}
+.code-preview-btn:hover { background: var(--bg-tertiary); }
+/* HTML 라이브 프리뷰 iframe — 캔버스를 꽉 채운다(흰 배경으로 렌더 안정) */
+.canvas-iframe {
+  width: 100%;
+  min-height: 70vh;
+  border: none;
+  border-radius: 8px;
+  background: #fff;
+}
+
+/* 재생성 버튼 — 마지막 answer 아래에 붙는다 */
+.regen-btn {
+  margin-top: 8px;
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  border-radius: 6px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.1s, color 0.1s;
+}
+.regen-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
+
+/* 메시지 편집 버튼 — user 말풍선 hover 시 노출 */
+.msg-edit-btn {
+  display: inline-block;
+  margin-top: 6px;
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-muted);
+  border-radius: 6px;
+  font-size: 11px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.1s, background 0.1s, color 0.1s;
+}
+.message:hover .msg-edit-btn { opacity: 0.6; }
+.msg-edit-btn:hover { opacity: 1 !important; background: var(--bg-hover); color: var(--text-primary); }
 
 /* ─── 스트리밍 커서 ─── */
 .streaming-cursor::after {
@@ -967,8 +1283,16 @@ body.resizing { cursor: col-resize; user-select: none; }
       <button class="new-chat-btn" onclick="newSession()">+ 새 대화</button>
       <button class="sidebar-close-btn" onclick="toggleSidebar()">&times;</button>
     </div>
+    <div class="sidebar-search">
+      <input type="text" id="sessionSearch" class="session-search-input"
+             placeholder="대화 검색..." autocomplete="off"
+             oninput="onSessionSearchInput(this.value)">
+    </div>
     <div class="session-list" id="sessionList"></div>
-    <div class="sidebar-footer">IDINO NOVA v0.1.0</div>
+    <div class="sidebar-footer">
+      <button class="settings-btn" onclick="openSettings()" title="설정">⚙ 설정</button>
+      <span class="footer-version">IDINO NOVA v0.1.0</span>
+    </div>
   </div>
 
   <!-- 사이드바↔메인 폭 조절 리사이저 (사이드바 열림 시에만 표시) -->
@@ -990,6 +1314,8 @@ body.resizing { cursor: col-resize; user-select: none; }
       <div class="input-container">
         <!-- 첨부파일 프리뷰 -->
         <div class="attach-preview" id="attachPreview"></div>
+        <!-- 프롬프트 템플릿 / 삽입 팝업 -->
+        <div class="prompt-popup" id="promptPopup" hidden></div>
         <div class="input-box">
           <button class="attach-btn" onclick="document.getElementById('fileInput').click()" title="파일 첨부">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -1001,7 +1327,7 @@ body.resizing { cursor: col-resize; user-select: none; }
                     placeholder="메시지를 입력하세요..."
                     rows="1"
                     onkeydown="handleKeyDown(event)"
-                    oninput="autoResize(this)"></textarea>
+                    oninput="autoResize(this); onInputForPrompt()"></textarea>
           <button class="send-btn" id="sendBtn" onclick="sendMessage()">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <path d="M22 2L11 13M22 2L15 22L11 13L2 9L22 2Z"/>
@@ -1028,6 +1354,38 @@ body.resizing { cursor: col-resize; user-select: none; }
     </div>
     <div class="canvas-body" id="canvasBody"></div>
   </aside>
+</div>
+
+<!-- 설정 모달 — 커스텀 인스트럭션 편집 (P2-2) -->
+<div class="modal-overlay" id="settingsOverlay" hidden>
+  <div class="modal">
+    <div class="modal-header">
+      <span class="modal-title">설정 — 커스텀 인스트럭션</span>
+      <button class="modal-close" onclick="closeSettings()" aria-label="닫기">&times;</button>
+    </div>
+    <div class="modal-body">
+      <div class="settings-section-title">커스텀 인스트럭션</div>
+      <p class="modal-desc">모든 대화의 시스템 프롬프트에 덧붙일 지시문입니다. (예: 답변은 항상 존댓말로, 코드에는 한글 주석을 달아줘)</p>
+      <textarea id="instructionText" class="instruction-textarea"
+                placeholder="예: 답변은 항상 간결하게 핵심부터. 표가 유용하면 표로 정리해줘." maxlength="4000"></textarea>
+
+      <div class="settings-divider"></div>
+      <div class="settings-section-title">프롬프트 템플릿 <span class="settings-hint">입력창에서 / 로 빠르게 삽입</span></div>
+      <div id="promptList" class="prompt-list"></div>
+      <button class="prompt-add-btn" type="button" onclick="addPromptRow()">+ 템플릿 추가</button>
+
+      <div class="settings-divider"></div>
+      <div class="settings-section-title">프로젝트 <span class="settings-hint">대화를 이 이름의 폴더(📁)에 넣으면 그 프로젝트의 지시문·지식소스가 적용됩니다</span></div>
+      <div id="projectList" class="prompt-list"></div>
+      <button class="prompt-add-btn" type="button" onclick="addProjectRow()">+ 프로젝트 추가</button>
+
+      <div class="instruction-status" id="instructionStatus"></div>
+    </div>
+    <div class="modal-footer">
+      <button class="modal-btn-secondary" onclick="closeSettings()">취소</button>
+      <button class="modal-btn-primary" onclick="saveSettings()">저장</button>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -1106,10 +1464,19 @@ window.addEventListener('DOMContentLoaded', () => {
   if (canvasClose) canvasClose.addEventListener('click', closeCanvas);
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
+      const overlay = document.getElementById('settingsOverlay');
+      if (overlay && !overlay.hidden) { closeSettings(); return; }
       const panel = document.getElementById('canvasPanel');
       if (panel && panel.classList.contains('open')) closeCanvas();
     }
   });
+  // 설정 모달 — 오버레이 바깥 클릭 시 닫기
+  const _settingsOverlay = document.getElementById('settingsOverlay');
+  if (_settingsOverlay) {
+    _settingsOverlay.addEventListener('click', (e) => {
+      if (e.target === _settingsOverlay) closeSettings();
+    });
+  }
   // 초기 welcome 문구를 시간대별 인사말로 설정(정적 HTML 블록이 남아 있는 경우).
   const wg = document.getElementById('welcomeGreeting');
   if (wg) wg.textContent = greetingByHour();
@@ -1134,6 +1501,45 @@ function setupSessionListDelegation() {
       if (sid) deleteSession(sid, ev);
       return;
     }
+    // 핀 고정 토글 버튼
+    const pinBtn = target.closest && target.closest('.session-pin-btn');
+    if (pinBtn) {
+      const sid = pinBtn.getAttribute('data-sid');
+      ev.stopPropagation();
+      if (sid) togglePin(sid);
+      return;
+    }
+    // 이름 변경 버튼
+    const renameBtn = target.closest && target.closest('.session-rename-btn');
+    if (renameBtn) {
+      const sid = renameBtn.getAttribute('data-sid');
+      ev.stopPropagation();
+      if (sid) renameSession(sid);
+      return;
+    }
+    // 내보내기 버튼
+    const exportBtn = target.closest && target.closest('.session-export-btn');
+    if (exportBtn) {
+      const sid = exportBtn.getAttribute('data-sid');
+      ev.stopPropagation();
+      if (sid) exportSession(sid, 'md');
+      return;
+    }
+    // 폴더로 이동 버튼
+    const folderBtn = target.closest && target.closest('.session-folder-btn');
+    if (folderBtn) {
+      const sid = folderBtn.getAttribute('data-sid');
+      ev.stopPropagation();
+      if (sid) setFolder(sid);
+      return;
+    }
+    // 폴더 헤더 클릭 → 접기/펴기
+    const folderHeader = target.closest && target.closest('.folder-header');
+    if (folderHeader) {
+      const fname = folderHeader.getAttribute('data-folder');
+      if (fname) { _toggleFolderCollapsed(fname); renderSessionList(); }
+      return;
+    }
     const item = target.closest && target.closest('.session-item');
     if (item) {
       const sid = item.getAttribute('data-sid');
@@ -1141,6 +1547,427 @@ function setupSessionListDelegation() {
       if (sid) switchSession(sid);
     }
   });
+}
+
+// 세션 메타(제목·핀)를 서버에 PATCH하고 로컬 상태·사이드바를 갱신하는 공용 헬퍼.
+// 서버가 meta.json에 영속화하므로 새로고침·재접속 후에도 유지된다.
+async function patchSessionMeta(id, patch) {
+  try {
+    const resp = await fetch(`/v1/sessions/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch),
+    });
+    if (!resp.ok) { console.warn('[session] meta PATCH 실패', resp.status); return null; }
+    return await resp.json();
+  } catch (err) {
+    console.warn('[session] meta PATCH 오류', err);
+    return null;
+  }
+}
+
+// 대화 이름 변경 — prompt로 새 제목을 받아 서버에 저장하고 목록을 다시 그린다.
+async function renameSession(id) {
+  const session = sessions.find(s => s.id === id);
+  const cur = (session && (session.customTitle || session.title)) || '';
+  const next = window.prompt('새 대화 제목을 입력하세요 (비우면 자동 제목):', cur);
+  if (next === null) return;                     // 취소
+  const title = next.trim().slice(0, 200);
+  const res = await patchSessionMeta(id, { title });
+  if (res && session) {
+    session.customTitle = res.title || null;      // 서버 확정값 반영
+    session.title = deriveSessionTitle(session);
+    renderSessionList();
+  }
+}
+
+// 핀 고정 토글 — 현재 상태를 뒤집어 서버에 저장하고 목록을 다시 그린다(핀은 맨 위로).
+async function togglePin(id) {
+  const session = sessions.find(s => s.id === id);
+  if (!session) return;
+  const res = await patchSessionMeta(id, { pinned: !session.pinned });
+  if (res) {
+    session.pinned = !!res.pinned;
+    renderSessionList();
+  }
+}
+
+// 대화를 폴더로 이동 — prompt로 폴더명을 받아 서버(meta.json)에 저장하고 목록을 다시 그린다.
+// 빈 값이면 '미분류'로 되돌린다.
+async function setFolder(id) {
+  const session = sessions.find(s => s.id === id);
+  const cur = (session && session.folder) || '';
+  const next = window.prompt('폴더명을 입력하세요 (비우면 미분류로):', cur);
+  if (next === null) return;                     // 취소
+  const folder = next.trim().slice(0, 60);
+  const res = await patchSessionMeta(id, { folder });
+  if (res && session) {
+    session.folder = res.folder || '';
+    renderSessionList();
+  }
+}
+
+// 대화 내보내기 — 서버가 md/txt로 조립해 준 텍스트를 파일로 저장한다.
+// 인증은 전역 window.fetch 오버라이드가 자동으로 붙인다(상대경로 /v1/...).
+async function exportSession(id, fmt) {
+  fmt = fmt || 'md';
+  try {
+    const res = await fetch(`/v1/sessions/${encodeURIComponent(id)}/export?fmt=${fmt}`);
+    if (!res.ok) { alert('내보내기 실패 (HTTP ' + res.status + ')'); return; }
+    const blob = await res.blob();
+    // 파일명은 서버가 준 Content-Disposition(UTF-8)에서 뽑고, 없으면 기본값.
+    let filename = `conversation.${fmt}`;
+    const cd = res.headers.get('Content-Disposition') || '';
+    const m = cd.match(/filename\*=UTF-8''([^;]+)/i);
+    if (m) { try { filename = decodeURIComponent(m[1]); } catch (e) { void e; } }
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (err) {
+    alert('내보내기 오류: ' + (err && err.message));
+  }
+}
+
+// ─── 설정: 커스텀 인스트럭션(P2-2) + 프롬프트 템플릿(P2-6) ───
+let _promptTemplates = [];   // [{title, text}] — / 삽입 팝업이 참조하는 캐시
+
+async function openSettings() {
+  const overlay = document.getElementById('settingsOverlay');
+  const ta = document.getElementById('instructionText');
+  const status = document.getElementById('instructionStatus');
+  const plist = document.getElementById('promptList');
+  const projlist = document.getElementById('projectList');
+  if (status) { status.textContent = ''; status.className = 'instruction-status'; }
+  if (ta) ta.value = '';
+  if (plist) plist.innerHTML = '';
+  if (projlist) projlist.innerHTML = '';
+  if (overlay) overlay.hidden = false;
+  // 커스텀 인스트럭션 로드
+  try {
+    const resp = await fetch('/v1/instructions');
+    if (resp.ok) { const d = await resp.json(); if (ta) ta.value = d.text || ''; }
+  } catch (e) { void e; }
+  // 프롬프트 템플릿 로드 → 편집 행 렌더
+  try {
+    const resp = await fetch('/v1/prompts');
+    if (resp.ok) { const d = await resp.json(); (d.prompts || []).forEach(p => addPromptRow(p.title, p.text)); }
+  } catch (e) { void e; }
+  // 프로젝트 로드 → 편집 행 렌더 (+ 소스 힌트)
+  try {
+    const resp = await fetch('/v1/projects');
+    if (resp.ok) {
+      const d = await resp.json();
+      _availableSources = d.available_sources || [];
+      (d.projects || []).forEach(p => addProjectRow(p.name, p.instruction, p.sources));
+    }
+  } catch (e) { void e; }
+  if (ta) ta.focus();
+}
+function closeSettings() {
+  const overlay = document.getElementById('settingsOverlay');
+  if (overlay) overlay.hidden = true;
+}
+
+// 프롬프트 템플릿 편집 행 추가(제목 input + 본문 textarea + 삭제 버튼).
+function addPromptRow(title, text) {
+  const plist = document.getElementById('promptList');
+  if (!plist) return;
+  const row = document.createElement('div');
+  row.className = 'prompt-row';
+  const t = document.createElement('input');
+  t.className = 'prompt-title-input'; t.type = 'text'; t.placeholder = '제목 (예: 코드리뷰)';
+  t.maxLength = 60; t.value = title || '';
+  const body = document.createElement('textarea');
+  body.className = 'prompt-text-input'; body.placeholder = '삽입될 프롬프트 내용';
+  body.maxLength = 2000; body.value = text || '';
+  const del = document.createElement('button');
+  del.className = 'prompt-del-btn'; del.type = 'button'; del.textContent = '×'; del.title = '삭제';
+  del.addEventListener('click', () => row.remove());
+  row.appendChild(t); row.appendChild(body); row.appendChild(del);
+  plist.appendChild(row);
+}
+
+// 편집 행들을 [{title, text}]로 수집(본문 빈 것은 제외).
+function collectPrompts() {
+  const out = [];
+  document.querySelectorAll('#promptList .prompt-row').forEach(r => {
+    const title = r.querySelector('.prompt-title-input').value.trim();
+    const text = r.querySelector('.prompt-text-input').value;
+    if (text.trim()) out.push({ title, text });
+  });
+  return out;
+}
+
+// 프로젝트(P3-3) — 이름(=폴더명) + 전용 지시문 + 지식소스 서브셋.
+let _availableSources = [];   // 테넌트 허용 소스(소스 입력 힌트용)
+function addProjectRow(name, instruction, sources) {
+  const plist = document.getElementById('projectList');
+  if (!plist) return;
+  const row = document.createElement('div');
+  row.className = 'prompt-row project-row';
+  const nameI = document.createElement('input');
+  nameI.className = 'prompt-title-input'; nameI.type = 'text';
+  nameI.placeholder = '프로젝트명 (= 폴더명)'; nameI.maxLength = 60; nameI.value = name || '';
+  const mid = document.createElement('div');
+  mid.style.cssText = 'flex:1;min-width:0;display:flex;flex-direction:column;gap:4px;';
+  const instr = document.createElement('textarea');
+  instr.className = 'prompt-text-input'; instr.placeholder = '이 프로젝트 전용 지시문(선택)';
+  instr.maxLength = 4000; instr.value = instruction || '';
+  const src = document.createElement('input');
+  src.className = 'prompt-title-input project-src-input'; src.type = 'text';
+  src.style.width = '100%'; src.style.flexShrink = '1';
+  src.placeholder = '지식소스(쉼표구분, 비우면 전체)' + (_availableSources.length ? ' 예: ' + _availableSources.join(', ') : '');
+  src.value = (sources || []).join(', ');
+  mid.appendChild(instr); mid.appendChild(src);
+  const del = document.createElement('button');
+  del.className = 'prompt-del-btn'; del.type = 'button'; del.textContent = '×'; del.title = '삭제';
+  del.addEventListener('click', () => row.remove());
+  row.appendChild(nameI); row.appendChild(mid); row.appendChild(del);
+  plist.appendChild(row);
+}
+function collectProjects() {
+  const out = [];
+  document.querySelectorAll('#projectList .project-row').forEach(r => {
+    const name = r.querySelector('.prompt-title-input').value.trim();
+    const instruction = r.querySelector('.prompt-text-input').value;
+    const srcRaw = (r.querySelector('.project-src-input') || {}).value || '';
+    const sources = srcRaw.split(',').map(s => s.trim()).filter(Boolean);
+    if (name) out.push({ name, instruction, sources });
+  });
+  return out;
+}
+
+// 설정 저장 — 커스텀 인스트럭션 + 프롬프트 템플릿을 함께 저장한다.
+async function saveSettings() {
+  const ta = document.getElementById('instructionText');
+  const status = document.getElementById('instructionStatus');
+  const instruction = ta ? ta.value : '';
+  const prompts = collectPrompts();
+  const projects = collectProjects();
+  try {
+    const [r1, r2, r3] = await Promise.all([
+      fetch('/v1/instructions', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text: instruction }) }),
+      fetch('/v1/prompts', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ prompts }) }),
+      fetch('/v1/projects', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ projects }) }),
+    ]);
+    if (r1.ok && r2.ok && r3.ok) {
+      _promptTemplates = prompts;   // / 팝업 캐시 갱신
+      if (status) { status.textContent = '저장되었습니다.'; status.className = 'instruction-status ok'; }
+      setTimeout(closeSettings, 800);
+    } else if (status) {
+      status.textContent = '일부 저장 실패 (지시=' + r1.status + ', 템플릿=' + r2.status + ')';
+      status.className = 'instruction-status err';
+    }
+  } catch (err) {
+    if (status) { status.textContent = '저장 오류: ' + (err && err.message); status.className = 'instruction-status err'; }
+  }
+}
+
+// ─── 프롬프트 템플릿 / 삽입 팝업 (P2-6) ───
+// 입력창이 '/'로 시작하면 템플릿 목록을 띄우고, 선택 시 본문을 입력창에 삽입한다.
+let _promptPopupIndex = -1;
+async function _ensurePromptTemplates() {
+  if (_promptTemplates.length) return;
+  try {
+    const resp = await fetch('/v1/prompts');
+    if (resp.ok) { const d = await resp.json(); _promptTemplates = d.prompts || []; }
+  } catch (e) { void e; }
+}
+function hidePromptPopup() {
+  const pop = document.getElementById('promptPopup');
+  if (pop) { pop.hidden = true; pop.innerHTML = ''; pop._matches = null; }
+  _promptPopupIndex = -1;
+}
+async function onInputForPrompt() {
+  const input = document.getElementById('userInput');
+  const pop = document.getElementById('promptPopup');
+  if (!input || !pop) return;
+  const val = input.value;
+  if (!val.startsWith('/')) { hidePromptPopup(); return; }
+  await _ensurePromptTemplates();
+  const q = val.slice(1).toLowerCase();
+  const matches = _promptTemplates.filter(p =>
+    (p.title || '').toLowerCase().includes(q) || (p.text || '').toLowerCase().includes(q));
+  if (!matches.length) { hidePromptPopup(); return; }
+  _promptPopupIndex = 0;
+  pop.innerHTML = matches.map((p, i) =>
+    `<div class="prompt-popup-item${i === 0 ? ' active' : ''}" data-idx="${i}">
+       <span class="prompt-popup-title">${escapeHtml(p.title || '(제목 없음)')}</span>
+       <span class="prompt-popup-preview">${escapeHtml((p.text || '').slice(0, 50))}</span>
+     </div>`).join('');
+  pop._matches = matches;
+  pop.hidden = false;
+  pop.querySelectorAll('.prompt-popup-item').forEach(el => {
+    el.addEventListener('click', () => insertPromptTemplate(parseInt(el.getAttribute('data-idx'), 10)));
+  });
+}
+function insertPromptTemplate(idx) {
+  const pop = document.getElementById('promptPopup');
+  const input = document.getElementById('userInput');
+  if (!pop || !input || !pop._matches || !pop._matches[idx]) return;
+  input.value = pop._matches[idx].text;
+  hidePromptPopup();
+  input.focus();
+  autoResize(input);
+}
+// 팝업 열려 있을 때 ↑↓/Enter/Esc 처리. handleKeyDown에서 먼저 호출(true면 소비).
+function promptPopupKeydown(e) {
+  const pop = document.getElementById('promptPopup');
+  if (!pop || pop.hidden || !pop._matches) return false;
+  const items = pop.querySelectorAll('.prompt-popup-item');
+  if (e.key === 'ArrowDown') { _promptPopupIndex = Math.min(_promptPopupIndex + 1, items.length - 1); items.forEach((el, i) => el.classList.toggle('active', i === _promptPopupIndex)); e.preventDefault(); return true; }
+  if (e.key === 'ArrowUp') { _promptPopupIndex = Math.max(_promptPopupIndex - 1, 0); items.forEach((el, i) => el.classList.toggle('active', i === _promptPopupIndex)); e.preventDefault(); return true; }
+  if (e.key === 'Enter') { insertPromptTemplate(_promptPopupIndex); e.preventDefault(); return true; }
+  if (e.key === 'Escape') { hidePromptPopup(); e.preventDefault(); return true; }
+  return false;
+}
+
+// ─── 메시지 편집·분기(fork) (P3-1) ───
+// user 메시지를 편집하면 그 지점에서 fork(새 세션)해 편집본으로 이어간다. 원본은 보존.
+async function editMessage(msgDiv) {
+  if (isStreaming) return;
+  const session = sessions.find(s => s.id === currentSessionId);
+  if (!session || !msgDiv) return;
+  const idxAttr = msgDiv.getAttribute('data-msg-index');
+  const idx = idxAttr === null ? -1 : parseInt(idxAttr, 10);
+  if (isNaN(idx) || idx < 0 || idx >= session.messages.length) return;
+  const cur = session.messages[idx].content || '';
+  const next = window.prompt('메시지를 편집하면 이 지점에서 새 분기(대화)가 만들어집니다:', cur);
+  if (next === null) return;
+  const edited = next.trim();
+  if (!edited) return;
+  // 서버 fork — idx 앞부분(0..idx)까지 복사한 새 세션 생성.
+  let forkData;
+  try {
+    const resp = await fetch(`/v1/sessions/${encodeURIComponent(currentSessionId)}/fork`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ at_index: idx }),
+    });
+    if (!resp.ok) { alert('분기 생성 실패 (HTTP ' + resp.status + ')'); return; }
+    forkData = await resp.json();
+  } catch (err) { alert('분기 오류: ' + (err && err.message)); return; }
+  // 새 세션을 로컬 목록에 추가.
+  const newId = forkData.new_session_id;
+  const prefix = (forkData.messages || []).map(m => ({ role: m.role, content: m.content }));
+  const newSession = {
+    id: newId, messages: prefix, source: 'server', last_modified: Date.now(),
+    folder: forkData.folder || '', customTitle: forkData.title || null,
+  };
+  newSession.title = deriveSessionTitle(newSession);
+  sessions.unshift(newSession);
+  // 새 세션으로 전환(접두부 렌더) 후 편집본을 전송해 분기를 이어간다.
+  await switchSession(newId);
+  const input = document.getElementById('userInput');
+  input.value = edited;
+  sendMessage();
+}
+
+// ─── 재생성(regenerate) ───
+// 마지막 assistant 응답을 버리고 마지막 user 메시지로 새 응답을 생성한다.
+// (Fable5: 현 모델 품질 편차 때문에 나쁜 응답을 즉시 다시 뽑는 탈출구로 가치가 큼)
+async function regenerateLast() {
+  if (isStreaming) return;
+  const session = sessions.find(s => s.id === currentSessionId);
+  if (!session || !session.messages || !session.messages.length) return;
+  // 로컬 캐시에서 마지막 user 메시지 텍스트 확보(서버 실패 시 폴백).
+  let lastUserText = null;
+  for (let i = session.messages.length - 1; i >= 0; i--) {
+    if (session.messages[i].role === 'user') { lastUserText = session.messages[i].content; break; }
+  }
+  if (!lastUserText) return;
+  // 서버 절단 — 마지막 (user, assistant) 교환을 히스토리+Redis에서 제거하고 user 텍스트 회수.
+  try {
+    const resp = await fetch(`/v1/sessions/${encodeURIComponent(currentSessionId)}/truncate`, { method: 'POST' });
+    if (resp.ok) { const d = await resp.json(); if (d.last_user) lastUserText = d.last_user; }
+  } catch (e) { void e; }
+  // 로컬 캐시에서도 마지막 assistant + 직전 user를 제거(서버와 동일 절단).
+  let lastAsst = -1;
+  for (let i = session.messages.length - 1; i >= 0; i--) { if (session.messages[i].role === 'assistant') { lastAsst = i; break; } }
+  if (lastAsst >= 0) {
+    let lu = -1;
+    for (let i = lastAsst - 1; i >= 0; i--) { if (session.messages[i].role === 'user') { lu = i; break; } }
+    session.messages.splice(lu >= 0 ? lu : lastAsst);
+  }
+  // 화면을 캐시 기준으로 다시 그려 옛 말풍선을 지운 뒤, user 텍스트를 재전송한다.
+  clearMessages();
+  session.messages.forEach(m => {
+    const el = appendMessage(m.role, m.content, false);
+    if (m.downloads && m.downloads.length) { renderImagePreviews(el, m.downloads); renderDownloadButtons(el, m.downloads); }
+  });
+  const input = document.getElementById('userInput');
+  input.value = lastUserText;
+  sendMessage();
+}
+
+// 마지막 assistant 말풍선에 "재생성" 버튼을 (재)배치한다. 스트리밍 중엔 숨긴다.
+function updateRegenerateButton() {
+  document.querySelectorAll('.regen-btn').forEach(b => b.remove());
+  if (isStreaming) return;
+  const inner = document.getElementById('messagesInner');
+  if (!inner) return;
+  const assts = inner.querySelectorAll('.message.msg-assistant');
+  if (!assts.length) return;
+  const body = assts[assts.length - 1].querySelector('.message-body') || assts[assts.length - 1];
+  const btn = document.createElement('button');
+  btn.className = 'regen-btn';
+  btn.type = 'button';
+  btn.textContent = '↻ 재생성';
+  btn.addEventListener('click', regenerateLast);
+  body.appendChild(btn);
+}
+
+// ─── 대화 검색 ───
+// 입력 300ms 디바운스 후 서버 검색. 2자 미만이면 일반 세션 목록으로 복귀한다.
+let _searchTimer = null;
+function onSessionSearchInput(q) {
+  clearTimeout(_searchTimer);
+  const query = (q || '').trim();
+  if (query.length < 2) { renderSessionList(); return; }
+  _searchTimer = setTimeout(() => searchSessions(query), 300);
+}
+
+async function searchSessions(query) {
+  try {
+    const resp = await fetch(`/v1/sessions/search?q=${encodeURIComponent(query)}`);
+    if (!resp.ok) return;
+    const data = await resp.json();
+    renderSearchResults(data.results || [], query);
+  } catch (err) {
+    console.warn('[search] 오류', err);
+  }
+}
+
+function renderSearchResults(results, query) {
+  const list = document.getElementById('sessionList');
+  if (!results.length) {
+    list.innerHTML = '<div class="search-empty">검색 결과 없음</div>';
+    return;
+  }
+  // 매치어만 <mark>로 강조 — 반드시 escapeHtml 이후에 적용한다(XSS 방지).
+  const highlight = (text) => {
+    const esc = escapeHtml(text || '');
+    try {
+      const q = escapeHtml(query).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      return esc.replace(new RegExp('(' + q + ')', 'gi'), '<mark>$1</mark>');
+    } catch (e) { void e; return esc; }
+  };
+  list.innerHTML = results.map(r => {
+    const local = sessions.find(s => s.id === r.session_id);
+    const title = escapeHtml((local && local.title) || r.session_id);
+    const sid = escapeHtml(r.session_id);
+    const snips = (r.snippets || []).slice(0, 2)
+      .map(sn => `<div class="search-snippet">${highlight(sn.text)}</div>`).join('');
+    return `<div class="session-item search-result-item" data-sid="${sid}">
+      <div class="search-result-title">${title}</div>
+      ${snips}
+    </div>`;
+  }).join('');
 }
 
 // HTML 특수문자 이스케이프 (서버에서 받은 session_id/메시지를 innerHTML에 넣을 때 사용)
@@ -1153,6 +1980,11 @@ function escapeHtml(s) {
 
 // 세션 제목 후보 — 첫 user 메시지 30자 → 없으면 session_id 뒷부분
 function deriveSessionTitle(session) {
+  // 사용자가 직접 지정한 제목(customTitle)이 있으면 최우선 사용.
+  if (session.customTitle) {
+    const t = String(session.customTitle).trim().replace(/\s+/g, ' ');
+    return t.length > 30 ? t.slice(0, 30) + '…' : t;
+  }
   // 서버에서 title_hint를 받아온 경우 최우선 사용 (파일 한 번 더 읽지 않음)
   if (session.titleHint) {
     const t = String(session.titleHint).trim().replace(/\s+/g, ' ');
@@ -1173,7 +2005,8 @@ function deriveSessionTitle(session) {
 // ─── 세션 관리 ───
 function newSession() {
   const id = 'session-' + Date.now();
-  const session = { id, title: '새 대화', messages: [], source: 'local' };
+  // last_modified: 최근 활동 시각(정렬 키). 생성 시각으로 초기화하고, 이후 전송할 때 갱신한다.
+  const session = { id, title: '새 대화', messages: [], source: 'local', last_modified: Date.now(), folder: '' };
   sessions.unshift(session);
   currentSessionId = id;
   renderSessionList();
@@ -1186,6 +2019,9 @@ function newSession() {
 async function switchSession(id) {
   console.log('[session] switchSession called id=', id);
   currentSessionId = id;
+  // 검색 결과에서 세션을 열었으면 검색창을 비운다 — renderSessionList가 일반 목록으로 되돌린다.
+  const _sb = document.getElementById('sessionSearch');
+  if (_sb) _sb.value = '';
   renderSessionList();
   let session = sessions.find(s => s.id === id);
   clearMessages();
@@ -1209,6 +2045,8 @@ async function switchSession(id) {
         const data = await resp.json();
         const msgs = (data.messages || []).map(m => ({
           role: m.role, content: m.content,
+          // 서버가 되붙인 생성물(이미지·문서) 링크 — 있으면 렌더 시 썸네일/버튼으로 복원.
+          downloads: m.downloads || null,
         }));
         session.messages = msgs;
         session.title = deriveSessionTitle(session);
@@ -1229,7 +2067,15 @@ async function switchSession(id) {
     }
   }
 
-  session.messages.forEach(m => appendMessage(m.role, m.content, false));
+  session.messages.forEach((m, i) => {
+    const el = appendMessage(m.role, m.content, false, i);
+    // 생성물(이미지·문서)이 있으면 라이브 때와 동일하게 인라인 썸네일 + 다운로드 버튼을 붙인다.
+    if (m.downloads && m.downloads.length) {
+      renderImagePreviews(el, m.downloads);
+      renderDownloadButtons(el, m.downloads);
+    }
+  });
+  updateRegenerateButton();   // 복원된 마지막 answer에 재생성 버튼 배치
 }
 
 // 페이지 시작 시 서버 세션 목록을 사이드바에 머지한다.
@@ -1248,6 +2094,9 @@ async function loadServerSessions() {
       const item = {
         id: sid,
         titleHint: it.title_hint || null,   // 서버가 계산해준 첫 user 메시지 요약
+        customTitle: it.title || null,       // 사용자가 지정한 제목(meta.json) — 있으면 우선
+        pinned: !!it.pinned,                 // 핀 고정 여부(meta.json)
+        folder: it.folder || '',             // 소속 폴더(meta.json, ''=미분류)
         messages: [],                        // 클릭 시점에 lazy-load
         source: 'server',
         last_modified: it.last_modified || null,
@@ -1307,21 +2156,82 @@ async function deleteSession(id, event) {
   }
 }
 
+// 세션 정렬 키 — "최근 활동 시각"을 숫자(epoch ms)로 돌려준다. 로컬 세션은
+// last_modified가 epoch(Number), 서버 세션은 ISO 문자열이라 둘 다 처리한다.
+// 값이 없으면 0을 돌려 맨 아래로 보낸다(정보 없는 세션).
+function sessionSortKey(s) {
+  const t = s.last_modified;
+  if (typeof t === 'number') return t;
+  if (typeof t === 'string') { const n = Date.parse(t); return isNaN(n) ? 0 : n; }
+  return 0;
+}
+
+// 세션 항목 하나의 HTML(폴더 그룹·미분류 공용). 위임 클릭은 data-sid로 처리.
+function sessionItemHtml(s) {
+  const cls = (s.id === currentSessionId ? 'active' : '') + (s.pinned ? ' pinned' : '');
+  const title = escapeHtml(s.title || s.id);
+  const sid = escapeHtml(s.id);
+  const pinTitle = s.pinned ? '핀 해제' : '핀 고정';
+  const pinIcon = s.pinned ? '📌' : '📍';
+  return (
+    `<div class="session-item ${cls}" data-sid="${sid}">
+      ${s.pinned ? '<span class="session-pin-mark" aria-hidden="true">📌</span>' : ''}
+      <span class="session-title">${title}</span>
+      <button class="session-pin-btn" title="${pinTitle}" data-sid="${sid}">${pinIcon}</button>
+      <button class="session-rename-btn" title="이름 변경" data-sid="${sid}">✎</button>
+      <button class="session-folder-btn" title="폴더로 이동" data-sid="${sid}">📁</button>
+      <button class="session-export-btn" title="내보내기 (Markdown)" data-sid="${sid}">⬇</button>
+      <button class="session-delete-btn" title="대화 삭제" data-sid="${sid}">×</button>
+     </div>`
+  );
+}
+
+// 폴더 접힘 상태(localStorage) — 폴더명별로 접힘 여부를 기억한다.
+function _folderCollapsed(name) {
+  try { return JSON.parse(localStorage.getItem('nova.folderCollapsed') || '{}')[name] === true; }
+  catch (e) { void e; return false; }
+}
+function _toggleFolderCollapsed(name) {
+  let m = {};
+  try { m = JSON.parse(localStorage.getItem('nova.folderCollapsed') || '{}'); } catch (e) { void e; }
+  m[name] = !m[name];
+  try { localStorage.setItem('nova.folderCollapsed', JSON.stringify(m)); } catch (e) { void e; }
+}
+
 function renderSessionList() {
   const list = document.getElementById('sessionList');
-  // 인라인 onclick 제거 — 컨테이너 위임(setupSessionListDelegation)이 클릭을 잡아간다.
-  // 데이터는 data-sid 속성으로 안전하게 전달 (escape는 escapeHtml 한 번만).
-  list.innerHTML = sessions.map(s => {
-    const cls = s.id === currentSessionId ? 'active' : '';
-    const title = escapeHtml(s.title || s.id);
-    const sid = escapeHtml(s.id);
-    return (
-      `<div class="session-item ${cls}" data-sid="${sid}">
-        <span class="session-title">${title}</span>
-        <button class="session-delete-btn" title="대화 삭제" data-sid="${sid}">×</button>
-       </div>`
-    );
-  }).join('');
+  // 핀 우선 + 최근 활동순 정렬 헬퍼(원본 미변경).
+  const bySort = (arr) => [...arr].sort((a, b) => {
+    const pa = a.pinned ? 1 : 0, pb = b.pinned ? 1 : 0;
+    if (pa !== pb) return pb - pa;
+    return sessionSortKey(b) - sessionSortKey(a);
+  });
+  // 폴더별 분류 + 미분류.
+  const folders = {};
+  const ungrouped = [];
+  for (const s of sessions) {
+    const f = (s.folder || '').trim();
+    if (f) { (folders[f] = folders[f] || []).push(s); }
+    else ungrouped.push(s);
+  }
+  const folderNames = Object.keys(folders).sort((a, b) => a.localeCompare(b));
+  let html = '';
+  // 폴더 섹션(상단, 접이식).
+  for (const fname of folderNames) {
+    const collapsed = _folderCollapsed(fname);
+    const items = bySort(folders[fname]);
+    html += `<div class="folder-group">
+      <div class="folder-header" data-folder="${escapeHtml(fname)}">
+        <span class="folder-caret">${collapsed ? '▸' : '▾'}</span>
+        <span class="folder-name">📁 ${escapeHtml(fname)}</span>
+        <span class="folder-count">${items.length}</span>
+      </div>
+      <div class="folder-items"${collapsed ? ' hidden' : ''}>${items.map(sessionItemHtml).join('')}</div>
+    </div>`;
+  }
+  // 미분류 섹션(폴더 아래).
+  html += bySort(ungrouped).map(sessionItemHtml).join('');
+  list.innerHTML = html;
 }
 
 function clearMessages() {
@@ -1428,7 +2338,9 @@ async function readFileContents() {
           (isImage ? `사용자가 이미지 파일을 업로드했습니다.\n` : `사용자가 문서 파일을 업로드했습니다.\n`) +
           `파일명: ${file.name}\n` +
           `서버 경로: ${uploadPath}\n` +
-          (isImage ? `위 서버 경로의 이미지를 분석해 주세요.` : `위 서버 경로의 문서를 분석해 주세요.`)
+          (isImage
+            ? `이 이미지의 내용을 분석·설명·요약·읽기(OCR)해 달라는 요청이면 AnalyzeImage 도구로 분석하세요. 이 이미지를 바탕으로(참고해서) 그리거나 수정해 달라는 요청이면(표현이 '그려줘'여도) ImageGenerate 도구를 호출하되 input_image를 위 서버 경로로 설정하세요(원본을 반영하는 img2img).`
+            : `위 서버 경로의 문서를 분석해 주세요.`)
         );
       } else {
         contents.push(`[첨부파일 업로드 실패: ${file.name}]`);
@@ -1463,13 +2375,14 @@ async function uploadFileToServer(file) {
 }
 
 // ─── 메시지 표시 ───
-function appendMessage(role, content, save = true) {
+function appendMessage(role, content, save = true, index = null) {
   const welcome = document.getElementById('welcome');
   if (welcome) welcome.remove();
 
   const inner = document.getElementById('messagesInner');
   const div = document.createElement('div');
-  div.className = 'message';
+  div.className = 'message msg-' + role;   // 역할 클래스(재생성 버튼 배치 등에 사용)
+  if (index !== null) div.dataset.msgIndex = index;   // 편집·분기(fork)용 인덱스
 
   const sender = role === 'user' ? '사용자' : 'IDINO NOVA';
   const avatarHtml = role === 'user'
@@ -1483,6 +2396,18 @@ function appendMessage(role, content, save = true) {
     </div>
     <div class="message-body">${formatContent(content)}</div>`;
 
+  // user 메시지엔 '편집' 버튼 — 클릭 시 이 지점에서 분기(fork)해 편집본으로 새 대화를 만든다.
+  if (role === 'user') {
+    const editBtn = document.createElement('button');
+    editBtn.className = 'msg-edit-btn';
+    editBtn.type = 'button';
+    editBtn.textContent = '✎ 편집';
+    editBtn.title = '이 메시지를 편집해 새 분기 만들기';
+    editBtn.addEventListener('click', () => editMessage(div));
+    const bodyEl = div.querySelector('.message-body');
+    if (bodyEl) bodyEl.appendChild(editBtn);
+  }
+
   inner.appendChild(div);
   scrollToBottom();
 
@@ -1490,12 +2415,14 @@ function appendMessage(role, content, save = true) {
     const session = sessions.find(s => s.id === currentSessionId);
     if (session) {
       session.messages.push({ role, content });
+      div.dataset.msgIndex = session.messages.length - 1;   // 방금 추가된 위치
       if (role === 'user' && session.title === '새 대화') {
         session.title = content.substring(0, 30) + (content.length > 30 ? '...' : '');
         renderSessionList();
       }
     }
   }
+  enhanceCodeBlocks(div);   // 히스토리·즉시 렌더 메시지의 코드블록도 향상
   return div;
 }
 
@@ -1528,6 +2455,72 @@ function applyInline(s) {
   return s;
 }
 
+// 코드블록 향상 — 언어 라벨 + 복사 버튼 헤더를 붙이고, highlight.js가 로드돼 있으면
+// 색칠한다. finalize/append 시 1회만 호출한다(스트리밍 델타마다 호출 금지 — 성능·깜빡임).
+// 라이브러리(window.hljs)가 없어도 라벨·복사는 그대로 동작한다(우아한 축소).
+function enhanceCodeBlocks(rootEl) {
+  if (!rootEl) return;
+  rootEl.querySelectorAll('pre > code').forEach((codeEl) => {
+    const pre = codeEl.parentElement;
+    if (!pre || pre.dataset.enhanced) return;      // 중복 처리 방지
+    pre.dataset.enhanced = '1';
+    // 하이라이트는 라이브러리가 있을 때만(에어갭이라 로컬 vendor 번들 필요 — 없으면 skip).
+    try { if (window.hljs && hljs.highlightElement) hljs.highlightElement(codeEl); } catch (e) { void e; }
+    const lang = codeEl.getAttribute('data-lang') || '';
+    const header = document.createElement('div');
+    header.className = 'code-header';
+    const label = document.createElement('span');
+    label.className = 'code-lang';
+    label.textContent = lang || 'code';
+    const btn = document.createElement('button');
+    btn.className = 'code-copy-btn';
+    btn.type = 'button';
+    btn.textContent = '복사';
+    btn.addEventListener('click', () => copyCodeText(codeEl, btn));
+    header.appendChild(label);
+    // HTML/SVG 코드블록엔 '미리보기' 버튼 — 우측 캔버스에서 sandbox iframe으로 렌더(P2-5).
+    if (lang === 'html' || lang === 'svg') {
+      const prev = document.createElement('button');
+      prev.className = 'code-preview-btn';
+      prev.type = 'button';
+      prev.textContent = '▶ 미리보기';
+      prev.addEventListener('click', () => {
+        const code = codeEl.innerText || codeEl.textContent || '';
+        openCanvas({ html: code, filename: 'preview.' + lang, format: lang });
+      });
+      header.appendChild(prev);
+    }
+    header.appendChild(btn);
+    pre.insertBefore(header, codeEl);              // 코드 위에 헤더 삽입
+  });
+}
+
+// 코드 텍스트를 클립보드에 복사한다. ★LAN HTTP(non-secure)에선 navigator.clipboard가
+// 없으므로 execCommand('copy') 폴백이 필수다(localhost 개발에선 재현 안 되지만 운영에선
+// 이 폴백 없이는 복사 버튼이 죽는다).
+function copyCodeText(codeEl, btn) {
+  const text = codeEl.innerText || codeEl.textContent || '';
+  const done = () => {
+    const prev = btn.textContent;
+    btn.textContent = '복사됨';
+    setTimeout(() => { btn.textContent = prev; }, 1200);
+  };
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text).then(done).catch(() => fallbackCopy(text, done));
+  } else {
+    fallbackCopy(text, done);
+  }
+}
+function fallbackCopy(text, done) {
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.cssText = 'position:fixed;left:-9999px;top:0;';
+  document.body.appendChild(ta);
+  ta.select();
+  try { if (document.execCommand('copy')) done(); } catch (e) { void e; }
+  document.body.removeChild(ta);
+}
+
 // 채팅 응답/문서 미리보기 공용 마크다운 렌더러.
 // 지원: 펜스 코드블록(```), 인라인코드(`), 굵기(**), 링크([]()),
 //       제목(#/##/### → h2/h3/h4), 순서없는 목록(- / *) + 들여쓰기 중첩,
@@ -1547,7 +2540,8 @@ function formatContent(text, streaming) {
   const codeBlocks = [];
   text = text.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => {
     const idx = codeBlocks.length;
-    codeBlocks.push(`<pre><code>${escapeHtml(code.replace(/\n+$/, ''))}</code></pre>`);
+    const cls = lang ? ` class="language-${escapeHtml(lang)}" data-lang="${escapeHtml(lang)}"` : '';
+    codeBlocks.push(`<pre><code${cls}>${escapeHtml(code.replace(/\n+$/, ''))}</code></pre>`);
     // 앞뒤 개행으로 감싸 코드블록이 항상 독립된 라인이 되게 한다.
     return `\n${idx}\n`;
   });
@@ -1724,7 +2718,7 @@ function startStreamingMessage() {
 
   const inner = document.getElementById('messagesInner');
   const div = document.createElement('div');
-  div.className = 'message';
+  div.className = 'message msg-assistant';   // 스트리밍 답변은 항상 assistant
   div.id = 'streamingMessage';
 
   div.innerHTML = `
@@ -1859,6 +2853,7 @@ function finalizeStreamingMessage() {
     }
     body.innerHTML = formatContent(raw);
     body.removeAttribute('id');
+    enhanceCodeBlocks(body);   // 코드블록 라벨·복사버튼·하이라이트(스트림 완료 시 1회)
 
     const session = sessions.find(s => s.id === currentSessionId);
     if (session) {
@@ -2161,6 +3156,18 @@ function renderImagePreviews(msgEl, downloads) {
 
 // ─── 문서 미리보기 캔버스 ───
 // doc = { url, filename, content(마크다운), format } — 이미지면 imageURL(objectURL) 를 받는다.
+// HTML 프리뷰용 — CSP <meta>를 <head>에 주입해 외부 리소스 로드를 차단하고,
+// 완전한 문서가 아니면 문서로 감싼다(에어갭: 외부 CDN·이미지·폰트 로드 불가).
+function _wrapHtmlWithCsp(html) {
+  const csp = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:; media-src data:;">`;
+  const s = String(html == null ? '' : html);
+  if (/<html[\s>]/i.test(s)) {
+    if (/<head[\s>]/i.test(s)) return s.replace(/<head([^>]*)>/i, `<head$1>${csp}`);
+    return s.replace(/<html([^>]*)>/i, `<html$1><head>${csp}</head>`);
+  }
+  return `<!doctype html><html><head>${csp}<meta charset="utf-8"></head><body>${s}</body></html>`;
+}
+
 function openCanvas(doc) {
   const panel = document.getElementById('canvasPanel');
   if (!panel) return;
@@ -2176,7 +3183,17 @@ function openCanvas(doc) {
   const dl = document.getElementById('canvasDownload');
   dl.setAttribute('href', doc.url || '#');   // dl-link 위임 핸들러가 인증 다운로드 처리
   const canvasBody = document.getElementById('canvasBody');
-  if (doc.imageURL) {
+  if (doc.html != null) {
+    // HTML 라이브 프리뷰(P2-5) — 샌드박스 iframe. allow-same-origin을 주지 않아
+    // 부모 오리진·쿠키·내부 API에 접근할 수 없고, srcdoc 안에 CSP <meta>를 주입해
+    // 외부 리소스 로드까지 차단한다(에어갭). 스크립트는 iframe 내부에서만 실행된다.
+    canvasBody.innerHTML = '';
+    const iframe = document.createElement('iframe');
+    iframe.className = 'canvas-iframe';
+    iframe.setAttribute('sandbox', 'allow-scripts');   // ★allow-same-origin 금지
+    iframe.srcdoc = _wrapHtmlWithCsp(doc.html);
+    canvasBody.appendChild(iframe);
+  } else if (doc.imageURL) {
     // 이미지 모드: 텍스트가 아니므로 formatContent 를 호출하지 않는다. 썸네일과 같은
     // objectURL 을 재사용해 원본을 크게 표시(재fetch 없음).
     canvasBody.innerHTML = '';
@@ -2300,6 +3317,11 @@ async function sendMessage() {
   input.value = '';
   autoResize(input);
   appendMessage('user', text);
+
+  // 이 세션을 방금 사용했으므로 최근 활동 시각을 갱신하고 목록을 다시 그린다 →
+  // 방금 대화한 세션이 사이드바 맨 위로 올라온다(시간순 정렬 유지).
+  const _curSess = sessions.find(s => s.id === currentSessionId);
+  if (_curSess) { _curSess.last_modified = Date.now(); renderSessionList(); }
 
   // 이제부터 스트리밍이 진행 중임을 표시하고, 전송 버튼을 '취소' 모드로 바꿔 중간 중단을 허용한다.
   isStreaming = true;
@@ -2470,6 +3492,17 @@ async function sendMessage() {
     // 이미지는 인라인 썸네일을 먼저(위) 붙이고, 다운로드 버튼은 그대로 그 아래에 유지한다.
     renderImagePreviews(target, pendingDownloads);
     renderDownloadButtons(target, pendingDownloads);
+    // 로컬 세션 캐시의 마지막 assistant 메시지에도 downloads를 저장한다 — 세션을
+    // 전환했다가 돌아왔을 때(로컬 캐시 재렌더)에도 이미지·버튼이 유지되게 한다.
+    // (새로고침은 서버 재조회로 복원되지만, 전환 복귀는 로컬 캐시를 다시 그린다.)
+    const _dlSess = sessions.find(s => s.id === currentSessionId);
+    if (_dlSess && Array.isArray(_dlSess.messages)) {
+      let _lastA = null;
+      for (let i = _dlSess.messages.length - 1; i >= 0; i--) {
+        if (_dlSess.messages[i].role === 'assistant') { _lastA = _dlSess.messages[i]; break; }
+      }
+      if (_lastA) _lastA.downloads = pendingDownloads.slice();
+    }
     // Claude 아티팩트처럼, 본문(content)이 있는 가장 최근 생성 문서를 오른쪽 캔버스에 자동으로 연다.
     // 캔버스가 이미 열려 있으면 openCanvas 가 내용만 갈아끼운다.
     const previewable = pendingDownloads.filter(d => d.content);
@@ -2485,6 +3518,7 @@ async function sendMessage() {
   // 취소로 끝난 경우라도 입력창에 원문을 되살리지는 않는다(원본은 이미 'user' 말풍선으로 남아 있음).
   // userAborted 는 위 흐름에서 표식 용도로만 쓰였으므로, 미사용 경고를 피하려 명시적으로 소비한다.
   void userAborted;
+  updateRegenerateButton();   // 완료된 마지막 answer에 재생성 버튼 배치
 }
 
 // ─── 헬스체크 ───
@@ -2503,6 +3537,8 @@ async function checkHealth() {
 
 // ─── UI 유틸 ───
 function handleKeyDown(e) {
+  // 프롬프트 템플릿 팝업이 열려 있으면 ↑↓/Enter/Esc를 먼저 소비한다.
+  if (promptPopupKeydown(e)) return;
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault();
     sendMessage();

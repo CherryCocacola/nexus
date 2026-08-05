@@ -31,6 +31,7 @@ from core.storage.artifacts import (
     cleanup_expired_artifacts,
     ensure_artifacts_schema,
     get_artifact_owner,
+    list_session_artifacts,
     record_artifact,
 )
 
@@ -54,7 +55,7 @@ class _FakeConn:
         self.executed.append(sql.strip())
         s = sql.strip().upper()
         if s.startswith("INSERT INTO TB_ARTIFACTS"):
-            # args: (filename, tenant_id, user_id, session_id, mime, size, sha256)
+            # args: (filename, tenant_id, user_id, session_id, turn, mime, size, sha256)
             filename = args[0]
             # ON CONFLICT (filename) DO NOTHING — 이미 있으면 무시(멱등).
             if filename not in self._store:
@@ -63,9 +64,10 @@ class _FakeConn:
                     "tenant_id": args[1],
                     "user_id": args[2],
                     "session_id": args[3],
-                    "mime": args[4],
-                    "size_bytes": args[5],
-                    "sha256": args[6],
+                    "turn": args[4],
+                    "mime": args[5],
+                    "size_bytes": args[6],
+                    "sha256": args[7],
                 }
             return "INSERT 0 1"
         if s.startswith("DELETE FROM TB_ARTIFACTS WHERE FILENAME"):
@@ -79,6 +81,15 @@ class _FakeConn:
         return self._store.get(args[0])
 
     async def fetch(self, sql: str, *args: Any) -> list[dict[str, Any]]:
+        s = sql.strip().upper()
+        if "WHERE SESSION_ID" in s:
+            # list_session_artifacts — 세션별 생성물을 filename/mime/turn으로 반환.
+            sid = args[0]
+            return [
+                {"filename": r["filename"], "mime": r.get("mime"), "turn": r.get("turn")}
+                for r in self._store.values()
+                if r.get("session_id") == sid
+            ]
         # cleanup 만료 SELECT — 단순화를 위해 전체를 '만료'로 간주해 돌려준다.
         return [{"filename": fn} for fn in list(self._store.keys())]
 
@@ -277,3 +288,42 @@ async def test_cleanup_missing_file_still_deletes_row(tmp_path: Path):
     deleted = await cleanup_expired_artifacts(pool, tmp_path, retention_days=90)
     assert deleted == 1
     assert len(pool.store) == 0
+
+
+# ─────────────────────────────────────────────
+# (f) list_session_artifacts — 히스토리 복원용 세션별 생성물 조회
+# ─────────────────────────────────────────────
+async def test_list_session_artifacts_filters_by_session_with_turn():
+    """세션 ID로 생성물을 걸러 filename/mime/turn을 돌려주고, 다른 세션은 제외한다."""
+    pool = _FakePool()
+    # 같은 세션(sess-A)에 이미지·문서 각 1건, 다른 세션(sess-B) 1건을 기록.
+    await record_artifact(
+        pool, "a.png", tenant_id="t1", session_id="sess-A",
+        mime="image/png", size_bytes=10, turn=3,
+    )
+    await record_artifact(
+        pool, "b.docx", tenant_id="t1", session_id="sess-A",
+        mime="application/vnd.openxmlformats", size_bytes=20, turn=5,
+    )
+    await record_artifact(
+        pool, "c.png", tenant_id="t1", session_id="sess-B",
+        mime="image/png", size_bytes=30, turn=1,
+    )
+
+    arts = await list_session_artifacts(pool, "sess-A")
+    names = {a["filename"] for a in arts}
+    assert names == {"a.png", "b.docx"}  # 다른 세션(c.png)은 제외
+    by_name = {a["filename"]: a for a in arts}
+    assert by_name["a.png"]["turn"] == 3
+    assert by_name["b.docx"]["turn"] == 5
+    assert by_name["a.png"]["mime"] == "image/png"
+
+
+async def test_list_session_artifacts_pool_none_returns_empty():
+    """pool=None이면 빈 리스트(fail-soft — 복원 실패가 세션 열람을 막지 않음)."""
+    assert await list_session_artifacts(None, "sess-X") == []
+
+
+async def test_list_session_artifacts_db_error_returns_empty():
+    """조회가 실패해도 예외를 던지지 않고 빈 리스트로 안전 처리한다."""
+    assert await list_session_artifacts(_ErrorPool(), "sess-X") == []

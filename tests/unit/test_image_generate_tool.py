@@ -185,3 +185,95 @@ def test_schema_and_flags():
     assert tool.is_read_only is False
     assert tool.is_concurrency_safe is False
     assert tool.name == "ImageGenerate"
+
+
+# ─────────────────────────────────────────────
+# img2img — input_image 경로 처리 + 할루시네이션 복구
+# ─────────────────────────────────────────────
+def _ctx_with_uploads(tmp_path: Path, uploads: Path) -> ToolUseContext:
+    """exports_dir·image_url·uploads_dir 을 주입한 컨텍스트(img2img 테스트용)."""
+    return ToolUseContext(
+        cwd=str(tmp_path),
+        options={
+            "exports_dir": str(tmp_path),
+            "image_url": "http://127.0.0.1:8003",
+            "uploads_dir": str(uploads),
+        },
+    )
+
+
+async def test_img2img_valid_input_image_sends_base64(tmp_path: Path, monkeypatch):
+    """input_image가 업로드 디렉토리의 실제 파일이면 그 파일을 base64로 실어 보낸다."""
+    fake = _FakeClient()
+    monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **k: fake)
+    uploads = tmp_path / "uploads"
+    uploads.mkdir()
+    src = uploads / "upload-realuuid.png"
+    src.write_bytes(_PNG_1X1)
+
+    tool = ImageGenerateTool()
+    result = await tool.call(
+        {"prompt": "smile", "input_image": str(src), "strength": 0.5},
+        _ctx_with_uploads(tmp_path, uploads),
+    )
+    assert not result.is_error, result.error_message
+    body = fake.captured["json"]
+    assert "input_image_base64" in body  # img2img 로 전달됨
+    assert body["strength"] == 0.5
+
+
+async def test_img2img_hallucinated_path_recovers_latest_upload(tmp_path: Path, monkeypatch):
+    """모델이 없는 경로(잘못된 uuid)를 줘도 업로드 디렉토리의 최근 이미지로 복구한다."""
+    import os
+
+    fake = _FakeClient()
+    monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **k: fake)
+    uploads = tmp_path / "uploads"
+    uploads.mkdir()
+    old = uploads / "upload-old.jpg"
+    new = uploads / "upload-newest.png"
+    old.write_bytes(_PNG_1X1)
+    new.write_bytes(_PNG_1X1)  # 가장 최근 = 복구 대상
+    # mtime을 명시적으로 벌려 "최근" 판정을 결정적으로 만든다(sleep 없이).
+    os.utime(old, (1000, 1000))
+    os.utime(new, (2000, 2000))
+
+    tool = ImageGenerateTool()
+    # 존재하지 않는(할루시네이션) 경로 — 단, 업로드 디렉토리 접두는 그럴듯하게.
+    ghost = str(uploads / "upload-133340f844277.png")
+    result = await tool.call(
+        {"prompt": "front view", "input_image": ghost},
+        _ctx_with_uploads(tmp_path, uploads),
+    )
+    assert not result.is_error, result.error_message
+    # 파일 없음 에러가 아니라 최근 업로드로 복구되어 img2img 로 전달됐는지.
+    assert "input_image_base64" in fake.captured["json"]
+
+
+async def test_img2img_no_upload_returns_helpful_error(tmp_path: Path, monkeypatch):
+    """input_image를 줬는데 업로드 디렉토리에 이미지가 하나도 없으면 안내 에러."""
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
+    uploads = tmp_path / "uploads"
+    uploads.mkdir()  # 비어 있음
+
+    tool = ImageGenerateTool()
+    result = await tool.call(
+        {"prompt": "x", "input_image": str(uploads / "upload-nope.png")},
+        _ctx_with_uploads(tmp_path, uploads),
+    )
+    assert result.is_error
+    assert "첨부" in result.error_message
+
+
+async def test_no_input_image_stays_text2img(tmp_path: Path, monkeypatch):
+    """input_image가 없으면 img2img 로 새지 않고 text2img(base64 미포함)로 간다."""
+    fake = _FakeClient()
+    monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **k: fake)
+    uploads = tmp_path / "uploads"
+    uploads.mkdir()
+    (uploads / "upload-something.png").write_bytes(_PNG_1X1)  # 업로드는 있으나 미지정
+
+    tool = ImageGenerateTool()
+    await tool.call({"prompt": "a fresh scene"}, _ctx_with_uploads(tmp_path, uploads))
+    # input_image 미제공 → 복구도 안 하고 text2img (OCR/신규생성 무영향 보장).
+    assert "input_image_base64" not in fake.captured["json"]

@@ -26,7 +26,10 @@ from core.memory.transcript import (
     SessionTranscript,
     delete_transcript_session,
     list_transcript_sessions,
+    read_session_meta,
     read_transcript_messages,
+    search_transcript_sessions,
+    write_session_meta,
 )
 from core.message import Message
 
@@ -401,3 +404,90 @@ async def test_finalize_turn_writes_real_transcript_file(tmp_path: Path) -> None
     assert len(lines) == 2
     assert json.loads(lines[0])["content"] == "hello"
     assert json.loads(lines[1])["content"] == "world"
+
+
+# ─────────────────────────────────────────────
+# 세션 메타(meta.json) — 제목·핀 (P1-1)
+# ─────────────────────────────────────────────
+def test_session_meta_roundtrip_and_partial_update(tmp_path: Path) -> None:
+    """write→read 라운드트립 + 부분 갱신(핀만 바꿔도 제목 보존)."""
+    write_session_meta(tmp_path, "s1", {"title": "내 대화", "pinned": True}, channel="web")
+    m = read_session_meta(tmp_path, "s1", channel="web")
+    assert m["title"] == "내 대화" and m["pinned"] is True
+    assert "updated_at" in m
+    # 부분 갱신 — pinned만 False로. title은 유지돼야 한다.
+    write_session_meta(tmp_path, "s1", {"pinned": False}, channel="web")
+    m2 = read_session_meta(tmp_path, "s1", channel="web")
+    assert m2["title"] == "내 대화" and m2["pinned"] is False
+
+
+def test_session_meta_missing_returns_empty(tmp_path: Path) -> None:
+    """meta.json이 없으면 빈 dict(fail-soft)."""
+    assert read_session_meta(tmp_path, "nope", channel="web") == {}
+
+
+def test_session_meta_rejects_path_traversal(tmp_path: Path) -> None:
+    """경로 탈출 session_id는 ValueError로 거부한다."""
+    with pytest.raises(ValueError):
+        write_session_meta(tmp_path, "../evil", {"title": "x"}, channel="web")
+
+
+def test_list_transcript_sessions_includes_meta(tmp_path: Path) -> None:
+    """list_transcript_sessions가 meta.json의 title/pinned를 실어 반환한다."""
+    t = SessionTranscript(sessions_dir=tmp_path, session_id="sa", channel="web")
+    t.append_entry("user", "안녕", 1)
+    write_session_meta(tmp_path, "sa", {"title": "제목X", "pinned": True}, channel="web")
+    out = list_transcript_sessions(tmp_path, channel="web")
+    row = next(r for r in out if r["session_id"] == "sa")
+    assert row["title"] == "제목X" and row["pinned"] is True
+
+
+def test_session_meta_deleted_with_session(tmp_path: Path) -> None:
+    """세션 삭제 시 meta.json도 디렉토리째 함께 정리된다."""
+    t = SessionTranscript(sessions_dir=tmp_path, session_id="sb", channel="web")
+    t.append_entry("user", "x", 1)
+    write_session_meta(tmp_path, "sb", {"title": "T"}, channel="web")
+    assert delete_transcript_session(tmp_path, "sb", channel="web") is True
+    assert read_session_meta(tmp_path, "sb", channel="web") == {}
+
+
+# ─────────────────────────────────────────────
+# 대화 검색 search_transcript_sessions (P1-2)
+# ─────────────────────────────────────────────
+def test_search_finds_match_with_snippet(tmp_path: Path) -> None:
+    """질의어를 포함한 세션을 찾고 매치 스니펫을 돌려준다."""
+    t = SessionTranscript(sessions_dir=tmp_path, session_id="s1", channel="web")
+    t.append_entry("user", "파이썬 리스트 정렬 방법이 궁금해", 1)
+    t.append_entry("assistant", "sorted()를 쓰세요", 1)
+    t2 = SessionTranscript(sessions_dir=tmp_path, session_id="s2", channel="web")
+    t2.append_entry("user", "오늘 날씨 어때", 1)
+
+    out = search_transcript_sessions(tmp_path, "파이썬", channel="web")
+    ids = {r["session_id"] for r in out}
+    assert "s1" in ids and "s2" not in ids
+    assert "파이썬" in out[0]["snippets"][0]["text"]
+
+
+def test_search_channel_isolation(tmp_path: Path) -> None:
+    """web 검색은 cli 채널 세션을 건드리지 않는다(진입점 격리)."""
+    tw = SessionTranscript(sessions_dir=tmp_path, session_id="sw", channel="web")
+    tw.append_entry("user", "공통키워드 하나", 1)
+    tc = SessionTranscript(sessions_dir=tmp_path, session_id="sc", channel="cli")
+    tc.append_entry("user", "공통키워드 둘", 1)
+
+    web_out = search_transcript_sessions(tmp_path, "공통키워드", channel="web")
+    assert {r["session_id"] for r in web_out} == {"sw"}
+
+
+def test_search_short_query_returns_empty(tmp_path: Path) -> None:
+    """2자 미만 질의는 빈 결과(전체 스캔 폭주 방지)."""
+    t = SessionTranscript(sessions_dir=tmp_path, session_id="s1", channel="web")
+    t.append_entry("user", "가나다", 1)
+    assert search_transcript_sessions(tmp_path, "가", channel="web") == []
+
+
+def test_search_no_match_returns_empty(tmp_path: Path) -> None:
+    """매치가 없으면 빈 리스트."""
+    t = SessionTranscript(sessions_dir=tmp_path, session_id="s1", channel="web")
+    t.append_entry("user", "안녕하세요", 1)
+    assert search_transcript_sessions(tmp_path, "존재하지않는단어", channel="web") == []

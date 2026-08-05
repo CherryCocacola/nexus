@@ -73,6 +73,38 @@ _SIZE_MAP: dict[str, tuple[int, int]] = {
     "1536x1024": (1536, 1024),
 }
 
+# img2img 입력으로 인정하는 이미지 확장자(소문자). 업로드 복구 시 이미지 파일만 고른다.
+_IMAGE_EXTS: frozenset[str] = frozenset({".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"})
+
+
+def _latest_uploaded_image(uploads_dir: Any) -> Any:
+    """업로드 디렉토리에서 가장 최근 수정된 이미지 파일 경로를 반환한다(없으면 None).
+
+    [왜 필요한가 — 모델의 경로 재현 취약성 복구]
+      img2img 입력 경로(/tmp/nexus_uploads/upload-<긴uuid>.jpg)를 모델이 tool 인자로
+      다시 타이핑해야 하는데, A.X-4.0이 긴 uuid를 재현하다 엉뚱한 파일명·확장자를
+      지어내는 일이 잦다(할루시네이션 → "파일 없음"). 사용자가 방금 올린 이미지가
+      업로드 디렉토리에서 가장 최근 파일이므로, 모델 경로가 어긋나면 이 파일로
+      복구해 img2img를 살린다. (다운로드 URL을 모델 텍스트가 아니라 서버가 확정하는
+      원칙과 동일 — 긴 경로 재현은 모델에게 맡기지 않는다.)
+
+    주의(멀티유저): 현재는 업로드 디렉토리 공유라 '전역 최신'을 쓴다. 제품화(다중
+      사용자) 시엔 요청별로 web이 실제 업로드 경로를 context로 주입하는 방식이 정확하다.
+    """
+    from pathlib import Path
+
+    base = Path(str(uploads_dir))
+    try:
+        imgs = [
+            p for p in base.iterdir() if p.is_file() and p.suffix.lower() in _IMAGE_EXTS
+        ]
+    except OSError:
+        return None
+    if not imgs:
+        return None
+    # 수정 시각(mtime) 최댓값 = 가장 최근 업로드.
+    return max(imgs, key=lambda p: p.stat().st_mtime)
+
 
 class ImageGenerateTool(BaseTool):
     """
@@ -138,6 +170,31 @@ class ImageGenerateTool(BaseTool):
                 "seed": {
                     "type": "integer",
                     "description": "Optional seed for reproducible generation.",
+                },
+                "input_image": {
+                    "type": "string",
+                    "description": (
+                        "업로드된 이미지의 서버 경로"
+                        "(예: /tmp/nexus_uploads/upload-xxx.jpg). "
+                        "★중요: 대화에 사용자가 업로드한 이미지의 '서버 경로'가 "
+                        "있고, 그 이미지를 '바탕으로/참고해서/보고/수정/편집/변형/"
+                        "비슷하게/정면으로/이 그림을 ~하게' 그리거나 바꿔 달라는 "
+                        "요청이면(=업로드 이미지가 있고 그리기·수정 의도면), "
+                        "표현이 '그려줘'여도 이 값을 반드시 그 업로드 이미지의 "
+                        "서버 경로로 설정한다. 그러면 원본에서 출발하는 img2img로 "
+                        "생성되어 원본 구도·스타일이 유지된다. 업로드 이미지 없이 "
+                        "완전히 새로 만들 때만 비워 둔다. (주의: 이미지를 "
+                        "'분석/설명/OCR'만 요청하면 ImageGenerate가 아니라 "
+                        "AnalyzeImage를 써야 하며 이 파라미터와 무관하다.)"
+                    ),
+                },
+                "strength": {
+                    "type": "number",
+                    "description": (
+                        "img2img 변형 강도(0.1~0.95, 기본 0.6). input_image가 있을 때만 유효. "
+                        "낮을수록 원본에 가깝고(작은 수정), 높을수록 프롬프트대로 크게 바뀐다. "
+                        "표정 변경 등 작은 수정은 0.4~0.6 권장."
+                    ),
                 },
             },
             "required": ["prompt"],
@@ -234,6 +291,44 @@ class ImageGenerateTool(BaseTool):
             "steps": steps,
             "seed": seed,
         }
+
+        # img2img — input_image(업로드 이미지 서버 경로)가 있으면 원본에서 출발해 수정한다.
+        # 경로는 AnalyzeImage와 동일하게 업로드 디렉토리 하위만 허용(경로 순회 차단).
+        input_image = input_data.get("input_image")
+        if input_image:
+            from pathlib import Path
+
+            from core.tools.implementations.analyze_image_tool import resolve_uploads_dir
+
+            uploads_dir = resolve_uploads_dir(context.options.get("uploads_dir"))
+            img_path = Path(str(input_image)).resolve()
+            # 지정 경로가 (1)업로드 디렉토리 하위이고 (2)실제 파일일 때만 그대로 쓴다.
+            # 둘 중 하나라도 아니면(=모델이 긴 uuid 경로를 잘못 재현) 업로드 디렉토리의
+            # 가장 최근 이미지로 복구한다. img2img 의도는 이미 확정(input_image 제공)이므로,
+            # 경로만 서버가 바로잡아 "파일 없음" 실패 대신 사용자가 방금 올린 이미지를 쓴다.
+            valid = img_path.is_relative_to(uploads_dir) and img_path.is_file()
+            if not valid:
+                recovered = _latest_uploaded_image(uploads_dir)
+                if recovered is None:
+                    return ToolResult.error(
+                        "수정할 업로드 이미지를 찾을 수 없습니다. 이미지를 먼저 "
+                        f"첨부해 주세요. (모델이 준 경로: {input_image})"
+                    )
+                logger.warning(
+                    "input_image 경로 불일치(%s) → 최근 업로드 이미지로 복구: %s",
+                    input_image,
+                    recovered.name,
+                )
+                img_path = recovered
+            try:
+                payload["input_image_base64"] = base64.b64encode(
+                    img_path.read_bytes()
+                ).decode("ascii")
+            except OSError as e:
+                return ToolResult.error(f"input_image 읽기 실패({img_path}): {e}")
+            strength = input_data.get("strength")
+            if strength is not None:
+                payload["strength"] = float(strength)
 
         # 3) HTTP 요청. GPU 확산 추론은 오래 걸릴 수 있어 타임아웃을 120초로 넉넉히 둔다.
         #    bare except 금지 — 예외 종류별로 구체적으로 잡아 원인을 구분해 안내한다.

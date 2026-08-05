@@ -284,6 +284,8 @@ def list_transcript_sessions(
         if first_user:
             # 미리보기는 60자까지만. 넘치면 잘라내고 말줄임표(…)를 붙인다.
             title_hint = first_user[:60] + ("…" if len(first_user) > 60 else "")
+        # 세션 메타(meta.json) — 사용자 지정 제목·핀 여부. 없으면 빈 dict.
+        meta = read_session_meta(sessions_dir, sub.name, channel)
         out.append(
             {
                 "session_id": sub.name,
@@ -293,12 +295,110 @@ def list_transcript_sessions(
                 "entries": lines,
                 "path": str(tfile.resolve()),
                 "title_hint": title_hint,
+                # 사용자 지정 제목(있으면 프론트가 우선 사용) + 핀 여부 + 폴더.
+                "title": meta.get("title"),
+                "pinned": bool(meta.get("pinned")),
+                "folder": meta.get("folder") or "",
             }
         )
 
     # 최신 수정 순으로 정렬한 뒤 상위 limit개만 잘라 반환.
     out.sort(key=lambda x: x["last_modified"], reverse=True)
     return out[:limit]
+
+
+def search_transcript_sessions(
+    sessions_dir: str | Path,
+    query: str,
+    *,
+    channel: str | None = None,
+    limit: int = 20,
+    max_snippets_per_session: int = 3,
+    max_lines_per_file: int = 5000,
+) -> list[dict[str, Any]]:
+    """세션 트랜스크립트를 훑어 질의어를 포함한 세션과 매치 스니펫을 반환한다.
+
+    [용도]
+    사이드바 대화 검색. 세션 JSONL을 라인 단위로 스캔해 user/assistant 발화 중
+    질의어(대소문자 무시 부분일치)를 포함한 줄을 찾아, 매치 주변 ±40자 스니펫을
+    세션별 최대 max_snippets_per_session개까지 모은다.
+
+    [채널 격리] channel을 주면 그 하위만 스캔(web/cli/api 상호 비침범).
+
+    [방어]
+      - query는 최소 2자(그보다 짧으면 빈 결과 — 전체 스캔 폭주 방지).
+      - 파일당 max_lines_per_file 줄까지만 스캔(거대 세션 방어).
+      - 손상된 JSON 라인은 건너뛴다.
+
+    반환: [{session_id, last_modified(ISO), snippets:[{role, text, turn, ts}]}, ...]
+          파일 최종 수정 시각 내림차순, 최대 limit개.
+    """
+    q = (query or "").strip()
+    if len(q) < 2:
+        return []
+    ql = q.lower()
+
+    base = Path(sessions_dir) / channel if channel else Path(sessions_dir)
+    if not base.exists() or not base.is_dir():
+        return []
+
+    results: list[dict[str, Any]] = []
+    for sub in base.iterdir():
+        if not sub.is_dir():
+            continue
+        tfile = sub / "transcript.jsonl"
+        if not tfile.exists():
+            continue
+        snippets: list[dict[str, Any]] = []
+        last_modified: str | None = None
+        try:
+            last_modified = datetime.fromtimestamp(
+                tfile.stat().st_mtime, tz=UTC
+            ).isoformat()
+            with tfile.open("r", encoding="utf-8") as f:
+                for i, raw in enumerate(f):
+                    if i >= max_lines_per_file or len(snippets) >= max_snippets_per_session:
+                        break
+                    line = raw.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    role = entry.get("role")
+                    content = entry.get("content")
+                    if role not in ("user", "assistant") or not isinstance(content, str):
+                        continue
+                    idx = content.lower().find(ql)
+                    if idx < 0:
+                        continue
+                    # 매치 주변 ±40자를 스니펫으로 잘라 한 줄로 편다.
+                    start = max(0, idx - 40)
+                    end = min(len(content), idx + len(q) + 40)
+                    text = content[start:end].replace("\n", " ").strip()
+                    snippets.append(
+                        {
+                            "role": role,
+                            "text": text,
+                            "turn": entry.get("turn"),
+                            "ts": entry.get("ts"),
+                        }
+                    )
+        except OSError:
+            # 특정 파일을 못 읽어도 전체 검색은 계속 진행.
+            continue
+        if snippets:
+            results.append(
+                {
+                    "session_id": sub.name,
+                    "last_modified": last_modified,
+                    "snippets": snippets,
+                }
+            )
+
+    results.sort(key=lambda x: x["last_modified"] or "", reverse=True)
+    return results[:limit]
 
 
 def read_transcript_messages(
@@ -387,6 +487,80 @@ def read_transcript_messages(
     if limit is not None and limit > 0 and len(out) > limit:
         out = out[-limit:]
     return out
+
+
+def read_session_meta(
+    sessions_dir: str | Path, session_id: str, channel: str | None = None
+) -> dict[str, Any]:
+    """세션 메타데이터(meta.json)를 읽어 dict로 반환한다(없거나 손상 시 빈 dict).
+
+    [용도]
+    트랜스크립트 본문(대화)과 분리된 부가 정보 — 사용자 지정 제목(title),
+    핀 여부(pinned), (후속) 폴더/프로젝트 소속 등 — 를 세션 디렉토리의
+    meta.json 사이드카에 둔다. 목록 조회(list_transcript_sessions)와
+    웹 PATCH 엔드포인트가 이 함수를 공유해 규약을 한 곳에서 지킨다.
+
+    fail-soft: 파일이 없거나 JSON이 깨져도 예외를 던지지 않고 빈 dict를 준다
+    (메타 부재/손상이 세션 열람을 막지 않게 — 가용성 우선).
+    """
+    base = _session_dir(sessions_dir, session_id, channel)
+    mfile = base / "meta.json"
+    if not mfile.exists():
+        return {}
+    try:
+        with mfile.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError) as e:
+        logger.warning("세션 메타 읽기 실패 (%s): %s", mfile, e)
+        return {}
+
+
+def write_session_meta(
+    sessions_dir: str | Path,
+    session_id: str,
+    meta: dict[str, Any],
+    channel: str | None = None,
+) -> bool:
+    """세션 메타데이터를 meta.json에 "병합" 저장한다(성공 시 True).
+
+    [병합 규칙]
+    기존 meta.json을 읽어 전달된 meta의 값 중 None이 아닌 것만 덮어쓴다
+    (pinned=False처럼 명시적 False는 반영, 미지정 None은 무시). updated_at은
+    항상 현재 UTC로 갱신한다.
+
+    [안전장치 — delete_transcript_session과 동일한 경로 탈출 방어]
+      1) session_id에 슬래시/백슬래시/'..'/널문자가 있으면 ValueError.
+      2) resolve() 후 대상이 sessions_dir 루트의 하위인지 재검증.
+    Redis-only(트랜스크립트 파일이 아직 없는) 세션도 메타를 가질 수 있도록
+    디렉토리를 없으면 만든다(mkdir parents=True).
+
+    fail-soft: 쓰기 I/O 오류는 경고만 남기고 False를 반환한다(요청을 깨지 않음).
+    """
+    if not session_id or any(ch in session_id for ch in ("/", "\\", "..", "\x00")):
+        raise ValueError(f"invalid session_id: {session_id!r}")
+
+    base_root = Path(sessions_dir).resolve()
+    target = _session_dir(sessions_dir, session_id, channel).resolve()
+    try:
+        target.relative_to(base_root)
+    except ValueError as e:
+        raise ValueError(
+            f"session_id가 sessions_dir 바깥을 가리킴: {session_id!r}"
+        ) from e
+
+    # 기존 메타에 병합(None 값은 무시 — 부분 갱신 지원).
+    current = read_session_meta(sessions_dir, session_id, channel)
+    current.update({k: v for k, v in meta.items() if v is not None})
+    current["updated_at"] = datetime.now(UTC).isoformat()
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        with (target / "meta.json").open("w", encoding="utf-8") as f:
+            json.dump(current, f, ensure_ascii=False)
+        return True
+    except OSError as e:
+        logger.warning("세션 메타 쓰기 실패 (%s): %s", target / "meta.json", e)
+        return False
 
 
 def delete_transcript_session(

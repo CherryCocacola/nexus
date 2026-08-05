@@ -315,7 +315,7 @@ class TestWebAPIIntegration:
         from web.app import _app_state
 
         sid = "title-hint-test-session"
-        sdir = tmp_path / sid
+        sdir = tmp_path / "web" / sid   # 채널 격리: web 하위에 생성(엔드포인트가 channel="web"로 읽음)
         sdir.mkdir(parents=True)
         with (sdir / "transcript.jsonl").open("w", encoding="utf-8") as f:
             f.write(_json.dumps({
@@ -351,7 +351,7 @@ class TestWebAPIIntegration:
         from web.app import _app_state
 
         sid = "delete-test-session"
-        sdir = tmp_path / sid
+        sdir = tmp_path / "web" / sid   # 채널 격리: web 하위에 생성(엔드포인트가 channel="web"로 읽음)
         sdir.mkdir(parents=True)
         with (sdir / "transcript.jsonl").open("w", encoding="utf-8") as f:
             f.write(_json.dumps({
@@ -417,7 +417,7 @@ class TestWebAPIIntegration:
 
         # 트랜스크립트 파일을 수동으로 생성
         sid = "integration-test-transcript"
-        sdir = tmp_path / sid
+        sdir = tmp_path / "web" / sid   # 채널 격리: web 하위에 생성(엔드포인트가 channel="web"로 읽음)
         sdir.mkdir(parents=True)
         tfile = sdir / "transcript.jsonl"
         with tfile.open("w", encoding="utf-8") as f:

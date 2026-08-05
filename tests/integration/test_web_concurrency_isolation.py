@@ -56,6 +56,7 @@ class _IsolationFakeEngine:
         self._context = kwargs.get("context")
         self._session_id = getattr(self._context, "session_id", "")
         self._messages: list = []
+        self._total_turns = 0   # 실 QueryEngine 계약(생성물 turn 기록에서 참조)
 
     def bind_request(
         self,
@@ -63,6 +64,7 @@ class _IsolationFakeEngine:
         tenant: Any | None = None,
         transcript: Any | None = None,
         restore_messages: list | None = None,
+        channel: str | None = None,
     ) -> None:
         """세션/테넌트를 바인딩한다(실 QueryEngine.bind_request 계약과 동일)."""
         self._session_id = session_id
@@ -75,6 +77,10 @@ class _IsolationFakeEngine:
     @property
     def session_id(self) -> str:
         return self._session_id
+
+    @property
+    def total_turns(self) -> int:
+        return self._total_turns
 
     async def submit_message(self, message: str):
         """배리어 이후 자기 상태를 읽어 'sid=..;tid=..' TEXT_DELTA 로 흘려보낸다."""
