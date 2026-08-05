@@ -29,19 +29,16 @@
 
 ## P1 — 기능·품질 (효과 큼)
 
-### 3. CLI Stage 1 나머지 (A1만 완료)
-`CLI_CLAUDE_CODEX_PORT_PLAN.md` 기준 남은 항목.
+### 3. ~~CLI Stage 1~~ — **전체 완료 (2026-08-05)**
+A1·A2·A3·A4·B1·B2·C1·D8·D9·D10 모두 구현·검증·커밋 완료. 상세는 progress.md 참조.
+- A1/A3 accept-edits 모드 + ask_handler v2(numbered·피드백) — 커밋 3f757c2
+- A2 런타임 전환 `/mode`·Shift+Tab, 4지점 원자 갱신 — 커밋 34d85ea
+- A4 Bash allow-list(명령 프리픽스, 메타문자·위험명령 차단) — 커밋 39ce121
+- B1/B2 diff 미리보기(256KB·200줄·바이너리 상한) — 커밋 1b35aa6
+- C1/D8~D10 도구 표시 축약·`/verbose`·자동완성·Alt+Enter·`/help` — 커밋 e220705
 
-- **A2 런타임 모드 전환**: `/mode` + Shift+Tab 순환. `_apply_mode_change()` 단일 헬퍼로 4지점
-  원자 갱신(pipeline.update_context + model_copy / ask_handler_v2 주입·제거 /
-  tool_ctx.permission_mode / GlobalState·배너). 전환은 프롬프트 경계에서만.
-  **주의**: `GlobalState.permission_mode`가 CLI 인자와 미동기(기존부터) — 여기서 함께 배선.
-- **A4 세션 allow-list 확장**: 현재 도구명 단위. Bash는 명령 프리픽스 단위로,
-  경로는 realpath+NFC 정규화 후 비교(`../` 우회 차단).
-- **B1~B2 diff 미리보기**: `formatters.format_diff()` + ask_handler_v2에서 Edit/Write/MultiEdit
-  승인 전 unified diff 표시. 상한 256KB/200줄/바이너리 감지.
-- **C1 도구 표시 축약**: `⏺ Tool(핵심인자)` + `⎿ 요약`. 상세는 `/verbose` 토글.
-- **D8~D10**: `/verbose` · `/` 자동완성 + 멀티라인 붙여넣기 + Ctrl+R · `/help` 갱신.
+**Stage 2(후속)**: C2 상태줄(bottom_toolbar) · C3 중단 힌트 · D1 `!` bash 패스스루 ·
+D2 `/compact` · D3 `/resume` 재바인드 · D4 `/diff` · D5 `/cost` · D6 `/copy` · D7 `/save`.
 
 ### 4. Devstral 코딩 서브모델 통합 미완
 B200 8005에 서빙 중이나 **NOVA가 아직 사용하지 않는다**(수동 호출만 가능).

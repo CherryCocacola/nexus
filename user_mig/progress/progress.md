@@ -3997,3 +3997,11 @@ FABLE5가 nova CLI를 정밀 진단(B-1~B-8)하고 5-Phase 수정계획 작성 �
 - **B2 승인 훅**: `prompt_permission_v2`가 FILE_WRITE 부류에 한해 프롬프트 직전 미리보기 출력. 생성 실패는 None으로 흡수해 **승인 흐름을 막지 않음**.
 - **검증**: 신규 단위 37건(allow-list 24 + diff 13) + 기존 프롬프트 테스트 확장(2건 — diff 표시/Bash 미표시). A4로 계약이 바뀐 기존 테스트 2건은 새 계약으로 갱신(Bash 프리픽스 등록/위험명령 미등록). **전체 unit 1764 passed**, ruff clean.
 - **P1 잔여**: C1(도구표시 축약 ⏺/⎿) → D8~D10(/verbose·자동완성·멀티라인·Ctrl+R·/help) / Devstral 라우팅 통합 / 플러그인 적용 확인.
+
+**★ CLI Stage 1 전체 완료 (2026-08-05).** A1~D10 10개 항목 구현·검증·커밋 종료.
+- **C1 도구 표시 축약**: `format_tool_use`/`format_tool_result`가 기본 축약 렌더 — `⏺ LS(.)` + `  ⎿ 디렉토리: .  (35줄)`. **에러는 축약 모드에서도 전문 표시**(원인 파악 우선). `summarize_tool_input()` 도구별 핵심 인자 추출(경로는 파일명만, MultiEdit은 건수, 미지 도구는 첫 스칼라 폴백, 60자 말줄임) + `summarize_tool_output()`(첫 내용 줄+총 줄수).
+- **D8 `/verbose`**: 축약↔전문 토글. **D9**: 슬래시 자동완성(`/`로 시작할 때만, 명령 목록을 **콜러블로 받아 REPL 실제 명령과 자동 일치** — 두 벌 관리 시 어긋남 방지) + Alt+Enter 줄바꿈(Enter는 전송 유지) + 히스토리 접두어 검색. **D10** `/help`에 명령·단축키(Shift+Tab·Alt+Enter·Ctrl+R·자동완성·Ctrl+C) 안내.
+- **검증**: 신규 단위 18건(요약기·표시모드·에러 전문·자동완성 동적목록). **전체 unit 1784 passed**, ruff clean. **실서버 실물 검증**: 축약 `⏺ LS(.)`/`⎿ …(35줄)` 확인, `/verbose` 켠 뒤 도구 입력 JSON 패널 표시 확인(1차 시도는 모델이 도구를 안 불러 FAIL로 찍혔으나 재시도로 PASS — 기능 결함 아님).
+- **커밋**: `[cli] 도구 표시 축약 + /verbose·자동완성·멀티라인 (C1, D8~D10)` e220705. 세션 누적 커밋 16개.
+- **Stage 1 완료 목록**: A1/A3(accept-edits+ask_handler v2) · A2(런타임 전환) · A4(Bash allow-list) · B1/B2(diff 미리보기) · C1/D8~D10(표시·입력 UX). `REMAINING_ISSUES_2026-08-05.md`의 P1 CLI 항목을 완료 처리하고 **Stage 2 목록**(C2 상태줄·C3 중단힌트·D1 `!`bash·D2 `/compact`·D3 `/resume`·D4 `/diff`·D5 `/cost`·D6 `/copy`·D7 `/save`)으로 갱신.
+- **P1 잔여**: Devstral 라우팅 통합(파서·config coder_url·라우팅 규칙·루프 비교) / 플러그인 적용 확인 / A.X 모델 한계(근본책).
