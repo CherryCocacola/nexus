@@ -4038,3 +4038,10 @@ FABLE5가 nova CLI를 정밀 진단(B-1~B-8)하고 5-Phase 수정계획 작성 �
 - **API**: `GET/PUT /v1/response-style` — 테넌트 단위 저장(`_instructions/{tid}.style.json`, 커스텀 인스트럭션과 같은 저장 규약). 모르는 프리셋 id는 기본값으로 강등(임의 문자열 저장 방지). 3경로(비스트림·스트림·OpenAI) 모두 주입.
 - **검증**: 단위 11건 + 전체 **1836 passed**, 신규 ruff clean. **실서버**: 같은 질문("클로저가 뭔지")에 normal 1,421자 → **concise 820자(42% 감소)**, formal 정상, 프리셋 목록 API 노출 확인. 배포는 import 그래프 전체(web/app.py + compose.py + styles.py + YAML) 동시 반영 후 부트스트랩 로그 확인(교훈 적용).
 - **미완(다음)**: ①**프론트 UI 미연결** — 설정 모달에 스타일 드롭다운 추가 필요(현재는 API로만 변경 가능) ②CLI 연동(같은 YAML을 읽어 `/style` 명령) ③W5 KaTeX 렌더러(게이트 GO, `\[ \]`·`\( \)` 형식 처리).
+
+**W1 프론트 UI 연결 완료 (2026-08-05, 커밋 a8a0208 · 이미지 nexus-web:w1ui-20260805).** 배포② 2단계 마무리.
+- **설정 모달 최상단에 응답 스타일 섹션 추가**: 프리셋 드롭다운(서버 `/v1/response-style`의 available로 채움 — **라벨·설명을 프론트에 하드코딩하지 않아 서버 YAML 수정이 UI에 자동 반영**), 선택 시 설명 표시, "직접 지정" textarea(입력 시 프리셋보다 우선). 저장은 기존 `saveSettings`의 Promise.all에 합류(인스트럭션·템플릿·프로젝트와 한 번에).
+- **결함 1건 자체 발견·수정**: select에 `instruction-textarea` 클래스를 재사용했더니 드롭다운 높이가 textarea만큼 커짐(스크린샷으로 확인) → 전용 인라인 스타일로 교체(41px 정상).
+- **브라우저 실검증**: 모달 열기 → 프리셋 4종 로드 확인 → concise 선택·저장 → `/v1/response-style` 재조회로 서버 반영 확인 → 화면 눈검증 → normal 원상복구 → 탭 정리. 정적 파일이라 docker cp만으로 반영(재시작 불필요), 이후 `docker commit`으로 영속화.
+- **배포② 현황**: 1단계 프롬프트 조립기 ✅ · 2단계 W1 응답스타일(백엔드+API+UI) ✅ · 3단계 **W5 KaTeX 렌더러 남음**(게이트 GO, `\[ \]`·`\( \)` 형식). W4 Mermaid는 NO-GO로 보류(프롬프트 규약 후 재측정).
+- **CLI 연동 후보**: 같은 `config/response_styles.yaml`을 읽는 `/style` 명령(웹·CLI 말투 통일).
