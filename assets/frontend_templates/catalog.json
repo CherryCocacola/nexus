@@ -1,0 +1,11 @@
+{
+  "_comment": "프론트엔드 템플릿 카탈로그 — ScaffoldWeb 도구가 읽는 단일 소스. 템플릿 추가 시 여기에 항목을 등록한다.",
+  "templates": [
+    {
+      "name": "landing-vue",
+      "description": "제품/서비스 소개 랜딩 페이지. Vue 3(로컬 번들, 에어갭 안전), 라이트 테마, 반응형. 섹션: 고정 네비게이션, 히어로, 기능 카드 그리드, 기술 사양, 문의 폼, 푸터.",
+      "files": ["index.html", "styles.css", "app.js", "vendor/vue.global.prod.js"],
+      "customize": "app.js 상단의 SITE 객체만 수정하면 모든 텍스트·카드·사양·푸터가 바뀝니다. 색상은 styles.css 최상단 :root CSS 변수만 수정합니다. 그 외 코드는 수정 금지."
+    }
+  ]
+}

@@ -340,6 +340,11 @@ async def init_phase2(state: GlobalState) -> dict:
                 "enabled": perm_cfg.enabled,
                 "mode": perm_cfg.mode,
             },
+            # 비전 배선(2026-08-04) — CLI 풀에 AnalyzeImage/RenderPreview가 추가되며
+            # 필요해졌다. 웹(web/app.py:684)과 같은 키로 주입해 표면 간 동작을 맞춘다.
+            # 값이 비어 있으면 도구가 자체 기본값(127.0.0.1:8004 등)으로 폴백한다.
+            "vision_url": getattr(config.gpu_server, "vision_url", ""),
+            "vision_model": getattr(config.gpu_server, "vision_model", ""),
         },
     )
     components["tool_use_context"] = context
@@ -668,10 +673,16 @@ async def init_phase2(state: GlobalState) -> dict:
     # model_dispatcher가 주입되면 submit_message는 dispatcher.route() 경로를 탄다.
     # 시스템 프롬프트에는 agent_registry를 반영하여 서브에이전트 사용 가이드를 넣는다.
     # Ch 16: CLI 세션용 JSONL 트랜스크립트 (기본 활성)
+    # channel="cli" 고정(2026-08-05 수정) — 이 값이 없으면 채널 하위가 아닌
+    # {sessions_dir} 루트(flat)에 기록된다. 그런데 `nexus sessions`는
+    # channel="cli"로만 조회하므로, 비대화형 `nexus ask` 대화가 저장은 되는데
+    # 목록에는 안 보이는 불일치가 있었다(실측: 루트에 flat 세션 370개).
+    # REPL은 bind_request(channel="cli")로 다시 주입하므로 종전과 동일하다.
     cli_transcript = SessionTranscript(
         sessions_dir=config.session.sessions_dir,
         session_id=state.session_id,
         enabled=config.session.transcript_enabled,
+        channel="cli",
     )
     components["transcript"] = cli_transcript
 
@@ -862,13 +873,20 @@ async def _create_pg_pool(config: Any) -> Any:
 
 
 def _create_tool_registry():  # noqa: ANN202 — ToolRegistry는 함수 내부에서 import
-    """23개 도구를 모두 등록한 "풀세트" ToolRegistry를 생성한다(실측 등록 개수).
+    """26개 도구를 모두 등록한 "풀세트" ToolRegistry를 생성한다(실측 등록 개수).
+
+    2026-08-04 확장: RenderPreview(헤드리스 렌더 스크린샷) + AnalyzeImage(VLM
+    스크린샷 검토)를 추가해 "만들고 → 찍고 → 고치는" 웹 자가 검증 루프를
+    CLI에서도 돌 수 있게 했다(기존 23개 → 25개).
+    2026-08-05 확장: ScaffoldWeb(검증 템플릿 결정적 복사) 추가(→ 26개) —
+    모델이 긴 HTML/CSS를 직접 작성/재현하지 않게 하는 템플릿 그라운딩.
 
     TIER_M/L(컨텍스트 여유) 및 Phase 2 ②의 메트릭용 레지스트리로 쓰인다.
     TIER_S에서는 컨텍스트 절약을 위해 대신 _create_cli_tool_registry(7개)를 사용한다.
     lazy import 이유: 도구 구현 모듈이 core 하위를 import하므로 함수 진입 시점에만 끌어와
     Phase 1과의 의존성 분리(순환 import 방지)를 지킨다.
     """
+    from core.tools.implementations.analyze_image_tool import AnalyzeImageTool
     from core.tools.implementations.bash_tool import BashTool
     from core.tools.implementations.docker_tools import DockerBuildTool, DockerRunTool
     from core.tools.implementations.edit_tool import EditTool
@@ -887,6 +905,8 @@ def _create_tool_registry():  # noqa: ANN202 — ToolRegistry는 함수 내부�
     from core.tools.implementations.multi_edit_tool import MultiEditTool
     from core.tools.implementations.notebook_tools import NotebookEditTool, NotebookReadTool
     from core.tools.implementations.read_tool import ReadTool
+    from core.tools.implementations.render_preview_tool import RenderPreviewTool
+    from core.tools.implementations.scaffold_web_tool import ScaffoldWebTool
     from core.tools.implementations.task_tools import TaskTool
     from core.tools.implementations.todo_tools import TodoReadTool, TodoWriteTool
     from core.tools.implementations.write_tool import WriteTool
@@ -926,6 +946,11 @@ def _create_tool_registry():  # noqa: ANN202 — ToolRegistry는 함수 내부�
             # Docker (2개)
             DockerBuildTool(),
             DockerRunTool(),
+            # 웹 자가 검증 루프 (2개, 2026-08-04) — 렌더 스크린샷 + VLM 검토
+            RenderPreviewTool(),
+            AnalyzeImageTool(),
+            # 템플릿 스캐폴드 (1개, 2026-08-05) — 검증 템플릿 결정적 복사
+            ScaffoldWebTool(),
         ]
     )
 
@@ -1088,13 +1113,13 @@ def _create_web_tool_registry(tier: Any = None):  # noqa: ANN202
     return registry
 
 
-# tool_names 미전달 시 가정하는 TIER_M/L 표준 풀(= _create_tool_registry의 23개).
+# tool_names 미전달 시 가정하는 TIER_M/L 표준 풀(= _create_tool_registry의 26개).
 # 실제 운영 경로는 항상 레지스트리에서 이름을 받아오므로 이 값은 테스트·하위호환용 폴백이다.
 _DEFAULT_EXPANDED_TOOLS = (
-    "Bash", "DockerBuild", "DockerRun", "Edit", "GitBranch", "GitCheckout",
-    "GitCommit", "GitDiff", "GitLog", "GitStatus", "Glob", "Grep", "LS",
-    "MemoryRead", "MemoryWrite", "MultiEdit", "NotebookEdit", "NotebookRead",
-    "Read", "Task", "TodoRead", "TodoWrite", "Write",
+    "AnalyzeImage", "Bash", "DockerBuild", "DockerRun", "Edit", "GitBranch",
+    "GitCheckout", "GitCommit", "GitDiff", "GitLog", "GitStatus", "Glob", "Grep",
+    "LS", "MemoryRead", "MemoryWrite", "MultiEdit", "NotebookEdit", "NotebookRead",
+    "Read", "RenderPreview", "ScaffoldWeb", "Task", "TodoRead", "TodoWrite", "Write",
 )
 
 # 티어와 무관하게 동일한 대화 규약 — 두 프롬프트 변형이 공유한다(중복 방지).
@@ -1244,6 +1269,67 @@ def _build_expanded_system_prompt(tool_names: set[str] | None = None) -> str:
     else:
         plan_note = ""
 
+    # 편집 복구 규칙(2026-08-04 실측 반영): A.X-4.0이 Edit old_string의 공백을
+    #   재현하지 못해 5연속 실패 후 "직접 수정하세요"로 포기한 사례. 도구 폴백
+    #   (공백 정규화 매칭)과 짝을 이뤄, 프롬프트에서도 Write 전환을 지시한다.
+    if {"Edit", "MultiEdit"} & names:
+        edit_note = (
+            "## Editing files — recover, never give up\n"
+            "NEVER Edit a file whose current content is not already in this "
+            "conversation: Read it FIRST, then copy old_string exactly from what "
+            "you read. Guessing file content produces old_string mismatches.\n"
+            "Edit requires old_string to match the file EXACTLY. If an Edit call "
+            "fails, the error includes the closest matching region — copy the "
+            "exact original text from it (or re-Read the file) and retry ONCE. "
+            "If Edit fails twice on the same spot, STOP retrying Edit: Read the "
+            "whole file and use Write to rewrite it with your change applied. "
+            "NEVER end the task telling the user to edit the file themselves — "
+            "the file on disk must contain the requested change before you "
+            "finish.\n\n"
+        )
+    else:
+        edit_note = ""
+
+    # 템플릿 그라운딩(2026-08-05): 모델이 긴 HTML/CSS를 처음부터 작성하면 품질이
+    #   낮고 출력이 붕괴하는 실측 + CHI 2026 실증(레지스트리 조립 95% 준수)에 따라,
+    #   웹 제작은 반드시 검증 템플릿 스캐폴드에서 시작하게 한다.
+    if "ScaffoldWeb" in names:
+        scaffold_note = (
+            "## Building web pages — ALWAYS start from a verified template\n"
+            "When asked to create a web page or site, do NOT write HTML/CSS from "
+            "scratch.\n"
+            "1) Call ScaffoldWeb() with no arguments to see available templates.\n"
+            "2) Call ScaffoldWeb(template=\"...\", target_dir=\"...\") to copy one "
+            "into the requested folder (deterministic copy — highest quality).\n"
+            "3) Customize ONLY the small marked slots: the SITE object in app.js, "
+            "and if colors must change, the :root variables at the top of "
+            "styles.css. Never rewrite index.html structure or the rest of the "
+            "CSS.\n"
+            "4) Verify with RenderPreview.\n"
+            "Only write a page from scratch if no template fits, and say so.\n\n"
+        )
+    else:
+        scaffold_note = ""
+
+    # 웹 결과물 자가 검증 루프(2026-08-04): 생성만 하고 렌더 확인을 안 해
+    #   레이아웃 결함을 놓친 실측 사례 반영. RenderPreview+AnalyzeImage가 풀에
+    #   있을 때만 지시한다(도구 없는 티어에서 존재하지 않는 도구 호출 방지).
+    if {"RenderPreview", "AnalyzeImage"} <= names:
+        render_note = (
+            "## Web output — render and inspect before finishing\n"
+            "After creating or substantially editing an HTML page, you MUST "
+            "verify it visually: call RenderPreview(file_path=...) to get a "
+            "screenshot, then AnalyzeImage on that screenshot asking for layout "
+            "problems (unstyled nav, stacked/overlapping elements, empty areas, "
+            "broken alignment). Fix the problems it finds and re-render. Do at "
+            "most 2 fix-and-rerender rounds, then report honestly what remains. "
+            "Also prefer clean modern layout: use CSS grid/flex for card lists, "
+            "a consistent spacing scale, and only the styles you actually "
+            "need — do not emit hundreds of lines of unused CSS.\n\n"
+        )
+    else:
+        render_note = ""
+
     # P1-b②: 상태를 바꾸는 행동 뒤에는 반드시 검증. 서버 시작/설치/대량 수정은
     #   "실행했다"와 "성공했다"가 다르다(실측: exit 0인데 서버 즉사인데도 성공 단정).
     #   Bash 도구가 붙여주는 관측 안내(P1-a)와 짝을 이룬다.
@@ -1269,6 +1355,9 @@ def _build_expanded_system_prompt(tool_names: set[str] | None = None) -> str:
         + explore_note
         + compute_note
         + plan_note
+        + edit_note
+        + scaffold_note
+        + render_note
         + _PROMPT_COMMON_SECTIONS
         + "## Hard rules\n"
         "- NEVER create a file the user didn't ask for.\n"

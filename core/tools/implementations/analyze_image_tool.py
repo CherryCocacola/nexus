@@ -237,7 +237,16 @@ class AnalyzeImageTool(BaseTool):
         """
         uploads_dir = resolve_uploads_dir(context.options.get("uploads_dir"))
         try:
-            target = Path(image_path).resolve()
+            raw = Path(image_path)
+            # 디렉토리 성분 없는 "파일명만" 들어오면 업로드 샌드박스 기준으로
+            # 해석한다(2026-08-04). 실측 근거: 모델(A.X-4.0)이 긴 절대 경로
+            # 리터럴을 복사·재현하지 못해 환각 경로(/tmp/...)를 반복 호출했다.
+            # 파일명(짧은 문자열)만으로 호출할 수 있게 하면 이 실패 모드를
+            # 구조적으로 우회한다. 샌드박스 검증(아래 is_relative_to)은 동일하게
+            # 통과해야 하므로 보안 경계는 변하지 않는다.
+            if raw.name == str(raw):
+                raw = uploads_dir / raw
+            target = raw.resolve()
         except (OSError, ValueError) as e:
             return None, f"이미지 경로를 해석할 수 없습니다: {e}"
 

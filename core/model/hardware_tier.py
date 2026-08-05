@@ -80,7 +80,7 @@ TIER_CONFIG = {
         # single_model: 컨텍스트 여유가 있어 Worker 하나로 전 과정을 처리한다.
         "orchestration_mode": "single_model",  # Worker 단독
         "scout_enabled": False,                # Scout 불필요
-        "max_worker_tools": 23,                # 정보용(강제 아님) — 풀세트 실측
+        "max_worker_tools": 26,                # 정보용(강제 아님) — 풀세트 실측(+렌더검증·스캐폴드)
         # 컨텍스트가 넉넉해 raw 메시지를 그대로 누적해도 되므로 외부화 비활성.
         "turn_state_enabled": False,           # raw messages 누적 가능
         "description": "H100 (80GB, 32K ctx)",
@@ -89,7 +89,7 @@ TIER_CONFIG = {
         # 최상위 티어 — TIER_M과 동일한 단독 모드에 컨텍스트만 훨씬 넓다.
         "orchestration_mode": "single_model",  # Worker 단독
         "scout_enabled": False,
-        "max_worker_tools": 23,                # 정보용(강제 아님) — 풀세트 실측
+        "max_worker_tools": 26,                # 정보용(강제 아님) — 풀세트 실측(+렌더검증·스캐폴드)
         "turn_state_enabled": False,
         "description": "H200/GB10 (128GB+, 128K ctx)",
     },

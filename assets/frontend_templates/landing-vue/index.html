@@ -1,0 +1,79 @@
+<!-- landing-vue 템플릿 — 모든 내용은 app.js의 SITE 객체에서 온다. 이 파일은 수정하지 않는 것이 원칙. -->
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>IDINO NOVA</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="app">
+    <!-- 고정 네비게이션 -->
+    <nav class="navbar">
+      <div class="nav-inner">
+        <a class="nav-brand" href="#top">{{ site.brandName }}</a>
+        <ul class="nav-links">
+          <li><a href="#features">기능</a></li>
+          <li><a href="#specs">사양</a></li>
+          <li><a href="#contact">문의</a></li>
+        </ul>
+      </div>
+    </nav>
+
+    <!-- 히어로 -->
+    <header class="hero" id="top">
+      <span class="hero-badge">{{ site.heroBadge }}</span>
+      <h1 class="hero-title">{{ site.brandName }}</h1>
+      <p class="hero-tagline">{{ site.tagline }}</p>
+      <a class="hero-cta" href="#contact">{{ site.ctaText }}</a>
+    </header>
+
+    <!-- 핵심 기능 카드 -->
+    <section class="section" id="features">
+      <h2 class="section-title">핵심 기능</h2>
+      <div class="feature-grid">
+        <article class="feature-card" v-for="f in site.features" :key="f.title">
+          <div class="feature-icon">{{ f.icon }}</div>
+          <h3>{{ f.title }}</h3>
+          <p>{{ f.desc }}</p>
+        </article>
+      </div>
+    </section>
+
+    <!-- 기술 사양 -->
+    <section class="section section-alt" id="specs">
+      <h2 class="section-title">기술 사양</h2>
+      <dl class="spec-list">
+        <div class="spec-item" v-for="s in site.specs" :key="s.label">
+          <dt>{{ s.label }}</dt>
+          <dd>{{ s.value }}</dd>
+        </div>
+      </dl>
+    </section>
+
+    <!-- 문의 폼 -->
+    <section class="section" id="contact">
+      <h2 class="section-title">{{ site.contactTitle }}</h2>
+      <form class="contact-form" @submit.prevent="submitForm">
+        <label>이름
+          <input type="text" v-model="form.name" required>
+        </label>
+        <label>이메일
+          <input type="email" v-model="form.email" required>
+        </label>
+        <label>문의 내용
+          <textarea rows="5" v-model="form.message" required></textarea>
+        </label>
+        <button type="submit">보내기</button>
+      </form>
+    </section>
+
+    <footer class="footer">{{ site.footer }}</footer>
+  </div>
+
+  <!-- Vue 3 로컬 번들 — 에어갭 환경에서도 동작(외부 CDN 없음) -->
+  <script src="vendor/vue.global.prod.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
