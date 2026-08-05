@@ -3805,3 +3805,182 @@ FABLE5가 nova CLI를 정밀 진단(B-1~B-8)하고 5-Phase 수정계획 작성 �
 - **진입점 배선**: web `/v1/chat`·`/stream`→`channel="web"`(bind_request+transcript+복원/저장), OpenAI API `_inject_openai_context`→`"api"`(양 api 엔드포인트 경유), `/v1/sessions*`(목록/메시지/삭제)→`"web"` 필터. cli는 repl `_bootstrap`에서 bind_request `channel="cli"`(비-resume 포함, 엔진이 bootstrap 공용 컨텍스트라 런타임 주입), resume 읽기·`nexus sessions`도 `"cli"`.
 - **효과**: 레거시 flat 세션은 채널 필터 조회에서 자연 제외(클린 컷, 마이그레이션 없음). 같은 session_id라도 채널 다르면 미충돌.
 - **검증**: 신규 `test_channel_isolation.py` 9건(short_term 5+transcript 4: 동일id 격리·오채널 빈응답·목록필터·flat 상호비침범·clear/read/delete 채널스코프) + `test_cli_session_resume.py` fixture를 cli 채널 경로로 갱신. **전체 1,611 passed**(hwpx 환경이슈 1 무관). ruff clean(web/app.py 기존 E402·S110 제외). 커밋·push 미실행(요청 대기).
+
+**이미지 img2img 수정 — 업로드 이미지를 "닮게" 수정 (2026-07-31).** 사용자 보고: 사진을 첨부하고 "정면 모습 그려줘" 식 수정 요청 시, 원본과 전혀 안 닮은 새 그림(text2img)만 나옴. 원인=이미지 서버가 text2img만 지원, 도구도 입력 이미지를 안 넘김.
+- **이미지 서버**(`scripts/image_server.py`): `StableDiffusion3Img2ImgPipeline.from_pipe(_pipe)`로 img2img 추가(동일 컴포넌트 공유 → VRAM 추가 없음). `GenReq`에 `input_image_base64`+`strength`(0.1~0.95, 기본0.6). 입력 이미지가 있으면 원본 픽셀에서 출발해 수정, 없으면 기존 text2img. `mode` 로그·응답 추가.
+- **ImageGenerate 도구**(`image_generate_tool.py`): input_schema에 `input_image`(업로드 서버경로)+`strength` 추가. `call()`이 uploads_dir 하위 검증 후 파일을 base64로 인코딩해 payload에 실음.
+- **배포**: B200(8003 서버 재기동)+112 웹(도구 docker cp). **웹 e2e 통과** — 중립표정 얼굴 업로드→"비슷하게 표정만 웃게 수정" 요청 시 B200 로그 `mode=img2img(strength=0.4)` 확인(모델이 실제로 `input_image` 전달). ruff clean.
+
+**생성물 링크 영속성 수정 — 새로고침·세션전환 후 이미지·파일 유지 (2026-07-31).** 사용자 보고: 다른 세션 갔다 오거나 새로고침하면 과거 대화의 그림·다운로드 링크가 사라짐. 원인=다운로드 URL(`/v1/download/...`)은 스트림의 `download` 프레임으로만 클라이언트에 전달되고 트랜스크립트(assistant 텍스트)엔 안 남음. tb_artifacts엔 session_id는 있으나 어느 메시지(턴)인지 매핑할 `turn`이 없었음.
+- **저장소**(`core/storage/artifacts.py`): tb_artifacts에 `turn INT` 컬럼 추가(기존 테이블용 `ALTER TABLE ADD COLUMN IF NOT EXISTS` 멱등 마이그레이션 + `idx_artifacts_session` 인덱스). `record_artifact`에 `turn` 파라미터. 신규 `list_session_artifacts(pool, session_id)` — 세션 생성물을 생성순으로 `{filename,mime,turn}` 반환(fail-soft).
+- **엔드포인트**(`web/app.py`): `_record_artifacts`에 `turn` 전달(스트리밍·비스트리밍·OpenAI 4개 호출부 모두 `engine.total_turns`). 신규 `_attach_session_artifacts()`가 세션 생성물을 `turn`으로 assistant 메시지에 매칭해 `downloads` 필드로 실음. `/v1/sessions/{id}/messages`의 Redis·트랜스크립트 양 반환 경로에 배선. 매칭 실패·레거시(turn NULL)분은 마지막 assistant에 폴백(하나도 안 잃음).
+- **프론트**(`web/static/index.html`): ①히스토리 map에서 `downloads` 보존 ②forEach 렌더 시 `downloads` 있으면 `renderImagePreviews`+`renderDownloadButtons`(라이브와 동일) ③라이브 완료 시 로컬 세션 캐시의 마지막 assistant에도 downloads 저장(세션 전환 복귀=로컬 재렌더 대비). **리포가 아닌 배포본(chunkfix baseline, `_streamBodyRaw` 없음)에 직접 3패치**(리포 HEAD의 스트리밍 실시간렌더는 이전 아티팩트 회귀 원인이라 배포 금지).
+- **한계(수용·문서화)**: Redis 경로 메시지는 `turn`을 저장 안 해(short_term 스키마 미변경), 24h 내 다중 이미지 세션 재조회는 폴백으로 마지막 메시지에 집중됨. 단일 이미지(일반적)는 정확, TTL 만료 후 트랜스크립트 경로는 per-turn 정확. 핵심(사라짐)은 해결.
+- **검증**: 단위테스트 18 passed(신규 4: list_session_artifacts 필터·turn·pool None·DB오류) + `_attach` 로직 turn매칭/레거시폴백 직접검증. 실 DB(`idino_ai`) tb_artifacts에 turn 컬럼 반영 확인. **웹 e2e 통과** — 고양이 이미지 생성→세션 재조회 시 assistant에 `downloads` 복원(PASS). ruff clean.
+- **배포·durability**: 3파일(index.html·artifacts.py·app.py) docker cp→`nexus-web` 재시작(health200). 컨테이너 커밋 `nexus-web:artifact-persist-20260731`+`latest` 재태그(기동 이미지는 `sessionfix-20260731`). 커밋·push 미실행(요청 대기). **잔여**: 브라우저 시각 확인(사용자), Redis per-turn 개선(선택).
+
+**img2img 라우팅 일관성 수정 — "그려줘" 표현도 첫 시도부터 img2img (2026-07-31).** 사용자 재보고: 사진 첨부+"노래 부르는 여성 정면 그려줘" 시 원본과 안 닮은 새 그림. B200 로그 확인 결과 **1차=text2img(모델이 input_image 미전달), 2차(지적 후)=img2img(0.45)** — 모델이 img2img를 언제 쓸지 일관되게 판단 못함. 사용자 핵심 우려="일관성 강화하면 OCR 라우팅 안 깨지나?".
+- **원인**: ①업로드 안내 템플릿이 "분석해 주세요"만 지시(그리기 라우팅 힌트 없음) ②`input_image` 도구설명 트리거가 '수정/편집/변형/비슷하게'만이라 "그려줘"(신규생성 표현)를 못 잡음. 사용자의 "그림 확인하고 ...그려줘"가 text2img로 샘.
+- **수정(의도별 분기 — OCR 무손상 원칙)**: ①업로드 템플릿(index.html)을 "분석·OCR이면 AnalyzeImage/DocumentProcess, **이 이미지를 바탕으로 그리기·수정이면 ImageGenerate(input_image=서버경로)**"로 조건부 분기. ②`image_generate_tool.py` `input_image` 설명 확대 — 업로드 이미지가 있고 그리기·수정 의도면 표현이 '그려줘'여도 반드시 경로 설정, 단 '분석/설명/OCR'만이면 AnalyzeImage(무관) 명시.
+- **검증(양 경로 e2e)**: OCR글자+얼굴형 이미지 업로드 후 — **PATH1(OCR "글자 읽어줘")=AnalyzeImage만 호출·ImageGenerate 안 샘**, **PATH2("바탕으로 정면 그려줘")=ImageGenerate 호출→B200 `mode=img2img(0.4)` 첫 시도부터**. 둘 다 PASS. ruff clean.
+- **한계(정직)**: img2img는 구도·색감·포즈만 이어받고 **특정 인물 얼굴(정체성)은 보존 못 함**(SD3.5 img2img는 identity-preserving 아님). "그 사람" 닮게=IP-Adapter/InstantID 필요(B200 파이프라인 추가, 사용자 선택지로 제시·보류). strength↑(포즈변경)와 닮음유지는 상충.
+- **배포·durability**: index.html·image_generate_tool.py docker cp→재시작(health200). 커밋 `nexus-web:img2img-routing-20260731`+`latest`. 리포 index.html도 동기 수정(배포본은 chunkfix baseline 직접패치 유지). 커밋·push 미실행.
+
+**img2img 경로 할루시네이션 복구 (2026-07-31).** 사용자 재테스트 중 `<tool_use_error>input_image 읽기 실패(/tmp/nexus_uploads/upload-133340f844277.png): No such file` 발생. 진단=라우팅은 성공(모델이 input_image 넘김)했으나, 모델이 **긴 uuid 경로를 재현하다 완전히 다른 경로를 조작**(실존 `upload-c47bfeece4c1.jpg`→조작 `upload-133340f844277.png`, 확장자 .jpg→.png까지 변조). 업로드 엔드포인트 주석에도 이미 경고된 "긴 문자열 재현 취약성".
+- **수정**(`image_generate_tool.py`): 도구가 모델 경로에 의존하지 않게 함. `_latest_uploaded_image(uploads_dir)` 헬퍼 추가(업로드 디렉토리에서 mtime 최신 이미지 반환). call()에서 모델의 input_image가 **업로드 디렉토리 하위 AND 실제 파일**이 아니면 → 최근 업로드 이미지로 복구(사용자가 방금 올린 게 최신). **img2img 의도(input_image 제공) 시에만 발동** → OCR·신규생성(input_image 미제공) 무영향. 복구 대상도 없으면 "이미지 먼저 첨부" 안내 에러.
+- **검증**: 단위테스트 4건 추가(정상경로 base64 전달·할루시네이션→최근업로드 복구·업로드없음 에러·미지정시 text2img 유지, os.utime로 mtime 결정화). test_image_generate_tool 10 passed. ruff clean. **라이브 e2e PASS**(업로드+"그려줘"→읽기실패에러 없음·다운로드링크 생성·B200 mode=img2img). 커밋 `nexus-web:img2img-recover-20260731`+`latest`.
+- **제품화 주의(멀티유저)**: 복구가 '전역 최신'이라 다중 사용자 동시 업로드 시 오선택 가능. 제품화 땐 web이 요청별 실제 업로드 경로를 context로 주입하는 방식이 정확(현재 단일사용자 데모엔 충분).
+
+**Claude web/app 기능 이식 — 설계(Fable 5) + Phase 1 착수 (2026-08-04).** 사용자 요청: Claude web/app vs NOVA 기능 비교 → 이식 가능 기능 정리 → Fable 5가 설계해서 진행. Fable 5(general-purpose, model=fable) 백그라운드 에이전트가 코드 근거(파일:라인)까지 검증한 3단계 로드맵 설계서 산출.
+- **비교 요약**: NOVA 우위=이미지생성(SD3.5)·문서생성(docx/pptx/hwpx)·에어갭·멀티테넌트·서브에이전트·대형RAG. Claude 우위(이식대상)=대화검색·이름변경·즐겨찾기·폴더·메시지편집/재생성·코드하이라이트/복사·LaTeX·내보내기·커스텀인스트럭션·프롬프트라이브러리·확장thinking토글·라이브HTML프리뷰·분석도구·프로젝트. 이식불가(에어갭)=웹검색·클라우드MCP·공유링크·음성.
+- **로드맵**: Phase1 퀵윈(세션메타+이름변경+핀 / 검색 / 코드복사+하이라이트 / 내보내기 / thinking접이), Phase2(재생성·커스텀인스트럭션·폴더·KaTeX·HTML프리뷰·프롬프트템플릿), Phase3(메시지편집·분기(fork방식)·분석도구·프로젝트). Fable5 핵심판단=메타가 폴더/프로젝트 토대라 최우선 / 재생성·편집은 엔진캐시(`_acquire_session_engine`) 무효화 관건이라 fork방식 / 에어갭 자산은 로컬 vendor 번들 / LAN HTTP는 non-secure라 복사버튼 execCommand 폴백 필수 / 프론트변경은 "신규함수+1줄훅"으로 배포baseline 이원화 대응.
+- **P1-1(세션 메타 인프라+이름변경+핀) 완료·배포**: 백엔드 `transcript.py` `read_session_meta`/`write_session_meta`(meta.json 사이드카, 병합갱신, 경로탈출방어) + `list_transcript_sessions`에 title/pinned 포함. `web/app.py` `PATCH /v1/sessions/{id}`(SessionMetaUpdate, channel=web 격리, title 200자). 프론트 index.html: customTitle 우선 제목·핀 정렬(핀 먼저)·핀/이름변경 버튼·`renameSession`/`togglePin`/`patchSessionMeta`+CSS. 단위 5건 추가(라운드트립·부분갱신·경로탈출거부·목록반영·삭제연동) → test_session_persistence 34 passed. ruff clean. **실서버 e2e PASS**(PATCH→목록 title/pinned 반영). 커밋 `nexus-web:p11-session-meta-20260804`+latest. 배포본 baseline에 프론트 5패치 직접적용.
+- **잔여 Phase1**: P1-3(코드복사+언어라벨+하이라이트) · P1-5(thinking접이) · P1-4(내보내기 md/txt) · P1-2(검색). 착수순 P1-3→P1-5→P1-4→P1-2.
+
+**로드맵 재검토(Fable 5) — 무의미 항목 가지치기 (2026-08-04).** 사용자가 "thinking이 현재 모델에 의미 있냐" 지적 → 확인 결과 무의미(A.X-4.0=Qwen2.5기반 비추론, `enable_thinking=False` 3본, Scout 비활성, `_strip_thinking` 정제 → thinking_delta 안 흐름). 이 잣대로 Fable 5가 로드맵 전체 재판정.
+- **제외/보류**: P1-5 thinking표시→백로그(추론모델 배포 시). P3-2 분석도구(코드실행)→보류(A.X-4.0 tool-arg JSON 붕괴 취약 + Bash로 이미 가능). P2-4 KaTeX→게이트(실서버 LaTeX 출력 검증 후, 대학 세그먼트와 묶음).
+- **재판정 주목**: P2-1 재생성은 현 모델 품질편차(degeneration) 때문에 오히려 가치 ↑.
+- **가지치기 최종순서**: [P1-3→P1-4→P1-2] → [재생성→커스텀인스트럭션→폴더→프롬프트템플릿→HTML프리뷰] → [프로젝트→편집·분기].
+
+**P1-3(코드블록 복사+언어라벨+하이라이트) 완료·배포 (2026-08-04).** 프론트 단독. index.html: ①formatContent가 펜스 언어명을 `language-xxx`/`data-lang` 클래스로 보존(기존엔 캡처만 하고 버림) ②`enhanceCodeBlocks(rootEl)` 신규 — pre>code에 언어라벨+복사버튼 헤더 삽입, `window.hljs` 가드로 하이라이트(없어도 라벨·복사 동작) ③복사는 `navigator.clipboard`+**`execCommand` 폴백**(LAN HTTP=non-secure라 clipboard 부재 대응, Fable5 지적 함정) ④finalizeStreamingMessage·appendMessage에 1줄 훅(델타마다 X, finalize 1회) ⑤코드헤더 CSS. **하이라이트 번들**: highlight.js v11.9.0 로컬 vendor 커밋(`web/static/vendor/highlight/` highlight.min.js 119KB + **github 라이트테마**(NOVA=라이트 UI, dark 아님) + BSD-3 LICENSE), `<head>`에 로컬 링크(외부 CDN 금지=에어갭). 검증: node 구문검사 OK(리포·배포본), 배포 후 js/css/index 200 서빙. 커밋 `nexus-web:p13-codeblock-20260804`+latest. 배포본 baseline에 6패치 직접적용. **시각 확인은 사용자 브라우저(코드 요청 시 라벨·복사·색칠)**.
+
+**P1-4(대화 내보내기 md/txt) + P1-2(대화 검색) 완료·배포 (2026-08-04).** Phase 1 전 항목 완료(P1-5 제외).
+- **P1-4 내보내기**: `web/app.py` — 메시지 로딩을 `_load_session_messages`(Redis→트랜스크립트, 생성물 미부착 원본)로 추출해 messages 엔드포인트·export가 공유(중복 제거). 신규 `_render_session_export(title,messages,fmt)`(md=제목헤더+`## 사용자`/`## IDINO NOVA` 교대·본문 마크다운 그대로, txt=라벨+평문, 외부의존 0) + `GET /v1/sessions/{id}/export?fmt=md|txt`(제목=meta.json 우선, Content-Disposition UTF-8 파일명, channel=web). 프론트: 사이드바 항목에 ⬇내보내기 버튼 + `exportSession`(전역 fetch 오버라이드 인증, blob→a.download, CD헤더에서 파일명 추출) + CSS. get_session_messages도 헬퍼 기반으로 리팩터(동작 불변).
+- **P1-2 검색**: `transcript.py` 신규 `search_transcript_sessions(query, channel, limit=20, max_snippets=3, max_lines=5000)`(JSONL 라인 스캔·대소문자무시 부분일치·매치±40자 스니펫·2자하한·거대파일 캡·채널격리). `GET /v1/sessions/search?q=`(channel=web). 프론트: 사이드바 검색 input(300ms 디바운스) + `searchSessions`/`renderSearchResults`(매치어 `<mark>` 강조는 escapeHtml 후 적용=XSS방지, 클릭→switchSession+검색창 초기화) + CSS.
+- **검증**: 단위 8건 추가(메타5+검색4는 앞서, 이번 검색4=매치·채널격리·2자하한·무매치) → test_session_persistence 38 passed. `_render_session_export`·`search_transcript_sessions` 단위 직접확인. ruff clean(transcript All passed, app.py 기존 E402·S110만). node 구문검사 OK(리포·배포본). **실서버 e2e PASS** — export(200·md본문·`Content-Disposition: attachment; filename*=UTF-8''대화%20...md`·text/markdown), search(매치1·2자미만0). 커밋 `nexus-web:p14p12-export-search-20260804`+latest. 배포본 baseline에 8패치 직접적용(Write도구로 스크립트 생성, raw문자열로 정규식 백슬래시 보존).
+- **Phase 1 완료 요약**: P1-1(메타/이름변경/핀)·P1-3(코드블록)·P1-4(내보내기)·P1-2(검색) 배포. P1-5(thinking)=백로그. **다음 Phase 2**: 재생성→커스텀인스트럭션→폴더→프롬프트템플릿→HTML프리뷰. 배포본 baseline 이원화(chunkfix vs 리포 스트리밍렌더)는 누적 패치 부담 — 향후 reconcile 검토 필요.
+
+**프론트 이원화 정리(reconcile) 완료 — 리포 HEAD 정본화 (2026-08-04).** 그간 배포 index.html이 리포 HEAD가 아닌 별도 chunkfix baseline이라 기능마다 이중 패치하던 부담 해소. 정밀 diff 결과 **두 계보의 실제 기능 차이는 "스트리밍 렌더" 하나뿐**(리포=`_streamBodyRaw`+60ms throttle 마크다운 실시간 렌더 / 배포본=`body.textContent` raw→완료시 팝). 나머지 diff 127줄은 전부 주석·CSS포매팅·업로드템플릿 문구(둘 다 img2img 라우팅 보유). 스트리밍 렌더는 아티팩트/다운로드/히스토리 코드를 안 건드리므로 과거 "아티팩트 회귀"의 원인 불가(그건 미해결 다운로드-트랜스크립트 문제였고 이후 서버측 tb_artifacts로 해결). **사용자 승인 후 리포 HEAD를 정본으로 배포**(기능 상위집합+실시간렌더 복원). 커밋 `nexus-web:reconciled-20260804`+latest, 롤백용 `p14p12-...` 보존.
+- **브라우저 실검증(claude-in-chrome)**: 페이지 정상 로드·콘솔오류0. 사이드바 P1 전부 라이브 — 검색창·핀고정세션 최상단(영속 커스텀제목 "내가 정한 제목")·핀/이름변경/내보내기/삭제 버튼. 메시지 전송→스트리밍 렌더 정상, 코드요청→**PYTHON 라벨+복사버튼+포맷 코드블록+마크다운 설명** 렌더.
+- **테마 주의(기록)**: UI는 CSS상 명백히 **라이트 테마**(`--bg-page #f1f4fa`·`--bg-input #ffffff`, 다크오버라이드 없음). 검증 브라우저가 다크로 보인 건 force-dark 확장 반전 아티팩트 — 실사용자는 라이트 UI라 highlight.js **라이트 github 테마 선택이 정답**(변경 불필요). 부수효과: 검증용 테스트 세션 1건("파이썬으로 두 수...") 생성됨(무해).
+- **효과**: 이후 프론트 배포는 리포 파일 그대로 docker cp(이중 패치 종료). Phase 2부터 단일 소스.
+
+**Phase 2 착수 — P2-1 재생성(regenerate) 완료·배포 (2026-08-04).** Fable5가 "현 모델 품질편차(degeneration) 대응으로 가치 큼"으로 판정한 항목. 관건=엔진 캐시(정확히는 `chat_histories` 인메모리 dict) 무효화("지운 메시지 되살아남" 방지).
+- **구조 파악**: 프로덕션 엔진은 요청마다 `_assemble_session_engine`로 새로 조립(캐시된 stale _messages 없음). 진짜 지속 히스토리=**`_app_state["chat_histories"][session_id]`(Message 리스트) + Redis**. 스트리밍 채팅이 요청마다 histories에서 engine._messages 재구축. → 재생성 절단은 이 dict + Redis만 건드리면 됨.
+- **백엔드**(`web/app.py`): `POST /v1/sessions/{id}/truncate` — 마지막 (user,assistant) 교환을 chat_histories+Redis 양쪽에서 제거하고 제거된 user 텍스트 반환. 세션 락으로 진행 중 생성과 직렬화. channel=web.
+- **프론트**(index.html): 마지막 assistant 말풍선에 "↻ 재생성" 버튼(`updateRegenerateButton`, finalize·히스토리복원 후 배치). `regenerateLast`=truncate 호출→로컬 캐시 절단→재렌더→마지막 user 재전송. appendMessage/startStreamingMessage에 `msg-{role}` 클래스 추가(버튼 배치용). CSS.
+- **검증**: 실서버 e2e — 초기 2 → truncate(removed=2, last_user 반환) → 재전송 → **user 1 + assistant 1 (중복 없음)** = "되살아남" 버그 방지 확인. 리팩터: get_session_messages를 `_load_session_messages`(Redis→트랜스크립트) 헬퍼로 정리(동작 불변). 커밋 `nexus-web:p21b-regenerate-20260804`+latest.
+- **테스트 위생(pre-existing 정리)**: 전체 스위트 실행 중 stale 테스트 발견·수정 — ①채널격리 작업(이전 세션) 미갱신: web_integration 3건 flat경로→web/, concurrency fake엔진 bind_request에 channel kwarg. ②내 아티팩트-turn 변경(`engine.total_turns`)이 여러 test fake엔진에서 노출 → **프로덕션을 `getattr(engine,"total_turns",None)` 방어형으로**(fail-soft, whack-a-mole 회피) + _IsolationFakeEngine에 total_turns 추가. **전체 1759 passed**, 1 failed=hwpx 환경이슈(python-hwpx, 무관), ruff clean. **P2-1 프로덕션 회귀 0**(수정은 전부 테스트측+방어형).
+- **다음 Phase 2**: 커스텀 인스트럭션 → 폴더 → 프롬프트 템플릿 → HTML 프리뷰.
+
+**P2-2 커스텀 인스트럭션 완료·배포 (2026-08-04).** 모든 대화의 시스템 프롬프트에 덧붙는 테넌트 단위 사용자 지시문. Fable5: A.X-4.0이 한국어 시스템 프롬프트 추종이 주특기라 가치 큼.
+- **저장**(`web/app.py`): `{sessions_dir}/_instructions/{tenant_id}.txt`(bind-mount 영속, 세션 스캔 미간섭). `_read_custom_instruction`/`_write_custom_instruction`(tenant_id 정화, fail-soft). 상한 4000자.
+- **엔드포인트**: `GET/PUT /v1/instructions`(테넌트는 _resolve_tenant로 해석, 기본 default).
+- **주입**: 기존 `_inject_openai_context`의 `engine.update_system_prompt(base + "[사용자 지시]" + text)` 패턴 재사용. 엔진이 요청마다 새로 조립돼 누적 없음. **양 경로 모두** 주입 — 비스트리밍 `/v1/chat`(bind_request 직후) + **스트리밍 `/v1/chat/stream`(웹 UI가 쓰는 경로)**. (초기엔 스트리밍 경로에만 넣어 비스트리밍 e2e가 실패 → 양쪽 주입으로 수정.)
+- **프론트**(index.html): 사이드바 푸터에 ⚙설정 버튼 → 커스텀 인스트럭션 편집 모달(textarea+저장/취소, GET로 로드·PUT로 저장, Esc·오버레이클릭 닫기). CSS(모달 오버레이·버튼).
+- **검증**: 실서버 e2e — PUT "답변 끝에 [지시반영됨] 붙여라" 설정 후, 비스트리밍 응답="...2입니다. [지시반영됨]" + 스트리밍 SSE 재조합="...6입니다. [지시반영됨]" **양쪽 반영 확인**(스트리밍은 프레임 분할이라 재조합 필요). 회귀 테스트 82 passed. ruff clean. 커밋 `nexus-web:p22b-instructions-20260804`+latest.
+- **다음 Phase 2**: 폴더 → 프롬프트 템플릿 → HTML 프리뷰.
+
+**P2-3 폴더/그룹 완료·배포 (2026-08-04).** P1-1 meta.json 인프라 위에 `folder` 필드를 얹어 사이드바를 폴더별 그룹 렌더. 순수 UI 인프라(모델 무관).
+- **백엔드**: `SessionMetaUpdate`에 `folder`(빈 문자열=미분류 복귀, 60자), PATCH 처리·반환, `list_transcript_sessions`에 folder 포함.
+- **프론트**(index.html): `renderSessionList` 재구성 — 폴더별 분류(상단 접이식 폴더 섹션 + 하단 미분류), `sessionItemHtml` 추출, 항목에 📁폴더 버튼(setFolder=prompt→PATCH), 폴더 헤더 클릭 접기/펴기(`localStorage nova.folderCollapsed`), 폴더 내에서도 핀 우선+최근순. CSS(폴더 헤더·캐럿·카운트, 버튼 5개 수용 위해 20px로 축소).
+- **검증**: 실서버 e2e — PATCH folder="업무"→목록 folder 반영, folder=""→미분류('') 복귀 확인. 회귀 80 passed. ruff clean. 커밋 `nexus-web:p23-folders-20260804`+latest.
+- **다음 Phase 2**: 프롬프트 템플릿 → HTML 프리뷰.
+
+**P2-6 프롬프트 템플릿 완료·배포 (2026-08-04).** 자주 쓰는 프롬프트를 저장하고 입력창 `/`로 빠르게 삽입. 사용자측 기능(모델 무관).
+- **백엔드**(`web/app.py`): 테넌트 단위 JSON(`{sessions_dir}/_prompts/{tid}.json`, bind-mount 영속). `_read_prompts`/`_write_prompts`(fail-soft), `GET/PUT /v1/prompts`(목록 통째 교체, 빈 본문 제외, 개수50·제목60·본문2000 상한). PromptItem/PromptsUpdate 모델.
+- **프론트**(index.html): 설정 모달에 "프롬프트 템플릿" 섹션(제목+본문 편집 행 동적 추가/삭제, saveSettings가 인스트럭션+템플릿 함께 저장). 입력창 `/` 팝업 — oninput에서 `/`로 시작하면 템플릿 필터(제목·본문 부분일치) 표시, ↑↓/Enter/Esc·클릭 삽입(본문으로 입력창 교체), handleKeyDown이 팝업 키를 먼저 소비. CSS(섹션·편집행·팝업 드롭다운).
+- **검증**: 실서버 e2e — PUT 3건(빈본문1)→2건 저장·GET 확인. **브라우저 실검증** — "/코" 입력→"코드리뷰" 템플릿만 필터 표시(제목+미리보기), 클릭→본문 "아래 코드를 리뷰하고..." 입력창 삽입·팝업 닫힘. 회귀 80 passed. ruff clean. 커밋 `nexus-web:p26-prompts-20260804`+latest. (데모 템플릿은 테스트 후 정리)
+- **다음 Phase 2 마지막**: P2-5 HTML 라이브 프리뷰.
+
+**P2-5 HTML 라이브 프리뷰 완료·배포 (2026-08-04) — Phase 2 전체 완료.** 모델이 만든 HTML을 우측 캔버스에서 sandbox iframe으로 렌더(Claude 아티팩트 유사). 프론트 단독.
+- **구현**(index.html): `enhanceCodeBlocks`가 `lang===html|svg` 코드블록 헤더에 "▶ 미리보기" 버튼 추가 → `openCanvas({html})`. `openCanvas`에 html 모드 신규 — `<iframe sandbox="allow-scripts">`(★allow-same-origin 없이 = 부모 오리진·쿠키·내부API 접근 불가) + `_wrapHtmlWithCsp`로 srcdoc `<head>`에 CSP `default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:` 주입(에어갭: 외부 CDN·이미지·폰트 로드 차단). 조각/완전문서 모두 처리. CSS(미리보기버튼·iframe).
+- **검증**: node 구문 OK. **브라우저 실검증** — HTML 요청→모델이 완성 HTML 코드블록(파란배경 흰글씨 중앙정렬)→헤더 "▶ 미리보기" 클릭→우측 캔버스 iframe에 **파란배경+흰글씨 "미리보기 테스트" 실제 렌더 확인**. 커밋 `nexus-web:p25-htmlpreview-20260804`+latest.
+
+**Phase 3 완료·배포 (2026-08-04) — P3-1 편집·분기 + P3-3 프로젝트.**
+- **P3-1 편집·분기(fork)**: `POST /v1/sessions/{id}/fork {at_index}` — at_index개 앞 메시지를 새 session_id로 복사(chat_histories+Redis+트랜스크립트), 원본 보존(append-only 충돌 회피, Fable5 설계). 폴더·제목 상속("(분기)"). 프론트: user 말풍선 hover에 "✎ 편집" 버튼(appendMessage에 data-msg-index 추적), editMessage=prompt편집→fork→새 세션 전환→편집본 전송. e2e: fork at_index=2 → 원본 4 보존/분기 2. 커밋 `nexus-web:p31-editfork-20260804`.
+- **P3-3 프로젝트**: 프로젝트={폴더(P2-3)+전용지시문+지식소스 서브셋}. "폴더명=프로젝트명"으로 세션 연결(폴더 재사용). 백엔드: `_read/_write_projects`(`_projects/{tid}.json`), `GET/PUT /v1/projects`(+available_sources 반환), `_resolve_project_for_session`(세션 folder→프로젝트), `_narrow_tenant_for_project`(TenantConfig.model_copy로 소스 narrow, **넓히기 금지=보안**). 양 채팅경로 통합 — bind 전 소스 narrow + 인스트럭션 결합(커스텀+프로젝트). ★스트리밍은 중첩함수라 tenant 재대입 시 UnboundLocalError(F823) → `_eff_tenant` 별도변수로 수정. 프론트: 설정 모달 "프로젝트" 섹션(이름·지시문·소스 쉼표구분), 소스입력 힌트=available_sources. e2e: 프로젝트(instruction+sources=kowiki) 저장→세션 folder 연결→채팅에 "[프로젝트적용]" 적용 확인. 커밋 `nexus-web:p33-projects-20260804`. 회귀 82 passed, ruff clean.
+- **★ Phase 1·2·3 전체 완료** — Fable5 로드맵의 이식가능 기능 전부 배포·검증(제외: thinking·분석도구=모델조건 백로그, KaTeX=게이트, 에어갭불가=웹검색·클라우드MCP·공유·음성).
+
+**심화 테스트 (Claude 작성→Fable5 검토→실행) 완료 (2026-08-04).** 사용자 요청: Phase3 후 심화 테스트(AI 흔한 실수 포함) 작성·검토·실행 + 사용자 수동 목록. 계획서 `user_mig/TEST_PLAN_deep_20260804.md`, 사용자용 `user_mig/TEST_사용자수동_20260804.md`.
+- **Fable5 검토 반영**: P0 빈틈 추가(TS-9 인스트럭션/템플릿/프로젝트 테넌트격리, TS-10 파일명 CRLF 헤더인젝션, TS-11 크기제한) + AI실수 추가(TA-11~17: 도구루프·조기종료·거짓완료·CJK혼입·순차컨텍스트·프롬프트유출·형식준수) + [A]/[M] 재분류.
+- **[A] 자동 실행 결과**: ①결정적(보안·CRUD·엣지) **18/18 PASS** — 경로탈출5·테넌트격리(인스트럭션·프로젝트)·CRLF인젝션차단·크기절단·소스narrow·title절단·404·fork클램프·빈본문필터·검색하한. ②모델기반 **7 PASS/0 FAIL/1 WARN** — 인스트럭션 적용·**누적방지(1회)**·제거, **재생성 되살아남 없음**(2→절단→2), **fork 원본보존**(4), **순차 컨텍스트 격리**, **CJK 한자누출 없음**. WARN=TA-17 "3줄로만"→1줄(A.X-4.0 형식준수 능력한계 P2, 버그 아님). ③전체 pytest **1759 passed**(hwpx 1 환경이슈 무관), ruff clean, node 구문 OK.
+- **발견·수정**: truncate가 없는 세션에 200(idempotent) → fork/export와 일관성 위해 **404로 수정**(hist 비면 404). 커밋 `nexus-web:phase3-tested-20260804`.
+- **알려진 한계(문서화)**: T3-1c fork 세션은 tb_artifacts가 원본 session_id 기준이라 **접두부의 생성이미지/다운로드 링크가 분기에 안 딸려옴**(텍스트는 복사됨). 수정=artifact 레코드 새 session_id로 복사 필요(후속). TA-1(경로할루시네이션 복구)·TA-2(tool-arg JSON)·TA-4(degeneration)·TA-5(긴문자열)는 앞선 세션에서 수정·검증됨.
+- **[A] 잔여 배치 실행(2차)**: T1-1b(Redis-only PATCH)·TS-2대조(web검색 잡힘)·TA-11(인사에 도구 미발동)·TA-13(가짜 다운로드 없음)·TA-4(특수토큰 없음) **전부 PASS**. T3-1c=WARN(fork 아티팩트 소실 한계 확인). TS-2 cli격리는 test_channel_isolation 단위9로 커버(e2e는 glob 스캔 이슈로 스킵). **최종: [A] 실제 FAIL 0** (WARN 2=TA-17 형식능력·T3-1c 한계).
+- 테스트 세션 20개 정리(사용자 실 세션 11개 잔존). 커밋 `nexus-web:phase3-tested-20260804`.
+
+**T3-1c 수정 완료 (2026-08-04) — fork 아티팩트 링크 소실 해소.** 사용자 요청으로 즉시 수정. 원인=tb_artifacts가 원본 session_id 기준+filename UNIQUE라 분기에 레코드 재삽입 불가. 해법=fork 시 원본 생성물 목록(직접+연쇄상속, fork지점 이전 turn만)을 새 세션 `meta.json`의 `inherited_artifacts`로 저장 → `_attach_session_artifacts`가 세션 자체 tb_artifacts + meta의 inherited를 병합해 assistant 메시지에 되붙임. **실서버 e2e PASS** — 고양이 이미지 생성한 대화 fork→분기가 이미지 링크(A_small_cute_cat...png) 상속 확인. 회귀 98 passed, ruff clean. 커밋 `nexus-web:t31c-fixed-20260804`. → 이제 [A] WARN은 TA-17(형식능력) 1건만 남음.
+- **다음(사용자)**: `TEST_사용자수동_20260804.md`의 [M] 눈확인 테스트(핀렌더·복사·HTML프리뷰·편집분기UI·프로젝트·언어품질·붕괴·유출 등). P0급: C2유지·B1복사·D4편집분기·D5프로젝트·E1언어·E2붕괴.
+
+**★ Phase 2 전체 완료 (2026-08-04)**: 재생성·커스텀인스트럭션·폴더·프롬프트템플릿·HTML프리뷰 5개 전부 배포·검증. Phase 1(메타/이름변경/핀·코드블록·내보내기·검색) + 이원화정리 + Phase 2 완료. **남은 로드맵**: Phase 3(프로젝트·편집/분기(fork)) / 게이트(KaTeX 실서버검증) / 백로그(thinking·분석도구=조건부 모델). 재생성·커스텀인스트럭션·폴더·템플릿·HTML프리뷰·코드블록복사·검색·내보내기·이름변경·핀 모두 브라우저 실검증 완료.
+
+**사이드바 대화 이력 정렬 — 최근 활동순 (2026-08-04).** 사용자 지적: 왼쪽 대화 목록이 시간순이 아니라 뒤죽박죽. 원인=`renderSessionList()`가 `sessions` 배열을 **정렬 없이** 그대로 렌더. 새 대화는 unshift(맨 위)·서버 세션은 push(맨 아래, mtime desc)로 섞이고, **기존 세션을 다시 써도 재정렬 안 됨**(위치 고정). 조치(index.html)=①`sessionSortKey(s)` 헬퍼(로컬 epoch/서버 ISO 모두 숫자화, 없으면 0) ②`renderSessionList`가 원본 안 건드리고 복사본을 최근활동 desc 정렬 ③`newSession`에 `last_modified: Date.now()` ④`sendMessage`가 전송 시 현재 세션 `last_modified` 갱신+재렌더(방금 대화한 세션이 맨 위로). 정적파일이라 docker cp만으로 반영(재시작 불필요). 커밋 `nexus-web:sidebar-sort-20260804`+`latest`. 리포·배포본 동기.
+
+---
+
+**CLI + web/app 기능 전수 재조사·통합 이식 로드맵 수립 (2026-08-04) — 계획만, 구현 미착수.**
+사용자 요청: ①CLI에 Claude Code·GPT Codex 최신 기능 이식 ②NOVA CLI 전수조사 ③적용가능 기능 이식 ④디자인 Claude Code화 ⑤파일수정/프로세스 중 중간확인·선택·피드백(manual/auto/accept mode) ⑤'전체 수정계획 작성→Fable5 검토→수정'. 이후 사용자가 "조사가 부실하다" 2회 지적 → 방법론 교정(기억 사전필터링→1차출처 전수조사 선행).
+
+- **NOVA CLI 현황 조사 완료**: `cli/repl.py`(942, NexusREPL, Rich+prompt-toolkit) `cli/commands.py`(439, Click: chat/ask/version/sessions/health) `cli/formatters.py`(438, OutputFormatter). 슬래시 7개(/help /clear /exit /model /config /session /thinking). 권한=`prompt_permission` Y/N/A(A 미저장), bootstrap ask_handler 배선(auto/bypass/trust면 미주입), enforce 활성. **핵심 실측**: executor ASK는 파이프라인 아닌 **도구 자체 check_permissions**가 결정(Write는 항상 ASK). PermissionModeValue↔PermissionMode 이원화, ACCEPT_EDITS로 가는 세션값 부재(도달불가). `pipeline.update_context()` 존재(모드 갱신용).
+- **1차출처 전수조사**(claude-code-guide + research 에이전트): Claude Code 슬래시40+·단축키70+·플래그60+ / Codex config150+·승인샌드박스 다층·훅·서브에이전트 / claude.ai web·app 대화관리·Projects·Artifacts·개인화·멀티모달·커넥터 전반. → 최초 25개 리스트가 극히 일부였음 확인.
+- **작성 문서 3종**(`user_mig/design/`): `FEATURE_RECATALOG_RECONCILE_2026-08.md`(3표면 NOVA 대조) · `CLI_CLAUDE_CODEX_PORT_PLAN.md`(CLI 계획 v2, Fable5 1차검토 조건부GO 5조건 반영) · `INTEGRATED_FEATURE_PLAN_2026-08.md`(v2 최종, Fable5 우선순위 재설계 반영).
+- **Fable5 2회 검토 반영**: [1차 CLI] 치명 A1 미동작(enum만으론 accept_edits 무효—Write 항상 ASK)→모드인지 ask_handler / set_mode 불필요(update_context 사용) / 모드갱신 4지점 단일헬퍼 / ask_handler **v2 계약**(구 bool 폴백) / `!`감사로그+plan비활성 · A4 Bash프리픽스·DANGEROUS제외. [2차 통합] **W7 Stop 이미 보유**(index.html:3226/app.py:1679)→제거 / W6 Continue 백로그(내부 max-output 복구 2단계 query_loop:100-156,1234-1276) / **시스템프롬프트 주입 3지점 append→단일화 헬퍼가 W1 선행**(`core/system_prompt/` 빈패키지가 자리) / W2 Incognito 제외(감사추적 컴플라이언스 충돌) / W8 업로드확장 승격 / W4·W5 방출게이트(≥70%·파싱≥80%) / **표면별 분리배포**.
+- **확정 로드맵(배포 단위)**: ①CLI Stage1(권한모드·ask_handler v2·diff미리보기·도구축약·자동완성 — 요청#5 본질) +병행 W4/W5 게이트 실측 → ②web(주입단일화 헬퍼→W1 응답스타일→게이트통과 mermaid/KaTeX) → ③CLI확장(상태줄·!bash·/compact·/resume·/diff·/cost·/copy·/save·/rewind[diff before-image 재사용]) → ④web확장(W8 업로드·W3 메모리UI 조건부). 백로그: W6·/branch(fork프리미티브 공통화 후)·ask JSON출력·hooks. 제외: /model(라우팅자동)·/init·웹검색·Extended Thinking·음성/카메라·Office애드인·Cowork·W2·W7.
+- **다음 세션 착수점**: **배포① CLI Stage1** — A1(accept-edits enum/매핑 core/state.py·mode_mapping.py + 모드인지 ask_handler_v2, executor 폴백) → A2~A4(런타임전환 /mode·Shift+Tab 4지점 헬퍼·allow-list) → B1~B2(diff 미리보기 formatters) → C1·D8~D10(도구축약·자동완성·멀티라인). 병행: W4/W5 게이트 실측(운영 transcript 방출빈도 집계 + 실서버 프로브 20~30). 배포게이트=executor v2폴백 회귀+웹 e2e 스모크. **구현 미착수** — 계획 검토·승인까지만 완료.
+
+**CLI Stage 1 — A1 구현 완료 (2026-08-04): accept-edits 모드 + 모드인지 ask_handler v2.**
+확정 로드맵 배포① 첫 단계. 계획서 `CLI_CLAUDE_CODEX_PORT_PLAN.md` §A1/§A3 그대로 구현.
+- **core(최소 침습 4점)**: ①`core/state.py` `PermissionModeValue.ACCEPT_EDITS="accept_edits"` 신설(기존 도달불가 해소) ②`mode_mapping.py` ACCEPT_EDITS→PermissionMode.ACCEPT_EDITS 매핑 ③`pipeline.py` 이름기반 분류를 모듈레벨 공개함수 `categorize_tool_name(name)->ToolCategory|None`으로 추출(분류표 단일출처, CLI 재사용·드리프트 방지. `_categorize_tool` 1단계가 위임 — 판정 100% 동일. MultiEdit을 FILE_WRITE 표에 명시=종전 flag폴백과 동일 판정, 경로만 1단계로) ④`executor.py` ASK 게이트에 **ask_handler_v2 우선 + 구 ask_handler(bool) 폴백**(웹·headless·기존테스트 무회귀). v2 계약=(tool_name,message,tool_input)->{approved,feedback,always_allow}. 거부+피드백 시 tool_use_error 안에 "사용자 피드백: ..."을 실어 모델이 다음 턴 반영. dict 아닌 반환은 bool 근사(방어적).
+- **CLI**: `commands.py` --permission-mode Choice에 accept_edits 추가. `repl.py` ①`_session_allow` 세트 신설 ②bootstrap 주입을 ask_handler→**ask_handler_v2**로 교체(auto/bypass/trust 미주입 동일, accept_edits는 주입—핸들러 안에서 선별) ③`prompt_permission_v2`: accept_edits 모드+FILE_WRITE(Write/Edit/MultiEdit/NotebookEdit)면 프롬프트 없이 "⏺ 자동 승인(accept edits)" 1줄+즉시승인, **미지의 도구는 자동승인 금지(fail-closed—None이면 물어봄)**, Bash는 종전대로 확인. numbered `1)예 2)예(세션 항상허용) 3)아니오(피드백)`. 2번은 세션 allow 등록(Bash·DANGEROUS·미지도구는 등록 제외=1회성), 3번/기타입력/취소는 거부(기타는 피드백 프롬프트로, Ctrl+C는 즉시). 구 `prompt_permission`(Y/N/A)은 유지(레거시 계약).
+- **검증**: 신규 테스트 3파일+기존 확장 — `test_permission_mode_mapping.py`(8모드 정답표) `test_tool_executor_ask.py`(+v2 4: 허용실행·거부피드백전달·v2우선v1미호출·bool근사) `test_cli_permission_prompt_v2.py`(신규 10: FILE_WRITE 4종 자동승인·Bash/미지도구 프롬프트 유지·default모드 프롬프트·numbered 3피드백·2등록후 재프롬프트 스킵·Bash 미등록·취소거부) `test_permission_categorize_tool_name.py`(신규: 분류표 고정+파이프라인 정합). **전체 unit 1658 passed**(hwpx 1 fail=python-hwpx 로컬 미설치 환경이슈, 무관·기존재), 변경파일 ruff check clean(신규코드 format 위반 없음 — 기존코드 미포맷 잔존은 건드리지 않음, line-length=100).
+- **다음**: A2(런타임 전환 /mode·Shift+Tab, `_apply_mode_change` 4지점 단일헬퍼—pipeline.update_context+model_copy·v2주입/제거·tool_ctx.permission_mode·GlobalState/배너) → A4(allow-list Bash 프리픽스+realpath/NFC) → B1~B2(diff 미리보기) → C1·D8~D10. 유의: GlobalState.permission_mode는 아직 CLI 인자와 미동기(기존부터)—A2 헬퍼에서 함께 배선.
+
+**A1 실서버 CLI e2e 검증 완료 (2026-08-04).** tmux 부재(Windows)라 REPL을 프로그램 구동 — 입력장치(PromptSession)만 스크립트 대체, 부트스트랩·엔진·도구·권한 게이트는 전부 실물(PC용 config + B200 직결 SSH 터널 18001/18002, vLLM ax-4.0 실추론). **3/3 PASS**: ①accept_edits 모드 Write → "⏺ 자동 승인(accept edits)" 표시·프롬프트 0회·파일 생성 ②default 모드 numbered 프롬프트 → 3(거부)+피드백 → 파일 미생성, tool_use_error에 피드백 포함 전달, **모델이 다음 턴에 피드백 반영**(파일 대신 내용을 채팅으로 출력) ③default 모드 1(허용) → 파일 생성. 부수 확인: 작업 디렉토리 밖 쓰기는 ASK 이전 Layer2 경로정책 DENY(fail-closed 정상 — 1차 시도에서 스크래치패드 경로가 막혀 리포 내부 임시폴더로 재시도). 테스트 산출물(.tmp_a1_e2e)·터널 정리 완료.
+
+**NOVA CLI 실전 제작 능력 테스트 (2026-08-04) — Vue 홈페이지 처음부터 끝까지.** 사용자 요청: "실제 프로그램을 만들 수 있는지" NOVA CLI로 Vue 기반 IDINO NOVA 소개 홈페이지 전과정 제작 검증. 방식=A1 e2e와 동일한 실물 구동(accept_edits 모드, B200 실추론, 파일쓰기 자동승인).
+- **턴1(제작, 208s)**: 단일 지시로 `.tmp_nova_homepage/`에 index.html(65줄)·styles.css(632줄)·app.js(30줄) 3파일 생성. Vue3 CDN·v-for 카드4(문서생성/이미지생성/비전분석/지식RAG)·v-model 문의폼·히어로·기술사양 전부 요구대로. Write 자동승인 동작(프롬프트 0회).
+- **턴2(개선, 40s)**: 네비게이션·hover는 Edit 성공. **푸터 Edit는 old_string 불일치로 5연속 실패 후 모델이 포기하고 "수정 내용을 알려드렸으니 직접 수정하세요"로 응답**(전형적 AI 포기 패턴 실측. A.X-4.0의 Edit 정확 문자열 매칭 약점 확인).
+- **턴3(복구, 새 세션)**: "Read로 읽고→Edit 실패 시 Write 전체 재작성" 명시 재지시 → 푸터 정상 반영(PASS). 사용자 개입 1회로 복구 가능함을 확인.
+- **최종 검증**: python http.server 서빙 + Chrome 헤드리스 --dump-dom(virtual-time-budget)으로 **Vue 실제 실행 확인**(v-for가 feature-card 4개로 확장 렌더) + 전체 스크린샷 눈검증 — 히어로/카드4/사양/폼/푸터 전부 표시. 검증 체크 10건 중 9 PASS→복구 후 10/10.
+- **평가**: 기능적 완성 가능(다중파일·데이터바인딩·반복지시 반영). 약점 2가지: ①Edit old_string 매칭 실패→포기(개선 아이디어: Edit 도구에 fuzzy 매칭 힌트 or 실패 N회 시 Write 폴백 프롬프트 가이드) ②CSS 632줄 과잉생성·네비 스타일 미적용 등 디자인 완성도는 중간(카드 세로나열). 산출물 보존: `.tmp_nova_homepage/` (미커밋, 확인용).
+
+**코딩 품질 보완 ②③ 구현 + ① 조사 (2026-08-04).** 홈페이지 "수준 이하" 지적 → 사용자 지시: ②③은 구현, ①(모델)은 조사만.
+- **② Edit 복구력**: `edit_tool.py`에 공백 정규화 폴백 매칭(`find_whitespace_fuzzy_span` — 유일 매치만, fail-closed) + 실패 시 근접 원문 힌트(`closest_match_hint`, difflib) + "Read→Write 재작성" 팁을 오류에 포함. MultiEdit도 공용 헬퍼 배선. 시스템 프롬프트(`_build_expanded_system_prompt`)에 edit_note("모르는 파일은 Edit 전 반드시 Read / 2회 실패 시 Write 전체 재작성 / '직접 수정하세요' 금지"). 테스트 `test_edit_fuzzy.py` 8건.
+- **③ 렌더 자가검증 루프**: `render_preview_tool.py` 신설(헤드리스 Chrome/Edge file:// 렌더→스크린샷 PNG를 **업로드 샌드박스**에 저장, ALLOW 명시완화, 브라우저 부재 시 fail-soft). CLI 풀 23→25(RenderPreview+AnalyzeImage 추가), bootstrap options에 vision_url/vision_model 주입, 프롬프트 render_note(생성 후 렌더→비전 검토→수정 최대 2회). `AnalyzeImage`가 **파일명 단독 입력을 업로드 샌드박스 기준 해석**하도록 확장(보안경계 불변, 테스트로 순회 차단 확인) — RenderPreview 안내도 짧은 파일명만 노출. max_worker_tools 25 갱신. 테스트 `test_render_preview_tool.py` 8건(실렌더 포함). **unit 1672+16 passed, ruff clean(신규분)**.
+- **발견·수정: pc config vision_model 구값** — `gemma-4-12b`로 남아 있어 AnalyzeImage 404(B200은 07-30부터 gemma-3-27b 서빙). `nexus_config.pc.yaml` 수정.
+- **재테스트 3라운드 실측(실추론+비전 터널)**:
+  - 1R: 모델이 지시 없이 RenderPreview→AnalyzeImage 자발 수행(프롬프트 효과 확인). 단 **긴 절대경로 오타**(nexus-b2200 — degeneration)로 경로정책 차단→상대경로 폴백으로 리포 루트에 생성(이동 정리함).
+  - 2R: 비전 404 수정 확인. 그러나 **Read 없이 장님 Edit**(새 세션이라 파일 내용 미보유)로 old_string 전멸 + **스크린샷 경로를 환각으로 재타이핑**(/tmp/... 반복 — 도구가 정답 경로를 복사 가능하게 줬는데도) + query_loop "동일도구 5연속 실패" 브레이커로 강제 종료.
+  - 3R(Read규칙+파일명단축 후): **Read 4회 선행 → 그라데이션 Edit 성공**(개선 확인). 그러나 hover 재작성 중 **긴 CSS를 도구 호출 아닌 텍스트로 출력 + 출력 붕괴(반복 루프)** 후 조기 종료. 원본 CSS에 1R degeneration 잔재가 있어 재현 시 증폭.
+- **결론(정직)**: 도구·프롬프트 레벨 개선은 전부 동작 검증됨(자발 렌더루프·Read선행·포기패턴 소멸·fuzzy 편집). 남은 벽은 **A.X-4.0 모델 한계 3종** — 긴 리터럴 재현 불가(경로·CSS), 장문 출력 degeneration, 다목표 턴 조기종료. → ① 조사 결론과 합치: (b)템플릿/컴포넌트 레지스트리 그라운딩(CHI2026 실증 95% 준수, 모델이 긴 CSS를 "작성"하지 않게 하는 구조적 우회)+(a)코딩 서브모델(Devstral Small 24B Apache/Granite 4.0-H 32B Apache, B200 여유 확인) 병행이 정공법. A.X-4.0은 코딩 벤치 공개 이력 자체가 없음(모델카드 확인).
+- 산출물: `.tmp_nova_homepage/`(1차 완성본)·`.tmp_nova_homepage_v2/`(재테스트 흔적, CSS 일부 붕괴 잔재). 커밋 안 함. 터널·서버 정리 완료.
+
+**1·2순위 실행 완료 (2026-08-05) — 템플릿 그라운딩 + 코딩 서브모델 배포.**
+- **1순위 템플릿 레지스트리**: `assets/frontend_templates/`(catalog.json + landing-vue — Vue3 **로컬 번들** vendor/vue.global.prod.js 3.5.40 포함=에어갭 CDN 문제 해결, 디자인토큰 :root·sticky nav·그라데이션 히어로·auto-fit 카드그리드·스펙칩·폼·푸터 289줄 CSS). `ScaffoldWebTool` 신설 — **결정적 파일 복사**(모델 텍스트 미경유=품질·무결성 보장), 카탈로그 조회 ALLOW/스캐폴드 ASK, cwd 하위 검증+충돌 시 overwrite 필요(fail-closed). CLI 풀 26개, FILE_WRITE 분류 등록(accept_edits 자동승인), 프롬프트 scaffold_note("웹 제작은 반드시 템플릿에서 시작, SITE·:root만 수정"). 테스트 `test_scaffold_web_tool.py` 7건.
+- **1순위 e2e (v3, 실서버)**: 슬로건·CTA·사양추가·브랜드색 변형 요구 → **10/10 PASS, 195s**. 모델이 ScaffoldWeb 목록→스캐폴드→SITE 슬롯 Edit→렌더 확인까지 자발 완주. 스크린샷 검수: 전문가급 품질(1차 대비 차원이 다름). 잔여 실수 1건: :root 색상을 교체 대신 **위에 삽입**(CSS 후순위 우선으로 구값 승리) — 수동 2줄 정리. 후속 아이디어: 색상도 SITE(JS 변수→CSS var 주입)로 옮겨 CSS 편집 자체를 제거.
+- **2순위 Devstral 서빙**: B200 실측 GPU0 여유 8.7GB뿐 → `run_vllm_fp8.sh` util 0.92→**0.70**(백업 `run_vllm_fp8.sh.bak-util092`), `run_coder.sh` 신설(Devstral-Small-2507, FP8 on-the-fly, util 0.20, **port 8005**, served-model-name=devstral-small, max-len 32768), start_all.sh에 coder 등록(watchdog 자동복구 포함). 재기동 후 GPU0 146/183GB 공존 확인, 112 웹 200 정상. **원복법**: coder 세션 kill+start_all의 coder줄 제거+bak 복원 후 vllm 재기동.
+- **비교 실측(단발, 하네스 없이)**: ①랜딩 원샷 — A.X=밋밋하나 완결 / **Devstral=레이아웃 붕괴**(흰 글자 묻힘·빈 화면). 원샷 디자인은 양쪽 다 템플릿 경로에 완패 → 1순위가 정답임을 재확인. ②붕괴 CSS 정리 — 둘 다 깨끗(단발에선 A.X도 미붕괴 — 붕괴는 **장컨텍스트 에이전트 루프 조건부**임을 재확인). Devstral이 2.3배 빠르고(10s vs 23s) 내용 보존 우수.
+- **다음(후속 결정)**: Devstral을 NOVA 라우팅에 통합하려면 ①mistral tool-call 파서 설정(--tokenizer-mode mistral 등) 검증 ②routing에 "코드 작업→devstral-small" 규칙 ③에이전트 루프 실전 비교(A.X 붕괴 조건에서 Devstral 완주 여부)가 남았다. pc/112 config에 coder_url(18005/8005) 추가도 필요. 색상 SITE화·템플릿 추가(dashboard/블로그)도 후보.
+
+**VSCode 플러그인 바이브 JSON 문제 — 진단·해법 검증 완료 (2026-08-05).** 사용자별도 세션에서 nexus-coding-key-001로 VSCode 플러그인 개발 중 "바이브코딩 변경안 JSON 해석 불가" 발생 → 이 세션에서 진단+①②실행.
+- **진단**: 플러그인 파서 정상. 모델 응답 JSON의 content 문자열 안에 이스케이프 아닌 **생 줄바꿈**(+말미 홀로 백슬래시, 날짜 환각 2023-10-05) — A.X-4.0 긴 리터럴 재현 약점의 재발현. "파일 전문을 JSON 문자열로" 설계가 근본 원인.
+- **① guided decoding 실서버 검증**: 112:8600 `/v1/chat/completions` + Bearer 코딩키 + `response_format(json_schema, strict)` — structured_output.enabled=true 이미 운영 활성. dynamic_prompt/backend/app.py(15KB) 전문 컨텍스트로 "docstring에 수정일 주석" 과제 → **HTTP 200(9s), json.loads 즉시 성공, find/replace 1건 정확 매칭 적용, 주석 정위치 반영 PASS**. 주의사항: tools와 동시 사용 금지, 스키마 64KB 상한, 날짜 등 사실값은 플러그인이 주입.
+- **② find/replace 스키마 + fuzzy 적용 TS 이식**: changes를 파일 전문 대신 find(3~8줄 유일 조각)/replace로. 적용부는 CLI Edit 폴백과 동일 알고리즘(공백 정규화 유일 매치, fail-closed)을 TypeScript로 이식 — node 실검증 5/5 PASS(정확·들여쓰기 불일치·CRLF·모호 2곳 null·미존재 null).
+- **핸드오프 문서**: `user_mig/design/VSCODE_PLUGIN_VIBE_JSON_HANDOFF.md` — 검증된 요청 예시(스키마 전문)·프롬프트 규칙·TS 코드·재시도 패턴·주의사항. 플러그인 세션에 이 파일 하나 전달하면 됨.
+
+**API/CLI 히스토리 채널 분리 + 잘림 신호 정직화 (2026-08-05, 112 배포 완료).** 사용자 질문("WEB/APP은 이력 공유하되 CLI·API는 분리 불가?")에서 시작해 실측 → 실제 결함 2건 발견·수정.
+- **실측 진단**: 채널 격리 인프라(디스크 `{sessions_dir}/{channel}/`, Redis `session:{channel}:*`)는 이미 3채널(web/cli/api) 구현·동작 중이었다. **그러나 플러그인 대화가 web 채널에 저장되고 있었다** — 원인은 플러그인이 OpenAI 호환(`/v1/chat/completions`, channel="api" 고정)이 아니라 **웹 UI용 `/v1/chat`·`/v1/chat/stream`(channel="web" 하드코딩)** 을 호출했기 때문. web 채널 transcript에서 `[VIBE_CODING_REQUEST]` 4건 확인.
+- **수정① 채널 분리**: `_resolve_channel(X-Client-Channel)` 신설 — 화이트리스트 `{web, app→web, cli, api}`만 허용(**channel이 디렉토리명·Redis 키가 되므로 순회 방지 fail-closed**), 미지정·미지값·비문자열(Header 객체)은 web(무회귀). `/v1/chat`·`/v1/chat/stream` 내부 8곳의 `channel="web"` 하드코딩을 변수화. 웹 UI 관리 API(목록·검색·삭제·폴더·fork)는 web 고정 유지.
+- **수정② finish_reason 정직화**: OpenAI 응답의 `finish_reason="stop"` 하드코딩 제거 — `MESSAGE_STOP` 이벤트의 stop_reason을 수집해 `MAX_TOKENS→"length"` 매핑(비스트림+스트리밍). response_format 요청인데 응답이 유효 JSON이 아니면 경고 로그 + (잘림 아닌 경우) `content_filter` 신호.
+- **수정③ max_tokens 배선**: `QueryEngine.submit_message(max_tokens_override=)` 신설 + 양 경로(dispatcher/폴백)에 적용, web OpenAI 경로에서 `request.max_tokens` 전달. **이전엔 완전히 무시됐다(실측: max_tokens=16 요청에 1086토큰 생성)**.
+- **검증**: unit 1705 passed(hwpx 1건은 기존 환경이슈), 신규 `test_web_channel_finish.py` 24건. 배포 후 실서버 e2e — (a)`X-Client-Channel: api` → api 채널만 +1, web 불변 **PASS** (b)헤더 없음 → web +1 **PASS** (c)정상 응답 finish=stop **PASS**. (d)max_tokens=16으로 잘림 유도는 length가 아닌 stop → **결함 아님**: query_loop의 잘림 자동복구(4K→8K→16K 에스컬레이션 + "이어서 작성" 멀티턴 3회)가 성공해 정상 종료한 것. `length`는 복구 소진 시에만 나오며 그게 플러그인이 겪은 상황이다.
+- **회귀 1건 자체 발견·수정**: 핸들러를 라우팅 없이 직접 호출하는 기존 테스트에서 `Header` 객체가 그대로 들어와 `AttributeError` — `_resolve_channel`에 isinstance 방어 추가(테스트 14건 실패 → 해소).
+- **플러그인 조치사항**: 핸드오프 문서 `VSCODE_PLUGIN_VIBE_JSON_HANDOFF.md` §0 신설 — ①요청에 `X-Client-Channel: api` 추가(또는 `/v1/chat/completions`로 이전 권장 — 채널 자동 격리 + guided decoding 사용 가능) ②`finish_reason !== "stop"`이면 파싱 시도 말고 잘림 안내.
+- **잔여(미조치)**: API 채널 세션은 요청마다 uuid 생성이라 무한 누적(TTL 정리 정책 없음) · 루트 flat 레거시 537개 · API 내부 소비자 구분 없음(테넌트로만 구별).
+
+**세션 저장소 누적·소비자 구분 문제 수정 + 정리 실행 (2026-08-05, 112 배포 완료).** 앞선 채널 분리 작업에서 "남겨둔 것"으로 보고했던 3건을 사용자 지시로 수정.
+- **추가 발견(코드 버그)**: `core/bootstrap.py`의 `cli_transcript`가 **channel 없이 생성**되어 비대화형 `nexus ask` 대화가 루트(flat)에 저장되는데, `nexus sessions`는 `channel="cli"`로만 조회 → 저장은 되나 목록에 안 보이는 불일치. `channel="cli"` 추가로 수정(REPL은 bind_request로 재주입하므로 무회귀). 배포 후 cli 채널 정상 생성 확인.
+- **정리 도구 신설** `scripts/cleanup_sessions.py` — 채널별 TTL 기반. **기본 dry-run**, `--apply` 필수. **web/cli(사용자 대화)는 기본 제외**(`--include-user-channels DAYS` 명시해야 대상), `_`로 시작하는 메타 폴더(_instructions/_projects/_prompts) 절대 제외, `--backup`으로 tar.gz 백업(실패 시 삭제 중단), 삭제 직전 sessions_dir 하위 재검증(순회 방어). 테스트 `test_cleanup_sessions.py` 8건(TTL 경계·사용자채널 보호·메타 제외·루트밖 차단).
+- **정리 실행 결과(백업 후)**: 레거시 flat 370개(전부 07-21 이전) + 작업 디렉토리 105개 = **475개 삭제**, 백업 `/app/.nexus/sessions_backup_20260805.tar.gz`(235KB). 553개→79개, 7.0M→1.2M. api 채널은 7일 미만이라 대상 0.
+- **자동화**: 112 호스트 crontab에 `10 4 * * * /home/idino/nova_cleanup.sh` 등록(매일 04:10). 래퍼가 컨테이너에 스크립트를 재복사 후 실행하므로 컨테이너 재생성에도 견딘다. 로그 `/home/idino/cleanup_sessions.log`. 즉시 1회 실행 확인.
+- **소비자 구분**: `X-Client-Id` 헤더 → `_sanitize_client_id`(영숫자·-·_만, 32자)로 정규화해 세션 메타에 기록. web 채널은 제외(외부 소비자만). 실측 확인 `{"client":"vscode-plugin","tenant":"coding"}`. 웹 2경로 + OpenAI 경로 모두 배선, 메타 기록은 fail-soft(실패해도 대화 안 깨짐).
+- **★배포 사고와 복구(교훈)**: `bootstrap.py`만 배포하고 그것이 import하는 신규 도구(`render_preview_tool`·`scaffold_web_tool`)를 함께 올리지 않아 **부트스트랩 실패 → 테넌트 미로딩 → 전 요청 401**. 로그(`No module named ...render_preview_tool`)로 즉시 특정, 관련 core 파일 10종 + 템플릿 자산까지 배포해 복구(부트스트랩 완료·401 해소 확인). **교훈: core 파일 배포 시 import 그래프 전체를 함께 올릴 것.**
+- **곁가지 수정**: 로컬 python-hwpx 2.9.0 → 운영과 동일한 2.24.0으로 맞춰 hwpx 테스트 통과(그간 유일하게 실패하던 항목 해소). **로컬 unit 1714 전건 통과.**
+- **최종 검증(실서버)**: 인증 복구 PASS / `X-Client-Channel: api` 격리 PASS(api만 +1, web 불변) / 헤더없음 web PASS / 소비자 메타 기록 PASS.
+
+**남은 문제 정리 + 저장소 청소 + 배포 영속화 (2026-08-05).** 사용자 "남아있는 문제들 모두 정리" 지시.
+- **★배포 영속화(시급 처리)**: 오늘 `docker cp`로 넣은 코드는 **컨테이너 레이어에만** 존재해 재생성 시 소실될 상태였다(코드는 이미지에 구워져 있고, 세션·config·exports만 호스트 마운트). `docker commit nexus-web nexus-web:channelfix-20260805` + `latest` 태그 갱신으로 영속화 완료(726MB). 컨테이너 재생성에도 견딤. 단 Dockerfile 정식 재빌드는 아니므로 리포 커밋 후 정식 빌드 권장.
+- **저장소 청소**: ①112 세션 475개(앞서) ②로컬 `.nexus/sessions` **231개 삭제**(245→14개, 1.2M→135K, 자체 도구 `cleanup_sessions.py`로 실행해 도구 동작도 재검증) ③테스트 임시 산출물 `.tmp_nova_homepage{,_v2,_v3}` 3개 삭제(517KB 백업 후). 모든 삭제는 백업 선행.
+- **미해결 과제 문서화**: `user_mig/design/REMAINING_ISSUES_2026-08-05.md` 신설 — P0(리포 미커밋·이미지 정합성) / P1(CLI Stage1 나머지 A2·A4·B·C1·D8~10, Devstral 통합 미완, A.X 모델한계 3종, 플러그인 적용확인) / P2(템플릿 커버리지·색상슬롯 SITE 이전, 렌더루프 종료조건) / P3(API 세션 구조, web/app.py 기존 lint 7건). 각 항목에 착수 지점·주의사항·원복 절차 포함.
+- **다음 세션 착수 순서 제안**: ①커밋 정리(논리 단위 7개 분리) ②CLI Stage1 A2 ③Devstral 라우팅 통합.
