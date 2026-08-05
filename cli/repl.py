@@ -171,6 +171,8 @@ class NexusREPL:
         # 도구 실행 컨텍스트 — _bootstrap이 채운다. 런타임 모드 전환(A2)이 이
         # 객체의 options·permission_mode를 갱신하므로 인스턴스에 보관한다.
         self._tool_ctx: Any = None
+        # 마지막 어시스턴트 응답 본문(/copy용, D6). TEXT_DELTA를 누적해 둔다.
+        self._last_response: str = ""
         # Bash "항상 허용" 명령 프리픽스 집합(A4). 도구명 단위로 Bash를 통째로
         # 풀면 이후 어떤 명령이든 통과하므로, 첫 토큰(예: "git", "ls") 단위로만
         # 등록한다. 등록·사용 시점 양쪽에서 CommandFilter 검사를 다시 통과해야 한다.
@@ -236,6 +238,10 @@ class NexusREPL:
             "/session": self._cmd_session,
             "/thinking": self._cmd_thinking,
             "/verbose": self._cmd_verbose,
+            "/cost": self._cmd_cost,
+            "/save": self._cmd_save,
+            "/diff": self._cmd_diff,
+            "/copy": self._cmd_copy,
         }
 
         # ── 부트스트랩 후에 채워지는 상태 변수 ──
@@ -627,6 +633,8 @@ class NexusREPL:
         # 새 응답 스트림 시작 — thinking 필터 상태를 초기화한다. 이전 응답이 사고
         # 구간을 닫지 못한 채 끝났더라도, 여기서 리셋해 다음 응답이 삼켜지지 않게 한다.
         self._formatter.reset_stream_state()
+        # /copy가 "직전 답변"만 담도록 매 턴 초기화한다.
+        self._last_response = ""
 
         # ── 스트리밍 + 진행 스피너 ──
         # QueryEngine.submit_message()는 AsyncGenerator로 이벤트를 하나씩 흘려준다.
@@ -783,6 +791,9 @@ class NexusREPL:
 
         # 텍스트 델타는 토큰이 이어져 한 문단을 이루므로 end=""로 줄바꿈 없이 붙인다.
         if event.type == StreamEventType.TEXT_DELTA:
+            # 화면에는 렌더된 값을, /copy용으로는 원문 텍스트를 따로 모은다.
+            if event.text:
+                self._last_response += event.text
             self.console.print(result, end="")
         # 사용량(토큰 수 등) 정보는 스트리밍 텍스트 뒤에 오므로 먼저 줄을 바꿔 마감한다.
         elif event.type == StreamEventType.USAGE_UPDATE:
@@ -1207,6 +1218,10 @@ class NexusREPL:
             ("/session", "세션 정보를 표시한다"),
             ("/thinking", "thinking 표시를 토글한다"),
             ("/verbose", "도구 표시를 축약↔전문으로 토글한다"),
+            ("/cost", "세션 누적 토큰 사용량을 보여준다"),
+            ("/save", "대화를 Markdown 파일로 저장한다"),
+            ("/diff", "작업 트리의 git 변경사항을 보여준다"),
+            ("/copy", "마지막 응답을 클립보드로 복사한다"),
         ]
         for cmd, desc in commands:
             table.add_row(cmd, desc)
@@ -1309,6 +1324,138 @@ class NexusREPL:
             self.console.print(table)
         else:
             self.console.print("[yellow]세션이 초기화되지 않았습니다.[/yellow]")
+
+    async def _cmd_cost(self, args: list[str]) -> None:
+        """/cost — 이 세션의 누적 토큰 사용량을 보여준다 (D5).
+
+        [왜 '비용'이 아니라 토큰인가] 에어갭 온프레미스라 API 과금이 없다.
+        대신 컨텍스트 예산 관리에 실제로 쓸모 있는 토큰 수를 보여 준다.
+        """
+        if not self._state:
+            self.console.print("[yellow]세션이 초기화되지 않았습니다.[/yellow]")
+            return
+        s = self._state.get_session_summary()
+        table = Table(title="토큰 사용량", border_style="blue", box=ROUNDED)
+        table.add_column("항목", style="cyan")
+        table.add_column("값", justify="right")
+        table.add_row("턴", f"{s.get('turns', 0):,}")
+        table.add_row("입력 토큰", f"{s.get('total_input_tokens', 0):,}")
+        table.add_row("출력 토큰", f"{s.get('total_output_tokens', 0):,}")
+        table.add_row(
+            "합계",
+            f"{s.get('total_input_tokens', 0) + s.get('total_output_tokens', 0):,}",
+        )
+        table.add_row("도구 호출", f"{s.get('total_tool_calls', 0):,}")
+        table.add_row("경과(초)", f"{s.get('total_duration_seconds', 0)}")
+        self.console.print(table)
+        self.console.print("[dim]온프레미스 실행이라 과금은 없습니다(토큰만 표시).[/dim]")
+
+    async def _cmd_save(self, args: list[str]) -> None:
+        """/save [파일명] — 이번 세션 대화를 Markdown으로 저장한다 (D7).
+
+        트랜스크립트(JSONL)를 그대로 두고, 사람이 읽고 공유할 수 있는 형태로
+        따로 내보낸다. 경로를 주지 않으면 현재 폴더에 세션 ID로 만든다.
+        """
+        if not self._state:
+            self.console.print("[yellow]세션이 초기화되지 않았습니다.[/yellow]")
+            return
+        try:
+            from pathlib import Path
+
+            from core.memory.transcript import read_transcript_messages
+
+            session_id = self._state.session_id
+            rows = read_transcript_messages(
+                self._state.config.sessions_dir, session_id, channel="cli"
+            )
+            if not rows:
+                self.console.print("[yellow]저장할 대화가 없습니다.[/yellow]")
+                return
+
+            target = Path(args[0]) if args else Path(f"nexus_{session_id[:8]}.md")
+            lines = [f"# Nexus 대화 기록 ({session_id})", ""]
+            for entry in rows:
+                role = entry.get("role", "")
+                content = (entry.get("content") or "").strip()
+                if not content:
+                    continue
+                label = {"user": "사용자", "assistant": "NOVA"}.get(role, role)
+                lines.append(f"## {label}")
+                lines.append("")
+                lines.append(content)
+                lines.append("")
+            target.write_text("\n".join(lines), encoding="utf-8")
+            self.console.print(
+                f"[green]대화를 저장했습니다:[/green] {target} ({len(rows)}개 메시지)"
+            )
+        except Exception as e:  # noqa: BLE001 — 저장 실패가 세션을 끊으면 안 된다
+            self.console.print(f"[red]저장 실패:[/red] {e}")
+
+    async def _cmd_diff(self, args: list[str]) -> None:
+        """/diff — 현재 작업 트리의 git 변경사항을 보여준다 (D4).
+
+        로컬 git만 호출하므로 에어갭에서도 안전하다. 리포가 아니면 안내만 한다.
+        """
+        # 비동기 서브프로세스로 실행한다 — REPL은 async 루프 위에서 도므로
+        # blocking subprocess.run을 쓰면 그 동안 입력·스트리밍이 모두 멈춘다.
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git",  # noqa: S607 — PATH의 git을 쓰는 것이 의도된 동작
+                "diff",
+                "--stat",
+                "--",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=self._state.cwd if self._state else None,
+            )
+            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=30)
+        except (OSError, TimeoutError) as e:
+            self.console.print(f"[red]git 실행 실패:[/red] {e}")
+            return
+        if proc.returncode != 0:
+            msg = stderr_b.decode("utf-8", "replace").strip() or "git 저장소가 아닙니다."
+            # git 출력에는 대괄호가 섞일 수 있다. 그대로 넘기면 Rich가 markup으로
+            # 해석해 MarkupError로 죽으므로, 외부 문자열은 항상 Text로 감싼다.
+            self.console.print(Text(msg, style="yellow"))
+            return
+        out = stdout_b.decode("utf-8", "replace").strip()
+        if not out:
+            self.console.print("[dim]변경사항이 없습니다.[/dim]")
+            return
+        self.console.print(
+            Panel(Text(out), title="git diff --stat", border_style="cyan", expand=False)
+        )
+
+    async def _cmd_copy(self, args: list[str]) -> None:
+        """/copy — 마지막 NOVA 응답을 클립보드로 복사한다 (D6).
+
+        pyperclip이 있으면 그것으로, 없으면 OSC52 이스케이프로 터미널에 맡긴다
+        (원격 SSH 세션에서도 로컬 클립보드로 복사되는 표준 방식).
+        """
+        text = (self._last_response or "").strip()
+        if not text:
+            self.console.print("[yellow]복사할 응답이 없습니다.[/yellow]")
+            return
+        try:
+            import pyperclip  # type: ignore[import-not-found]
+
+            pyperclip.copy(text)
+            self.console.print(f"[green]복사했습니다[/green] [dim]({len(text)}자)[/dim]")
+            return
+        except Exception as e:  # noqa: BLE001 — 미설치·환경 미지원이면 OSC52로 폴백
+            logger.debug("pyperclip 복사 실패 — OSC52로 폴백: %s", e)
+        try:
+            import base64
+            import sys
+
+            b64 = base64.b64encode(text.encode("utf-8")).decode("ascii")
+            sys.stdout.write(f"\033]52;c;{b64}\a")
+            sys.stdout.flush()
+            self.console.print(
+                f"[green]복사 요청을 보냈습니다[/green] [dim]({len(text)}자, OSC52)[/dim]"
+            )
+        except Exception as e:  # noqa: BLE001
+            self.console.print(f"[red]복사 실패:[/red] {e}")
 
     async def _cmd_thinking(self, args: list[str]) -> None:
         """/thinking — 모델의 사고(thinking) 블록을 화면에 표시할지 여부를 켜고 끈다."""
