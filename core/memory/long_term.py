@@ -472,6 +472,71 @@ class LongTermMemory:
         entries.sort(key=lambda e: e.created_at, reverse=True)
         return entries[:limit]
 
+    # ─── 소유자별 조회·삭제 (메모리 UI 전용) ───
+    #
+    # 왜 별도 메서드인가: get_all/delete 는 소유자를 보지 않는다. 사용자에게 자기
+    # 기억을 보여주고 지우게 하려면 "내 것만" 이라는 보장이 코드로 강제돼야 한다
+    # (IDOR 차단). 그래서 소유자 조건을 SQL 에 직접 박은 전용 메서드를 둔다.
+    # 부수 효과로 코드 RAG 청크(113만 건)는 소유자가 없어 자연히 빠진다.
+
+    async def list_by_owner(self, owner: str, limit: int = 50) -> list[MemoryEntry]:
+        """특정 소유자의 기억을 최신순으로 돌려준다.
+
+        owner 가 빈 값이면 빈 목록을 돌려준다 — 소유자를 모르는 채로 남의 기억을
+        보여주는 것보다 아무 것도 안 보여주는 편이 안전하다(fail-closed).
+        """
+        if not owner:
+            return []
+
+        if self._pg is not None:
+            try:
+                rows = await self._pg.fetch(
+                    """
+                    SELECT * FROM tb_memories
+                    WHERE metadata->>'owner' = $1
+                    ORDER BY created_at DESC
+                    LIMIT $2
+                    """,
+                    owner,
+                    limit,
+                )
+                return [self._row_to_entry(row) for row in rows]
+            except Exception as e:
+                logger.warning("PostgreSQL list_by_owner 실패: %s — 폴백 사용", e)
+
+        # 인메모리 폴백 — DB 경로와 같은 규칙.
+        entries = [e for e in self._store.values() if e.metadata.get("owner") == owner]
+        entries.sort(key=lambda e: e.created_at, reverse=True)
+        return entries[:limit]
+
+    async def delete_owned(self, memory_id: str, owner: str) -> bool:
+        """소유자가 일치할 때만 삭제한다. 삭제했으면 True.
+
+        조회 후 삭제(2단계)가 아니라 DELETE 문 자체에 소유자 조건을 넣는다.
+        2단계로 하면 그 사이에 소유자가 바뀌는 경쟁 상태가 생기고, 무엇보다
+        "확인을 빠뜨리면 남의 것이 지워지는" 실수 여지가 남는다.
+        """
+        if not owner or not memory_id:
+            return False
+
+        if self._pg is not None:
+            try:
+                result = await self._pg.execute(
+                    "DELETE FROM tb_memories WHERE id = $1 AND metadata->>'owner' = $2",
+                    memory_id,
+                    owner,
+                )
+                # asyncpg 의 execute 는 "DELETE N" 문자열을 돌려준다.
+                return str(result).split()[-1] != "0"
+            except Exception as e:
+                logger.warning("PostgreSQL delete_owned 실패: %s — 폴백 사용", e)
+
+        entry = self._store.get(memory_id)
+        if entry is None or entry.metadata.get("owner") != owner:
+            return False
+        del self._store[memory_id]
+        return True
+
     # ─── PostgreSQL 구현 (내부) ───
 
     async def _add_pg(self, entry: MemoryEntry) -> str:

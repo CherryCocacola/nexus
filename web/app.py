@@ -3254,6 +3254,81 @@ class ResponseStyleUpdate(BaseModel):
     custom: str = ""
 
 
+@app.get("/v1/memories")
+async def list_memories(
+    limit: int = 50,
+    x_tenant_id: str | None = Header(default=None, alias="X-Tenant-ID"),
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """이 테넌트가 저장한 대화 기억 목록을 최신순으로 돌려준다(메모리 UI용).
+
+    ★소유자는 요청에서 받지 않고 서버가 인증 정보로 정한다. 클라이언트가 owner를
+      넘길 수 있게 하면 남의 기억을 조회하는 통로가 된다(IDOR).
+    코드 RAG 청크는 소유자가 없어 자연히 제외된다 — 사용자가 볼 것은 자기 대화뿐이다.
+    """
+    manager = _app_state.get("memory_manager")
+    if manager is None:
+        return {"memories": [], "total": 0}
+
+    tenant = _resolve_tenant(None, x_tenant_id, authorization)
+    owner = str(getattr(tenant, "id", "") or "")
+    if not owner:
+        return {"memories": [], "total": 0}
+
+    # 한 번에 너무 많이 긁어오지 않도록 상한을 둔다.
+    limit = max(1, min(int(limit or 50), 200))
+    try:
+        entries = await manager.long_term.list_by_owner(owner, limit=limit)
+    except Exception as e:  # noqa: BLE001 — 조회 실패가 화면을 깨뜨리지 않게
+        logger.warning("메모리 목록 조회 실패: %s", e)
+        return {"memories": [], "total": 0}
+
+    return {
+        "memories": [
+            {
+                "id": e.id,
+                "content": e.content,
+                "role": (e.metadata or {}).get("role", ""),
+                "importance": e.importance,
+                "created_at": e.created_at.isoformat() if e.created_at else "",
+            }
+            for e in entries
+        ],
+        "total": len(entries),
+    }
+
+
+@app.delete("/v1/memories/{memory_id}")
+async def delete_memory(
+    memory_id: str,
+    x_tenant_id: str | None = Header(default=None, alias="X-Tenant-ID"),
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """기억 한 건을 지운다 — 요청 테넌트가 소유한 것만.
+
+    소유자 조건은 DELETE 문 자체에 들어가므로(delete_owned), 남의 id를 넣어도
+    지워지지 않는다. 존재하지 않는 id와 남의 id를 같은 404로 응답해 '있는지 없는지'
+    조차 알려주지 않는다(존재 은닉 — 다운로드 라우트와 같은 방침).
+    """
+    from fastapi import HTTPException
+
+    manager = _app_state.get("memory_manager")
+    tenant = _resolve_tenant(None, x_tenant_id, authorization)
+    owner = str(getattr(tenant, "id", "") or "")
+    if manager is None or not owner:
+        raise HTTPException(status_code=404, detail="기억을 찾을 수 없습니다.")
+
+    try:
+        deleted = await manager.long_term.delete_owned(memory_id, owner)
+    except Exception as e:  # noqa: BLE001 — 실패를 500으로 흘리지 않고 404로 수렴
+        logger.warning("메모리 삭제 실패: %s", e)
+        deleted = False
+
+    if not deleted:
+        raise HTTPException(status_code=404, detail="기억을 찾을 수 없습니다.")
+    return {"status": "ok", "id": memory_id}
+
+
 @app.get("/v1/response-style")
 async def get_response_style(
     x_tenant_id: str | None = Header(default=None, alias="X-Tenant-ID"),

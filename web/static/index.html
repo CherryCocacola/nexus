@@ -493,6 +493,31 @@ body.resizing { cursor: col-resize; user-select: none; }
 }
 .prompt-add-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
 
+/* ─── 저장된 기억(W3) ─── */
+.memory-list { display: flex; flex-direction: column; gap: 6px; max-height: 220px; overflow-y: auto; }
+.memory-row {
+  display: flex; gap: 8px; align-items: flex-start;
+  padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px;
+  background: var(--bg-primary);
+}
+.memory-text {
+  flex: 1; min-width: 0; font-size: 12px; line-height: 1.5; color: var(--text-primary);
+  word-break: break-word;
+}
+/* 본문은 3줄까지만 보여준다. 승격된 assistant 답변은 수천 자짜리도 있어서, 그대로 두면
+   기억 하나가 목록 전체를 덮는다(실측). 전문은 아래 툴팁(title)으로 확인한다. */
+.memory-body {
+  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.memory-meta { display: block; margin-top: 3px; font-size: 11px; color: var(--text-muted); }
+.memory-del {
+  flex-shrink: 0; border: 0; background: transparent; color: var(--text-muted);
+  cursor: pointer; font-size: 14px; line-height: 1; padding: 2px 4px;
+}
+.memory-del:hover { color: var(--error); }
+.memory-empty { font-size: 12px; color: var(--text-muted); padding: 6px 2px; }
+
 /* 프롬프트 / 삽입 팝업 — 입력창 위로 뜨는 드롭다운 */
 .input-container { position: relative; }
 .prompt-popup {
@@ -1415,6 +1440,14 @@ body.resizing { cursor: col-resize; user-select: none; }
       <div id="projectList" class="prompt-list"></div>
       <button class="prompt-add-btn" type="button" onclick="addProjectRow()">+ 프로젝트 추가</button>
 
+      <!-- 저장된 기억(W3) — 대화에서 "기억해 줘"라고 한 내용만 쌓인다. 여기서 지울 수 있다. -->
+      <div class="settings-divider"></div>
+      <div class="settings-section-title">저장된 기억
+        <span class="settings-hint">대화 중 "기억해 줘"라고 하면 저장되고, 이후 대화에서 참고합니다</span>
+      </div>
+      <p class="modal-desc">지우면 다음 대화부터 참고하지 않습니다. 다른 사용자의 기억은 보이지 않습니다.</p>
+      <div id="memoryList" class="memory-list"></div>
+
       <div class="instruction-status" id="instructionStatus"></div>
     </div>
     <div class="modal-footer">
@@ -1681,6 +1714,73 @@ function updateStyleDesc() {
   desc.textContent = opt && opt.dataset ? (opt.dataset.desc || '') : '';
 }
 
+// ─── 저장된 기억(W3) ───
+// 목록·삭제 모두 서버가 인증 정보로 소유자를 정한다. 브라우저는 소유자를 보내지
+// 않는다(보낼 수 있게 하면 남의 기억을 조회하는 통로가 된다).
+async function loadMemories() {
+  const box = document.getElementById('memoryList');
+  if (!box) return;
+  box.innerHTML = '<div class="memory-empty">불러오는 중…</div>';
+  try {
+    const resp = await fetch('/v1/memories?limit=50');
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const data = await resp.json();
+    const items = data.memories || [];
+    if (!items.length) {
+      box.innerHTML = '<div class="memory-empty">저장된 기억이 없습니다. 대화 중 "기억해 줘"라고 하면 여기에 쌓입니다.</div>';
+      return;
+    }
+    box.innerHTML = '';
+    for (const m of items) {
+      const row = document.createElement('div');
+      row.className = 'memory-row';
+
+      const text = document.createElement('div');
+      text.className = 'memory-text';
+      const body = document.createElement('div');
+      body.className = 'memory-body';
+      body.textContent = m.content || '';           // textContent — HTML 주입 방지
+      body.title = m.content || '';                 // 잘린 본문 전문은 툴팁으로
+      text.appendChild(body);
+      const meta = document.createElement('span');
+      meta.className = 'memory-meta';
+      meta.textContent = (m.created_at || '').slice(0, 10) + (m.role ? ' · ' + m.role : '');
+      text.appendChild(meta);
+
+      const del = document.createElement('button');
+      del.className = 'memory-del';
+      del.type = 'button';
+      del.title = '이 기억 지우기';
+      del.textContent = '×';
+      del.addEventListener('click', () => deleteMemory(m.id, row));
+
+      row.appendChild(text);
+      row.appendChild(del);
+      box.appendChild(row);
+    }
+  } catch (e) {
+    console.error('기억 목록 조회 실패:', e);
+    box.innerHTML = '<div class="memory-empty">기억을 불러오지 못했습니다.</div>';
+  }
+}
+
+async function deleteMemory(id, rowEl) {
+  if (!confirm('이 기억을 지울까요? 다음 대화부터 참고하지 않습니다.')) return;
+  try {
+    const resp = await fetch('/v1/memories/' + encodeURIComponent(id), { method: 'DELETE' });
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    if (rowEl) rowEl.remove();
+    // 마지막 항목을 지웠으면 빈 안내로 되돌린다.
+    const box = document.getElementById('memoryList');
+    if (box && !box.querySelector('.memory-row')) {
+      box.innerHTML = '<div class="memory-empty">저장된 기억이 없습니다. 대화 중 "기억해 줘"라고 하면 여기에 쌓입니다.</div>';
+    }
+  } catch (e) {
+    console.error('기억 삭제 실패:', e);
+    alert('기억을 지우지 못했습니다.');
+  }
+}
+
 async function openSettings() {
   const overlay = document.getElementById('settingsOverlay');
   const ta = document.getElementById('instructionText');
@@ -1692,6 +1792,7 @@ async function openSettings() {
   if (plist) plist.innerHTML = '';
   if (projlist) projlist.innerHTML = '';
   if (overlay) overlay.hidden = false;
+  loadMemories();   // 저장된 기억 목록(W3) — 서버가 소유자를 판단해 내 것만 돌려준다
   // 응답 스타일 로드 — 프리셋 목록을 서버에서 받아 드롭다운을 채운다(문구는 서버 YAML이 단일 소스).
   try {
     const resp = await fetch('/v1/response-style');
