@@ -1178,6 +1178,34 @@ _app_state: dict[str, Any] = {
 # ─────────────────────────────────────────────
 # Lifespan (앱 시작/종료 이벤트)
 # ─────────────────────────────────────────────
+async def _uploads_cleanup_loop(
+    uploads_dir: Path, retention_hours: float, interval_minutes: float
+) -> None:
+    """업로드 샌드박스를 주기적으로 쓸어내는 백그라운드 루프.
+
+    왜 인프로세스 주기 태스크인가: 호스트 크론에 의존하면 배포처(고객 에어갭
+    환경 포함)마다 별도 프로비저닝이 필요하다. 웹 서버가 스스로 도는 편이
+    어디에 올려도 동작한다. 정리 자체는 파일시스템 작업이라 asyncio.to_thread
+    로 돌려 이벤트 루프를 막지 않는다.
+
+    기동 직후 한 번 먼저 돌린다 — 재시작 시점에 밀린 찌꺼기를 바로 걷어내기
+    위함이다. 이후 interval_minutes 간격으로 반복한다.
+
+    실패는 삼킨다(fail-soft). 정리는 부가 기능이며 서비스를 멈춰선 안 된다.
+    다만 CancelledError 는 종료 신호이므로 그대로 올려보낸다.
+    """
+    from core.storage.uploads import cleanup_expired_uploads
+
+    while True:
+        try:
+            await asyncio.to_thread(cleanup_expired_uploads, uploads_dir, retention_hours)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 — 정리 실패가 서비스를 막지 않는다
+            logger.warning("업로드 정리 실패(무시): %s", e)
+        await asyncio.sleep(interval_minutes * 60)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """FastAPI 수명주기 훅 — 서버 기동/종료 시 딱 한 번씩 실행된다.
@@ -1255,9 +1283,49 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     except Exception as e:
         logger.warning(f"부트스트랩 실패, 기본 설정으로 시작: {e}")
 
+    # 업로드 정리 잡 기동 — 업로드본이 무한히 쌓이는 것을 막는다.
+    # 부트스트랩 성공/실패와 무관하게 띄운다(설정을 못 읽으면 기본값 사용).
+    # 저장 경로는 업로드 라우트와 같은 resolve_uploads_dir 단일 소스를 쓴다.
+    try:
+        from core.config import UploadConfig
+        from core.tools.implementations.analyze_image_tool import resolve_uploads_dir
+
+        upload_cfg = getattr(_app_state.get("config"), "upload", None) or UploadConfig()
+        interval = upload_cfg.cleanup_interval_minutes
+        if interval > 0 and upload_cfg.retention_hours > 0:
+            _app_state["uploads_cleanup_task"] = asyncio.create_task(
+                _uploads_cleanup_loop(
+                    resolve_uploads_dir(), upload_cfg.retention_hours, interval
+                )
+            )
+            logger.info(
+                "업로드 정리 잡 기동: 보존 %d시간, 주기 %d분",
+                upload_cfg.retention_hours,
+                interval,
+            )
+        else:
+            logger.info(
+                "업로드 정리 잡 비활성 (retention_hours=%s, cleanup_interval_minutes=%s)",
+                upload_cfg.retention_hours,
+                interval,
+            )
+    except Exception as e:  # noqa: BLE001 — 정리 잡 기동 실패가 서버 기동을 막지 않는다
+        logger.warning("업로드 정리 잡 기동 실패(무시): %s", e)
+
     yield
 
     # 종료: 리소스 정리
+    # 업로드 정리 잡을 먼저 취소한다(파일시스템 작업이라 오래 붙잡지 않는다).
+    cleanup_task = _app_state.get("uploads_cleanup_task")
+    if cleanup_task is not None and not cleanup_task.done():
+        cleanup_task.cancel()
+        try:
+            await cleanup_task
+        except asyncio.CancelledError:
+            pass  # 우리가 보낸 취소 신호 — 정상 종료 경로다.
+        except Exception as e:  # noqa: BLE001 — 종료 경로: 사유만 남기고 계속 진행
+            logger.debug("업로드 정리 잡 종료 중 예외(무시): %s", e)
+
     # v0.14.8 — 임베딩 keepalive task를 깨끗이 취소
     keepalive = _app_state.get("embedding_keepalive_task")
     if keepalive is not None and not keepalive.done():
@@ -3771,6 +3839,13 @@ async def upload_file(file: UploadFile) -> dict[str, Any]:
     그 서버 경로를 돌려준다. 이후 채팅에서 그 경로를 DocumentProcess 도구로 넘기면
     모델이 파일 내용을 읽어 분석할 수 있다(모델은 파일 자체가 아니라 경로를 받는다).
     반환: {status, file_path, file_name, size_bytes}.
+
+    입력 검증(2026-08-06 W8) — 브라우저 UI의 10MB 제한은 라우트를 직접 호출하면
+    우회되므로 실제 방어선은 여기다(fail-closed).
+      - 확장자가 허용 목록 밖이면 415로 거절한다(파싱도 못 하는 파일을 디스크에
+        쌓지 않기 위함).
+      - 크기가 상한을 넘으면 413으로 거절한다. 이때 전체를 메모리에 올린 뒤
+        재는 것이 아니라 조각 단위로 읽으며 넘는 즉시 중단한다(메모리 폭주 방지).
     """
     # 업로드 저장 위치 — AnalyzeImage 도구의 경로 검증과 같은 resolve_uploads_dir 로
     # 단일 소스를 공유한다({tempdir}/nexus_uploads). 저장 경로와 분석 허용 경로가
@@ -3778,9 +3853,17 @@ async def upload_file(file: UploadFile) -> dict[str, Any]:
     import uuid
     from pathlib import Path as _Path
 
+    from fastapi import HTTPException
+
     from core.tools.implementations.analyze_image_tool import resolve_uploads_dir
 
     upload_dir = resolve_uploads_dir()
+
+    # 업로드 한계값은 설정에서 읽는다(하드코딩 금지). 설정이 없는 경량 경로에서도
+    # 동작해야 하므로 UploadConfig 기본값으로 폴백한다.
+    from core.config import UploadConfig
+
+    upload_cfg = getattr(_app_state.get("config"), "upload", None) or UploadConfig()
 
     # 저장 파일명은 ASCII-safe로 만든다. 이유: 이후 채팅에서 모델이 이 "서버 경로"를
     # DocumentProcess 도구 인자로 다시 타이핑해야 하는데, 한글·특수문자가 긴 경로는
@@ -3790,17 +3873,50 @@ async def upload_file(file: UploadFile) -> dict[str, Any]:
     suffix = _Path(orig_name).suffix.lower()
     if len(suffix) > 8 or not all(c.isalnum() or c == "." for c in suffix):
         suffix = ""  # 확장자가 비정상이면 붙이지 않는다(경로 안전)
-    stored_name = f"upload-{uuid.uuid4().hex[:12]}{suffix}"
 
+    # ── 확장자 검사 ─────────────────────────────────────────────
+    # allowed_extensions 가 비어 있으면 검사를 건너뛴다(운영 중 임시 완화 탈출구).
+    allowed = [e.lower() for e in (upload_cfg.allowed_extensions or [])]
+    if allowed and suffix not in allowed:
+        raise HTTPException(
+            status_code=415,
+            detail=(
+                f"지원하지 않는 파일 형식입니다: {suffix or '확장자 없음'}. "
+                f"허용 형식: {', '.join(allowed)}"
+            ),
+        )
+
+    stored_name = f"upload-{uuid.uuid4().hex[:12]}{suffix}"
     file_path = upload_dir / stored_name
-    content = await file.read()
-    file_path.write_bytes(content)
+
+    # ── 크기 제한 + 저장 ────────────────────────────────────────
+    # 조각(1MB) 단위로 읽어 바로 디스크에 흘려보낸다. 상한을 넘는 순간 쓰기를
+    # 멈추고 이미 쓴 부분 파일을 지운 뒤 413으로 거절한다(찌꺼기 방지).
+    max_bytes = max(int(upload_cfg.max_size_bytes or 0), 0)
+    written = 0
+    try:
+        with file_path.open("wb") as out:
+            while chunk := await file.read(1024 * 1024):
+                written += len(chunk)
+                if max_bytes and written > max_bytes:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            f"파일이 너무 큽니다. 최대 "
+                            f"{max_bytes // (1024 * 1024)}MB까지 업로드할 수 있습니다."
+                        ),
+                    )
+                out.write(chunk)
+    except Exception:
+        # 실패(크기 초과·디스크 오류)하면 반쯤 쓰인 파일을 남기지 않는다.
+        file_path.unlink(missing_ok=True)
+        raise
 
     return {
         "status": "ok",
         "file_path": str(file_path),   # ASCII-safe 실제 저장 경로(모델이 재현할 경로)
         "file_name": orig_name,        # 원본 파일명(표시용)
-        "size_bytes": len(content),
+        "size_bytes": written,
     }
 
 

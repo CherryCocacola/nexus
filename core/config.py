@@ -952,6 +952,68 @@ class DocumentExportConfig(BaseModel):
     retention_days: int = 90
 
 
+class UploadConfig(BaseModel):
+    """
+    파일 업로드(웹 /v1/upload) 설정 — 받아줄 파일의 크기·형식 한계.
+
+    왜 서버에도 한계가 필요한가:
+      브라우저 UI가 10MB 제한을 걸고 있지만 그건 "예의 바른 클라이언트"에게만
+      해당한다. 라우트를 직접 호출하면 얼마든지 우회되므로, 실제 방어선은
+      서버에 있어야 한다(fail-closed). 한계를 넘으면 저장하지 않고 거절한다.
+
+    필드 설명:
+      - max_size_bytes: 업로드 1건의 최대 크기(바이트). 초과하면 413으로 거절.
+      - allowed_extensions: 저장을 허용할 확장자 목록(소문자, 점 포함).
+        DocumentProcess 가 파싱할 수 있는 문서 + AnalyzeImage/ImageGenerate 가
+        다루는 이미지 + 평문/코드 계열로 한정한다. 목록이 비어 있으면 확장자
+        검사를 하지 않는다(운영 중 임시 완화용 탈출구).
+      - retention_hours: 업로드 파일 보존 시간. 정리 잡이 이 값을 기준으로
+        오래된 업로드를 지운다. 0 이하이면 정리하지 않는다.
+      - cleanup_interval_minutes: 정리 잡을 몇 분마다 돌릴지. 웹 서버가 기동 직후
+        한 번 쓸어내고, 이후 이 간격으로 반복한다. 0 이하이면 정리 잡을 아예
+        띄우지 않는다(정리 기능 끄기).
+    """
+
+    max_size_bytes: int = 20 * 1024 * 1024  # 20MB — 스캔 PDF·발표자료를 수용하는 선
+    allowed_extensions: list[str] = Field(
+        default_factory=lambda: [
+            # 문서 — DocumentProcess 가 파싱 가능한 형식
+            ".pdf",
+            ".docx",
+            ".doc",
+            ".xlsx",
+            ".xls",
+            ".pptx",
+            ".hwpx",
+            ".hwp",
+            # 이미지 — AnalyzeImage(비전) / ImageGenerate(img2img) 입력
+            ".jpg",
+            ".jpeg",
+            ".png",
+            ".gif",
+            ".webp",
+            ".bmp",
+            # 평문·코드 — 그대로 텍스트로 읽는 계열
+            ".txt",
+            ".md",
+            ".csv",
+            ".json",
+            ".yaml",
+            ".yml",
+            ".xml",
+            ".log",
+            ".py",
+            ".js",
+            ".ts",
+            ".html",
+            ".css",
+            ".sql",
+        ]
+    )
+    retention_hours: int = 24
+    cleanup_interval_minutes: int = 60
+
+
 class SecurityConfig(BaseModel):
     """
     보안 및 샌드박스 설정.
@@ -1402,6 +1464,9 @@ class NexusConfig(BaseSettings):
 
     # 문서 생성(DocumentExport 도구) — docx/pptx/hwpx/md/txt 생성 + 웹 다운로드
     document_export: DocumentExportConfig = Field(default_factory=DocumentExportConfig)
+
+    # 파일 업로드(웹 /v1/upload) — 크기·확장자 상한 (2026-08-06 W8 업로드 확장)
+    upload: UploadConfig = Field(default_factory=UploadConfig)
 
     # v7.0 Part 2.5 쿼리 라우팅 — 지식/도구 질의 분기 (2026-04-21 추가)
     routing: RoutingConfig = Field(default_factory=RoutingConfig)

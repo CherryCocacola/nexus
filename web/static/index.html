@@ -1333,7 +1333,7 @@ body.resizing { cursor: col-resize; user-select: none; }
               <path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/>
             </svg>
           </button>
-          <input type="file" id="fileInput" multiple accept=".txt,.py,.js,.ts,.json,.yaml,.yml,.md,.csv,.html,.css,.sql,.xml,.log,.pdf,.docx,.hwp,.xlsx" onchange="handleFileSelect(event)">
+          <input type="file" id="fileInput" multiple accept=".txt,.py,.js,.ts,.json,.yaml,.yml,.md,.csv,.html,.css,.sql,.xml,.log,.pdf,.docx,.doc,.hwp,.hwpx,.xlsx,.xls,.pptx,.jpg,.jpeg,.png,.gif,.webp,.bmp" onchange="handleFileSelect(event)">
           <textarea id="userInput"
                     placeholder="메시지를 입력하세요..."
                     rows="1"
@@ -2337,8 +2337,10 @@ function updateTokenDisplay() {
 function handleFileSelect(event) {
   const files = Array.from(event.target.files);
   files.forEach(file => {
-    if (file.size > 10 * 1024 * 1024) {
-      alert(`파일이 너무 큽니다 (10MB 제한): ${file.name}`);
+    // 서버 상한(config upload.max_size_bytes, 기본 20MB)과 맞춘 사전 안내다.
+    // 실제 차단은 서버가 하며(413), 여기서는 헛된 업로드를 미리 줄이는 용도다.
+    if (file.size > 20 * 1024 * 1024) {
+      alert(`파일이 너무 큽니다 (20MB 제한): ${file.name}`);
       return;
     }
     attachedFiles.push(file);
@@ -2369,8 +2371,9 @@ function removeFile(index) {
 }
 
 async function readFileContents() {
-  // 바이너리 파일 확장자 — 서버에 업로드하여 Scout 서브에이전트가 분석
-  const binaryExts = ['.docx', '.doc', '.xlsx', '.xls', '.pdf', '.hwp', '.pptx'];
+  // 바이너리 문서 확장자 — 서버에 업로드한 뒤 DocumentProcess 도구가 파싱한다.
+  // (DocumentProcess 의 지원 목록과 일치시켜야 한다 — core/tools/implementations/document_tool.py)
+  const binaryExts = ['.docx', '.doc', '.xlsx', '.xls', '.pdf', '.hwp', '.hwpx', '.pptx'];
   // 이미지 확장자 — 서버 업로드 후 AnalyzeImage(비전)로 분석한다.
   const imageExts = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'];
   // 텍스트 파일 최대 문자 수
@@ -2386,19 +2389,21 @@ async function readFileContents() {
       // (이미지를 file.text()로 읽으면 JFIF 바이너리가 깨진 텍스트로 들어가고 서버
       //  업로드가 안 돼, 모델이 원본 파일명을 도구에 넘겨 "업로드 디렉토리 권한 거부"가
       //  났던 버그를 수정 — 이미지도 업로드 경로를 넘긴다.)
-      const uploadPath = await uploadFileToServer(file);
-      if (uploadPath) {
+      const uploaded = await uploadFileToServer(file);
+      if (uploaded.path) {
         const isImage = imageExts.includes(ext);
         contents.push(
           (isImage ? `사용자가 이미지 파일을 업로드했습니다.\n` : `사용자가 문서 파일을 업로드했습니다.\n`) +
           `파일명: ${file.name}\n` +
-          `서버 경로: ${uploadPath}\n` +
+          `서버 경로: ${uploaded.path}\n` +
           (isImage
             ? `이 이미지의 내용을 분석·설명·요약·읽기(OCR)해 달라는 요청이면 AnalyzeImage 도구로 분석하세요. 이 이미지를 바탕으로(참고해서) 그리거나 수정해 달라는 요청이면(표현이 '그려줘'여도) ImageGenerate 도구를 호출하되 input_image를 위 서버 경로로 설정하세요(원본을 반영하는 img2img).`
             : `위 서버 경로의 문서를 분석해 주세요.`)
         );
       } else {
-        contents.push(`[첨부파일 업로드 실패: ${file.name}]`);
+        // 거절 사유를 사용자에게도 즉시 알리고(알림), 모델 맥락에도 남긴다.
+        alert(`첨부 실패: ${file.name}\n${uploaded.error}`);
+        contents.push(`[첨부파일 업로드 실패: ${file.name} — ${uploaded.error}]`);
       }
       continue;
     }
@@ -2413,19 +2418,23 @@ async function readFileContents() {
   return contents.join('\n\n');
 }
 
+// 파일을 서버에 올리고 { path } 또는 { error } 를 돌려준다.
+// 왜 사유(error)까지 돌려주나: 서버가 크기 초과(413)·형식 불가(415)로 거절했을 때
+// 예전에는 그냥 "업로드 실패"만 떠서 사용자가 무엇을 고쳐야 할지 알 수 없었다.
 async function uploadFileToServer(file) {
   try {
     const formData = new FormData();
     formData.append('file', file);
     const resp = await fetch('/v1/upload', { method: 'POST', body: formData });
-    const data = await resp.json();
-    if (data.status === 'ok') {
-      return data.file_path;
+    const data = await resp.json().catch(() => ({}));
+    if (resp.ok && data.status === 'ok') {
+      return { path: data.file_path };
     }
-    return null;
+    // FastAPI 는 거절 사유를 detail 에 담아 준다. 없으면 상태코드로 대신 안내.
+    return { error: data.detail || `서버가 파일을 거절했습니다 (HTTP ${resp.status})` };
   } catch (e) {
     console.error('파일 업로드 실패:', e);
-    return null;
+    return { error: '서버에 연결하지 못했습니다.' };
   }
 }
 
