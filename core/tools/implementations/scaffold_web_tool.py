@@ -76,12 +76,20 @@ class ScaffoldWebTool(BaseTool):
     @property
     def description(self) -> str:
         # 모델에게 "직접 작성 대신 템플릿에서 시작"을 유도하는 설명.
+        # 유형을 구체적으로 나열하는 이유: 실측에서 "소개 페이지"·"신청 폼"은 이 도구를
+        # 잘 고르는데 "사용 설명서를 웹으로 정리"·"온보딩 가이드" 같은 문서형 요청에서는
+        # 도구를 아예 부르지 않고 글로만 답하는 경우가 있었다(3/18). 문서·매뉴얼·대시보드도
+        # '웹 페이지'라는 점을 설명에 못박아 그 누락을 막는다.
         return (
             "Scaffold a verified, professionally designed web template into a "
             "target directory (deterministic file copy — no code generation). "
-            "Call with no arguments to list available templates. ALWAYS use this "
-            "when asked to build a web page/site; then edit only the SITE data "
-            "object in app.js instead of writing HTML/CSS from scratch."
+            "Templates cover landing pages, admin dashboards, documentation/manual "
+            "pages, and application forms. Call with no arguments to list them. "
+            "ALWAYS use this when asked to build ANY web page or site — including "
+            "a manual/guide page, an admin/status screen, or a signup/application "
+            "form (웹 페이지·소개 페이지·대시보드·사용 설명서·매뉴얼·가이드·신청서/폼). "
+            "Then edit only the SITE data object in app.js instead of writing "
+            "HTML/CSS from scratch."
         )
 
     @property
@@ -175,6 +183,10 @@ class ScaffoldWebTool(BaseTool):
             lines = ["사용 가능한 템플릿:"]
             for t in catalog:
                 lines.append(f"- {t['name']}: {t['description']}")
+                # '언제 쓰는지'를 함께 보여준다 — 템플릿이 여러 종류가 되면서
+                # 설명만으로는 어느 유형을 고를지 판단하기 어려워졌다.
+                if t.get("use_when"):
+                    lines.append(f"  이럴 때: {t['use_when']}")
                 lines.append(f"  커스터마이징: {t.get('customize', '')}")
             lines.append(
                 "다음 단계: ScaffoldWeb(template=\"이름\", target_dir=\"대상 폴더\")"

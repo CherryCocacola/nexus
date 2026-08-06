@@ -1,11 +1,33 @@
 {
-  "_comment": "프론트엔드 템플릿 카탈로그 — ScaffoldWeb 도구가 읽는 단일 소스. 템플릿 추가 시 여기에 항목을 등록한다.",
+  "_comment": "프론트엔드 템플릿 카탈로그 — ScaffoldWeb 도구가 읽는 단일 소스. 템플릿 추가 시 여기에 항목을 등록한다. 모든 템플릿은 app.js 의 SITE 객체 하나만 수정하면 되도록 통일돼 있다(색상 포함).",
   "templates": [
     {
       "name": "landing-vue",
-      "description": "제품/서비스 소개 랜딩 페이지. Vue 3(로컬 번들, 에어갭 안전), 라이트 테마, 반응형. 섹션: 고정 네비게이션, 히어로, 기능 카드 그리드, 기술 사양, 문의 폼, 푸터.",
+      "description": "제품/서비스 소개 랜딩 페이지. 섹션: 고정 네비게이션, 히어로, 기능 카드 그리드, 기술 사양, 문의 폼, 푸터. Vue 3(로컬 번들, 에어갭 안전), 라이트 테마, 반응형.",
+      "use_when": "제품·서비스·행사를 소개하고 문의를 받는 한 장짜리 페이지",
       "files": ["index.html", "styles.css", "app.js", "vendor/vue.global.prod.js"],
-      "customize": "app.js 상단의 SITE 객체만 수정하면 모든 텍스트·카드·사양·푸터가 바뀝니다. 색상은 styles.css 최상단 :root CSS 변수만 수정합니다. 그 외 코드는 수정 금지."
+      "customize": "app.js 상단의 SITE 객체만 수정합니다. 텍스트·카드·사양·푸터는 물론 색상(SITE.colors)까지 전부 여기서 바뀝니다. index.html·styles.css는 열지 마세요."
+    },
+    {
+      "name": "dashboard-vue",
+      "description": "운영/관리 대시보드. 구성: 좌측 사이드바 메뉴, 지표(KPI) 카드 그리드, 가로 막대 비중 차트, 상태 배지가 있는 데이터 표. Vue 3(로컬 번들), 라이트 테마, 반응형.",
+      "use_when": "현황·지표·통계를 한눈에 보여주는 관리자 화면",
+      "files": ["index.html", "styles.css", "app.js", "vendor/vue.global.prod.js"],
+      "customize": "app.js 상단의 SITE 객체만 수정합니다. menu·kpis·usage·columns/rows 배열을 채우면 화면이 그대로 만들어지고, 색상은 SITE.colors에서 바꿉니다. index.html·styles.css는 열지 마세요."
+    },
+    {
+      "name": "docs-vue",
+      "description": "매뉴얼/문서 페이지. 구성: 스크롤을 따라가는 좌측 목차, 섹션 본문(단락·목록·번호 절차·코드·강조 노트·표). Vue 3(로컬 번들), 라이트 테마, 반응형.",
+      "use_when": "사용 설명서·가이드·정책 문서처럼 목차를 따라 읽는 문서형 페이지",
+      "files": ["index.html", "styles.css", "app.js", "vendor/vue.global.prod.js"],
+      "customize": "app.js 상단의 SITE 객체만 수정합니다. sections 배열에 제목과 blocks(p/list/steps/code/note/table)를 넣으면 목차가 자동 생성되고, 색상은 SITE.colors에서 바꿉니다. index.html·styles.css는 열지 마세요."
+    },
+    {
+      "name": "form-vue",
+      "description": "신청서/등록 폼 페이지. 구성: 섹션별 입력 필드(텍스트·이메일·전화·숫자·날짜·여러줄·선택·체크박스), 필수 항목 검증과 오류 표시, 제출 후 요약 화면. Vue 3(로컬 번들), 라이트 테마, 반응형.",
+      "use_when": "신청·접수·설문처럼 입력을 받아 제출하는 페이지",
+      "files": ["index.html", "styles.css", "app.js", "vendor/vue.global.prod.js"],
+      "customize": "app.js 상단의 SITE 객체만 수정합니다. sections[].fields 에 key·label·type·required 를 적으면 입력칸·검증·제출 요약이 자동으로 만들어지고, 색상은 SITE.colors에서 바꿉니다. index.html·styles.css는 열지 마세요."
     }
   ]
 }

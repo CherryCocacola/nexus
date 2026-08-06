@@ -1,0 +1,114 @@
+/* form-vue 템플릿 스타일 — 이 파일은 수정하지 마세요.
+   색상은 app.js 의 SITE.colors 에서 바꿉니다(런타임에 CSS 변수로 주입됨).
+   아래 :root 값은 JS가 실행되지 않았을 때를 위한 기본값일 뿐입니다. */
+:root {
+  --brand: #4338ca;
+  --brand-2: #6366f1;
+  --ink: #111827;
+  --muted: #6b7280;
+  --bg: #f5f6fa;
+  --surface: #ffffff;
+  --line: #e5e7eb;
+  --bad: #dc2626;
+  --radius: 12px;
+  --shadow: 0 1px 3px rgba(17, 24, 39, .06), 0 10px 30px rgba(17, 24, 39, .07);
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: "Pretendard", "Noto Sans KR", -apple-system, "Segoe UI", "Malgun Gothic", sans-serif;
+  color: var(--ink);
+  background: var(--bg);
+  line-height: 1.65;
+}
+
+.wrap { max-width: 680px; margin: 0 auto; padding: 40px 16px 56px; }
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 28px;
+}
+
+.head { padding-bottom: 18px; border-bottom: 1px solid var(--line); margin-bottom: 20px; }
+.head h1 { margin: 0; font-size: 22px; font-weight: 700; letter-spacing: -.3px; }
+.sub { margin: 6px 0 0; color: var(--muted); font-size: 14px; }
+
+.section { margin-bottom: 22px; }
+.section-title {
+  margin: 0 0 12px; font-size: 13px; font-weight: 700;
+  letter-spacing: .05em; color: var(--muted); text-transform: uppercase;
+}
+
+.field { margin-bottom: 14px; }
+.label { display: block; font-size: 14px; font-weight: 600; margin-bottom: 6px; }
+.req { color: var(--bad); margin-left: 3px; }
+
+input, select, textarea {
+  width: 100%;
+  padding: 10px 12px;
+  font: inherit;
+  font-size: 14px;
+  color: var(--ink);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  outline: none;
+}
+input:focus, select:focus, textarea:focus {
+  border-color: var(--brand);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--brand) 18%, transparent);
+}
+textarea { resize: vertical; min-height: 92px; }
+input.invalid, select.invalid, textarea.invalid { border-color: var(--bad); }
+
+.field-check { margin-top: 4px; }
+.check { display: flex; align-items: flex-start; gap: 9px; font-size: 14px; cursor: pointer; }
+.check input { width: auto; margin-top: 3px; accent-color: var(--brand); }
+
+.error { margin: 5px 0 0; color: var(--bad); font-size: 13px; }
+
+.submit {
+  width: 100%;
+  margin-top: 8px;
+  padding: 12px 18px;
+  font: inherit;
+  font-size: 15px;
+  font-weight: 700;
+  color: #fff;
+  background: linear-gradient(135deg, var(--brand), var(--brand-2));
+  border: 0;
+  border-radius: 10px;
+  cursor: pointer;
+}
+.submit:hover { filter: brightness(1.06); }
+.submit.ghost {
+  margin-top: 18px;
+  color: var(--brand);
+  background: transparent;
+  border: 1px solid var(--line);
+}
+
+/* ── 제출 요약 ── */
+.summary { margin: 0; }
+.summary-row {
+  display: grid;
+  grid-template-columns: 150px 1fr;
+  gap: 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--line);
+}
+.summary-row:last-child { border-bottom: 0; }
+.summary dt { color: var(--muted); font-size: 14px; }
+.summary dd { margin: 0; font-size: 14px; white-space: pre-wrap; }
+
+.footer { margin-top: 20px; text-align: center; color: var(--muted); font-size: 13px; }
+
+@media (max-width: 560px) {
+  .card { padding: 20px 16px; }
+  .summary-row { grid-template-columns: 1fr; gap: 2px; }
+}

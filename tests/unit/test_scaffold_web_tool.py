@@ -138,17 +138,48 @@ async def test_unknown_template_lists_available(tmp_path) -> None:
     assert "mini" in result.error_message
 
 
-def test_repo_landing_vue_assets_match_catalog() -> None:
-    """리포의 실제 landing-vue 자산이 카탈로그 파일 목록과 일치해야 한다."""
+def _repo_catalog() -> list[dict]:
+    """리포의 실제 카탈로그 항목들."""
     catalog = json.loads(
         (_DEFAULT_TEMPLATES_DIR / "catalog.json").read_text(encoding="utf-8")
     )
-    entry = next(t for t in catalog["templates"] if t["name"] == "landing-vue")
-    for rel in entry["files"]:
-        f = _DEFAULT_TEMPLATES_DIR / "landing-vue" / rel
-        assert f.is_file() and f.stat().st_size > 0, f"누락/빈 파일: {rel}"
-    # 핵심 슬롯 표식 확인 — 모델이 편집할 지점이 실제로 존재하는지.
-    app_js = (_DEFAULT_TEMPLATES_DIR / "landing-vue" / "app.js").read_text(
-        encoding="utf-8"
-    )
-    assert "const SITE" in app_js
+    return catalog["templates"]
+
+
+def test_repo_catalog_files_exist() -> None:
+    """카탈로그에 적힌 파일이 리포에 실제로 있어야 한다(모든 템플릿).
+
+    카탈로그만 고치고 자산을 안 넣으면 스캐폴드가 런타임에 실패한다 — 그 불일치를 막는다.
+    """
+    entries = _repo_catalog()
+    assert len(entries) >= 4, "템플릿이 줄었는지 확인 필요"
+    for entry in entries:
+        for rel in entry["files"]:
+            f = _DEFAULT_TEMPLATES_DIR / entry["name"] / rel
+            assert f.is_file() and f.stat().st_size > 0, f"{entry['name']}: 누락/빈 파일 {rel}"
+
+
+def test_repo_templates_expose_single_edit_slot() -> None:
+    """모든 템플릿이 'app.js의 SITE 하나만 고치면 된다'는 규약을 지켜야 한다.
+
+    이 규약이 곧 품질이다. 모델이 여러 파일을 헤집기 시작하면 결과가 무너진다.
+    색상까지 SITE.colors 로 옮긴 이유는 styles.css 의 :root 를 '교체'하는 대신
+    새 블록을 덧붙이는 실수가 잦았기 때문이다(CSS는 뒤 규칙이 이겨 옛 색이 남았다).
+    """
+    for entry in _repo_catalog():
+        app_js = (_DEFAULT_TEMPLATES_DIR / entry["name"] / "app.js").read_text(
+            encoding="utf-8"
+        )
+        name = entry["name"]
+        assert "const SITE" in app_js, f"{name}: SITE 슬롯 없음"
+        assert "colors:" in app_js, f"{name}: 색상이 SITE 안에 없음"
+        # 색을 실제로 CSS 변수에 주입해야 styles.css 를 건드릴 필요가 사라진다.
+        assert "setProperty" in app_js, f"{name}: 색상 주입 코드 없음"
+
+
+def test_repo_catalog_entries_guide_selection() -> None:
+    """카탈로그 항목이 '언제 쓰는지'를 알려줘야 모델이 유형을 고를 수 있다."""
+    for entry in _repo_catalog():
+        assert entry.get("description"), f"{entry['name']}: description 없음"
+        assert entry.get("use_when"), f"{entry['name']}: use_when 없음"
+        assert entry.get("customize"), f"{entry['name']}: customize 없음"

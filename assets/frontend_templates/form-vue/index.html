@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>신청서</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<!-- 구조 코드 — 수정하지 마세요. 내용·색상은 app.js 의 SITE 에서 바꿉니다. -->
+<div id="app">
+  <div class="wrap">
+    <!-- 제출 전 — 입력 폼 -->
+    <form v-if="!submitted" class="card" @submit.prevent="submit" novalidate>
+      <header class="head">
+        <h1>{{ site.formTitle }}</h1>
+        <p class="sub">{{ site.formSubtitle }}</p>
+      </header>
+
+      <section v-for="(s, si) in site.sections" :key="si" class="section">
+        <h2 class="section-title">{{ s.title }}</h2>
+
+        <div v-for="f in s.fields" :key="f.key" class="field"
+             :class="{ 'field-check': f.type === 'checkbox' }">
+          <label v-if="f.type !== 'checkbox'" :for="'f-' + f.key" class="label">
+            {{ f.label }}<span v-if="f.required" class="req">*</span>
+          </label>
+
+          <textarea v-if="f.type === 'textarea'" :id="'f-' + f.key" rows="4"
+                    v-model="form[f.key]" :placeholder="f.placeholder"
+                    :class="{ invalid: errors[f.key] }"></textarea>
+
+          <select v-else-if="f.type === 'select'" :id="'f-' + f.key"
+                  v-model="form[f.key]" :class="{ invalid: errors[f.key] }">
+            <option value="">선택하세요</option>
+            <option v-for="o in f.options" :key="o" :value="o">{{ o }}</option>
+          </select>
+
+          <label v-else-if="f.type === 'checkbox'" class="check">
+            <input :id="'f-' + f.key" type="checkbox" v-model="form[f.key]">
+            <span>{{ f.label }}<span v-if="f.required" class="req">*</span></span>
+          </label>
+
+          <input v-else :id="'f-' + f.key" :type="f.type"
+                 v-model="form[f.key]" :placeholder="f.placeholder"
+                 :class="{ invalid: errors[f.key] }">
+
+          <p v-if="errors[f.key]" class="error">{{ errors[f.key] }}</p>
+        </div>
+      </section>
+
+      <button class="submit" type="submit">{{ site.submitText }}</button>
+    </form>
+
+    <!-- 제출 후 — 요약 -->
+    <div v-else class="card">
+      <header class="head">
+        <h1>{{ site.doneTitle }}</h1>
+        <p class="sub">{{ site.doneText }}</p>
+      </header>
+      <dl class="summary">
+        <div v-for="(row, i) in summary()" :key="i" class="summary-row">
+          <dt>{{ row.label }}</dt>
+          <dd>{{ row.value }}</dd>
+        </div>
+      </dl>
+      <button class="submit ghost" type="button" @click="reset">{{ site.resetText }}</button>
+    </div>
+
+    <p class="footer">{{ site.footer }}</p>
+  </div>
+</div>
+
+<script src="vendor/vue.global.prod.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

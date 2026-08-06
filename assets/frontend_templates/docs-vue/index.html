@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>사용자 매뉴얼</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<!-- 구조 코드 — 수정하지 마세요. 내용·색상은 app.js 의 SITE 에서 바꿉니다. -->
+<div id="app">
+  <aside class="toc">
+    <div class="toc-head">{{ site.tocTitle }}</div>
+    <nav>
+      <a v-for="s in site.sections" :key="s.id" :href="'#' + s.id"
+         class="toc-link" :class="{ active: activeId === s.id }">{{ s.title }}</a>
+    </nav>
+  </aside>
+
+  <main class="doc">
+    <header class="doc-head">
+      <h1>{{ site.docTitle }}</h1>
+      <p class="doc-sub">{{ site.docSubtitle }}</p>
+    </header>
+
+    <section v-for="s in site.sections" :key="s.id" :id="s.id" class="section">
+      <h2>{{ s.title }}</h2>
+
+      <template v-for="(b, bi) in s.blocks" :key="bi">
+        <p v-if="b.type === 'p'">{{ b.text }}</p>
+
+        <ul v-else-if="b.type === 'list'">
+          <li v-for="(it, i) in b.items" :key="i">{{ it }}</li>
+        </ul>
+
+        <ol v-else-if="b.type === 'steps'">
+          <li v-for="(it, i) in b.items" :key="i">{{ it }}</li>
+        </ol>
+
+        <pre v-else-if="b.type === 'code'"><code>{{ b.text }}</code></pre>
+
+        <div v-else-if="b.type === 'note'" class="note">{{ b.text }}</div>
+
+        <div v-else-if="b.type === 'table'" class="table-wrap">
+          <table>
+            <thead><tr><th v-for="c in b.columns" :key="c">{{ c }}</th></tr></thead>
+            <tbody>
+              <tr v-for="(row, ri) in b.rows" :key="ri">
+                <td v-for="(cell, ci) in row" :key="ci">{{ cell }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </template>
+    </section>
+
+    <footer class="footer">{{ site.footer }}</footer>
+  </main>
+</div>
+
+<script src="vendor/vue.global.prod.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

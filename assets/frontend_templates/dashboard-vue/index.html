@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>운영 대시보드</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<!-- 구조 코드 — 수정하지 마세요. 내용·색상은 app.js 의 SITE 에서 바꿉니다. -->
+<div id="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <span class="brand-dot"></span>
+      <span class="brand-name">{{ site.brandName }}</span>
+    </div>
+    <nav class="menu">
+      <a v-for="item in site.menu" :key="item.label"
+         class="menu-item" :class="{ active: item.active }" href="#">
+        <span class="menu-icon">{{ item.icon }}</span>{{ item.label }}
+      </a>
+    </nav>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <div>
+        <h1 class="title">{{ site.brandName }}</h1>
+        <p class="subtitle">{{ site.subtitle }}</p>
+      </div>
+    </header>
+
+    <section class="kpi-grid">
+      <div class="card kpi" v-for="k in site.kpis" :key="k.label">
+        <div class="kpi-label">{{ k.label }}</div>
+        <div class="kpi-value">{{ k.value }}</div>
+        <div class="kpi-delta" :class="'tone-' + (k.tone || 'ok')">{{ k.delta }}</div>
+      </div>
+    </section>
+
+    <section class="grid-2">
+      <div class="card">
+        <h2 class="card-title">{{ site.usageTitle }}</h2>
+        <div class="bar-row" v-for="u in site.usage" :key="u.label">
+          <span class="bar-label">{{ u.label }}</span>
+          <span class="bar-track"><span class="bar-fill" :style="{ width: u.value + '%' }"></span></span>
+          <span class="bar-value">{{ u.value }}%</span>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2 class="card-title">{{ site.tableTitle }}</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th v-for="c in site.columns" :key="c">{{ c }}</th></tr>
+            </thead>
+            <tbody>
+              <tr v-for="(row, ri) in site.rows" :key="ri">
+                <td v-for="(cell, ci) in row" :key="ci">
+                  <span v-if="isStatusCell(ci)" :class="statusClass(cell)">{{ cell }}</span>
+                  <span v-else>{{ cell }}</span>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <footer class="footer">{{ site.footer }}</footer>
+  </main>
+</div>
+
+<script src="vendor/vue.global.prod.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
