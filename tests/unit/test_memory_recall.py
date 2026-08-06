@@ -82,8 +82,11 @@ class _StubManager:
         self._fail = fail
         self.called = False
 
-    async def on_turn_start(self, session_id: str, user_message: str) -> list[MemoryEntry]:
+    async def on_turn_start(
+        self, session_id: str, user_message: str, owner: str | None = None
+    ) -> list[MemoryEntry]:
         self.called = True
+        self.owner = owner  # 회상이 소유자를 넘겨주는지 확인용
         if self._fail:
             raise RuntimeError("검색 실패")
         return self._entries
@@ -100,7 +103,9 @@ def _engine(manager: Any, options: dict | None = None) -> QueryEngine:
         _session_id="s1",
         _context=SimpleNamespace(options=options or {}),
     )
+    # 회상이 소유자 해석을 함께 쓰므로 두 메서드를 같이 빌려 붙인다.
     engine._recall_memories = QueryEngine._recall_memories.__get__(engine, QueryEngine)
+    engine._memory_owner = QueryEngine._memory_owner.__get__(engine, QueryEngine)
     return engine  # type: ignore[return-value]
 
 
@@ -169,3 +174,142 @@ async def test_recall_without_manager_is_noop():
     engine = _engine(None, {"memory_recall": {"enabled": True}})
 
     assert await engine._recall_memories("질문") == ""
+
+
+# ─────────────────────────────────────────────
+# 소유자 격리 — 개인정보가 남의 대화로 새지 않아야 한다
+# ─────────────────────────────────────────────
+#
+# 왜 중요한가: 사용자 발화까지 저장하게 되면서 사번·소속 같은 개인정보가 기억에
+# 들어온다. tb_memories 에는 테넌트 컬럼이 없어 metadata.owner 로 구분하므로,
+# 이 필터가 뚫리면 A 테넌트의 개인정보가 B 테넌트 대화에 주입된다.
+
+
+class _StubLongTerm:
+    """search_by_vector/search_by_text 의 owner 필터를 실제로 수행하는 스텁."""
+
+    def __init__(self, entries: list[MemoryEntry]) -> None:
+        self._entries = entries
+
+    def _filtered(self, owner: str | None) -> list[MemoryEntry]:
+        if owner is None:
+            return list(self._entries)
+        return [e for e in self._entries if e.metadata.get("owner") == owner]
+
+    async def search_by_vector(self, embedding, memory_type=None, top_k=5, owner=None):
+        return self._filtered(owner)[:top_k]
+
+    async def search_by_text(self, query, memory_type=None, top_k=10, owner=None):
+        return self._filtered(owner)[:top_k]
+
+
+def _owned(content: str, owner: str | None) -> MemoryEntry:
+    meta: dict[str, Any] = {"session_id": "s"}
+    if owner:
+        meta["owner"] = owner
+    return MemoryEntry(
+        memory_type=MemoryType.EPISODIC,
+        content=content,
+        key="turn:s:x",
+        tags=["conversation"],
+        importance=0.9,
+        metadata=meta,
+    )
+
+
+def _manager_with(entries: list[MemoryEntry]):
+    """LongTermMemory 만 스텁으로 갈아끼운 실제 MemoryManager."""
+    from core.memory.manager import MemoryManager
+
+    manager = MemoryManager.__new__(MemoryManager)
+    manager._long_term = _StubLongTerm(entries)
+    manager._model_provider = None  # 임베딩 없이 텍스트 검색 경로만 탄다
+    return manager
+
+
+async def test_recall_returns_only_own_tenant_memories():
+    """다른 테넌트의 기억은 회상되지 않는다(개인정보 격리)."""
+    entries = [
+        _owned("A사 직원 사번은 NX-8842", owner="tenant-a"),
+        _owned("B사 직원 사번은 QQ-1111", owner="tenant-b"),
+    ]
+
+    got = await _manager_with(entries).on_turn_start("s", "사번", owner="tenant-a")
+
+    assert [e.content for e in got] == ["A사 직원 사번은 NX-8842"]
+
+
+async def test_recall_excludes_ownerless_legacy_memories():
+    """소유자 표식이 없는 레거시 기억은 회상되지 않는다(fail-closed)."""
+    entries = [_owned("소유자 미상 기억", owner=None)]
+
+    got = await _manager_with(entries).on_turn_start("s", "기억", owner="tenant-a")
+
+    assert got == []
+
+
+async def test_search_relevant_is_also_scoped():
+    """MemoryRead 경로(search_relevant)도 같은 격리를 적용한다."""
+    entries = [
+        _owned("A사 기억", owner="tenant-a"),
+        _owned("B사 기억", owner="tenant-b"),
+    ]
+
+    got = await _manager_with(entries).search_relevant("기억", owner="tenant-b")
+
+    assert [e.content for e in got] == ["B사 기억"]
+
+
+def test_memory_owner_reads_tenant_id():
+    """테넌트 객체에서 소유자 식별자를 뽑는다."""
+    engine = _engine(None, {"tenant": SimpleNamespace(id="tenant-a")})
+
+    assert engine._memory_owner() == "tenant-a"
+
+
+def test_memory_owner_none_without_tenant():
+    """테넌트를 모르면 소유자도 None — 그 기억은 회상에서 제외된다."""
+    assert _engine(None, {})._memory_owner() is None
+
+
+# ─────────────────────────────────────────────
+# 명시적 기억 요청 — 사용자가 말할 때만 저장한다
+# ─────────────────────────────────────────────
+#
+# 기존 중요도 키워드는 전부 에러·수정·아키텍처 같은 '코딩 조수' 어휘라, 사용자가 말한
+# 사실은 0.30점에 그쳐 승격 임계(0.6)를 넘지 못했다. 그래서 "기억해 줘"라고 해도
+# 아무 것도 저장되지 않았다. 반대로 모든 발화를 저장하면 개인정보가 무분별하게 쌓인다.
+# 그래서 **사용자가 명시적으로 요청했을 때만** 승격시킨다 — 저장 여부를 사용자가 정한다.
+
+
+def _assessed(content: str):
+    from core.memory.importance import ImportanceAssessor
+
+    assessor = ImportanceAssessor()
+    score = assessor.assess(content, MemoryType.EPISODIC)
+    entry = MemoryEntry(memory_type=MemoryType.EPISODIC, content=content, importance=score)
+    return score, assessor.should_promote(entry)
+
+
+def test_explicit_memory_request_is_promoted():
+    """'기억해 줘'가 붙은 사용자 발화는 승격된다."""
+    score, promoted = _assessed(
+        "제 소속은 정보전산원이고 담당 업무는 서버 운영입니다. 기억해 주세요."
+    )
+
+    assert promoted is True
+    assert score > 0.6
+
+
+def test_casual_utterance_is_not_promoted():
+    """평범한 발화는 저장하지 않는다 — 개인정보가 무분별하게 쌓이지 않게."""
+    for text in ("안녕하세요", "오늘 날씨 어때?", "제 사번은 NX-8842입니다."):
+        _score, promoted = _assessed(text)
+        assert promoted is False, f"저장돼선 안 되는 발화가 승격됨: {text}"
+
+
+def test_english_memory_request_is_promoted():
+    """영어 요청도 인식한다."""
+    _score, promoted = _assessed("My team standup is at 10am. Please remember this.")
+
+    assert promoted is True

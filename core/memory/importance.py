@@ -58,6 +58,37 @@ logger = logging.getLogger("nexus.memory.importance")
 
 # 높은 중요도 키워드 — 이 키워드가 포함되면 중요도가 크게 올라간다.
 # 문제 발생·해결·설계 판단·보안·중대 변경처럼 "나중에 꼭 다시 볼" 신호들.
+# ─────────────────────────────────────────────
+# 명시적 기억 요청 신호 (2026-08-06)
+# ─────────────────────────────────────────────
+# 왜 필요한가:
+#   기존 키워드는 전부 에러·수정·아키텍처 같은 '코딩 조수' 어휘라, 사용자가 말한
+#   사실("제 소속은 정보전산원입니다")은 0.30점에 그쳐 승격 임계(0.6)를 넘지 못했다.
+#   그래서 사용자가 "기억해 줘"라고 말해도 아무 것도 저장되지 않았다(실측).
+#
+# 왜 이 방식인가:
+#   모든 발화를 저장하면 개인정보가 무분별하게 쌓인다. 반대로 아무 것도 저장하지
+#   않으면 기억 기능이 무의미하다. **사용자가 명시적으로 요청했을 때만** 저장하면
+#   두 문제를 함께 피한다 — 저장 여부를 사용자가 정하는 셈이다.
+MEMORY_INTENT_KEYWORDS: list[str] = [
+    "기억해",  # 기억해 / 기억해줘 / 기억해 주세요 를 모두 포괄
+    "기억하고",
+    "기억해둬",
+    "기억해 둬",
+    "잊지 마",
+    "잊지마",
+    "메모해",
+    "remember this",
+    "remember that",
+    "keep in mind",
+    "don't forget",
+]
+
+# 명시적 요청이 있을 때 더해 줄 점수. 기본 0.3 + 0.4 = 0.7 로 승격 임계(0.6)를
+# 확실히 넘긴다(감점 키워드가 겹쳐도 여유가 남도록 잡은 값).
+MEMORY_INTENT_BONUS = 0.4
+
+
 HIGH_IMPORTANCE_KEYWORDS: list[str] = [
     # 에러/장애 관련
     "error",
@@ -241,6 +272,12 @@ class ImportanceAssessor:
         if re.search(r"```|Traceback|File \"", content):
             score += 0.1
 
+        # 5.5 명시적 기억 요청 — 사용자가 "기억해 줘"라고 말했으면 강하게 가산한다.
+        #     주제 키워드와 무관하게, 저장 여부의 최종 판단은 사용자 의사를 따른다.
+        memory_intent = any(kw in content_lower for kw in MEMORY_INTENT_KEYWORDS)
+        if memory_intent:
+            score += MEMORY_INTENT_BONUS
+
         # 6. 타입별 보정 — 사전에 없는 타입이면 0.0(보정 없음)으로 처리.
         bias = TYPE_IMPORTANCE_BIAS.get(memory_type, 0.0)
         score += bias
@@ -249,12 +286,13 @@ class ImportanceAssessor:
         final_score = max(0.0, min(1.0, score))
 
         logger.debug(
-            "중요도 평가: type=%s, score=%.2f (high=%d, mid=%d, low=%d)",
+            "중요도 평가: type=%s, score=%.2f (high=%d, mid=%d, low=%d, intent=%s)",
             memory_type,
             final_score,
             high_matches,
             medium_matches,
             low_matches,
+            memory_intent,
         )
         return round(final_score, 2)
 

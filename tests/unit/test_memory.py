@@ -421,8 +421,10 @@ class TestLongTermMemoryEnsureSchema:
         # 최소한 다음 DDL이 실행되어야 한다 (순서·갯수까지 검증):
         #   1) CREATE EXTENSION vector
         #   2) CREATE TABLE tb_memories
-        #   3) 인덱스 5종 (type/tags/created_at/importance/embedding hnsw)
-        assert len(executed) == 7, f"실행된 SQL 수 불일치: {len(executed)} (기대 7)"
+        #   3) 인덱스 6종 (type/tags/created_at/importance/embedding hnsw/owner)
+        #      owner 인덱스는 2026-08-06 추가 — 회상이 metadata->>'owner' 로 좁힌 뒤
+        #      거리 계산을 하므로 그 조회를 받쳐 준다.
+        assert len(executed) == 8, f"실행된 SQL 수 불일치: {len(executed)} (기대 8)"
         assert "CREATE EXTENSION" in executed[0]
         assert "tb_memories" in executed[1]
         assert "varchar(12) PRIMARY KEY" in executed[1]
@@ -438,6 +440,11 @@ class TestLongTermMemoryEnsureSchema:
         assert "idx_memories_embedding" in idx_sqls
         assert "USING hnsw" in idx_sqls
         assert "vector_cosine_ops" in idx_sqls
+        # 소유자 인덱스 — 소유자 없는 행(코드 RAG 113만 건)은 제외하는 부분 인덱스여야
+        # 인덱스 크기가 불필요하게 커지지 않는다.
+        assert "idx_memories_owner" in idx_sqls
+        assert "metadata->>'owner'" in idx_sqls
+        assert "WHERE metadata ? 'owner'" in idx_sqls
 
 
 # ─────────────────────────────────────────────

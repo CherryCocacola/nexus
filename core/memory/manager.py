@@ -105,7 +105,9 @@ class MemoryManager:
 
     # ─── 턴 생명주기 ───
 
-    async def on_turn_start(self, session_id: str, user_message: str) -> list[MemoryEntry]:
+    async def on_turn_start(
+        self, session_id: str, user_message: str, owner: str | None = None
+    ) -> list[MemoryEntry]:
         """
         턴 시작 시 호출된다. 사용자 메시지와 관련된 과거 기억을 찾아, 이번 턴의
         모델 컨텍스트에 주입할 후보 목록을 반환한다.
@@ -125,6 +127,11 @@ class MemoryManager:
         Args:
             session_id: 현재 세션 ID(로깅용)
             user_message: 사용자 입력 텍스트(검색 쿼리로 사용)
+            owner: 소유자(테넌트) 필터. 주면 그 소유자의 기억만 회상한다.
+                None이면 필터 없음 — 소유자 없는 레거시 기억까지 보인다.
+                ★대화 회상에는 반드시 owner를 넘겨야 한다. 넘기지 않으면 다른
+                테넌트가 남긴 기억(사번·소속 같은 개인정보 포함)이 남의 대화에
+                주입될 수 있다.
 
         Returns:
             관련 MemoryEntry 목록 (최대 10개, 중요도 높은 순)
@@ -140,7 +147,7 @@ class MemoryManager:
                 embeddings = await self._model_provider.embed([user_message])
                 if embeddings and len(embeddings) > 0:
                     vector_results = await self._long_term.search_by_vector(
-                        embedding=embeddings[0], top_k=5
+                        embedding=embeddings[0], top_k=5, owner=owner
                     )
                     results.extend(vector_results)
             except Exception as e:
@@ -150,7 +157,7 @@ class MemoryManager:
         #    (전체 상한 10건 - 지금까지 모은 건수)만큼 추가로 요청한다.
         if len(results) < 5:
             text_results = await self._long_term.search_by_text(
-                query=user_message, top_k=10 - len(results)
+                query=user_message, top_k=10 - len(results), owner=owner
             )
             # 이미 벡터 검색으로 담긴 항목과 겹치지 않게 ID 기준으로 중복 제거한다.
             existing_ids = {e.id for e in results}
@@ -186,6 +193,7 @@ class MemoryManager:
         messages: list[Message],
         tool_results: list[str] | None = None,
         channel: str | None = None,
+        owner: str | None = None,
     ) -> None:
         """
         턴 종료 시 호출된다. 이번 턴의 대화를 단기 메모리에 저장하고, 그중 중요한
@@ -198,7 +206,10 @@ class MemoryManager:
 
         [처리 순서]
           1. 이번 턴 메시지 전체를 직렬화해 단기 메모리(Redis)에 대화 컨텍스트로 저장.
-          2. assistant 메시지만 골라 본문 중요도를 평가(너무 짧은 건 건너뜀).
+          2. user/assistant 메시지를 골라 본문 중요도를 평가(너무 짧은 건 건너뜀).
+             ★사용자 발화도 포함하는 이유: "제 소속은 정보전산원입니다" 같은 사실은
+             사용자가 말하지 assistant가 말하지 않는다. assistant만 승격하던 때는
+             사용자가 "기억해 줘"라고 해도 아무 것도 저장되지 않았다(실측 0건).
           3. 승격 기준(should_promote)을 통과하면 EPISODIC 엔트리로 장기 저장.
           4. 도구 실행 결과 중 중요도가 높은 것은 PROCEDURAL 엔트리로 장기 저장.
 
@@ -207,7 +218,12 @@ class MemoryManager:
             messages: 이번 턴에서 오간 Message 목록
             tool_results: 이번 턴의 도구 실행 결과 텍스트 목록(없으면 None)
             channel: 진입점 채널(web/cli/api). 단기 메모리 키를 채널별로 격리한다.
-                None이면 flat 키(하위호환). 장기 메모리(tb_memories)는 채널 무관 글로벌 유지.
+                None이면 flat 키(하위호환).
+            owner: 소유자(테넌트) 식별자. 승격되는 기억의 metadata.owner 에 새긴다.
+                ★사용자 발화까지 저장하게 되면서 개인정보(사번·소속 등)가 들어올 수
+                있다. 소유자를 새겨야 회상 시 같은 테넌트에게만 돌아간다. owner가
+                None이면 소유자 없이 저장되고, 그런 기억은 회상에서 제외된다
+                (fail-closed — 누구 것인지 모르는 기억을 남에게 주지 않는다).
         """
         # 1. 이번 턴 메시지를 dict로 직렬화해 단기 메모리에 통째로 저장한다.
         #    (직렬화 규칙은 _serialize_message 참고 — content를 평문으로 통일한다.)
@@ -217,12 +233,13 @@ class MemoryManager:
             session_id, serialized, channel=channel
         )
 
-        # 2. assistant 메시지만 골라 중요 내용을 추출·평가한다.
+        # 2. user/assistant 메시지를 골라 중요 내용을 추출·평가한다.
+        #    사용자 발화를 포함하는 이유는 위 docstring 참고(사실은 사용자가 말한다).
+        #    도구 결과(tool_result)는 여기가 아니라 아래 4단계에서 따로 다룬다.
         for msg in messages:
             # role은 문자열일 수도, Enum일 수도 있어 양쪽 모두 문자열로 정규화한다.
             role = msg.role if isinstance(msg.role, str) else msg.role.value
-            # 사용자/도구 메시지는 여기서 승격 대상이 아니므로 건너뛴다.
-            if role != "assistant":
+            if role not in ("assistant", "user"):
                 continue
 
             content = msg.text_content
@@ -254,7 +271,13 @@ class MemoryManager:
                 key=key,
                 tags=["conversation", session_id],
                 importance=importance,
-                metadata={"session_id": session_id, "role": role},
+                # owner: 회상 시 같은 테넌트에게만 돌려주기 위한 소유자 표식.
+                # None이면 키를 넣지 않아, 소유자 필터가 걸린 회상에서 제외된다.
+                metadata={
+                    "session_id": session_id,
+                    "role": role,
+                    **({"owner": owner} if owner else {}),
+                },
             )
 
             # 임베딩 생성 (ModelProvider가 있을 때만) — 나중에 벡터 검색이 되도록.
@@ -306,7 +329,9 @@ class MemoryManager:
 
     # ─── 검색 ───
 
-    async def search_relevant(self, query: str, top_k: int = 10) -> list[MemoryEntry]:
+    async def search_relevant(
+        self, query: str, top_k: int = 10, owner: str | None = None
+    ) -> list[MemoryEntry]:
         """
         질문(query)과 관련된 메모리를 검색한다.
 
@@ -332,7 +357,7 @@ class MemoryManager:
                 embeddings = await self._model_provider.embed([query])
                 if embeddings and len(embeddings) > 0:
                     vector_results = await self._long_term.search_by_vector(
-                        embedding=embeddings[0], top_k=top_k
+                        embedding=embeddings[0], top_k=top_k, owner=owner
                     )
                     for entry in vector_results:
                         if entry.id not in existing_ids:
@@ -344,7 +369,9 @@ class MemoryManager:
         # 남은 자리(top_k - 지금까지 모은 건수)만큼 텍스트 검색으로 보충한다.
         remaining = top_k - len(results)
         if remaining > 0:
-            text_results = await self._long_term.search_by_text(query=query, top_k=remaining)
+            text_results = await self._long_term.search_by_text(
+                query=query, top_k=remaining, owner=owner
+            )
             for entry in text_results:
                 if entry.id not in existing_ids:
                     results.append(entry)

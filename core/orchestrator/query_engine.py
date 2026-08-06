@@ -276,12 +276,6 @@ class QueryEngine:
         if self._turn_state_store is not None:
             self._messages.clear()
 
-        # 과거 기억 회상 — 관련 있는 장기 기억을 이번 턴 앞에 끼워 넣는다.
-        # (기본 비활성. config memory.recall_enabled 로 켠다 — 아래 _recall_memories 참고)
-        recall_block = await self._recall_memories(user_input)
-        if recall_block:
-            self._messages.append(Message.user(recall_block))
-
         # 사용자 메시지를 대화 히스토리에 추가
         user_msg = Message.user(user_input)
         self._messages.append(user_msg)
@@ -313,6 +307,17 @@ class QueryEngine:
             user_input=user_input,
             decision=decision,
         )
+
+        # 과거 기억 회상 — 관련 있는 장기 기억을 '시스템 프롬프트'에 덧붙인다.
+        # ★messages 에 넣지 않는 이유(실측으로 드러난 버그): 회상 블록을
+        #   Message.user() 로 히스토리에 넣었더니 턴 종료 시 그것이 '사용자 발화'로
+        #   다시 저장되고, 저장된 것이 다음 턴에 또 회상돼 주입되는 되먹임이 생겼다
+        #   ("--- 과거 기억 --- - --- 과거 기억 ---" 중첩이 실제로 관측됐다).
+        #   회상은 대화가 아니라 참고 자료이므로 지식 RAG와 같은 자리(시스템 프롬프트)에
+        #   둔다. 그러면 저장 대상 자체가 되지 않는다.
+        recall_block = await self._recall_memories(user_input)
+        if recall_block:
+            effective_system_prompt = f"{effective_system_prompt}\n\n{recall_block}"
 
         # ─── 지식 RAG 출처 인용 (Point 4-2) ─────────────────
         # 프롬프트 조립 직후, 이번 턴에 KB로 '실제 주입된' 청크의 출처 목록이 있으면
@@ -464,6 +469,21 @@ class QueryEngine:
             # 예외 중에도 호출되며 — finalize_error가 있으면 system 에러 엔트리도 남긴다.
             await self._finalize_turn(user_input, finalize_error=finalize_error)
 
+    def _memory_owner(self) -> str | None:
+        """이번 대화의 기억 소유자(테넌트) 식별자.
+
+        회상·저장 양쪽에서 같은 값을 써야 "내가 저장한 것만 내가 회상"이 성립한다.
+        테넌트를 알 수 없으면 None — 그 경우 저장물에 소유자 표식이 없어 회상에서
+        제외된다(fail-closed). 개인정보가 남의 대화로 새는 것보다 회상이 안 되는
+        편이 낫다.
+        """
+        tenant = self._context.options.get("tenant") if self._context else None
+        if tenant is None:
+            return None
+        # 테넌트는 객체(.id)일 수도, 이미 문자열일 수도 있다.
+        owner = getattr(tenant, "id", tenant)
+        return str(owner) if owner else None
+
     async def _recall_memories(self, user_input: str) -> str:
         """이번 입력과 관련된 과거 기억을 찾아 주입용 블록으로 만든다.
 
@@ -490,7 +510,9 @@ class QueryEngine:
 
         try:
             entries = await self._memory_manager.on_turn_start(
-                session_id=self._session_id, user_message=user_input
+                session_id=self._session_id,
+                user_message=user_input,
+                owner=self._memory_owner(),
             )
         except Exception as e:  # noqa: BLE001 — 회상 실패가 대화를 막지 않게
             logger.warning("메모리 회상 실패 (session=%s): %s", self._session_id, e)
@@ -535,6 +557,7 @@ class QueryEngine:
                     session_id=self._session_id,
                     messages=self._messages,
                     channel=self._channel,
+                    owner=self._memory_owner(),
                 )
             except Exception as e:
                 # 메모리 저장 실패는 치명적이지 않다 — 로그만 남기고 진행

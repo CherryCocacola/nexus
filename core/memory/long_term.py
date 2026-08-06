@@ -96,6 +96,11 @@ _DDL_TB_MEMORIES_INDEXES = [
     "ON tb_memories (importance DESC)",
     "CREATE INDEX IF NOT EXISTS idx_memories_embedding "
     "ON tb_memories USING hnsw (embedding vector_cosine_ops)",
+    # 소유자(테넌트) 조회 가속 — 회상은 항상 metadata->>'owner' 로 좁힌 뒤 거리 계산을
+    # 한다(위 _search_by_vector_pg 주석 참고). 소유자 없는 행은 인덱스에서 제외해
+    # 크기를 줄인다(코드 RAG 113만 건이 여기 해당).
+    "CREATE INDEX IF NOT EXISTS idx_memories_owner "
+    "ON tb_memories ((metadata->>'owner')) WHERE metadata ? 'owner'",
 ]
 
 
@@ -240,6 +245,7 @@ class LongTermMemory:
         query: str,
         memory_type: MemoryType | None = None,
         top_k: int = 10,
+        owner: str | None = None,
     ) -> list[MemoryEntry]:
         """
         텍스트 키워드로 메모리를 검색한다.
@@ -251,13 +257,15 @@ class LongTermMemory:
             query: 검색 쿼리 문자열
             memory_type: 특정 타입으로 필터링 (None이면 전체)
             top_k: 최대 반환 건수
+            owner: 소유자(테넌트) 필터. 주면 그 소유자의 기억만 본다.
+                None이면 필터 없음(소유 개념이 없는 호출부의 기존 동작 유지).
 
         Returns:
             관련도 순 MemoryEntry 목록
         """
         if self._pg is not None:
             try:
-                return await self._search_by_text_pg(query, memory_type, top_k)
+                return await self._search_by_text_pg(query, memory_type, top_k, owner)
             except Exception as e:
                 logger.warning("PostgreSQL 텍스트 검색 실패: %s — 폴백 사용", e)
 
@@ -268,6 +276,10 @@ class LongTermMemory:
         for entry in self._store.values():
             # 타입 필터: 특정 타입만 원하면 나머지는 건너뛴다.
             if memory_type is not None and entry.memory_type != memory_type:
+                continue
+
+            # 소유자 필터 — DB 경로와 같은 규칙(소유자 없는 행은 제외).
+            if owner is not None and entry.metadata.get("owner") != owner:
                 continue
 
             # content뿐 아니라 key와 tags까지 한 문자열로 합쳐 폭넓게 매칭한다.
@@ -289,6 +301,7 @@ class LongTermMemory:
         embedding: list[float],
         memory_type: MemoryType | None = None,
         top_k: int = 5,
+        owner: str | None = None,
     ) -> list[MemoryEntry]:
         """
         벡터 유사도로 메모리를 검색한다.
@@ -300,13 +313,15 @@ class LongTermMemory:
             embedding: 쿼리 벡터 (e5-large 등으로 생성)
             memory_type: 특정 타입으로 필터링 (None이면 전체)
             top_k: 최대 반환 건수
+            owner: 소유자(테넌트) 필터. 주면 그 소유자의 기억만 본다.
+                None이면 필터 없음(코드 RAG 등 소유 개념이 없는 호출부).
 
         Returns:
             유사도 순 MemoryEntry 목록
         """
         if self._pg is not None:
             try:
-                return await self._search_by_vector_pg(embedding, memory_type, top_k)
+                return await self._search_by_vector_pg(embedding, memory_type, top_k, owner)
             except Exception as e:
                 logger.warning("PostgreSQL 벡터 검색 실패: %s — 폴백 사용", e)
 
@@ -317,6 +332,10 @@ class LongTermMemory:
         for entry in self._store.values():
             # 타입 필터: 특정 타입만 원하면 나머지는 건너뛴다.
             if memory_type is not None and entry.memory_type != memory_type:
+                continue
+
+            # 소유자 필터 — DB 경로와 같은 규칙(소유자 없는 행은 제외).
+            if owner is not None and entry.metadata.get("owner") != owner:
                 continue
 
             # 임베딩이 없는 항목은 유사도 비교 자체가 불가능하므로 제외한다.
@@ -501,9 +520,35 @@ class LongTermMemory:
         return self._row_to_entry(row)
 
     async def _search_by_text_pg(
-        self, query: str, memory_type: MemoryType | None, top_k: int
+        self,
+        query: str,
+        memory_type: MemoryType | None,
+        top_k: int,
+        owner: str | None = None,
     ) -> list[MemoryEntry]:
-        """PostgreSQL ILIKE 기반 텍스트 검색."""
+        """PostgreSQL ILIKE 기반 텍스트 검색.
+
+        owner 를 주면 metadata->>'owner' 가 일치하는 행만 본다(소유자 없는 레거시 행은
+        제외 = fail-closed). 필터를 SQL 에서 거는 이유는 벡터 검색과 같다 — 파이썬에서
+        걸면 LIMIT 이 남의 기억까지 세어 내 기억이 밀려난다.
+        """
+        if owner is not None:
+            conditions = ["content ILIKE $1", "metadata->>'owner' = $2"]
+            params: list[Any] = [f"%{query}%", owner]
+            if memory_type is not None:
+                params.append(memory_type)
+                conditions.append(f"memory_type = ${len(params)}")
+            params.append(top_k)
+            # 안전: 위 벡터 검색과 동일 — 조건 문자열은 고정, 값은 전부 파라미터 바인딩.
+            query = f"""
+                SELECT * FROM tb_memories
+                WHERE {" AND ".join(conditions)}
+                ORDER BY importance * (1 + access_count) DESC
+                LIMIT ${len(params)}
+            """  # noqa: S608
+            rows = await self._pg.fetch(query, *params)
+            return [self._row_to_entry(row) for row in rows]
+
         if memory_type is not None:
             rows = await self._pg.fetch(
                 """
@@ -530,41 +575,68 @@ class LongTermMemory:
         return [self._row_to_entry(row) for row in rows]
 
     async def _search_by_vector_pg(
-        self, embedding: list[float], memory_type: MemoryType | None, top_k: int
+        self,
+        embedding: list[float],
+        memory_type: MemoryType | None,
+        top_k: int,
+        owner: str | None = None,
     ) -> list[MemoryEntry]:
         """
         pgvector 코사인 거리(<=>) 기반 벡터 검색(공개 search_by_vector의 DB 경로).
 
         <=>는 "거리"라서 값이 작을수록 유사하다. 그래서 distance를 ASC(오름차순)로
         정렬해 가장 가까운(=가장 비슷한) 것부터 top_k개를 가져온다.
+
+        owner 를 주면 metadata->>'owner' 가 정확히 일치하는 행만 본다. 소유자 없는
+        레거시 행은 이때 제외된다(fail-closed) — 누구 것인지 모르는 기억을 남의
+        대화에 주입하지 않기 위해서다. owner=None 이면 필터를 걸지 않는다(코드 RAG
+        리트리버처럼 소유 개념이 없는 호출부의 기존 동작 유지).
+
+        ★필터를 파이썬이 아니라 SQL 에서 거는 이유: 파이썬에서 걸면 LIMIT 이 남의
+        기억까지 세어 버려, 정작 내 기억은 top_k 안에 못 들어오는 일이 생긴다.
         """
         # 질의 벡터도 pgvector가 이해하도록 문자열로 바꾼 뒤 ::vector로 캐스팅한다.
         embedding_str = str(embedding)
+        # WHERE 절을 조건에 맞춰 조립한다. 값은 전부 $N 파라미터 바인딩이라 인젝션 여지가 없다.
+        conditions = ["embedding IS NOT NULL"]
+        params: list[Any] = [embedding_str]
         if memory_type is not None:
-            rows = await self._pg.fetch(
-                """
+            params.append(memory_type)
+            conditions.append(f"memory_type = ${len(params)}")
+        if owner is not None:
+            params.append(owner)
+            conditions.append(f"metadata->>'owner' = ${len(params)}")
+        params.append(top_k)
+
+        # ★소유자 필터가 걸리면 '필터 먼저, 거리계산 나중' 순서를 강제한다.
+        #   왜: embedding 컬럼에는 HNSW 인덱스가 있는데, HNSW 는 후보 몇십 건을 먼저
+        #   훑은 뒤 필터를 적용한다(post-filter). 전체 113만 건 중 내 소유가 몇 건뿐이면
+        #   후보 안에 한 건도 안 들어와 **결과가 0건**이 된다(실측: 텍스트 검색은 1건을
+        #   찾는데 벡터 검색만 0건이었다).
+        #   서브쿼리 안의 OFFSET 0 은 PostgreSQL 의 최적화 펜스다 — 이게 있으면 플래너가
+        #   조건을 바깥 정렬로 끌어올리지 못해, 좁혀진 집합만 정확히 거리 계산한다.
+        #   소유자로 좁힌 집합은 작으므로 정확 스캔 비용이 문제되지 않는다.
+        if owner is not None:
+            query = f"""
                 SELECT *, embedding <=> $1::vector AS distance
-                FROM tb_memories
-                WHERE embedding IS NOT NULL AND memory_type = $2
+                FROM (
+                    SELECT * FROM tb_memories
+                    WHERE {" AND ".join(conditions)}
+                    OFFSET 0
+                ) AS scoped
                 ORDER BY distance ASC
-                LIMIT $3
-                """,
-                embedding_str,
-                memory_type,
-                top_k,
-            )
+                LIMIT ${len(params)}
+            """  # noqa: S608
         else:
-            rows = await self._pg.fetch(
-                """
+            # 소유자 필터가 없으면 기존대로 HNSW 인덱스를 그대로 활용한다(코드 RAG 경로).
+            query = f"""
                 SELECT *, embedding <=> $1::vector AS distance
                 FROM tb_memories
-                WHERE embedding IS NOT NULL
+                WHERE {" AND ".join(conditions)}
                 ORDER BY distance ASC
-                LIMIT $2
-                """,
-                embedding_str,
-                top_k,
-            )
+                LIMIT ${len(params)}
+            """  # noqa: S608
+        rows = await self._pg.fetch(query, *params)
         return [self._row_to_entry(row) for row in rows]
 
     async def _update_pg(self, memory_id: str, **kwargs: Any) -> bool:
