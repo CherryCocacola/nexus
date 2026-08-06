@@ -4103,3 +4103,244 @@ FABLE5가 nova CLI를 정밀 진단(B-1~B-8)하고 5-Phase 수정계획 작성 �
 - 테스트: unit 1836 passed(hwpx 포함 전건). ruff: 신규분 clean, web/app.py 기존 7건 잔존.
 - 112 배포본 = 리포 동기(해시 대조 확인). B200: A.X(8001, util 0.70)+임베딩(8002)+이미지(8003)+비전(8004)+Devstral(8005).
 - 과제 문서: `user_mig/design/REMAINING_ISSUES_2026-08-05.md` (최신화 완료)
+
+---
+
+# W8 업로드 확장 (2026-08-06)
+
+## 미니스펙 — 조사 결과 실제 구멍은 "업로드 경로"가 아니라 "파싱 커버리지"였다
+
+착수 전 가정은 "PDF·문서 업로드를 DocumentProcess로 넘기는 배선이 없다"였으나, 실측해 보니
+`/v1/upload` → 서버 경로 반환 → 프런트가 경로를 본문에 실어 전달 → 모델이 DocumentProcess 호출
+까지는 **이미 동작 중**이었다. 진짜 문제는 아래 넷이다.
+
+1. **파싱 커버리지 구멍** — `DocumentProcess._extract_text`가 `.pdf/.docx/.xlsx`만 분기하고
+   `.pptx/.hwpx/.hwp`는 else 가지(UTF-8 평문)로 흘러 **깨진 문자열이 그대로 모델에 입력**됐다.
+   그런데 `bootstrap.py:1126` 주석과 프런트 `accept`는 이미 "지원한다"고 적혀 있었다 → 문서-구현 불일치.
+2. **중복 구현 위험** — `core/ingest/parsers/`에 PptxParser·HwpxParser·HwpViaLibreOfficeParser가
+   이미 구현·테스트돼 있었다. 새로 짜면 두 벌이 따로 굳는다 → **재사용**이 정답.
+3. **업로드 라우트 무방비** — 크기 상한·확장자 검증이 **전무**. 브라우저 10MB 제한은 라우트를
+   직접 호출하면 우회된다(디스크 무한 증식 가능).
+4. **의존성 미선언** — pypdf/python-docx/openpyxl/python-pptx/python-hwpx/defusedxml/pdfplumber가
+   `requirements.txt`에 **한 줄도 없었다**. 에어갭 wheel 번들 누락 위험.
+
+## 한 것
+
+**1) DocumentProcess ↔ core/ingest 파서 연결** (`core/tools/implementations/document_tool.py`)
+- `_INGEST_EXTS = (.pptx, .hwpx, .hwp)` → `_get_ingest_registry()`(지연·1회 생성)로 라우팅.
+  파서별 개별 import + 실패 시 경고만 남기고 스킵 → 한 라이브러리가 없어도 나머지는 동작.
+- **등록하지 않은 것도 설계**: Docling(레이아웃)·OCR(Tesseract/Paddle)은 무겁고 GPU를 써서
+  채팅 응답 경로에 올리지 않는다. PDF는 기존 pypdf 경로 유지(무회귀).
+- `_flatten_tree()` — DocumentTree를 평문으로 펼치되 페이지/슬라이드 전환에 머리표를 넣고,
+  파서의 fail-soft `warnings`를 본문 끝에 붙인다(조용한 누락 방지).
+- `_extract_text`를 async로 전환(호출부는 `call()` 하나뿐). 인제스트 파서의 `parse()`는 async
+  선언이지만 내부가 블로킹(특히 HWP의 LibreOffice 변환)이라 **`asyncio.to_thread` + 독립 루프**로
+  돌린다 → 웹 이벤트 루프 정지 방지(운영 수칙 "async에서 blocking subprocess 금지").
+
+**2) 미지원 바이너리·인코딩 처리** (`_read_text_file`)
+- 앞 4KB에 NUL 바이트가 있으면 바이너리로 보고 **지원 형식을 안내하는 오류**를 낸다.
+- UTF-8 실패 시 **CP949 재시도**(한글 레거시 텍스트가 물음표로 뭉개지던 문제).
+- **개행 정규화(CRLF→LF)** — 바이트로 읽으면 파이썬 텍스트 모드의 universal newlines가
+  걸리지 않아 Windows 파일에 `\r`이 남고 글자 수가 늘어 **청크 경계가 어긋난다**.
+  기존 테스트(singleshot 경계 40000자)가 이걸 잡아냈다 → 회귀 보정 후 통과.
+
+**3) 업로드 라우트 하드닝** (`web/app.py` `/v1/upload`)
+- 확장자 allowlist 위반 → **415**, 크기 상한 초과 → **413**.
+- 크기 검사는 전체를 메모리에 올린 뒤가 아니라 **1MB 조각 단위로 읽으며 넘는 즉시 중단**,
+  이미 쓰인 부분 파일은 삭제(찌꺼기 방지).
+- 한계값은 `config.upload`(신설 `UploadConfig`)에서 로드. `allowed_extensions`를 비우면
+  검사를 건너뛴다(운영 중 임시 완화 탈출구).
+
+**4) 프런트 정합** (`web/static/index.html`)
+- `accept`에 `.hwpx/.pptx/.doc/.xls` + 이미지 확장자 추가, `binaryExts`에 `.hwpx` 추가.
+- `uploadFileToServer`가 `{path}` 또는 `{error}`를 반환 → 서버 거절 사유(413/415 detail)를
+  **alert + 모델 맥락 양쪽에 표시**. 예전엔 "업로드 실패"만 떠서 원인을 알 수 없었다.
+- 클라이언트 사전 안내 한도를 서버 기본값과 맞춰 10MB→20MB.
+
+**5) 정합·선언 보강** — `bootstrap.py` 주석 2곳 정정, `requirements.txt`에 문서 파싱 의존성
+7종 명시(설치 버전 실측 반영: python-hwpx 2.24.0 등), `config/nexus_config.yaml`·`.112.yaml`에
+`upload:` 섹션 추가.
+
+## 검증
+
+- 신규 단위 테스트 12건 — `tests/unit/test_document_tool_formats.py`(6) +
+  `tests/unit/test_web_upload_limits.py`(6). 픽스처는 python-pptx/python-hwpx로 실행 시점 생성.
+- **unit 1848 passed**(기존 1836 + 신규 12). 회귀 없음.
+- ruff: 신규분 clean(포맷 포함). `web/app.py` 기존 7건(E402×6·S110)은 그대로 잔존.
+- 실파일 스모크: 리포의 실제 docx/pdf/xlsx 3종 정상 파싱 확인(무회귀), 생성 픽스처로
+  pptx/hwpx 본문 추출 확인, 확장자만 `.hwp`인 위조 파일은 매직바이트 검사로 거절 확인.
+
+## 남은 것
+
+- **실서버 e2e 미실시** — 112 배포 후 브라우저에서 hwpx/pptx 업로드→분석까지 확인 필요.
+  배포는 지시 대기(core 파일이므로 import 그래프 전체 + `docker cp` 후 `docker commit` 수칙 적용).
+- **`.hwp` 구포맷은 LibreOffice(soffice) 의존** — 웹 컨테이너에 미설치면 파싱이 빈 결과+경고로
+  끝난다(크래시는 없음). 설치 여부는 배포 판단 사항(이미지 용량 증가).
+- `upload.retention_hours`는 설정만 신설했고 **정리 잡은 미배선**(exports의 cleanup 잡과
+  같은 방식으로 붙이면 된다).
+
+## 배포 (2026-08-06) — 112 nexus-web
+
+### 배포 중 발견한 진짜 지뢰: 패키지 `__init__` 즉시 import
+
+사전 점검(읽기 전용)에서 컨테이너에 **`docling`·`pdfplumber`·`defusedxml`이 없음**을 확인했고,
+실제로 프로브를 돌려 보니 세 파서가 **전부** import 실패했다.
+
+```
+core.ingest.parsers.pptx IMPORT_FAIL ModuleNotFoundError No module named 'docling'
+```
+
+원인: 파이썬은 하위 모듈을 import 할 때 **부모 패키지 `__init__`을 먼저 실행**한다.
+`core/ingest/parsers/__init__.py`(그리고 상위 `core/ingest/__init__.py`)가 7개 파서를 전부
+즉시 import 했고, 그 모듈들은 `docling`/`pdfplumber`/`pytesseract`를 최상위에서 불러온다.
+따라서 **PPTX 하나만 쓰려 해도 docling까지 끌려 들어와 통째로 죽었다**. 도구 쪽에 파서별
+try/except를 이미 넣어 뒀지만, 실패 지점이 패키지 `__init__`이라 셋 다 같이 걸렸다 —
+"파서 하나 실패해도 나머지는 산다"는 방어가 무력화된 것이다.
+
+이대로 배포했으면 **W8은 조용한 무동작**이 됐을 것이다(업로드는 되는데 파싱만 안 됨).
+[[feedback_deploy_import_graph]] 수칙이 그대로 재현된 사례이며, 이번엔 배포 전 프로브로 잡았다.
+
+**조치** — `core/ingest/__init__.py`와 `core/ingest/parsers/__init__.py`를 **PEP 562
+모듈 `__getattr__` 지연 재노출**로 전환. 표(`_LAZY_EXPORTS`/`_LAZY_PARSERS`)만 들고 있다가
+이름을 실제로 꺼낼 때 그 모듈만 로드한다. 외부 사용법(`from core.ingest import X`)은 불변.
+실사용처(scripts/prepare_documents.py·mcp_servers/docingest_server.py)는 원래 서브모듈을
+직접 import 하고 있어 **즉시 re-export의 실익은 0, 결합 비용만 있었다**.
+
+### 배포 절차 (수칙 준수)
+
+1. **사전 점검(읽기 전용)** — 컨테이너 마운트·설치 패키지·파일 해시·soffice 유무 확인.
+2. **백업** — 대상 8파일을 컨테이너 `/tmp/w8_backup`에, config는 호스트 `.w8bak`으로.
+3. **배포** — SFTP 스테이징 → `docker cp` 8파일.
+   config(`nexus_config.112.yaml`)는 **bind-mount라 호스트 경로에 직접** 써야 반영된다
+   (`/home/idino/nexus-config/`). 스테이징 파일명은 경로 평탄화 — `core/ingest/__init__.py`와
+   `core/ingest/parsers/__init__.py`가 basename 충돌로 서로를 덮어쓸 뻔했다.
+4. **의존성** — `defusedxml` 설치(HwpxParser 필수, 컨테이너에 없었음). requirements.txt에도 선언.
+5. **재시작 → 검증 → `docker commit`**.
+
+### 실서버 검증 (전부 통과)
+
+- 부트스트랩: 26개 도구 정상, health 200, **미인증 401**(fail-closed 정상).
+- 파서 레지스트리 실측: `지원 확장자: ('.hwp', '.hwpx', '.pptx')`.
+- 업로드 e2e: pptx/hwpx 업로드 → 서버 경로 반환 → **DocumentProcess가 실제 본문 추출**.
+- 거절 e2e: `.exe` → **415**(허용 목록 안내), 25MB → **413**(20MB 한도 안내).
+- 위조 `.hwp`(매직바이트 불일치) → 쓰레기 텍스트 아닌 **오류**.
+- **채팅 경로 e2e**: 프런트와 같은 형식의 메시지로 `/v1/chat/completions` 호출 →
+  모델이 `DocumentProcess`를 호출(0.14초)하고 hwpx 제목·단락을 그대로 답변.
+- 영속화: `docker commit` → **`nexus-web:w8-upload-20260806` + `latest`**(730MB).
+
+### 상태
+
+- 리포 = 112 배포본 동기. unit+integration **1980 passed, 1 skipped**.
+- **커밋·push 미실행**(지시 대기). 미커밋 변경 = 코드 8 + config 2 + 테스트 2 + progress.
+- 컨테이너에 `docling`·`pdfplumber`는 여전히 없다. 지연 import 덕에 **무해**하지만,
+  웹 컨테이너에서 지식 인제스트(PDF 고품질/OCR)를 돌릴 계획이면 그때 설치해야 한다.
+- `.hwp` 구포맷은 컨테이너에 **soffice 미설치**라 실제 변환 불가(빈 결과+경고, 크래시 없음).
+  한글 구포맷 지원이 필요하면 LibreOffice 설치가 선행돼야 한다 — 이미지 용량 증가 판단 필요.
+
+## W8 위험 점검 전수 테스트 (2026-08-06)
+
+변경분의 폭발 반경(특히 지연 import 전환)을 기준으로 위험 지점 33건을 목록화해 전부 실측했다.
+
+**로컬 21건** — 지연 import 무결성(R1~R6: 전 이름 조회·별표 import·오타 AttributeError·
+서브모듈 격리·ImportError 비은폐·8스레드 동시접근), async 전환 안전성(R7),
+파싱 엣지(R8~R18: UTF-16/BOM·확장자 없음·CP949 오탐·CRLF+CR 혼재·0바이트·빈 PPTX·
+손상 PPTX·없는 파일·청크 이어읽기·이벤트루프 비차단·_flatten_tree 정렬/경고/자식노드),
+설정 로딩(R19), 프런트-서버 형식 정합(R20), index.html JS 문법(R21).
+
+**실서버 12건** — 대문자 확장자·확장자 없음·경로순회 파일명·이중 확장자(.pdf.exe)·
+0바이트·크기 경계(20MB 정확=200 / +1바이트=413)·413 후 부분파일 잔존·미인증 401·
+file 파트 없음 422·동시 업로드 10건 경로 충돌·배포본 해시·서비스 상태.
+
+### 발견·수정한 실제 결함 1건
+
+**UTF-16 텍스트 파일이 바이너리로 오거부됨.** 바이너리 판별을 NUL 바이트로 하는데
+UTF-16은 본문 곳곳에 NUL이 있다(Windows 메모장 '유니코드' 저장이 대표적). 조치=
+BOM(UTF-8-sig/UTF-16 LE·BE/UTF-32 LE·BE)을 NUL 검사보다 **먼저** 판별해 해독한다.
+UTF-32LE BOM(FF FE 00 00)이 UTF-16LE BOM(FF FE)으로 시작하므로 **긴 것부터 검사**해야
+한다(순서가 곧 정확성). 덤으로 UTF-8 BOM이 본문 앞 보이지 않는 문자로 남던 것도 사라졌다.
+테스트 2건 추가 후 재배포·실서버 재확인(u16/bom/cp949 정상, 바이너리는 오류).
+
+**하네스 오탐 1건** — R7(_extract_text 호출부 수)은 `git grep`의 한글 출력 디코딩 실패로
+FAIL이 났다. 도구로 직접 재확인해 호출부 1건·`await` 사용 확정(제품 결함 아님).
+
+### 최종 상태
+
+- **unit+integration 1982 passed, 1 skipped** (신규 테스트 누적 14건).
+- ruff: 변경·신규 파일 **clean**(포맷 포함). `web/app.py` 기존 7건(E402×6·S110) 잔존 — 무관.
+- **리포 ↔ 112 배포본 해시 7파일 전부 일치**. config bind-mount 반영 확인.
+- 영속화 재수행: `nexus-web:w8-upload-20260806` + `latest`(730MB, 01:34 UTC).
+
+### 점검에서 드러난 운영 리스크 (미해결)
+
+- **업로드 디렉토리 무한 증식** — `/tmp/nexus_uploads` 현재 29개 / **19MB**. `retention_hours: 24`
+  설정은 넣었으나 **정리 잡이 미배선**이라 실제로 지워지지 않는다. 컨테이너 `/tmp`라
+  재시작으로 비워지지만 장기 가동 시 계속 쌓인다. exports의 cleanup 잡과 같은 방식으로
+  붙이는 것이 다음 순위 과제다.
+- `.hwp` 구포맷은 컨테이너에 soffice 미설치 → 실제 변환 불가(빈 결과+경고).
+
+## 업로드 정리 잡 + .hwp 결론 (2026-08-06)
+
+### 1. 업로드 정리 잡 배선 — 완료·실동작 확인
+
+**설계 판단**: 호스트 크론이 아니라 **인프로세스 주기 태스크**로 붙였다. 크론은 배포처마다
+별도 프로비저닝이 필요한데(고객 에어갭 환경 포함), 웹 서버가 스스로 도는 편이 어디에 올려도
+동작하기 때문이다. 정리는 파일시스템 작업이라 `asyncio.to_thread`로 돌려 루프를 막지 않는다.
+
+- 신설 `core/storage/uploads.py::cleanup_expired_uploads(uploads_dir, retention_hours, now=None)`
+  - 업로드 디렉토리 **바로 아래 일반 파일**만 대상. 이름 규칙을 따지지 않는다 —
+    `upload-*`(업로드본)·`render_*`(RenderPreview 스크린샷)·ASCII 명명 이전 레거시 한글명이
+    섞여 있고 셋 다 임시 산출물이다.
+  - 하위 디렉토리는 **재귀하지 않는다**(보수적).
+  - `retention_hours <= 0` 이면 no-op — "0=전부 삭제" 오작동 방지(artifacts 규칙과 동일).
+  - 파일 하나 실패해도 나머지 계속(fail-soft). `now` 주입으로 대기 없이 경계 테스트 가능.
+- `web/app.py` lifespan에 `_uploads_cleanup_loop` 기동/종료 배선. **기동 직후 1회** 쓸고
+  이후 `cleanup_interval_minutes` 간격 반복. 종료 시 태스크 취소.
+- 설정 `upload.cleanup_interval_minutes`(기본 60) 신설. 0 이하이면 잡 자체를 띄우지 않는다.
+- 테스트 9건 추가(정리 함수 7 + 루프 2: 반복 확인·실패 후 생존).
+
+**실서버 실동작**: 재시작 즉시 `업로드 정리 완료: 23개 삭제, 18.4MB 확보` —
+**29개/19MB → 6개/92KB**, 남은 6개는 전부 24시간 이내. 24시간 초과 파일 0개.
+
+### 2. `.hwp` LibreOffice — 설치하지 않기로 결론(실측 근거)
+
+운영 컨테이너를 오염시키기 전에 **임시 컨테이너**(`nexus-web:latest` 복제)에서 먼저 검증했다.
+결과가 결정적이었다.
+
+- LibreOffice 25.2 설치 시 138개 패키지, `/usr` **455MB → 828MB(+373MB)**. 이미지가 약 1.1GB로 팽창.
+- 등록된 한글 필터는 **`writer_MIZI_Hwp_97`** 하나뿐이다.
+- 필터 바이너리(`libhwplo.so`)가 인식하는 시그니처는 **`HWP Document File V2.00 / V2.10 / V3.00`**
+  뿐이고, HWP 5.0의 OLE 스트림명(`BodyText`/`DocInfo`/`FileHeader`) 참조는 **0건**.
+- 실동작: `HWP Document File V3.00` 시그니처 파일은 변환 성공. 반면 OLE2 파일은 내용 기반으로
+  MS Word로 인식될 뿐 한글 필터를 타지 않는다.
+
+**즉 LibreOffice는 한글 97(V3.0) 이하만 연다. 한글 2002 이후가 쓰는 HWP 5.0은 열지 못한다.**
+그런데 우리 파서 `HwpViaLibreOfficeParser.can_parse`는 **OLE2 매직만 통과**시킨다(= HWP 5.0 전용).
+양쪽이 정확히 어긋나 있어, **373MB를 써도 실사용 .hwp는 단 한 건도 열리지 않는다.**
+→ 설치하지 않는다. 임시 컨테이너는 제거했고 운영 컨테이너에 soffice는 없다(재확인).
+
+**대신 한 것** — 사용자가 조치할 수 있는 안내로 바꿨다.
+- `.hwp` 추출 실패 시 "한/글에서 **HWPX** 또는 **PDF**로 저장해 다시 올려 주세요"를 **먼저** 보여주고,
+  내부 진단(soffice 미설치 등)은 `[진단]` 블록으로 뒤에 붙인다.
+- 판정 기준을 `_tree_has_text()`(노드 text만 확인)로 분리했다. 기존처럼 `_flatten_tree` 결과로
+  판정하면 파서의 fail-soft **경고 때문에 항상 "내용 있음"** 이 되어, 정작 사용자에게는
+  알맹이 없이 내부 경고만 전달된다.
+- 실서버 확인: HWP 5.0(OLE2) 파일 → 안내 문구가 먼저, 진단이 뒤에.
+
+**후속 선택지**(사용자 판단 필요): HWP 5.0을 진짜 지원하려면 LibreOffice가 아니라
+**순수 파이썬 HWP 5.0 파서**(olefile 기반 OLE 스트림 해석 + zlib + 레코드 파싱)를 만들어야 한다.
+`.hwpx`는 이미 완전 지원되므로, 우선순위는 사용자 실제 수요에 달렸다.
+
+### 상태
+
+- unit+integration **1992 passed, 1 skipped**(신규 누적 23건). ruff 신규분 clean,
+  `web/app.py` 기존 7건 그대로(내가 늘렸던 S110 1건은 로그 추가로 해소).
+- 리포 ↔ 112 배포본 **8파일 해시 전부 일치**.
+- 영속화 `nexus-web:w8-cleanup-20260806` + `latest`(**729MB**). 용량 산정 중 운영 컨테이너에
+  남은 apt 패키지 목록 21MB도 제거하고 재커밋했다.
+- **커밋·push 미실행**(지시 대기).
+
+### 남은 관찰 1건(경미)
+
+`HwpConfig.soffice_cmd` 기본값이 Windows 경로(`C:\Program Files\LibreOffice\...`)라, 리눅스
+컨테이너의 `[진단]` 문구에 Windows 경로가 찍힌다. 기능 영향은 없고(어차피 .hwp 미지원),
+기존 값이라 손대지 않았다. .hwp를 정식 지원하게 되면 함께 정리할 것.
