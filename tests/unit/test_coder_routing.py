@@ -67,3 +67,19 @@ class TestConfigDefaults:
     def test_coder_keywords_have_defaults(self) -> None:
         """키워드 기본값이 비어 있지 않아야 켜자마자 동작한다."""
         assert len(RoutingConfig().coder_keywords) > 0
+
+    def test_test_writing_keywords_excluded(self) -> None:
+        """테스트 작성 질의는 코딩 모델로 보내지 않는다.
+
+        2026-08-07 실행 채점 비교: 디버깅·리팩터링은 A.X와 Devstral이 각각 6/6로
+        동률이었지만, **테스트 작성만 Devstral이 더 나빴다**(0~1/6 vs 1~2/6).
+        rep penalty를 운영값으로 올린 뒤에도 폭주가 1/12 남았다. 그래서 이 범주는
+        전환 대상에서 뺐다 — 켜더라도 primary(A.X)가 받는다.
+        """
+        resolver = RoutingResolver(RoutingConfig(coder_enabled=True))
+
+        assert resolver.resolve("이 함수 테스트 코드 짜줘").use_coder is False
+        assert resolver.resolve("write a unit test for this").use_coder is False
+        # 동률이 확인된 범주는 그대로 전환된다.
+        assert resolver.resolve("이 함수 디버깅해줘").use_coder is True
+        assert resolver.resolve("리팩터링 부탁해").use_coder is True

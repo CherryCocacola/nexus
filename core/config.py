@@ -599,17 +599,27 @@ class RoutingConfig(BaseModel):
     chat_max_length: int = 30
     chat_keywords: list[str] = Field(default_factory=lambda: list(_DEFAULT_CHAT_KEYWORDS))
 
-    # ── 코딩 서브모델 라우팅 (2026-08-05) ──────────────────────────────
+    # ── 코딩 서브모델 라우팅 (2026-08-05, 실측 갱신 2026-08-07) ─────────
     # 코드 작성·수정 질의를 primary(A.X-4.0) 대신 코딩 특화 모델로 보낼지.
-    # **기본 False(fail-safe)**: 실측상 코딩 모델이 항상 더 낫지는 않았다
-    # (원샷 랜딩 페이지 생성은 오히려 A.X가 완결성이 높았고, Devstral은 레이아웃이
-    #  붕괴했다). 반면 코드 정리·리팩터링류는 코딩 모델이 빠르고 정확했다.
-    # 그래서 자동 전환은 운영자가 명시적으로 켤 때만 동작하게 한다.
+    #
+    # **기본 False 유지 — 2026-08-07 실행 채점 비교 결과**
+    #   실행으로 채점되는 6개 과제 × 2모델 × 3회(+운영 프로필 재측정 24회):
+    #     디버깅   A.X 6/6  vs Devstral 6/6   (동률)
+    #     리팩터링 A.X 6/6  vs Devstral 6/6   (동률)
+    #     테스트작성 A.X 1~2/6 vs Devstral 0~1/6 (둘 다 나쁘고 Devstral이 더 나쁨)
+    #   속도는 Devstral이 178 vs 63 tok/s(2.8배)에 출력도 짧아 체감 3~4배 빠르다.
+    #   한국어 설명 비율도 대등했다(우려와 달리 문제 없음).
+    #   즉 **바꿔서 얻는 것은 속도뿐이고 품질 이득은 측정되지 않았다.** 상주 24B의
+    #   VRAM과 장애면이 늘어나므로 자동 전환은 운영자가 명시적으로 켤 때만 한다.
     # gpu_server.coder_url이 비어 있으면 이 값이 True여도 라우팅되지 않는다.
     coder_enabled: bool = False
     # 이 키워드가 포함되면 코딩 질의로 본다(coder_enabled=True일 때만 평가).
     # 좁게 유지하는 이유: 일반 한국어 대화가 코딩으로 오분류되면 한국어가 약한
     # 코딩 모델로 흘러가 품질이 떨어진다.
+    #
+    # 2026-08-07: **테스트 작성 계열 키워드를 뺐다.** 위 실측에서 Devstral이 이
+    # 범주만 A.X보다 못했고(0~1/6 vs 1~2/6), rep penalty 적용 후에도 폭주가
+    # 1/12 남았다. 동률이 확인된 디버깅·리팩터링 계열만 남긴다.
     coder_keywords: list[str] = Field(
         default_factory=lambda: [
             "리팩터링",
@@ -621,8 +631,6 @@ class RoutingConfig(BaseModel):
             "traceback",
             "컴파일",
             "compile",
-            "테스트 코드",
-            "unit test",
             "함수를 고쳐",
             "코드를 고쳐",
             "버그를 고쳐",
