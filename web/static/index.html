@@ -20,8 +20,13 @@
   /* KaTeX 레이아웃 보정 — 본문에 걸린 line-height가 분수·루트의 세로 조판을 눌러
      글리프가 잘려 보인다(실측). KaTeX 내부는 자체 조판을 쓰므로 normal로 되돌린다. */
   .katex, .katex * { line-height: normal; }
-  /* 긴 수식은 잘라내지 말고 가로 스크롤로 흘린다(세로는 잘리면 안 되므로 visible). */
-  .katex-display { overflow-x: auto; overflow-y: visible; padding: 6px 0; margin: 8px 0; }
+  /* 긴 수식은 잘라내지 말고 가로 스크롤로 흘린다.
+     주의(실측 2026-08-06): 여기에 overflow-y: visible 을 적어도 계산값은 auto 가 된다.
+     CSS 스펙상 한 축이 auto/scroll 이면 다른 축의 visible 은 auto 로 승격되기 때문이다
+     (한 축만 스크롤 가능하게 만들 수 없다). 다만 auto 는 넘칠 때 '스크롤'이지 '잘라내기'가
+     아니고, 실측에서 세로 넘침은 0이었다(scrollHeight == clientHeight). 그래서 그대로 둔다.
+     세로 여유가 필요해지면 padding 을 키워 넘침 자체를 없애는 편이 안전하다. */
+  .katex-display { overflow-x: auto; padding: 6px 0; margin: 8px 0; }
 </style>
 <style>
 /* ─── idino 컬러 팔레트 ─── */
@@ -2531,13 +2536,18 @@ function applyInline(s) {
 // $ 단일 구분자는 "가격 $100" 같은 평문을 수식으로 오인하므로 **쓰지 않는다**.
 // 라이브러리가 없으면 아무것도 하지 않는다(우아한 축소 — 텍스트 그대로 보인다).
 function renderMath(rootEl) {
-  // ★미완성 기능 잠금(2026-08-05): 벤더·배선·구분자는 검증됐으나, 분수·루트가
-  //   세로로 눌려 잘리는 CSS 충돌이 남아 있다(mfrac 높이 20px — 최소 2줄 필요).
-  //   보정 CSS(line-height/overflow)로는 해결되지 않았고 원인 특정에 시간이 더 필요해,
-  //   깨진 화면을 배포하지 않도록 기본 비활성으로 둔다. 원문 LaTeX가 그대로 보이며
-  //   이는 이 기능 도입 전과 동일하다(무회귀).
-  //   실험/재개: 콘솔에서 window.NOVA_MATH_ENABLED = true 후 메시지를 다시 렌더.
-  if (!window.NOVA_MATH_ENABLED) return;
+  // 잠금 해제(2026-08-06). 2026-08-05에 "분수·루트가 세로로 눌려 잘린다"는 이유로
+  // 기본 비활성이었으나, 브라우저에서 실측해 보니 재현되지 않았다.
+  //   · 당시 근거였던 "mfrac 높이 20px"은 증상이 아니라 정상값이다. 20px은 분수
+  //     '안쪽' 상자 높이이고, 표시용 분수 전체(.katex)는 35~44px로 제대로 잡힌다.
+  //   · 실제 잘림 여부를 기하학적으로 확인했다 — 모든 표본에서
+  //     .katex-display 의 scrollHeight == clientHeight (세로 넘침 0).
+  //   · 분수·중첩분수·제곱근·중첩루트·근의공식·적분·행렬·cases·극한/총합·인라인
+  //     10종을 실제 화면에서 확인했고 오류 0건.
+  // 위 CSS의 line-height 보정이 원인을 이미 해소한 것으로 보인다.
+  // 끄고 싶으면 콘솔에서 window.NOVA_MATH_ENABLED = false 로 명시하면 된다
+  // (그 경우 원문 LaTeX가 그대로 보이며 기능 도입 전과 동일하다).
+  if (window.NOVA_MATH_ENABLED === false) return;
   if (!rootEl || !window.renderMathInElement) return;
   try {
     window.renderMathInElement(rootEl, {
@@ -2640,6 +2650,24 @@ function formatContent(text, streaming) {
     // 앞뒤 개행으로 감싸 코드블록이 항상 독립된 라인이 되게 한다.
     return `\n${idx}\n`;
   });
+
+  // 1.5) 블록 수식을 한 줄로 접는다(W5) — 실측으로 확인한 필수 보정이다.
+  //    모델(A.X-4.0)은 블록 수식을 아래처럼 구분자와 본문을 각각 다른 줄에 쓴다.
+  //        \[
+  //        x = \frac{-b \pm \sqrt{b^2-4ac}}{2a}
+  //        \]
+  //    그런데 아래 단락 처리(flushPara)가 줄들을 <br>로 이어 붙이므로 DOM 이
+  //        <p>\[<br>x = \frac{...}{2a}<br>\]</p>
+  //    가 되어 여는 구분자·본문·닫는 구분자가 서로 다른 텍스트 노드로 쪼개진다.
+  //    KaTeX auto-render 는 "하나의 텍스트 노드 안에서" 구분자 쌍을 찾기 때문에
+  //    이렇게 쪼개지면 블록 수식이 통째로 렌더되지 않고 원문이 그대로 노출됐다
+  //    (인라인 \( \) 는 한 노드 안에 있어 정상 동작 — 그래서 증상이 블록에만 났다).
+  //    그래서 여기서 구분자 사이의 개행을 공백으로 접어 한 줄로 만든다.
+  //    코드블록은 위 1)에서 이미 플레이스홀더로 빠졌으므로 영향받지 않는다.
+  const foldNewlines = (open, inner, close) =>
+    open + inner.replace(/\s*\n\s*/g, ' ') + close;
+  text = text.replace(/\\\[([\s\S]*?)\\\]/g, (_m, inner) => foldNewlines('\\[', inner, '\\]'));
+  text = text.replace(/\$\$([\s\S]*?)\$\$/g, (_m, inner) => foldNewlines('$$', inner, '$$'));
 
   // 2) 전체 텍스트를 HTML 이스케이프한다(XSS 방지).
   //    마크다운 기호(#, *, -, `, [, ])는 이스케이프 대상이 아니라 그대로 남는다.
