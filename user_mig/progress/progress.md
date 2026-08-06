@@ -4053,3 +4053,53 @@ FABLE5가 nova CLI를 정밀 진단(B-1~B-8)하고 5-Phase 수정계획 작성 �
 - **조치**: `renderMath` 진입부에 `NOVA_MATH_ENABLED` 플래그(기본 false). **꺼진 상태에서는 원문 LaTeX가 그대로 보여 도입 전과 동일**(무회귀). 재개 시 콘솔 `window.NOVA_MATH_ENABLED = true`로 즉시 실험 가능.
 - **다음 세션 착수점**: KaTeX CSS 충돌 특정 — ①`katex.min.css`가 실제로 전부 적용되는지(.vlist-t/.vlist-r 규칙 존재 확인) ②`.message-body` 계열의 상속 규칙을 하나씩 비활성화하며 이분 탐색 ③최후 수단으로 `.katex` 하위를 `all: revert` 후 KaTeX CSS만 재적용.
 - **배포② 현황**: 1단계 조립기 ✅ · 2단계 W1(백엔드·API·UI) ✅ · 3단계 W5 **부분완료(잠금)**. W4 Mermaid는 NO-GO 보류.
+
+
+---
+
+# ★ 세션 종합 정리 (2026-08-04 ~ 08-06) — 다음 세션 인수인계
+
+## 이번 세션에서 끝낸 것 (커밋 37개, feature/b200-bakeoff, **push 미실행**)
+
+**1) CLI 이식 계획서 전 범위 종료 (Stage 1 + Stage 2)**
+- Stage 1: A1/A3 accept-edits 모드 + ask_handler v2(numbered 1/2/3+피드백) · A2 런타임 전환(`/mode`·Shift+Tab, 4지점 원자 갱신) · A4 Bash allow-list(명령 프리픽스 단위, 셸 메타문자·위험명령 차단, CommandFilter 재사용) · B1/B2 diff 미리보기(256KB·200줄·바이너리 상한) · C1 도구표시 축약(⏺/⎿) · D8~D10(`/verbose`·자동완성·Alt+Enter·`/help`)
+- Stage 2: C2 상태줄(bottom_toolbar) · C3 중단 힌트 · D1 `!`bash(plan/deny_all 차단+CommandFilter+감사로그+표시전용) · D2 `/compact` · D3 `/resume`(session_id 재바인드) · D4 `/diff` · D5 `/cost` · D6 `/copy`(OSC52 폴백) · D7 `/save`
+- 슬래시 명령 7개 → 16개, 단축키 4종. 실서버 검증 통과.
+
+**2) 코딩 품질 3축 보완**
+- Edit/MultiEdit 공백 정규화 폴백 + 근접 원문 힌트 + "Read→Write 재작성" 프롬프트 규칙
+- RenderPreview(헤드리스 렌더) + AnalyzeImage 연계 = 웹 결과물 자가 검증 루프
+- **ScaffoldWeb 템플릿 그라운딩**(landing-vue, Vue3 로컬번들) — e2e 10/10, 품질 전문가급. 도구 26개.
+
+**3) Devstral 코딩 서브모델 통합** — B200 8005 서빙(`--tool-call-parser mistral`, `--tokenizer-mode mistral`은 금지=chat_template 400 원인), `supports_chat_template_kwargs=False`로 회피. config `coder_url`+`routing.coder_enabled`(기본 false)+`QueryEngine(coder_provider=)`.
+
+**4) 히스토리 채널 분리·운영 정합화** — `X-Client-Channel`(web/app→web, cli, api) · `finish_reason` 정직화(length/content_filter) · `max_tokens` 배선 · `X-Client-Id` 소비자 식별 · `nexus ask` cli 채널 버그 · 세션 정리 도구(`scripts/cleanup_sessions.py`)+cron 04:10 · 707개 세션 정리(백업 후).
+
+**5) 배포② web 2/3** — 프롬프트 주입 단일화 헬퍼(`compose_system_prompt`, 멱등·base 재조립) + **W1 응답 스타일**(YAML 프리셋 4종·로더·API·설정모달 UI, concise가 42% 짧아짐 실측).
+
+**6) W4/W5 방출 게이트 실측** — **W5 KaTeX GO**(방출 10/10·파싱 10/10, 형식은 `\[ \]`·`\( \)`) / **W4 Mermaid NO-GO**(2/10).
+
+## 다음 세션 착수점 (이 순서 그대로)
+
+**① W5 KaTeX 잠금 해제 [P0]** — 벤더·배선·구분자·금액오인방지 완료, `NOVA_MATH_ENABLED=false`로 잠김.
+   남은 문제: 분수·루트가 세로로 눌려 잘림(mfrac 20px). 폰트20종·색상·DOM구조·line-height 전부 원인 아님을 확인함.
+   착수: ①katex.min.css의 `.vlist-t`/`.vlist-r` 적용 확인 ②`.message-body` 상속 규칙 이분탐색 ③최후 `.katex` 하위 `all: revert`.
+   재개 실험: 콘솔 `window.NOVA_MATH_ENABLED = true`.
+
+**② W8 업로드 확장 [P1, 배포④]** — PDF·문서·스프레드시트 업로드 → DocumentProcess 재사용. 제품화(대학·기업) 가치 최상위. 미니스펙 선행.
+
+**③ 선택 항목** — W4 재측정(프롬프트 규약 후) · 템플릿 유형 추가(대시보드·포털·문서형)+색상슬롯 SITE 이전 · CLI `/style`·`/rewind`·`/context` · 렌더루프 종료조건 · VSCode 플러그인 적용 확인 · web/app.py 기존 lint 7건.
+
+## 반드시 지킬 운영 수칙 (이번 세션 사고에서 얻음)
+
+- **core 파일 배포 시 import 그래프 전체를 함께 올릴 것.** bootstrap.py만 올렸다가 신규 도구 모듈 누락 → 부트스트랩 실패 → **전 요청 401**. health 200은 정상 판정 근거가 아니다. 반드시 `docker logs | grep 부트스트랩` + 인증 엔드포인트 200까지 확인.
+- **docker cp 후 반드시 `docker commit`.** 안 하면 컨테이너 재생성 시 소실. 최신 이미지 `nexus-web:katex-vendor-20260805`(=latest).
+- **외부 문자열은 Rich `Text()`로 감쌀 것**(대괄호가 markup으로 해석돼 MarkupError 크래시).
+- **async 함수에서 blocking subprocess 금지**(REPL 입력·스트리밍이 멈춘다).
+
+## 현재 상태
+
+- 작업 트리: 개인 설정(.claude/settings*.json) 1건 외 clean. **push 미실행.**
+- 테스트: unit 1836 passed(hwpx 포함 전건). ruff: 신규분 clean, web/app.py 기존 7건 잔존.
+- 112 배포본 = 리포 동기(해시 대조 확인). B200: A.X(8001, util 0.70)+임베딩(8002)+이미지(8003)+비전(8004)+Devstral(8005).
+- 과제 문서: `user_mig/design/REMAINING_ISSUES_2026-08-05.md` (최신화 완료)
