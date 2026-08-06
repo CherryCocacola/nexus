@@ -27,6 +27,15 @@
      아니고, 실측에서 세로 넘침은 0이었다(scrollHeight == clientHeight). 그래서 그대로 둔다.
      세로 여유가 필요해지면 padding 을 키워 넘침 자체를 없애는 편이 안전하다. */
   .katex-display { overflow-x: auto; padding: 6px 0; margin: 8px 0; }
+  /* 다이어그램(W4 Mermaid) — 넓은 그림은 가로 스크롤로 흘리고, 폭은 말풍선에 맞춘다. */
+  .mermaid-figure {
+    margin: 12px 0; padding: 12px; overflow-x: auto;
+    background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 8px;
+  }
+  /* SVG를 말풍선 폭에 맞춰 줄이지 않는다. 줄이면 글자가 뭉개져 읽을 수 없다(실측: 자연
+     너비 1817px 다이어그램이 622px로 눌려 높이 68px가 됐다). 자연 크기를 유지하고
+     넘치는 만큼만 위 컨테이너에서 가로 스크롤한다. */
+  .mermaid-figure svg { max-width: none; width: auto; height: auto; display: block; margin: 0 auto; }
 </style>
 <style>
 /* ─── idino 컬러 팔레트 ─── */
@@ -2491,6 +2500,7 @@ function appendMessage(role, content, save = true, index = null) {
       }
     }
   }
+  renderMermaid(div);       // 다이어그램 렌더(W4) — 코드블록 향상보다 먼저(그림으로 대체)
   enhanceCodeBlocks(div);   // 히스토리·즉시 렌더 메시지의 코드블록도 향상
   renderMath(div);          // 수식 렌더(W5) — 히스토리 복원 시에도 적용
   return div;
@@ -2561,6 +2571,70 @@ function renderMath(rootEl) {
       throwOnError: false     // 문법이 틀려도 화면이 깨지지 않게 원문을 남긴다
     });
   } catch (e) { void e; }
+}
+
+// ─── 다이어그램 렌더(W4 Mermaid) ───
+// 모델이 ```mermaid 코드블록으로 낸 다이어그램을 실제 그림으로 바꾼다.
+//
+// 지연 로딩인 이유: mermaid 번들이 3.5MB라 매 페이지 로드에 얹으면 첫 화면이 느려진다.
+// 실제로 다이어그램이 들어온 메시지에서만 처음 한 번 내려받고, 이후에는 재사용한다.
+// (에어갭이므로 CDN이 아니라 로컬 vendor 번들을 쓴다. 파일이 없으면 코드블록 그대로
+//  남으니 우아하게 축소된다 — 기능 도입 전과 같은 화면.)
+let _mermaidLoading = null;   // 로딩 Promise 캐시(중복 로드 방지)
+
+function loadMermaid() {
+  if (window.mermaid) return Promise.resolve(window.mermaid);
+  if (_mermaidLoading) return _mermaidLoading;
+  _mermaidLoading = new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = '/static/vendor/mermaid/mermaid.min.js';
+    s.onload = () => {
+      try {
+        // startOnLoad=false: 우리가 직접 렌더 시점을 잡는다(스트리밍 중 미완성 렌더 방지).
+        // securityLevel='strict': 다이어그램 안의 HTML/스크립트를 실행하지 않는다.
+        window.mermaid.initialize({ startOnLoad: false, securityLevel: 'strict', theme: 'default' });
+        resolve(window.mermaid);
+      } catch (e) { reject(e); }
+    };
+    s.onerror = () => reject(new Error('mermaid 번들을 불러오지 못했습니다'));
+    document.head.appendChild(s);
+  });
+  return _mermaidLoading;
+}
+
+// 완료된 메시지에만 1회 적용한다(스트리밍 중 호출 금지 — 미완성 문법이 에러로 깜빡인다).
+async function renderMermaid(rootEl) {
+  if (!rootEl) return;
+  // data-lang은 formatContent가 코드펜스 언어에서 옮겨 붙인다.
+  const blocks = [...rootEl.querySelectorAll('pre > code[data-lang="mermaid"]')]
+    .filter((el) => !el.parentElement.dataset.mermaidDone);
+  if (!blocks.length) return;   // ★다이어그램이 없으면 번들을 아예 받지 않는다
+
+  let mermaid;
+  try {
+    mermaid = await loadMermaid();
+  } catch (e) {
+    console.warn('mermaid 로드 실패 — 코드블록 그대로 둡니다:', e);
+    return;
+  }
+
+  for (const codeEl of blocks) {
+    const pre = codeEl.parentElement;
+    pre.dataset.mermaidDone = '1';       // 재렌더 방지(성공/실패 무관)
+    const source = codeEl.textContent || '';
+    const id = 'mmd-' + Math.random().toString(36).slice(2, 10);
+    try {
+      const { svg } = await mermaid.render(id, source);
+      const figure = document.createElement('div');
+      figure.className = 'mermaid-figure';
+      figure.innerHTML = svg;
+      pre.replaceWith(figure);
+    } catch (e) {
+      // 문법 오류 — 원문 코드블록을 그대로 남긴다(사용자가 내용은 볼 수 있게).
+      console.warn('mermaid 렌더 실패:', e);
+      pre.dataset.enhanced = '';         // 코드블록 향상은 받게 둔다
+    }
+  }
 }
 
 function enhanceCodeBlocks(rootEl) {
@@ -2976,6 +3050,7 @@ function finalizeStreamingMessage() {
     }
     body.innerHTML = formatContent(raw);
     body.removeAttribute('id');
+    renderMermaid(body);       // 다이어그램 렌더(W4) — 코드블록 향상보다 먼저(그림으로 대체)
     enhanceCodeBlocks(body);   // 코드블록 라벨·복사버튼·하이라이트(스트림 완료 시 1회)
     renderMath(body);          // 수식 렌더(W5) — 스트림이 끝난 뒤 1회만
 
