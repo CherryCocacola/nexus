@@ -173,6 +173,44 @@ def _collect_downloads(messages: list) -> list[dict[str, str]]:
     return out
 
 
+def _collect_tool_result_texts(messages: list) -> list[str]:
+    """이번 턴의 tool_result 내용을 모은다 — 숫자 인용 검증의 '근거 자료'다.
+
+    _collect_downloads 와 같은 자리(engine._messages 의 이번 턴 구간)를 훑는다.
+    도구를 쓰지 않은 턴이면 빈 목록이 되고, 그때 검증기는 아무 것도 하지 않는다
+    (대조할 원문이 없으면 경고도 없다).
+    """
+    out: list[str] = []
+    for msg in messages:
+        role = msg.role if isinstance(msg.role, str) else msg.role.value
+        if role == "tool_result" and isinstance(msg.content, str):
+            out.append(msg.content)
+    return out
+
+
+def _number_warning_for(answer: str, messages: list) -> str:
+    """답변에 인용된 숫자를 이번 턴 도구 결과와 대조해 경고 문구를 만든다.
+
+    프롬프트로 "숫자를 그대로 옮기라"고 지시해도 모델이 자릿수를 틀리는 일이
+    실측으로 확인됐다(계약금액 150,000,000 → 1,500,000,000). 지시로 안 되는 것은
+    코드로 대조한다. 값을 고치지는 않고 사실만 덧붙인다 — 자세한 판단 근거는
+    core/verification/number_citation.py 참조.
+
+    검증 자체가 실패해도 답변은 그대로 나가야 하므로 fail-soft 로 감싼다.
+    """
+    try:
+        from core.verification.number_citation import (
+            build_number_warning,
+            find_uncited_numbers,
+        )
+
+        sources = _collect_tool_result_texts(messages)
+        return build_number_warning(find_uncited_numbers(answer, sources))
+    except Exception as e:  # noqa: BLE001 — 검증 실패가 응답을 막지 않게 한다
+        logger.warning("숫자 인용 검증 실패(무시): %s", e)
+        return ""
+
+
 # sha256 계산 시 파일을 한 번에 읽지 않고 스트리밍하는 청크 크기(64KB).
 _SHA256_CHUNK = 64 * 1024
 # sha256을 계산할 파일 크기 상한(8MB). 이보다 큰 파일은 성능을 위해 해시를 생략한다.
@@ -1697,6 +1735,13 @@ async def chat(
         if expose:
             sources_out = knowledge_sources[:max_sources]
 
+    # 숫자 인용 검증 — 문서에서 옮긴 금액·수량의 자릿수가 틀리면 경고를 덧붙인다.
+    # (도구를 쓰지 않은 턴이면 근거 자료가 없어 아무 것도 붙지 않는다.)
+    if engine is not None:
+        response_text += _number_warning_for(
+            response_text, engine._messages[dl_start_idx:]
+        )
+
     return ChatResponse(
         session_id=response_session_id,
         response=response_text,
@@ -1880,6 +1925,10 @@ async def chat_stream(
         # 이 턴에서 새로 추가되는 메시지의 시작 인덱스 — 아래(스트림 종료 후)에서
         # tool_result 메시지의 다운로드 URL을 정확히 뽑기 위한 기준점.
         dl_start_idx = len(engine._messages)
+        # 스트림으로 흘려보낸 답변 텍스트를 함께 모아 둔다 — 스트림이 끝난 뒤
+        # 숫자 인용 검증(문서 원문과 자릿수 대조)에 쓴다. 표시는 이미 나간 뒤라
+        # 경고는 마지막에 별도 text 프레임으로 덧붙인다.
+        answer_parts: list[str] = []
 
         # ─── 요청 단위 타이밍/관측 로그 ───────────────────
         # 첨부 파일 경로가 메시지에 포함되면 업로드 케이스로 표시
@@ -1961,6 +2010,9 @@ async def chat_stream(
                     }
                     if event.text:
                         sse_data["text"] = event.text
+                        # 본문 텍스트만 모은다(도구 라벨 등 다른 이벤트의 text 제외).
+                        if etype == "text_delta":
+                            answer_parts.append(event.text)
                     if event.message:
                         sse_data["message"] = event.message
                     # 중간 활동 표시용: 도구 이벤트(TOOL_USE_START/STOP)가 담고 온
@@ -2069,6 +2121,15 @@ async def chat_stream(
         # 프레임으로 보낸다 → UI가 모델 텍스트(오탈자 가능) 대신 이걸로 버튼/미리보기 생성.
         # TODO(nexus): TOOL_RESULT StreamEvent 발신 리팩터 후에는 consume 루프 안에서
         #   이벤트로 바로 download 프레임을 내보내고 이 사후 스캔을 제거한다.
+        # 숫자 인용 검증 — 스트림으로 이미 나간 본문은 고치지 않고, 확인이 필요한
+        # 숫자가 있으면 경고만 별도 text 프레임으로 덧붙인다(사용자가 판단하도록).
+        _warning = _number_warning_for(
+            "".join(answer_parts), engine._messages[dl_start_idx:]
+        )
+        if _warning:
+            _warn_frame = {"type": "text_delta", "session_id": session_id, "text": _warning}
+            yield f"data: {json.dumps(_warn_frame, ensure_ascii=False)}\n\n"
+
         _dls = _collect_downloads(engine._messages[dl_start_idx:])
         # 생성물 메타데이터를 tb_artifacts에 fail-soft 기록(pg 없으면 조용히 스킵).
         await _record_artifacts(_dls, tenant, session_id, turn=getattr(engine, "total_turns", None))
@@ -2461,6 +2522,8 @@ async def chat_completions(
     )
 
     content = "".join(response_text_parts)
+    # 숫자 인용 검증 — 문서에서 옮긴 금액·수량의 자릿수가 원문과 다르면 경고를 덧붙인다.
+    content += _number_warning_for(content, engine._messages[dl_start_idx:])
     # 표준 클라이언트도 링크를 볼 수 있게 content 끝에 마크다운으로 덧붙인다.
     content += _downloads_markdown(downloads)
 
@@ -2546,6 +2609,8 @@ async def _openai_stream_generate(
     dl_start_idx = _inject_openai_context(
         engine, system_content, prior_messages, session_id, tenant
     )
+    # 스트림으로 내보낸 본문을 모아 둔다 — 끝난 뒤 숫자 인용 검증에 쓴다.
+    answer_parts: list[str] = []
 
     # OpenAI 관례: 첫 프레임에 delta.role='assistant' 를 실어 스트림 시작을 알린다.
     yield _chunk({"role": "assistant"})
@@ -2597,6 +2662,8 @@ async def _openai_stream_generate(
             if isinstance(event, StreamEvent):
                 # 텍스트 조각만 delta.content 로 흘린다. 나머지 이벤트는 무시.
                 if event.type == StreamEventType.TEXT_DELTA and event.text:
+                    # 스트림이 끝난 뒤 숫자 인용 검증에 쓰려고 본문을 함께 모아 둔다.
+                    answer_parts.append(event.text)
                     yield _chunk({"content": event.text})
                 elif event.type == StreamEventType.MESSAGE_STOP and event.stop_reason:
                     # 턴마다 갱신 — 마지막 값이 이 응답의 최종 종료 이유다.
@@ -2616,6 +2683,13 @@ async def _openai_stream_generate(
                 session_id,
                 type(stream_abort_error).__name__,
             )
+
+    # 숫자 인용 검증 — 이미 흘려보낸 본문은 고치지 않고 경고만 마지막 청크로 덧붙인다.
+    _num_warning = _number_warning_for(
+        "".join(answer_parts), engine._messages[dl_start_idx:]
+    )
+    if _num_warning:
+        yield _chunk({"content": _num_warning})
 
     # 이 턴에 생성된 문서 다운로드 링크를 마지막 content 청크로 덧붙인다.
     downloads = _collect_downloads(engine._messages[dl_start_idx:])
