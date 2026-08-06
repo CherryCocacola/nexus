@@ -84,19 +84,19 @@ _INGEST_EXTS = (".pptx", ".hwpx", ".hwp")
 # "추출 실패"만 알려 주면 사용자는 같은 파일을 계속 다시 올린다. 무엇을 하면
 # 되는지(다른 형식으로 저장)를 알려 줘야 실제로 해결된다.
 #
-# .hwp(구포맷) 주석 — 2026-08-06 실측으로 확인한 사실:
-#   변환 경로인 LibreOffice 의 한글 필터(libhwplo.so)는 HWP **V2.00/V2.10/V3.00**
-#   (한글 97 이하)만 인식한다. 한글 2002 이후가 쓰는 **HWP 5.0**(OLE 복합문서)은
-#   지원하지 않는다(필터 바이너리에 HWP5 스트림명 BodyText/DocInfo/FileHeader 참조가
-#   전혀 없음). 즉 LibreOffice 를 설치해도 요즘 .hwp 파일은 열리지 않는다.
-#   반면 .hwpx(신포맷)는 python-hwpx 로 완전히 지원되므로, 한/글에서 HWPX 또는
-#   PDF 로 저장해 올리는 것이 현재 가장 확실한 우회다.
+# .hwp 주석 — 2026-08-06 기준 지원 상태:
+#   · HWP 5.0(한글 2002 이후, 실사용분의 대부분)은 HwpNativeParser 가 OLE2 스트림을
+#     직접 읽어 **지원한다**. 외부 변환기가 필요 없다.
+#   · 남은 실패 경우는 (a) 암호/배포용 문서(복호화 불가), (b) 한글 97 이하의 아주 오래된
+#     형식, (c) 손상 파일 정도다. (b)는 LibreOffice 변환 폴백이 담당하는데 컨테이너에
+#     soffice 가 없으면 그것도 실패한다.
+#   구체적 사유는 [진단] 블록에 함께 실리므로, 이 문구는 "무엇을 하면 되는지"만 말한다.
 _EXTRACT_FAILED_HINTS = {
     ".hwp": (
-        "[.hwp(한글 구포맷) 파일의 텍스트를 추출하지 못했습니다. "
-        "한/글에서 이 문서를 열어 '다른 이름으로 저장'에서 "
-        "**HWPX** 또는 **PDF** 형식으로 저장한 뒤 다시 올려 주세요. "
-        "두 형식은 완전히 지원됩니다]"
+        "[이 .hwp 파일의 텍스트를 추출하지 못했습니다. "
+        "암호가 걸려 있거나, 한글 97 이하의 오래된 형식이거나, 파일이 손상됐을 수 있습니다. "
+        "한/글에서 문서를 열어 '다른 이름으로 저장'에서 **HWPX** 또는 **PDF** 로 저장한 뒤 "
+        "다시 올려 주세요]"
     ),
 }
 _EXTRACT_FAILED_DEFAULT = (
@@ -124,16 +124,22 @@ def _get_ingest_registry() -> ParserRegistry:
 
     registry = ParserRegistry()
 
-    # (모듈 경로, 클래스 이름) 목록. 하나가 실패해도 나머지는 등록된다.
+    # (모듈 경로, 클래스 이름, 우선순위) 목록. 하나가 실패해도 나머지는 등록된다.
+    # .hwp 에 두 파서가 걸려 있는데 우선순위로 갈린다:
+    #   HwpNativeParser(10)      — HWP 5.0(한글 2002 이후)을 직접 읽는다. 이게 실사용분이다.
+    #   HwpViaLibreOfficeParser(0) — LibreOffice 변환. 실측상 HWP V2/V3(한글 97 이하)만
+    #     열리고 HWP 5.0 은 못 연다. 그래서 native 가 can_parse 로 거부한 파일
+    #     (=구버전 포맷)에 대해서만 폴백으로 시도된다.
     candidates = (
-        ("core.ingest.parsers.pptx", "PptxParser"),
-        ("core.ingest.parsers.hwpx", "HwpxParser"),
-        ("core.ingest.parsers.hwp_libreoffice", "HwpViaLibreOfficeParser"),
+        ("core.ingest.parsers.pptx", "PptxParser", 0),
+        ("core.ingest.parsers.hwpx", "HwpxParser", 0),
+        ("core.ingest.parsers.hwp_native", "HwpNativeParser", 10),
+        ("core.ingest.parsers.hwp_libreoffice", "HwpViaLibreOfficeParser", 0),
     )
-    for module_path, class_name in candidates:
+    for module_path, class_name, priority in candidates:
         try:
             module = __import__(module_path, fromlist=[class_name])
-            registry.register(getattr(module, class_name)())
+            registry.register(getattr(module, class_name)(), priority=priority)
         except Exception as e:  # noqa: BLE001 — 어떤 라이브러리든 없으면 그 포맷만 포기
             # bare except 가 아니라 사유를 남기고 넘어간다(부분 가용성 우선).
             logger.warning("문서 파서 등록 실패: %s (%s: %s)", class_name, type(e).__name__, e)

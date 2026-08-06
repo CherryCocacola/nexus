@@ -153,6 +153,24 @@ async def test_document_process_hwp_empty_result_gives_actionable_hint(
     assert result.data.index("HWPX") < result.data.index("soffice")
 
 
+async def test_document_process_reads_real_hwp5(tmp_path: Path):
+    """실제 HWP 5.0 파일을 DocumentProcess 가 본문까지 읽어낸다(외부 변환기 없이).
+
+    HwpNativeParser 가 우선순위로 LibreOffice 폴백보다 먼저 선택되는지도 함께 확인한다.
+    """
+    fixture = Path(__file__).resolve().parents[1] / "fixtures" / "sample_hwp5.hwp"
+    target = tmp_path / "문서.hwp"
+    target.write_bytes(fixture.read_bytes())
+
+    result = await _run(target)
+
+    assert not result.is_error, result.error_message
+    assert "한글 문서 첫 번째 문단입니다." in result.data
+    assert "표 안의 내용도 같은 방식으로 담긴다." in result.data
+    # 안내 문구가 아니라 실제 본문이 나와야 한다.
+    assert "HWPX" not in result.data
+
+
 async def test_document_process_fake_hwp_rejected_not_garbled(tmp_path: Path):
     """확장자만 .hwp 인 파일은 쓰레기 텍스트가 아니라 오류로 거절된다(fail-closed)."""
     path = tmp_path / "fake.hwp"

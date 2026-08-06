@@ -58,6 +58,7 @@ from typing import Any
 # 이 표가 "무엇을 재노출하는가"의 단일 진실원이다(새 파서는 여기에만 추가).
 _LAZY_PARSERS: dict[str, str] = {
     "DoclingParser": "core.ingest.parsers.docling_layout",
+    "HwpNativeParser": "core.ingest.parsers.hwp_native",
     "HwpViaLibreOfficeParser": "core.ingest.parsers.hwp_libreoffice",
     "HwpxParser": "core.ingest.parsers.hwpx",
     "PaddleOcrParser": "core.ingest.parsers.ocr_paddle",

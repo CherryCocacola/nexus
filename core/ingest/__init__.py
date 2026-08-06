@@ -75,6 +75,7 @@ _LAZY_EXPORTS: dict[str, str] = {
     "PdfPlumberParser": "core.ingest.parsers.pdf_plumber",
     "DoclingParser": "core.ingest.parsers.docling_layout",
     "HwpxParser": "core.ingest.parsers.hwpx",
+    "HwpNativeParser": "core.ingest.parsers.hwp_native",
     "HwpViaLibreOfficeParser": "core.ingest.parsers.hwp_libreoffice",
     # 청킹기 — 문서 트리를 논리 단위(계층)로 잘라 청크 리스트로 만든다
     "StructureAwareChunker": "core.ingest.chunker",

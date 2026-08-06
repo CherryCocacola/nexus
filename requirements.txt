@@ -37,6 +37,7 @@ python-pptx>=0.6.23
 openpyxl>=3.1.0
 python-hwpx>=2.24.0
 defusedxml>=0.7.1
+olefile>=0.47          # HWP 5.0(.hwp) OLE2 복합문서 읽기 — HwpNativeParser
 
 # ── 유틸리티 ──
 pyyaml>=6.0.1
