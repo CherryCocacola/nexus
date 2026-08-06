@@ -5,27 +5,23 @@
 
 ---
 
-## P0 — 결정 필요 (다음 세션 첫 항목)
+## P0 — 다음에 먼저 볼 것
 
-### 1. 리포 미커밋
-이번 세션의 모든 변경이 커밋되지 않았다. 다음 세션에서 혼란을 피하려면 정리 필요.
+### 1. ~~리포 미커밋~~ · ~~112 이미지 정합성~~ — **해소 (2026-08-05)**
+세션 작업 전부를 논리 단위 커밋 36개로 정리했고(작업 트리는 개인 설정 1건만 잔존),
+112는 `docker commit`으로 영속화했다(최신 `nexus-web:katex-vendor-20260805` = latest).
+리포 ↔ 배포본 해시 대조로 동기 확인 완료.
+**단, push는 하지 않았다** — 원격 반영이 필요하면 별도 결정.
 
-- **수정** 29개: `web/app.py` · `core/bootstrap.py` · `core/orchestrator/query_engine.py` ·
-  `core/tools/executor.py` · `core/tools/implementations/{edit,multi_edit,analyze_image}_tool.py` ·
-  `core/permission/{pipeline,mode_mapping}.py` · `core/state.py` · `core/model/hardware_tier.py` ·
-  `cli/{repl,commands}.py` · `config/nexus_config.pc.yaml` · 테스트 9종 · `progress.md` 등
-- **신규**: `scripts/cleanup_sessions.py` · `core/tools/implementations/{render_preview,scaffold_web}_tool.py` ·
-  `assets/frontend_templates/**` · `tests/unit/test_{edit_fuzzy,render_preview_tool,scaffold_web_tool,cleanup_sessions,web_channel_finish,permission_categorize_tool_name,cli_permission_prompt_v2}.py` ·
-  `user_mig/design/{VSCODE_PLUGIN_VIBE_JSON_HANDOFF,REMAINING_ISSUES_2026-08-05}.md`
-- 커밋 단위 제안(논리별 분리): ①CLI 권한 A1 ②Edit 복구력 ③렌더 자가검증 ④템플릿 스캐폴드
-  ⑤채널 분리·finish_reason ⑥세션 정리 도구 ⑦문서
-
-### 2. 112 이미지 정합성
-오늘 배포는 `docker cp` + `docker commit`(`nexus-web:channelfix-20260805`, `latest` 갱신)으로
-영속화했다. 컨테이너 재생성에는 견디지만 **Dockerfile 기반 정식 재빌드는 아니다.**
-리포 커밋 후 정식 빌드로 한 번 정리하는 것이 안전하다.
-
----
+### 2. W5 KaTeX 잠금 해제 (부분 완료 상태)
+벤더·배선·구분자·오인방지까지 검증됐으나 **분수·루트가 세로로 눌려 잘리는 CSS 충돌**이
+남아 `NOVA_MATH_ENABLED=false`로 잠가 둔 상태다(꺼진 동안은 원문 LaTeX 표시 = 무회귀).
+- 확인된 것: 폰트 20종 로드 OK, 색상 OK, DOM 구조 OK, line-height 보정은 원인 아님,
+  블록/인라인 모드 무관하게 mfrac 높이 20px(2줄 조판이 1줄로 눌림).
+- 착수 순서: ①`katex.min.css`의 `.vlist-t`/`.vlist-r` 규칙이 실제 적용되는지 확인
+  ②`.message-body` 계열 상속 규칙을 이분 탐색으로 하나씩 비활성화
+  ③최후 수단 `.katex` 하위 `all: revert` 후 KaTeX CSS만 재적용
+- 재개: 콘솔에서 `window.NOVA_MATH_ENABLED = true` 후 메시지 재렌더로 즉시 실험.
 
 ## P1 — 기능·품질 (효과 큼)
 
@@ -60,6 +56,23 @@ config `coder_url`/`coder_model` + `routing.coder_enabled`(**기본 False**)/`co
 
 **원복 절차**: coder tmux 세션 kill → `start_all.sh`의 coder 줄 제거 →
 `run_vllm_fp8.sh.bak-util092` 복원 → vllm 재기동(util 0.92).
+
+### 4-b. 배포② web 저위험·고가치 — **2/3 완료**
+- ✅ 1단계 프롬프트 주입 단일화 헬퍼(`core/system_prompt/compose.py`, 커밋 49b0663)
+- ✅ 2단계 W1 응답 스타일 — 프리셋 YAML + 로더 + API + 설정 모달 UI
+  (커밋 1d1ed62·a8a0208). 실측: concise가 기본 대비 42% 짧아짐.
+- ⏸ 3단계 W5 KaTeX — 위 P0-2 참조(잠금)
+- ❌ W4 Mermaid — **게이트 NO-GO**(방출률 20%). 재개하려면 base 프롬프트에
+  다이어그램 출력 규약 1줄을 넣고 프로브를 재측정해야 한다.
+
+### 4-c. 배포④ web 확장 — **미착수**
+- **W8 업로드확장**(PDF·문서·스프레드시트 → DocumentProcess). 제품화(대학·기업)
+  관점에서 가치 최상위. 미니스펙 선행 필요.
+- **W3 메모리UI**(조건부) — 장기메모리가 실제 응답에 관여 중인지 실측 후. IDOR 격리 필수.
+
+### 4-d. CLI 남은 후보 (계획서 밖·선택)
+`/rewind`(diff before-image 재사용) · `/context` · `!` v2(결과를 대화 맥락에 주입) ·
+`@파일` 참조 자동완성 · `#` 메모리 단축 · `/style`(웹과 같은 YAML을 읽어 말투 통일).
 
 ### 5. A.X-4.0 모델 한계 3종 (근본 원인)
 완화책은 적용했으나 근본 해결은 모델 교체/LoRA.
