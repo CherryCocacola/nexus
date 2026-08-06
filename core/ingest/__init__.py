@@ -35,6 +35,15 @@ core.ingest — 문서 양식(레이아웃) 인식 임베딩 파이프라인 (v7
 끼워 넣는다(어댑터 슬롯). 즉 새 포맷 지원은 파서 한 개를 추가하고
 레지스트리에 등록하는 방식으로 확장된다.
 
+■ 왜 "지연(lazy) 재노출"인가 (2026-08-06 수정)
+  예전에는 이 파일이 하위 심볼을 전부 즉시 import 했다. 그러면 파이썬이 부모
+  패키지 __init__ 을 먼저 실행하는 성질 때문에,
+      from core.ingest.parser_base import ParserRegistry   # 계약 하나만 필요해도
+  가 docling·pdfplumber·pipeline(→core.rag/core.model)까지 통째로 끌고 들어왔다.
+  실제로 웹 컨테이너(docling 미설치)에서 이것 때문에 문서 파서 전체가 죽었다.
+  모듈 수준 __getattr__(PEP 562)로 "이름을 실제로 꺼낼 때"만 로드하도록 바꾼다.
+  외부 사용법(`from core.ingest import DocumentIngestPipeline`)은 그대로다.
+
 의존성 방향 (P2 규칙):
   core.ingest → core.rag(KnowledgeStore), core.model(ModelProvider). 역방향 없음.
   (즉 rag/model 이 ingest 를 import 하지 않는다 — 단방향 의존을 지킨다.)
@@ -46,51 +55,56 @@ core.ingest — 문서 양식(레이아웃) 인식 임베딩 파이프라인 (v7
 # 타입 힌트를 문자열처럼 지연 평가(lazy)해 순환 import·전방참조 문제를 줄여준다.
 from __future__ import annotations
 
-# --- 아래는 하위 모듈의 공개 심볼을 끌어와 패키지 레벨에서 다시 노출하는 부분 ---
-# 여기서 미리 import 해두면, 외부는 하위 파일 경로를 몰라도 core.ingest 에서 바로 쓴다.
-# 청킹기: 문서 트리를 논리 단위(계층)로 잘라 청크 리스트로 만든다.
-from core.ingest.chunker import StructureAwareChunker
+import importlib
+from typing import Any
 
-# 파서 공통 계약(ABC)과, 포맷별 파서를 등록·조회하는 레지스트리.
-from core.ingest.parser_base import DocumentParser, ParserRegistry
+# --- 공개 이름 → 실제 구현이 들어 있는 하위 모듈 경로 ---
+# 이 표가 "core.ingest 가 무엇을 재노출하는가"의 단일 진실원이다. 즉시 import 하지
+# 않고 표만 들고 있다가, 아래 __getattr__ 이 요청받은 이름 하나만 로드한다.
+_LAZY_EXPORTS: dict[str, str] = {
+    # 데이터 모델(types)
+    "ElementType": "core.ingest.types",
+    "DocumentNode": "core.ingest.types",
+    "DocumentTree": "core.ingest.types",
+    "DocumentChunk": "core.ingest.types",
+    # 파서 공통 계약(ABC)과 포맷별 파서를 등록·조회하는 레지스트리
+    "DocumentParser": "core.ingest.parser_base",
+    "ParserRegistry": "core.ingest.parser_base",
+    # 포맷별 파서 구현 — 각각 하나의 파일 형식을 DocumentTree 로 해석한다
+    "PptxParser": "core.ingest.parsers.pptx",
+    "PdfPlumberParser": "core.ingest.parsers.pdf_plumber",
+    "DoclingParser": "core.ingest.parsers.docling_layout",
+    "HwpxParser": "core.ingest.parsers.hwpx",
+    "HwpViaLibreOfficeParser": "core.ingest.parsers.hwp_libreoffice",
+    # 청킹기 — 문서 트리를 논리 단위(계층)로 잘라 청크 리스트로 만든다
+    "StructureAwareChunker": "core.ingest.chunker",
+    # 파이프라인 본체와 적재 출처(source) 태그 상수
+    "DocumentIngestPipeline": "core.ingest.pipeline",
+    "INGEST_SOURCE": "core.ingest.pipeline",
+}
 
-# 포맷별 파서 구현들 — 각각 하나의 파일 형식을 DocumentTree 로 해석한다.
-from core.ingest.parsers.docling_layout import DoclingParser  # PDF 고품질(Docling)
-from core.ingest.parsers.hwp_libreoffice import HwpViaLibreOfficeParser  # 구포맷 .hwp
-from core.ingest.parsers.hwpx import HwpxParser  # HWPX(OWPML)
-from core.ingest.parsers.pdf_plumber import PdfPlumberParser  # PDF 경량
-from core.ingest.parsers.pptx import PptxParser  # PPTX
 
-# 파이프라인 본체와, 적재 출처(source) 태그 상수.
-from core.ingest.pipeline import INGEST_SOURCE, DocumentIngestPipeline
+def __getattr__(name: str) -> Any:
+    """패키지에 없는 이름을 요청받으면 그때 해당 하위 모듈만 import 한다(PEP 562).
 
-# 데이터 모델(문서 트리·노드·청크와 요소 타입 열거형).
-from core.ingest.types import (
-    DocumentChunk,
-    DocumentNode,
-    DocumentTree,
-    ElementType,
-)
+    한 번 가져온 값은 globals() 에 캐시하므로 두 번째부터는 일반 속성 조회다.
+    등록되지 않은 이름은 AttributeError 로 돌려 오타를 조용히 넘기지 않는다.
+    라이브러리 부재로 인한 ImportError 는 감추지 않고 그대로 올린다 — 호출부가
+    "이 환경에서는 이 포맷을 못 쓴다"를 판단할 수 있어야 하기 때문이다.
+    """
+    module_path = _LAZY_EXPORTS.get(name)
+    if module_path is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(importlib.import_module(module_path), name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    """dir() 과 자동완성이 지연 노출 이름까지 보이도록 한다."""
+    return sorted([*globals().keys(), *_LAZY_EXPORTS])
+
 
 # __all__: `from core.ingest import *` 시 밖으로 내보낼 공개 이름 목록.
 # 문서화·자동완성의 '공식 공개 API' 역할도 하므로 내부 전용 심볼은 넣지 않는다.
-__all__ = [
-    # 데이터 모델(types)
-    "ElementType",
-    "DocumentNode",
-    "DocumentTree",
-    "DocumentChunk",
-    # 파서(parser) — 공통 계약·레지스트리 및 포맷별 구현
-    "DocumentParser",
-    "ParserRegistry",
-    "PptxParser",
-    "PdfPlumberParser",
-    "DoclingParser",
-    "HwpxParser",
-    "HwpViaLibreOfficeParser",
-    # 청킹기(chunker)
-    "StructureAwareChunker",
-    # 파이프라인(pipeline)
-    "DocumentIngestPipeline",
-    "INGEST_SOURCE",
-]
+__all__ = list(_LAZY_EXPORTS)
