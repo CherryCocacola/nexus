@@ -1340,18 +1340,31 @@ def _build_expanded_system_prompt(tool_names: set[str] | None = None) -> str:
     else:
         scaffold_note = ""
 
-    # 웹 결과물 자가 검증 루프(2026-08-04): 생성만 하고 렌더 확인을 안 해
-    #   레이아웃 결함을 놓친 실측 사례 반영. RenderPreview+AnalyzeImage가 풀에
-    #   있을 때만 지시한다(도구 없는 티어에서 존재하지 않는 도구 호출 방지).
+    # 웹 결과물 자가 검증 루프(2026-08-04, 종료조건 개정 2026-08-07):
+    #   생성만 하고 렌더 확인을 안 해 레이아웃 결함을 놓친 실측이 출발점이었다.
+    #   그러나 2026-08-07 실측에서 이 등급 VLM은 "보기는 해도 판정은 못 한다"가
+    #   드러났다(정상 화면에 없는 결함을 지어내거나, 파손 화면을 정상이라 답함).
+    #   그래서 판정 근거를 RenderPreview의 자산 점검(코드가 확정)으로 옮기고,
+    #   비전은 겹침·잘림을 눈으로 훑는 보조 역할로 격하한다.
     if {"RenderPreview", "AnalyzeImage"} <= names:
         render_note = (
             "## Web output — render and inspect before finishing\n"
-            "After creating or substantially editing an HTML page, you MUST "
-            "verify it visually: call RenderPreview(file_path=...) to get a "
-            "screenshot, then AnalyzeImage on that screenshot asking for layout "
-            "problems (unstyled nav, stacked/overlapping elements, empty areas, "
-            "broken alignment). Fix the problems it finds and re-render. Do at "
-            "most 2 fix-and-rerender rounds, then report honestly what remains. "
+            "After creating or substantially editing an HTML page, call "
+            "RenderPreview(file_path=...), then AnalyzeImage on the screenshot "
+            "using the exact question the RenderPreview result gives you.\n"
+            "Judge from the RenderPreview asset check, which is authoritative: "
+            "it tells you for certain whether the referenced css/js/img files "
+            "exist. If it reports missing assets or no stylesheet, fix that "
+            "first — that is the real 'page looks unstyled' defect.\n"
+            "The AnalyzeImage answer is a DESCRIPTION, not a verdict. The vision "
+            "model is unreliable at judging quality: it invents defects on "
+            "correct pages. Use it only to spot overlapping or cut-off content, "
+            "and never treat its remarks about fonts, colors, spacing, or "
+            "wording as defects — do not edit or re-render because of them.\n"
+            "When the asset check passes and nothing is overlapping or cut off, "
+            "you are done. Say so and stop.\n"
+            "RenderPreview enforces a hard limit of 3 renders per file. When it "
+            "refuses, stop and report honestly what you fixed and what remains. "
             "Also prefer clean modern layout: use CSS grid/flex for card lists, "
             "a consistent spacing scale, and only the styles you actually "
             "need — do not emit hundreds of lines of unused CSS.\n\n"
