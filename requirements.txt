@@ -26,6 +26,18 @@ rich>=13.7.0
 prompt-toolkit>=3.0.47
 click>=8.1.7
 
+# ── 문서 파싱/생성 ──
+# DocumentProcess(업로드 문서 읽기) · DocumentExport(문서 생성) · core/ingest 파서가
+# 사용한다. 전부 순수 파이썬이라 에어갭 오프라인 wheel 번들에 그대로 담긴다.
+# (.hwp 구포맷만 예외 — LibreOffice(soffice) 바이너리가 별도로 필요하다.)
+pypdf>=4.2.0
+pdfplumber>=0.11.0
+python-docx>=1.1.0
+python-pptx>=0.6.23
+openpyxl>=3.1.0
+python-hwpx>=2.24.0
+defusedxml>=0.7.1
+
 # ── 유틸리티 ──
 pyyaml>=6.0.1
 jinja2>=3.1.4

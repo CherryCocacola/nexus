@@ -990,7 +990,7 @@ def _create_scout_tool_registry():  # noqa: ANN202
         큰 문서를 Scout가 흡수해 요약만 Worker에 넘기면 Worker는 8K ctx 안에서
         여유롭게 동작할 수 있다.
       - Read/Glob/Grep/LS: 코드/파일 탐색
-      - DocumentProcess: 업로드된 PDF/DOCX/XLSX를 청크 단위로 파싱
+      - DocumentProcess: 업로드된 PDF/DOCX/XLSX/PPTX/HWPX/HWP를 청크 단위로 파싱
       - 전부 is_read_only=True라 권한 프롬프트가 뜨지 않음
       - 수정 도구(Edit/Write/Bash)는 포함하지 않음 (fail-closed)
     """
@@ -1123,7 +1123,7 @@ def _create_web_tool_registry(tier: Any = None):  # noqa: ANN202
 
         registry.register_many(
             [
-                DocumentProcessTool(),  # 업로드 문서(.pdf/.docx/.xlsx/.hwp/.pptx) 파싱
+                DocumentProcessTool(),  # 업로드 문서(.pdf/.docx/.xlsx/.pptx/.hwpx/.hwp) 파싱
                 DocumentExportTool(),  # 문서 생성(.docx/.pptx/.hwpx/.md/.txt) + 다운로드
                 ImageGenerateTool(),  # 이미지 생성(프롬프트→PNG) + 다운로드/미리보기
                 AnalyzeImageTool(),  # 이미지 분석(VLM, 업로드 이미지→텍스트) — 읽기 전용

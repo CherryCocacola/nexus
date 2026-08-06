@@ -1,10 +1,12 @@
 """
-DocumentProcess 도구 — 문서 파일(PDF/DOCX/XLSX)을 파싱해 텍스트를 뽑아내고,
-그 텍스트를 작은 "청크(chunk)" 단위로 잘라서 돌려주는 읽기 전용 도구.
+DocumentProcess 도구 — 문서 파일(PDF/DOCX/XLSX/PPTX/HWPX/HWP)을 파싱해 텍스트를
+뽑아내고, 그 텍스트를 작은 "청크(chunk)" 단위로 잘라서 돌려주는 읽기 전용 도구.
 
 이 파일이 하는 일 (한눈에):
   - 에어갭(폐쇄망) 환경에서 로컬 문서를 LLM이 읽을 수 있는 평문 텍스트로 변환한다.
   - PDF/DOCX/XLSX처럼 바이너리 형식인 문서도 외부 API 없이 로컬 라이브러리로 파싱한다.
+  - PPTX/HWPX/HWP는 인제스트(ingest) 레이어에 이미 있는 파서를 그대로 빌려 쓴다
+    (같은 파싱 로직을 두 벌 유지하지 않기 위함 — 아래 _get_ingest_registry 참조).
   - 문서가 크면 한 번에 다 넘기지 않고 여러 조각(청크)으로 나눠, 호출할 때마다
     한 조각씩 반환한다. (사양서 Ch.13.6에 정의된 도구)
 
@@ -34,9 +36,10 @@ DocumentProcess 도구 — 문서 파일(PDF/DOCX/XLSX)을 파싱해 텍스트�
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from core.tools.base import (
     BaseTool,
@@ -45,6 +48,10 @@ from core.tools.base import (
     ToolResult,
     ToolUseContext,
 )
+
+if TYPE_CHECKING:  # 타입 힌트 전용 import — 런타임에는 실행되지 않는다(지연 로딩 유지).
+    from core.ingest.parser_base import ParserRegistry
+    from core.ingest.types import DocumentNode, DocumentTree
 
 logger = logging.getLogger("nexus.tools.document")
 
@@ -60,13 +67,145 @@ CHUNK_SIZE = 2500
 # 모듈 수준(프로세스 공유) 캐시다. (프로세스가 살아있는 동안 유지)
 _document_cache: dict[str, list[str]] = {}
 
+# ─────────────────────────────────────────────
+# 인제스트 파서 연결 (PPTX / HWPX / HWP)
+# ─────────────────────────────────────────────
+# 왜 여기서 core.ingest 를 빌려 쓰나:
+#   PPTX·HWPX·HWP 파싱은 core/ingest/parsers/ 에 이미 구현·테스트돼 있다. 같은 로직을
+#   이 파일에 한 벌 더 만들면 두 곳이 따로 굳어 버린다(버그 수정이 한쪽에만 반영됨).
+#   그래서 "지식 적재용 파서"를 그대로 재사용하고, 이 도구는 결과 트리를 평문으로
+#   펼치는 일만 한다.
+# 무엇을 등록하지 '않는가'도 중요하다:
+#   Docling(레이아웃)·OCR(Tesseract/Paddle) 파서는 무겁고 GPU를 쓰므로 채팅 응답
+#   경로에 올리지 않는다. PDF는 기존 pypdf 경로를 그대로 유지한다(무회귀).
+_INGEST_EXTS = (".pptx", ".hwpx", ".hwp")
+
+# 텍스트를 못 뽑았을 때 사용자에게 돌려줄 안내. 왜 형식별로 다른가:
+# "추출 실패"만 알려 주면 사용자는 같은 파일을 계속 다시 올린다. 무엇을 하면
+# 되는지(다른 형식으로 저장)를 알려 줘야 실제로 해결된다.
+#
+# .hwp(구포맷) 주석 — 2026-08-06 실측으로 확인한 사실:
+#   변환 경로인 LibreOffice 의 한글 필터(libhwplo.so)는 HWP **V2.00/V2.10/V3.00**
+#   (한글 97 이하)만 인식한다. 한글 2002 이후가 쓰는 **HWP 5.0**(OLE 복합문서)은
+#   지원하지 않는다(필터 바이너리에 HWP5 스트림명 BodyText/DocInfo/FileHeader 참조가
+#   전혀 없음). 즉 LibreOffice 를 설치해도 요즘 .hwp 파일은 열리지 않는다.
+#   반면 .hwpx(신포맷)는 python-hwpx 로 완전히 지원되므로, 한/글에서 HWPX 또는
+#   PDF 로 저장해 올리는 것이 현재 가장 확실한 우회다.
+_EXTRACT_FAILED_HINTS = {
+    ".hwp": (
+        "[.hwp(한글 구포맷) 파일의 텍스트를 추출하지 못했습니다. "
+        "한/글에서 이 문서를 열어 '다른 이름으로 저장'에서 "
+        "**HWPX** 또는 **PDF** 형식으로 저장한 뒤 다시 올려 주세요. "
+        "두 형식은 완전히 지원됩니다]"
+    ),
+}
+_EXTRACT_FAILED_DEFAULT = (
+    "[{ext} 파일에서 텍스트를 추출하지 못했습니다. "
+    "빈 문서이거나, 그림·표 이미지로만 이루어진 문서일 수 있습니다. "
+    "PDF 로 저장해 다시 올리면 인식되는 경우가 있습니다]"
+)
+
+# 레지스트리는 한 번만 만들어 재사용한다(파서 객체 생성 비용 절감). None = 아직 미생성.
+_ingest_registry: ParserRegistry | None = None
+
+
+def _get_ingest_registry() -> ParserRegistry:
+    """PPTX/HWPX/HWP 파서만 담은 인제스트 레지스트리를 (한 번만) 만들어 돌려준다.
+
+    파서별로 따로 import 하는 이유: 특정 라이브러리(python-pptx 등)가 설치되지
+    않은 환경에서도 나머지 포맷은 계속 동작해야 하기 때문이다. import 에 실패한
+    파서는 등록하지 않고 경고만 남긴다 → 그 확장자는 "미지원"으로 안내된다.
+    """
+    global _ingest_registry
+    if _ingest_registry is not None:
+        return _ingest_registry
+
+    from core.ingest.parser_base import ParserRegistry
+
+    registry = ParserRegistry()
+
+    # (모듈 경로, 클래스 이름) 목록. 하나가 실패해도 나머지는 등록된다.
+    candidates = (
+        ("core.ingest.parsers.pptx", "PptxParser"),
+        ("core.ingest.parsers.hwpx", "HwpxParser"),
+        ("core.ingest.parsers.hwp_libreoffice", "HwpViaLibreOfficeParser"),
+    )
+    for module_path, class_name in candidates:
+        try:
+            module = __import__(module_path, fromlist=[class_name])
+            registry.register(getattr(module, class_name)())
+        except Exception as e:  # noqa: BLE001 — 어떤 라이브러리든 없으면 그 포맷만 포기
+            # bare except 가 아니라 사유를 남기고 넘어간다(부분 가용성 우선).
+            logger.warning("문서 파서 등록 실패: %s (%s: %s)", class_name, type(e).__name__, e)
+
+    _ingest_registry = registry
+    return registry
+
+
+def _tree_has_text(tree: DocumentTree) -> bool:
+    """트리에 실제 본문 글자가 하나라도 있는지 확인한다(경고는 세지 않는다).
+
+    왜 필요한가: 인제스트 파서는 fail-soft라 변환에 실패해도 예외 대신 '빈 트리 +
+    경고'를 돌려준다. 그래서 "내용이 있느냐"를 _flatten_tree 결과로 판정하면
+    경고 문구 때문에 항상 참이 되어, 정작 사용자에게는 알맹이 없이 내부 경고만
+    전달된다. 이 함수는 노드의 text 만 보고 판정한다.
+    """
+
+    def walk(nodes: tuple[DocumentNode, ...]) -> bool:
+        for node in nodes:
+            if (node.text or "").strip():
+                return True
+            if node.children and walk(node.children):
+                return True
+        return False
+
+    return walk(tree.nodes)
+
+
+def _flatten_tree(tree: DocumentTree) -> str:
+    """구조 트리(DocumentTree)를 LLM이 읽을 평문 한 덩어리로 펼친다.
+
+    규칙:
+      - 노드를 order 순으로 훑되, 자식(children)까지 재귀로 따라간다.
+      - 페이지/슬라이드 번호가 바뀌면 "[슬라이드 N]" 머리표를 한 줄 넣는다.
+        (PDF 파서가 "[페이지 N]"을 넣는 것과 같은 맥락 표시 방식)
+      - 텍스트가 빈 컨테이너 노드(SLIDE 등)는 머리표 판단에만 쓰고 본문에서는 건너뛴다.
+      - 파서가 남긴 fail-soft 경고(warnings)는 맨 끝에 붙여, 일부만 읽힌 경우를
+        모델이 알 수 있게 한다(조용한 누락 방지).
+    """
+    lines: list[str] = []
+    last_page: int | None = None
+
+    def walk(nodes: tuple[DocumentNode, ...]) -> None:
+        nonlocal last_page
+        for node in sorted(nodes, key=lambda n: n.order):
+            # 페이지(PPTX는 슬라이드 번호)가 바뀌는 지점마다 머리표를 넣는다.
+            if node.page is not None and node.page != last_page:
+                lines.append(f"\n[슬라이드/페이지 {node.page}]")
+                last_page = node.page
+            text = (node.text or "").strip()
+            if text:
+                lines.append(text)
+            if node.children:
+                walk(node.children)
+
+    walk(tree.nodes)
+
+    body = "\n".join(lines).strip()
+    if tree.warnings:
+        # 경고는 본문과 구분해 맨 끝에 모아 붙인다.
+        warn_text = "\n".join(f"- {w}" for w in tree.warnings)
+        body = f"{body}\n\n[파싱 경고]\n{warn_text}" if body else f"[파싱 경고]\n{warn_text}"
+    return body
+
 
 class DocumentProcessTool(BaseTool):
     """
     문서 파일을 파싱해 텍스트를 청크 단위로 꺼내주는 읽기 전용 도구.
 
-    지원 형식: PDF(.pdf), Word(.docx/.doc), Excel(.xlsx/.xls).
-    그 외 확장자는 UTF-8 평문으로 간주해 그대로 읽는다.
+    지원 형식: PDF(.pdf), Word(.docx/.doc), Excel(.xlsx/.xls),
+    PowerPoint(.pptx), 한글(.hwpx/.hwp).
+    그 외 확장자는 평문 텍스트로 간주해 읽되, 바이너리면 명확한 오류를 돌려준다.
 
     동작 방식:
       - chunk_index를 주지 않으면(=0) 문서 개요 + 첫 청크를 반환한다.
@@ -86,7 +225,7 @@ class DocumentProcessTool(BaseTool):
     @property
     def description(self) -> str:
         """LLM에게 노출되는 한 줄 설명. 어떤 파일을 다루는 도구인지 알린다."""
-        return "Parse PDF, DOCX, or XLSX files."
+        return "Parse PDF, DOCX, XLSX, PPTX, HWPX, or HWP files."
 
     @property
     def aliases(self) -> list[str]:
@@ -204,7 +343,7 @@ class DocumentProcessTool(BaseTool):
         if cache_key not in _document_cache:
             try:
                 # 확장자에 맞는 파서로 문서 전체 텍스트를 추출한다.
-                full_text = self._extract_text(path, input_data.get("pages"))
+                full_text = await self._extract_text(path, input_data.get("pages"))
             except Exception as e:
                 # 파서 라이브러리 오류·손상된 파일 등은 여기서 잡아 오류로 감싼다.
                 # (bare except 금지 규칙에 따라 예외 타입·메시지를 그대로 노출한다.)
@@ -273,14 +412,19 @@ class DocumentProcessTool(BaseTool):
 
     # ─── 텍스트 추출 (확장자별 분기) ───
 
-    def _extract_text(self, path: Path, pages: str | None = None) -> str:
+    async def _extract_text(self, path: Path, pages: str | None = None) -> str:
         """
         파일 확장자를 보고 알맞은 파서를 골라 문서 전체 텍스트를 뽑아낸다.
 
         - .pdf              → _parse_pdf (pages 범위 지정 가능)
         - .docx / .doc      → _parse_docx
         - .xlsx / .xls      → _parse_xlsx
-        - 그 외             → UTF-8 평문으로 읽되, 깨진 바이트는 대체 문자로 치환한다.
+        - .pptx/.hwpx/.hwp  → _parse_via_ingest (core/ingest 파서 재사용)
+        - 그 외             → _read_text_file (평문으로 간주하되 바이너리는 거부)
+
+        async 인 이유: 인제스트 파서의 계약이 async parse() 이고, HWP 변환처럼
+        수 초가 걸리는 작업을 이벤트 루프를 막지 않고 처리해야 하기 때문이다.
+        (호출부는 call() 하나뿐이며 이미 async 다.)
         """
         ext = path.suffix.lower()
 
@@ -290,8 +434,106 @@ class DocumentProcessTool(BaseTool):
             return self._parse_docx(path)
         elif ext in (".xlsx", ".xls"):
             return self._parse_xlsx(path)
+        elif ext in _INGEST_EXTS:
+            return await self._parse_via_ingest(path)
         else:
-            return path.read_text(encoding="utf-8", errors="replace")
+            return self._read_text_file(path)
+
+    @staticmethod
+    async def _parse_via_ingest(path: Path) -> str:
+        """PPTX/HWPX/HWP를 인제스트 파서로 파싱해 평문으로 펼친다.
+
+        왜 별도 스레드(asyncio.to_thread)에서 돌리나:
+          인제스트 파서의 parse() 는 async 로 선언돼 있지만 내부는 파일 파싱·
+          LibreOffice 변환 같은 '블로킹' 작업이다. 웹 서버의 이벤트 루프에서 그대로
+          await 하면 그동안 다른 요청의 스트리밍까지 멈춘다. 그래서 워커 스레드에서
+          독립 이벤트 루프(asyncio.run)로 돌려 루프 정지를 막는다.
+
+        파서를 못 찾은 경우(라이브러리 미설치·매직바이트 불일치)는 예외를 던져
+        call() 의 공통 오류 처리("문서 파싱 실패: ...")로 흘려보낸다.
+        """
+        parser = _get_ingest_registry().get_for_path(path)
+        if parser is None:
+            raise ValueError(
+                f"{path.suffix.lower()} 형식을 처리할 파서가 없습니다. "
+                "파일이 손상됐거나 해당 포맷 라이브러리가 설치되지 않았습니다."
+            )
+
+        tree = await asyncio.to_thread(lambda: asyncio.run(parser.parse(path)))
+
+        # 본문이 한 글자도 없으면 사용자가 바로 조치할 수 있는 안내를 돌려준다.
+        # 판정은 '경고를 뺀 본문' 기준이다 — 파서가 fail-soft 경고를 남기면
+        # _flatten_tree 결과는 경고 때문에 비어 있지 않게 되므로, 그걸로 판정하면
+        # "soffice 미설치" 같은 내부 경고만 사용자에게 노출되고 만다.
+        if not _tree_has_text(tree):
+            hint = _EXTRACT_FAILED_HINTS.get(
+                path.suffix.lower(), _EXTRACT_FAILED_DEFAULT
+            ).format(ext=path.suffix.lower())
+            if tree.warnings:
+                # 진단 정보는 안내 뒤에 덧붙인다(원인 추적은 가능하게 두되 주가 아니게).
+                diag = "\n".join(f"- {w}" for w in tree.warnings)
+                hint = f"{hint}\n\n[진단]\n{diag}"
+            return hint
+        return _flatten_tree(tree)
+
+    @staticmethod
+    def _read_text_file(path: Path) -> str:
+        """알려진 문서 포맷이 아닌 파일을 평문 텍스트로 읽는다.
+
+        두 가지를 막는다:
+          1) 바이너리를 평문으로 읽어 깨진 문자열이 모델에 들어가는 것 —
+             앞부분에 NUL 바이트가 있으면 바이너리로 보고 명확한 오류를 낸다.
+             (예전에는 .hwp/.pptx가 여기로 흘러들어 쓰레기 텍스트가 됐다.)
+          2) 한글 CP949(euc-kr) 텍스트가 물음표로 뭉개지는 것 — UTF-8 해독이
+             실패하면 CP949를 한 번 더 시도한 뒤에야 대체 문자로 넘어간다.
+        """
+        raw = path.read_bytes()
+
+        # 1) BOM 우선 판별 — UTF-16/UTF-32 텍스트는 본문 곳곳에 NUL 바이트가 있어
+        #    아래 바이너리 스니핑에 그대로 걸린다(Windows 메모장의 '유니코드' 저장이
+        #    대표적). BOM이 있으면 인코딩의 확실한 증거이므로 먼저 해독한다.
+        #    UTF-32LE BOM(FF FE 00 00)은 UTF-16LE BOM(FF FE)으로 시작하므로
+        #    반드시 더 긴 것부터 검사해야 한다(순서 중요).
+        for bom, encoding in (
+            (b"\xef\xbb\xbf", "utf-8-sig"),
+            (b"\xff\xfe\x00\x00", "utf-32-le"),
+            (b"\x00\x00\xfe\xff", "utf-32-be"),
+            (b"\xff\xfe", "utf-16"),
+            (b"\xfe\xff", "utf-16"),
+        ):
+            if raw.startswith(bom):
+                return DocumentProcessTool._normalize_newlines(
+                    raw.decode(encoding, errors="replace")
+                )
+
+        # 2) 바이너리 판별 — 텍스트 파일에는 NUL 바이트가 사실상 나오지 않는다.
+        if b"\x00" in raw[:4096]:
+            raise ValueError(
+                f"지원하지 않는 파일 형식입니다({path.suffix.lower() or '확장자 없음'}). "
+                "지원 형식: PDF, DOCX, XLSX, PPTX, HWPX, HWP, 그리고 평문 텍스트."
+            )
+
+        # 3) 인코딩 추정 — UTF-8 → CP949 → (최후) 대체 문자.
+        for encoding in ("utf-8", "cp949"):
+            try:
+                text = raw.decode(encoding)
+                break
+            except UnicodeDecodeError:
+                continue
+        else:
+            text = raw.decode("utf-8", errors="replace")
+
+        return DocumentProcessTool._normalize_newlines(text)
+
+    @staticmethod
+    def _normalize_newlines(text: str) -> str:
+        """개행을 LF로 통일한다(CRLF/CR → LF).
+
+        바이트로 읽으면 파이썬 텍스트 모드의 universal newlines 변환이 걸리지
+        않아 Windows 파일에 \\r 이 그대로 남는다. 그만큼 글자 수가 늘어 청크
+        분할 경계가 어긋나므로 여기서 맞춰 준다(무회귀 보정).
+        """
+        return text.replace("\r\n", "\n").replace("\r", "\n")
 
     # ─── 청크 분할 ───
 
