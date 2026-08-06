@@ -276,6 +276,12 @@ class QueryEngine:
         if self._turn_state_store is not None:
             self._messages.clear()
 
+        # 과거 기억 회상 — 관련 있는 장기 기억을 이번 턴 앞에 끼워 넣는다.
+        # (기본 비활성. config memory.recall_enabled 로 켠다 — 아래 _recall_memories 참고)
+        recall_block = await self._recall_memories(user_input)
+        if recall_block:
+            self._messages.append(Message.user(recall_block))
+
         # 사용자 메시지를 대화 히스토리에 추가
         user_msg = Message.user(user_input)
         self._messages.append(user_msg)
@@ -457,6 +463,58 @@ class QueryEngine:
             # (2) Transcript.append_entry — JSONL 파일에 user/assistant 쌍 기록
             # 예외 중에도 호출되며 — finalize_error가 있으면 system 에러 엔트리도 남긴다.
             await self._finalize_turn(user_input, finalize_error=finalize_error)
+
+    async def _recall_memories(self, user_input: str) -> str:
+        """이번 입력과 관련된 과거 기억을 찾아 주입용 블록으로 만든다.
+
+        [왜 기본 비활성인가]
+          2026-08-06 실측 전까지 이 회상 훅(MemoryManager.on_turn_start)은 프로덕션
+          어디서도 호출되지 않았다 — 장기 기억은 '쓰기 전용'이었다. 이제 배선했지만,
+          매 턴 모든 응답에 과거 기억이 끼어드는 것은 큰 동작 변화라 설정으로 켜게 둔다
+          (config: memory.recall_enabled, 기본 false = 기존 동작 그대로 = 무회귀).
+
+        [무엇을 주입하나]
+          코드 RAG 청크는 MemoryManager 쪽에서 이미 걸러진다(is_rag_chunk). 여기서는
+          너무 긴 기억이 컨텍스트를 잡아먹지 않도록 건수·길이만 제한한다.
+
+        실패는 삼킨다 — 회상은 부가 기능이고, 실패했다고 대화가 막혀선 안 된다.
+        """
+        if self._memory_manager is None:
+            return ""
+
+        # 설정은 값으로 주입받는다(bootstrap/web이 options에 넣어 준다).
+        # permission_enforcement 등 기존 주입 패턴과 같은 모양이라 시그니처 변경이 없다.
+        recall_cfg = (self._context.options.get("memory_recall") if self._context else None) or {}
+        if not recall_cfg.get("enabled", False):
+            return ""
+
+        try:
+            entries = await self._memory_manager.on_turn_start(
+                session_id=self._session_id, user_message=user_input
+            )
+        except Exception as e:  # noqa: BLE001 — 회상 실패가 대화를 막지 않게
+            logger.warning("메모리 회상 실패 (session=%s): %s", self._session_id, e)
+            return ""
+
+        max_items = recall_cfg.get("max_items", 5)
+        max_chars = recall_cfg.get("max_chars", 400)
+        lines = [
+            f"- {(e.content or '').strip()[:max_chars]}"
+            for e in entries[:max_items]
+            if (e.content or "").strip()
+        ]
+        if not lines:
+            return ""
+
+        logger.info(
+            "메모리 회상: session=%s, 주입 %d건", self._session_id, len(lines)
+        )
+        # 참고 자료임을 분명히 해, 모델이 이걸 사용자 발화로 오해하지 않게 한다.
+        return (
+            "--- 과거 기억 (참고용, 사용자가 방금 한 말이 아님) ---\n"
+            + "\n".join(lines)
+            + "\n관련 있을 때만 활용하고, 무관하면 무시하라."
+        )
 
     async def _finalize_turn(
         self,

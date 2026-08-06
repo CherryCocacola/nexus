@@ -40,7 +40,7 @@ from typing import TYPE_CHECKING
 from core.memory.importance import ImportanceAssessor
 from core.memory.long_term import LongTermMemory
 from core.memory.short_term import ShortTermMemory
-from core.memory.types import MemoryEntry, MemoryType
+from core.memory.types import MemoryEntry, MemoryType, is_rag_chunk
 
 if TYPE_CHECKING:
     from core.message import Message
@@ -157,6 +157,12 @@ class MemoryManager:
             for entry in text_results:
                 if entry.id not in existing_ids:
                     results.append(entry)
+
+        # 2.5 코드 RAG 청크를 걸러낸다 — 대화 회상에 소스코드가 섞이면 안 된다.
+        #     같은 tb_memories 에 코드 인덱스(113만 건)와 대화 기억(수백 건)이 함께
+        #     사는데, RAG 청크는 importance=0.8 로 높아 아래 중요도 정렬에서 앞자리를
+        #     독차지한다. 코드 검색은 SymbolSearch/RAG 리트리버가 따로 담당한다.
+        results = [e for e in results if not is_rag_chunk(e)]
 
         # 3. 중요도 내림차순 정렬 (importance가 클수록 앞으로) — 주입 우선순위 결정.
         results.sort(key=lambda e: e.importance, reverse=True)
@@ -344,7 +350,10 @@ class MemoryManager:
                     results.append(entry)
                     existing_ids.add(entry.id)
 
-        return results[:top_k]
+        # 코드 RAG 청크는 '기억 조회' 결과가 아니다 — 걸러낸다.
+        # (MemoryRead 도구가 소스코드 조각을 돌려주면 사용자에게 잡음이다.
+        #  코드 검색은 SymbolSearch/RAG 리트리버가 담당한다.)
+        return [e for e in results if not is_rag_chunk(e)][:top_k]
 
     # ─── 직접 추가 ───
 

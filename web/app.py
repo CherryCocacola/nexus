@@ -825,6 +825,14 @@ def _build_web_engine_parts(components: dict, state: Any) -> dict:
         "document_singleshot_chars": (
             _web_budgets.document_singleshot_chars if _web_budgets else None
         ),
+        # 장기 기억 회상 — QueryEngine._recall_memories 가 읽는다(2026-08-06).
+        # CLI(bootstrap)와 쌍으로 주입해 표면 간 동작을 일치시킨다. 기본 비활성이라
+        # 미주입/꺼짐이면 기존 동작 그대로다(무회귀).
+        "memory_recall": {
+            "enabled": getattr(getattr(state.config, "memory", None), "recall_enabled", False),
+            "max_items": getattr(getattr(state.config, "memory", None), "recall_max_items", 5),
+            "max_chars": getattr(getattr(state.config, "memory", None), "recall_max_chars", 400),
+        },
         # 생성 문서 저장 위치 — DocumentExport 도구가 읽는다. 빈 값이면 도구가
         # {tempdir}/nexus_exports 로 폴백(다운로드 라우트와 동일 경로).
         "exports_dir": getattr(getattr(state.config, "document_export", None), "exports_dir", ""),

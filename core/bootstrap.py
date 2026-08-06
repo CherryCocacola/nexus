@@ -346,6 +346,13 @@ async def init_phase2(state: GlobalState) -> dict:
             # 문서 통짜 반환 상한 — 이 이하 문서는 청크 없이 1회 반환. 0(기본)이면
             # 비활성 → 기존 청크 동작. 웹(web/app.py)과 쌍으로 주입해 표면 간 동작 일치.
             "document_singleshot_chars": config.context_budgets.document_singleshot_chars,
+            # 장기 기억 회상 — QueryEngine._recall_memories 가 읽는다(2026-08-06).
+            # 기본 비활성이라 미주입/꺼짐이면 기존 동작 그대로다(무회귀).
+            "memory_recall": {
+                "enabled": config.memory.recall_enabled,
+                "max_items": config.memory.recall_max_items,
+                "max_chars": config.memory.recall_max_chars,
+            },
             # 권한 강제 파이프라인 배선(감사 Critical #1~3, 2026-07-03) — executor가
             # options에서 꺼내 쓴다. 왜 options인가: ToolUseContext는 이미 executor까지
             # 흐르고, memory_manager/agent_registry 등 세션 의존성도 전부 options로

@@ -959,6 +959,30 @@ class DocumentExportConfig(BaseModel):
     retention_days: int = 90
 
 
+class MemoryConfig(BaseModel):
+    """장기 기억 회상(recall) 설정 — 과거 기억을 이번 턴에 주입할지 여부와 분량.
+
+    왜 기본 비활성인가 (2026-08-06 실측):
+      회상 훅(MemoryManager.on_turn_start)은 구현돼 있었지만 프로덕션 어디서도
+      호출되지 않아, 장기 기억은 사실상 **쓰기 전용**이었다. 이제 배선했으나
+      매 턴 모든 응답에 과거 기억이 끼어드는 것은 큰 동작 변화다. 기본값을 끈 채로
+      두면 기존 동작이 1비트도 바뀌지 않는다(무회귀). 운영에서 켜 보고 판단한다.
+
+    주의: 코드 RAG 청크(tb_memories의 99.98%)는 회상 대상에서 제외된다
+      (core/memory/types.py 의 is_rag_chunk). 이 필터 없이 켜면 소스코드 조각이
+      컨텍스트를 덮는다 — RAG 청크는 importance=0.8 로 높아 우선순위를 독차지한다.
+
+    필드 설명:
+      - recall_enabled: 회상 주입 사용 여부. False면 조회 자체를 하지 않는다.
+      - recall_max_items: 한 턴에 주입할 최대 기억 건수.
+      - recall_max_chars: 기억 1건당 주입할 최대 글자 수(컨텍스트 보호).
+    """
+
+    recall_enabled: bool = False
+    recall_max_items: int = 5
+    recall_max_chars: int = 400
+
+
 class UploadConfig(BaseModel):
     """
     파일 업로드(웹 /v1/upload) 설정 — 받아줄 파일의 크기·형식 한계.
@@ -1474,6 +1498,9 @@ class NexusConfig(BaseSettings):
 
     # 파일 업로드(웹 /v1/upload) — 크기·확장자 상한 (2026-08-06 W8 업로드 확장)
     upload: UploadConfig = Field(default_factory=UploadConfig)
+
+    # 장기 기억 회상 — 과거 기억 주입 여부/분량 (2026-08-06 회상 배선, 기본 비활성)
+    memory: MemoryConfig = Field(default_factory=MemoryConfig)
 
     # v7.0 Part 2.5 쿼리 라우팅 — 지식/도구 질의 분기 (2026-04-21 추가)
     routing: RoutingConfig = Field(default_factory=RoutingConfig)

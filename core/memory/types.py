@@ -141,6 +141,31 @@ DECAY_HALF_LIFE: dict[MemoryType, float] = {
 
 
 # ─────────────────────────────────────────────
+# 코드 RAG 청크 판별 (대화 기억과 구분)
+# ─────────────────────────────────────────────
+# 왜 필요한가 (2026-08-06 실측):
+#   tb_memories 한 테이블에 두 종류가 섞여 산다.
+#     · 코드 RAG 인덱서가 넣은 소스코드 청크 — key="rag:파일:chunk_N", tags에 "rag",
+#       metadata.source="rag_indexer". 실측 113만 건(전체의 99.98%).
+#     · 실제 대화 기억 — key="turn:...". 실측 174건.
+#   RAG 리트리버는 자기 것만 골라 쓰지만(core/rag/retriever.py), 대화 회상 쪽에는
+#   반대 방향 필터가 없었다. 그대로 회상을 켜면 코드 청크가 컨텍스트를 덮는다
+#   (RAG 청크는 importance=0.8로 높게 매겨져 중요도 정렬에서 앞자리를 차지한다).
+#   판별 기준은 리트리버와 동일하게 유지해야 양쪽이 어긋나지 않는다.
+_RAG_SOURCE = "rag_indexer"
+_RAG_TAG = "rag"
+
+
+def is_rag_chunk(entry: MemoryEntry) -> bool:
+    """이 기억이 '코드 RAG 인덱서가 넣은 청크'인지 판별한다.
+
+    core/rag/retriever.py 가 자기 결과를 고를 때 쓰는 기준과 같은 술어다.
+    대화 회상 쪽은 이 함수가 True인 항목을 제외해 코드 조각이 섞이지 않게 한다.
+    """
+    return entry.metadata.get("source") == _RAG_SOURCE or _RAG_TAG in entry.tags
+
+
+# ─────────────────────────────────────────────
 # 메모리 검색 결과 (점수 포함)
 # ─────────────────────────────────────────────
 class MemorySearchResult(BaseModel):
