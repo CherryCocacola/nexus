@@ -145,7 +145,7 @@ def test_iter_records_handles_extended_size():
 
     got = list(HwpNativeParser._iter_records(data))
 
-    assert [(t, len(p)) for t, p in got] == [(67, 5), (66, 5000)]
+    assert [(t, len(p)) for t, _lv, p in got] == [(67, 5), (66, 5000)]
 
 
 def test_iter_records_stops_on_truncated_stream():
@@ -154,7 +154,17 @@ def test_iter_records_stops_on_truncated_stream():
 
     got = list(HwpNativeParser._iter_records(data))
 
-    assert [t for t, _ in got] == [67]
+    assert [t for t, _lv, _p in got] == [67]
+
+
+def test_iter_records_reports_level():
+    """레코드의 level(개체 중첩 깊이)을 함께 돌려준다 — 표 시작·끝 판정에 쓴다."""
+    data = _rec(66, b"a", level=0) + _rec(67, b"b", level=3)
+
+    assert [(t, lv) for t, lv, _p in HwpNativeParser._iter_records(data)] == [
+        (66, 0),
+        (67, 3),
+    ]
 
 
 def test_decode_para_text_skips_inline_control():
@@ -202,6 +212,110 @@ def test_maybe_decompress_handles_raw_deflate():
     packed = zlib.compress(original)[2:-4]
 
     assert HwpNativeParser._maybe_decompress(packed, True) == original
+
+
+# ─────────────────────────────────────────────
+# 표 복원 — 셀 주소로 행을 되살린다
+# ─────────────────────────────────────────────
+#
+# 왜 중요한가: 예전에는 셀을 각각 별도 문단으로 평탄화해 "어느 셀이 같은 행인지"를
+# 알 수 없었다. 입찰공고문·제안요청서처럼 표가 곧 본문인 문서에서 치명적이다.
+# 실제 .hwp 의 레코드 배치는 다음과 같다(실측).
+#     CTRL_HEADER(lv=1, ctrl_id='tbl ')
+#       TABLE(lv=2)                 ← 행/열 수
+#       LIST_HEADER(lv=2)           ← 셀 1 (payload 에 열·행 주소)
+#         PARA_HEADER(lv=2) / PARA_TEXT(lv=3)
+#       LIST_HEADER(lv=2)           ← 셀 2 ...
+
+CTRL_HEADER = 71
+LIST_HEADER = 72
+TABLE_TAG = 77
+PARA_HEADER = 66
+PARA_TEXT = 67
+
+
+def _cell_payload(col: int, row: int) -> bytes:
+    """LIST_HEADER payload — 앞 8바이트 공통 헤더 뒤에 열·행 주소가 온다."""
+    return b"\x00" * 8 + struct.pack("<HH", col, row) + b"\x00" * 4
+
+
+def _utf16(text: str) -> bytes:
+    return text.encode("utf-16-le")
+
+
+def _table_stream(cells: list[tuple[int, int, str]]) -> bytes:
+    """(열, 행, 텍스트) 목록으로 표 하나짜리 레코드 스트림을 만든다."""
+    data = _rec(CTRL_HEADER, b"tbl "[::-1] + b"\x00" * 20, level=1)
+    data += _rec(TABLE_TAG, b"\x00" * 28, level=2)
+    for col, row, text in cells:
+        data += _rec(LIST_HEADER, _cell_payload(col, row), level=2)
+        data += _rec(PARA_HEADER, b"\x00" * 22, level=2)
+        data += _rec(PARA_TEXT, _utf16(text), level=3)
+    return data
+
+
+def test_extract_groups_table_cells_into_rows():
+    """셀들이 행 주소별로 묶여 ' | ' 로 이어진다."""
+    data = _table_stream(
+        [(0, 0, "공고번호"), (1, 0, "입찰건명"), (0, 1, "제26-58호"), (1, 1, "AI 플랫폼")]
+    )
+
+    out = HwpNativeParser._extract_paragraphs(data)
+
+    assert len(out) == 1
+    element_type, text = out[0]
+    assert element_type.value == "table"
+    assert text == "공고번호 | 입찰건명\n제26-58호 | AI 플랫폼"
+
+
+def test_extract_table_orders_cells_by_column():
+    """레코드 순서가 뒤섞여도 열 주소 순으로 정렬한다."""
+    data = _table_stream([(2, 0, "셋째"), (0, 0, "첫째"), (1, 0, "둘째")])
+
+    _element_type, text = HwpNativeParser._extract_paragraphs(data)[0]
+
+    assert text == "첫째 | 둘째 | 셋째"
+
+
+def test_extract_keeps_paragraphs_around_table_in_order():
+    """표 앞뒤의 본문 문단이 문서 순서를 유지한다."""
+    before = _rec(PARA_HEADER, b"\x00" * 22, level=0) + _rec(
+        PARA_TEXT, _utf16("표 앞 문단"), level=1
+    )
+    after = _rec(PARA_HEADER, b"\x00" * 22, level=0) + _rec(
+        PARA_TEXT, _utf16("표 뒤 문단"), level=1
+    )
+    data = before + _table_stream([(0, 0, "셀")]) + after
+
+    out = HwpNativeParser._extract_paragraphs(data)
+
+    assert [t for _e, t in out] == ["표 앞 문단", "셀", "표 뒤 문단"]
+    assert [e.value for e, _t in out] == ["paragraph", "table", "paragraph"]
+
+
+def test_extract_joins_multiple_paragraphs_in_one_cell():
+    """한 셀 안에 문단이 여러 개면 공백으로 이어 한 줄로 만든다(행이 깨지지 않게)."""
+    data = _rec(CTRL_HEADER, b"tbl "[::-1] + b"\x00" * 20, level=1)
+    data += _rec(TABLE_TAG, b"\x00" * 28, level=2)
+    data += _rec(LIST_HEADER, _cell_payload(0, 0), level=2)
+    data += _rec(PARA_HEADER, b"\x00" * 22, level=2)
+    data += _rec(PARA_TEXT, _utf16("첫 줄"), level=3)
+    data += _rec(PARA_HEADER, b"\x00" * 22, level=2)
+    data += _rec(PARA_TEXT, _utf16("둘째 줄"), level=3)
+
+    _element_type, text = HwpNativeParser._extract_paragraphs(data)[0]
+
+    assert text == "첫 줄 둘째 줄"
+
+
+def test_read_cell_address_falls_back_when_payload_short():
+    """셀 주소를 읽을 수 없을 만큼 짧으면 (0,0)으로 두고 내용은 살린다(fail-soft)."""
+    assert HwpNativeParser._read_cell_address(b"\x00" * 4) == (0, 0)
+
+
+def test_read_cell_address_reads_row_and_column():
+    """payload 에서 (행, 열) 주소를 정확히 읽는다."""
+    assert HwpNativeParser._read_cell_address(_cell_payload(col=3, row=7)) == (7, 3)
 
 
 # ─────────────────────────────────────────────

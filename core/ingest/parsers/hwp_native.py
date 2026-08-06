@@ -75,6 +75,19 @@ _FLAG_DISTRIBUTION = 0x04  # 배포용 문서 — 별도 암호화, 복호화 �
 _HWPTAG_BEGIN = 0x010
 _HWPTAG_PARA_HEADER = _HWPTAG_BEGIN + 50  # 66 — 문단 시작
 _HWPTAG_PARA_TEXT = _HWPTAG_BEGIN + 51  # 67 — 문단 본문(UTF-16LE)
+_HWPTAG_CTRL_HEADER = _HWPTAG_BEGIN + 55  # 71 — 개체 시작(표/그림 등)
+_HWPTAG_LIST_HEADER = _HWPTAG_BEGIN + 56  # 72 — 문단 목록 시작(표에서는 '셀' 하나)
+_HWPTAG_TABLE = _HWPTAG_BEGIN + 61  # 77 — 표 속성(행·열 수)
+
+# CTRL_HEADER 의 개체 종류 식별자. 4바이트가 뒤집혀 저장돼 있어 [::-1] 로 읽는다.
+_CTRL_ID_TABLE = b"tbl "
+
+# 표 셀 정보(LIST_HEADER payload)의 오프셋.
+#   앞 8바이트는 공통 헤더(문단 수 int32 + 속성 uint32)이고 그 뒤에 셀 주소가 온다.
+#   실측(입찰공고문.hwp)으로 확인: 열주소·행주소·열병합·행병합이 uint16 으로 이어진다.
+_CELL_COL_OFFSET = 8
+_CELL_ROW_OFFSET = 10
+_CELL_MIN_SIZE = 12  # 행/열 주소를 읽으려면 최소 이만큼은 있어야 한다
 
 # PARA_TEXT 안의 제어문자 분류.
 #   확장/인라인 제어문자는 자기 자신 포함 8 코드유닛을 차지한다(16바이트).
@@ -151,10 +164,8 @@ class HwpNativeParser(DocumentParser):
                     # 본문을 못 읽었으면 미리보기 평문이라도 건진다(부분 가용성).
                     paragraphs = self._read_preview_text(ole, warnings)
 
-            for order, text in enumerate(paragraphs):
-                nodes.append(
-                    DocumentNode(element_type=ElementType.PARAGRAPH, text=text, order=order)
-                )
+            for order, (element_type, text) in enumerate(paragraphs):
+                nodes.append(DocumentNode(element_type=element_type, text=text, order=order))
         except Exception as e:  # noqa: BLE001 — fail-soft: 사유를 경고로 남기고 빈 트리
             logger.warning("HWP 파싱 실패: %s — %s", path, e)
             warnings.append(f"HWP 파싱 실패: {type(e).__name__}: {e}")
@@ -195,8 +206,8 @@ class HwpNativeParser(DocumentParser):
 
     def _read_body_paragraphs(
         self, ole: olefile.OleFileIO, compressed: bool, warnings: list[str]
-    ) -> list[str]:
-        """BodyText/SectionN 을 순서대로 읽어 문단 텍스트 목록을 만든다."""
+    ) -> list[tuple[ElementType, str]]:
+        """BodyText/SectionN 을 순서대로 읽어 (요소종류, 텍스트) 목록을 만든다."""
         # 섹션 스트림 목록을 모아 번호순으로 정렬한다(Section10 이 Section2 보다
         # 뒤에 오도록 문자열이 아니라 숫자로 정렬 — 문서 순서가 뒤집히면 안 된다).
         sections: list[tuple[int, list[str]]] = []
@@ -209,7 +220,7 @@ class HwpNativeParser(DocumentParser):
             warnings.append("BodyText 섹션이 없습니다.")
             return []
 
-        paragraphs: list[str] = []
+        paragraphs: list[tuple[ElementType, str]] = []
         for _num, entry in sorted(sections, key=lambda t: t[0]):
             name = "/".join(entry)
             try:
@@ -237,35 +248,109 @@ class HwpNativeParser(DocumentParser):
             return raw
 
     @classmethod
-    def _extract_paragraphs(cls, data: bytes) -> list[str]:
-        """레코드 스트림을 훑어 PARA_TEXT 들을 문단 단위 문자열로 모은다.
+    def _extract_paragraphs(cls, data: bytes) -> list[tuple[ElementType, str]]:
+        """레코드 스트림을 훑어 본문 문단과 표를 문서 순서대로 모은다.
 
-        PARA_HEADER 를 만날 때마다 새 문단을 시작한다. 한 문단이 여러 PARA_TEXT
-        레코드로 쪼개져 있을 수 있으므로, 문단 경계 전까지는 이어 붙인다.
+        일반 문단: PARA_HEADER 를 만날 때마다 새 문단을 시작한다. 한 문단이 여러
+        PARA_TEXT 레코드로 쪼개져 있을 수 있으므로 경계 전까지는 이어 붙인다.
+
+        표: CTRL_HEADER 의 개체 식별자가 'tbl ' 이면 표가 시작된다. 그 안의
+        LIST_HEADER 하나가 셀 하나이고, 셀의 (행, 열) 주소가 payload 에 들어 있다.
+        이 주소로 셀을 행별로 묶어 " | " 로 이어 붙인다 — 주소를 쓰기 때문에
+        병합 셀(rowspan/colspan)이 있어도 행이 뒤섞이지 않는다.
+        (예전에는 셀을 각각 별도 문단으로 평탄화해, 어느 셀이 같은 행인지 알 수
+         없었다. 입찰공고문·제안요청서처럼 표가 본문인 문서에서 특히 문제였다.)
+
+        표는 중첩될 수 있으므로 스택으로 다룬다. 표 안의 레코드는 CTRL_HEADER 보다
+        깊은 level 을 갖는다는 성질을 이용해, level 이 그 이하로 돌아오면 표를 닫는다.
         """
-        paragraphs: list[str] = []
-        current: list[str] = []
+        out: list[tuple[ElementType, str]] = []
+        current: list[str] = []  # 지금 모으는 중인 문단 조각들
+        # 열려 있는 표들. 각 항목: {"level": 시작 level, "cells": {(행,열): [텍스트...]}}
+        tables: list[dict] = []
 
-        def flush() -> None:
+        def flush_para() -> None:
+            """모아 둔 문단 조각을 확정한다. 표 안이면 현재 셀에, 밖이면 본문에 넣는다."""
             text = "".join(current).strip()
-            if text:
-                paragraphs.append(text)
             current.clear()
+            if not text:
+                return
+            if tables and tables[-1]["current_cell"] is not None:
+                tables[-1]["cells"].setdefault(tables[-1]["current_cell"], []).append(text)
+            else:
+                out.append((ElementType.PARAGRAPH, text))
 
-        for tag_id, payload in cls._iter_records(data):
-            if tag_id == _HWPTAG_PARA_HEADER:
-                flush()
+        def close_table() -> None:
+            """가장 안쪽 표를 닫아 행 단위 텍스트로 만들어 내보낸다."""
+            table = tables.pop()
+            cells: dict[tuple[int, int], list[str]] = table["cells"]
+            if not cells:
+                return
+            rows: dict[int, list[tuple[int, str]]] = {}
+            for (row, col), parts in cells.items():
+                # 한 셀 안의 여러 문단은 공백으로 이어 한 줄로 만든다(행이 깨지지 않게).
+                rows.setdefault(row, []).append((col, " ".join(parts).strip()))
+            lines = []
+            for row in sorted(rows):
+                ordered = [text for _col, text in sorted(rows[row])]
+                line = " | ".join(t for t in ordered if t)
+                if line:
+                    lines.append(line)
+            if not lines:
+                return
+            text = "\n".join(lines)
+            # 중첩 표였다면 바깥 표의 현재 셀 안에 텍스트로 넣고, 아니면 본문에 내보낸다.
+            if tables and tables[-1]["current_cell"] is not None:
+                tables[-1]["cells"].setdefault(tables[-1]["current_cell"], []).append(text)
+            else:
+                out.append((ElementType.TABLE, text))
+
+        for tag_id, level, payload in cls._iter_records(data):
+            # 표 밖으로 빠져나왔으면(level 이 시작 level 이하) 열린 표를 닫는다.
+            while tables and level <= tables[-1]["level"]:
+                flush_para()
+                close_table()
+
+            if tag_id == _HWPTAG_CTRL_HEADER:
+                flush_para()
+                # 개체 식별자 4바이트는 뒤집혀 저장돼 있다('tbl ' → ' lbt').
+                if payload[:4][::-1] == _CTRL_ID_TABLE:
+                    tables.append({"level": level, "cells": {}, "current_cell": None})
+            elif tag_id == _HWPTAG_LIST_HEADER and tables:
+                # 표 안의 LIST_HEADER = 셀 하나의 시작. 앞 셀 내용을 확정하고 주소를 읽는다.
+                flush_para()
+                tables[-1]["current_cell"] = cls._read_cell_address(payload)
+            elif tag_id == _HWPTAG_PARA_HEADER:
+                flush_para()
             elif tag_id == _HWPTAG_PARA_TEXT:
                 current.append(cls._decode_para_text(payload))
-        flush()
-        return paragraphs
+
+        flush_para()
+        while tables:
+            close_table()
+        return out
+
+    @staticmethod
+    def _read_cell_address(payload: bytes) -> tuple[int, int]:
+        """표 셀(LIST_HEADER)의 (행, 열) 주소를 읽는다.
+
+        payload 앞 8바이트는 공통 헤더(문단 수 + 속성)이고 그 뒤에 열주소·행주소가
+        uint16 으로 이어진다. 주소를 읽을 수 없을 만큼 짧으면 (0, 0) 으로 돌려
+        최소한 내용은 살린다(형식이 다른 파일에서도 죽지 않게 — fail-soft).
+        """
+        if len(payload) < _CELL_MIN_SIZE:
+            return (0, 0)
+        col = int.from_bytes(payload[_CELL_COL_OFFSET : _CELL_COL_OFFSET + 2], "little")
+        row = int.from_bytes(payload[_CELL_ROW_OFFSET : _CELL_ROW_OFFSET + 2], "little")
+        return (row, col)
 
     @staticmethod
     def _iter_records(data: bytes):
-        """레코드 스트림을 (tag_id, payload) 로 순회한다.
+        """레코드 스트림을 (tag_id, level, payload) 로 순회한다.
 
         헤더 DWORD 에서 tag/level/size 를 뽑고, size 가 0xFFF 이면 뒤 4바이트가
-        실제 크기다. 남은 바이트가 모자라면 조용히 멈춘다(손상 파일 방어).
+        실제 크기다. level 은 개체 중첩 깊이라 표의 시작·끝 판정에 쓴다.
+        남은 바이트가 모자라면 조용히 멈춘다(손상 파일 방어).
         """
         pos = 0
         end = len(data)
@@ -273,6 +358,7 @@ class HwpNativeParser(DocumentParser):
             header = int.from_bytes(data[pos : pos + 4], "little")
             pos += 4
             tag_id = header & 0x3FF
+            level = (header >> 10) & 0x3FF
             size = (header >> 20) & 0xFFF
             if size == 0xFFF:  # 확장 크기 — 뒤 4바이트가 진짜 크기
                 if pos + 4 > end:
@@ -281,7 +367,7 @@ class HwpNativeParser(DocumentParser):
                 pos += 4
             if pos + size > end:  # 손상/잘린 스트림
                 return
-            yield tag_id, data[pos : pos + size]
+            yield tag_id, level, data[pos : pos + size]
             pos += size
 
     @staticmethod
@@ -316,7 +402,9 @@ class HwpNativeParser(DocumentParser):
     # ── 내부: 미리보기 폴백 ────────────────────────────────────
 
     @staticmethod
-    def _read_preview_text(ole: olefile.OleFileIO, warnings: list[str]) -> list[str]:
+    def _read_preview_text(
+        ole: olefile.OleFileIO, warnings: list[str]
+    ) -> list[tuple[ElementType, str]]:
         """본문을 못 읽었을 때 PrvText(미리보기 평문)라도 건진다.
 
         PrvText 는 항상 비압축 UTF-16LE 이고 문서 앞부분만 담는다. 전문이 아니므로
@@ -334,7 +422,7 @@ class HwpNativeParser(DocumentParser):
         if not text:
             return []
         warnings.append("본문을 읽지 못해 미리보기 텍스트만 추출했습니다(문서 앞부분 일부).")
-        return [p.strip() for p in text.split("\n") if p.strip()]
+        return [(ElementType.PARAGRAPH, p.strip()) for p in text.split("\n") if p.strip()]
 
     # ── 내부: 결과 조립 ────────────────────────────────────────
 
