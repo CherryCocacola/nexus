@@ -256,7 +256,11 @@ routing:
     max_tokens: 8192          # 도구 호출/프로젝트 작업 — 8192로 상향(4096→8192)
     enable_thinking: false
     top_p: 0.95
-    repetition_penalty: 1.0   # 비활성 — tool_call JSON/XML 반복 토큰 보호(프롬프트 재현 페널티 회피)
+    # 1.0(비활성)→1.05 (2026-08-06 문서 금액 오독 수정 — 근거는 .112.yaml 주석 참조)
+    #   자릿수 구분 숫자에서 영(0) 그룹이 하나 더 붙는 현상(150,000,000 → 1,500,000,000)의
+    #   유일한 원인이 rep 비활성이었다. 실측: rep 1.0 → 0/5, 1.05 → 4~5/5.
+    #   tool_call 무결성은 1.05 에서 확인함(호출 6/6, 경로 리터럴 6/6, 긴 arguments 5/5).
+    repetition_penalty: 1.05
     frequency_penalty: 0.15   # runaway degeneration(반복 붕괴) 억제. rep과 달리 프롬프트 토큰
                               # 미포함 + 출현횟수 비례라 tool_call JSON 무결성 지키며 붕괴만 차단
     presence_penalty: 0.0

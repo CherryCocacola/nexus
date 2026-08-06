@@ -252,7 +252,16 @@ routing:
     max_tokens: 8192          # 도구 호출/프로젝트 작업 — 65536 창 기준(pc.yaml과 동일)
     enable_thinking: false
     top_p: 0.95
-    repetition_penalty: 1.0   # 비활성 — tool_call JSON/XML 반복 토큰 보호(프롬프트 재현 페널티 회피)
+    # 1.0(비활성)→1.05 (2026-08-06 문서 금액 오독 수정)
+    #   왜 바꿨나: 비활성이면 자릿수 구분 숫자에서 영(0) 그룹이 하나 더 붙는다.
+    #     150,000,000 은 ",000" 이 2회, 1,500,000,000 은 3회 — 반복을 막을 장치가
+    #     없으니 모델이 한 그룹 더 붙이는 쪽으로 흘렀다. 실측 결과 rep 만이 원인이고
+    #     temperature(0.0~0.3)·frequency_penalty(0.0~0.15)는 무관했다.
+    #       rep 1.0 → 0/5,  rep 1.02 → 1/5,  rep 1.05 → 4~5/5
+    #   원래 비활성이던 이유(tool_call JSON 반복 키 보호)는 1.05 에서 실측으로 확인해
+    #   문제 없음: 도구 호출 6/6, 긴 경로 리터럴 재현 6/6 정확, 긴 arguments 파싱 5/5.
+    #   (2026-07-20 degeneration 사고는 rep 1.15 였다 — 1.05 는 그보다 훨씬 약하다.)
+    repetition_penalty: 1.05
     frequency_penalty: 0.15   # runaway degeneration(반복 붕괴) 억제. rep과 달리 프롬프트 토큰
                               # 미포함 + 출현횟수 비례라 tool_call JSON 무결성 지키며 붕괴만 차단
     presence_penalty: 0.0

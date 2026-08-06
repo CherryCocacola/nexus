@@ -496,7 +496,11 @@ def test_resolve_chat_query_propagates_sampling_params() -> None:
 
 
 def test_resolve_tool_query_propagates_sampling_params() -> None:
-    """TOOL성 질의의 RoutingDecision에 TOOL 프로필 샘플링 값이 실린다(반복 페널티=1.0)."""
+    """TOOL성 질의의 RoutingDecision에 TOOL 프로필 샘플링 값이 실린다(반복 페널티=1.05).
+
+    1.05인 이유는 test_config.py::test_tool_repetition_penalty_is_weak_but_enabled 참조
+    — 비활성(1.0)이면 문서의 금액을 10배로 잘못 옮긴다.
+    """
     from core.orchestrator.routing import RoutingResolver
 
     cfg = RoutingConfig()
@@ -505,7 +509,7 @@ def test_resolve_tool_query_propagates_sampling_params() -> None:
 
     assert decision.query_class == "TOOL"
     assert decision.top_p == pytest.approx(0.95)
-    assert decision.repetition_penalty == pytest.approx(1.0)
+    assert decision.repetition_penalty == pytest.approx(1.05)
     assert decision.frequency_penalty == pytest.approx(0.0)
     assert decision.presence_penalty == pytest.approx(0.0)
 

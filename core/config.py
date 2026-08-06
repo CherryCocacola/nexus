@@ -653,12 +653,19 @@ class RoutingConfig(BaseModel):
             max_tokens=4096,
             enable_thinking=False,
             description="도구 호출 — Phase 3 LoRA + 중간 temperature",
-            # 도구 호출 모드는 repetition_penalty=1.0(비활성)이 핵심이다.
-            # 왜: tool_call JSON/XML은 같은 키("name","arguments" 등)와 괄호를
-            # 반복할 수밖에 없는데, 반복 페널티를 걸면 이 필수 토큰이 왜곡되어
-            # 파싱 실패를 유발한다. top_p만 0.95로 살짝 좁혀 안정성만 확보.
+            # repetition_penalty 1.0(비활성) → 1.05 (2026-08-06 문서 금액 오독 수정).
+            # 원래 비활성이던 이유: tool_call JSON/XML은 같은 키("name","arguments")와
+            #   괄호를 반복할 수밖에 없는데 반복 페널티가 이 필수 토큰을 왜곡할까 우려.
+            # 왜 바꿨나: 비활성이면 자릿수 구분 숫자에서 영(0) 그룹이 하나 더 붙는다.
+            #   150,000,000 은 ",000" 이 2회, 1,500,000,000 은 3회 — 반복을 막을 장치가
+            #   없어 모델이 한 그룹 더 붙이는 쪽으로 흘렀다(계약금액 10배 오독).
+            #   실측상 rep 만이 원인이고 temperature(0.0~0.3)·frequency_penalty
+            #   (0.0~0.15)는 무관했다: rep 1.0 → 0/5, 1.02 → 1/5, 1.05 → 4~5/5.
+            # 우려했던 부작용은 1.05에서 실측으로 배제했다 — 도구 호출 6/6, 긴 경로
+            #   리터럴 재현 6/6 정확, 긴 arguments JSON 파싱 5/5(오히려 내용이 더 충실).
+            #   (2026-07-20 degeneration 사고는 rep 1.15 였다. 1.05는 그보다 훨씬 약하다.)
             top_p=0.95,
-            repetition_penalty=1.0,
+            repetition_penalty=1.05,
             frequency_penalty=0.0,
             presence_penalty=0.0,
         )

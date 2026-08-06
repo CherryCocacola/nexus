@@ -195,10 +195,10 @@ class TestRoutingConfigClassDefaults:
         assert cfg.chat_mode.presence_penalty == pytest.approx(0.0)
 
     def test_tool_mode_sampling_values(self):
-        """TOOL 프로필 — repetition_penalty=1.0(비활성)이 포맷 보존의 핵심이다."""
+        """TOOL 프로필 — 약한 반복 억제(1.05)로 숫자 자릿수 폭주를 막는다."""
         cfg = RoutingConfig()
         assert cfg.tool_mode.top_p == pytest.approx(0.95)
-        assert cfg.tool_mode.repetition_penalty == pytest.approx(1.0)
+        assert cfg.tool_mode.repetition_penalty == pytest.approx(1.05)
         assert cfg.tool_mode.frequency_penalty == pytest.approx(0.0)
         assert cfg.tool_mode.presence_penalty == pytest.approx(0.0)
 
@@ -207,14 +207,20 @@ class TestRoutingConfigClassDefaults:
         cfg = RoutingConfig()
         assert cfg.knowledge_mode.repetition_penalty > 1.0
 
-    def test_tool_repetition_penalty_format_preserved(self):
-        """회귀 가드 — TOOL은 repetition_penalty == 1.0(tool_call 포맷 보존).
+    def test_tool_repetition_penalty_is_weak_but_enabled(self):
+        """회귀 가드 — TOOL의 repetition_penalty는 '켜져 있되 약해야' 한다.
 
-        왜: tool_call JSON/XML은 같은 키/괄호를 반복해야 하는데 반복 페널티를
-        걸면 필수 토큰이 왜곡되어 파싱 실패를 유발한다.
+        두 방향의 실패를 모두 막는 가드다.
+        - 1.0(비활성)로 되돌리면: 자릿수 구분 숫자에서 영(0) 그룹이 하나 더 붙어
+          계약금액을 10배로 잘못 쓴다(150,000,000 → 1,500,000,000).
+          실측 2026-08-06: rep 1.0 → 0/5, 1.02 → 1/5, 1.05 → 4~5/5.
+        - 너무 올리면(1.15 등): 2026-07-20 degeneration 사고처럼 긴 생성이 붕괴한다.
+
+        원래 1.0이던 이유(tool_call JSON 반복 키 보호)는 1.05에서 실측으로 배제했다
+        — 도구 호출 6/6, 긴 경로 리터럴 재현 6/6, 긴 arguments 파싱 5/5.
         """
         cfg = RoutingConfig()
-        assert cfg.tool_mode.repetition_penalty == pytest.approx(1.0)
+        assert 1.0 < cfg.tool_mode.repetition_penalty <= 1.1
 
 
 # ─────────────────────────────────────────────
