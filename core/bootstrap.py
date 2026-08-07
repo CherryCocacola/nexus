@@ -1519,7 +1519,12 @@ def _build_expanded_system_prompt(tool_names: set[str] | None = None) -> str:
             "whole file and use Write to rewrite it with your change applied. "
             "NEVER end the task telling the user to edit the file themselves — "
             "the file on disk must contain the requested change before you "
-            "finish.\n\n"
+            "finish.\n"
+            "Prefer Edit over Write when changing an existing file. Rewriting a "
+            "whole file means reproducing every line exactly, and long verbatim "
+            "content is where output gets corrupted — a change of three lines "
+            "should not put the other three hundred at risk. Write is for new "
+            "files, or as the fallback above.\n\n"
         )
     else:
         edit_note = ""

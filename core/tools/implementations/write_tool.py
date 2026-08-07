@@ -67,8 +67,19 @@ class WriteTool(BaseTool):
 
     @property
     def description(self) -> str:
-        # 모델에게 노출되는 한 줄 설명. 도구 목록/프롬프트에 들어간다.
-        return "Create or overwrite a file."
+        # 모델에게 노출되는 설명. 도구 목록/프롬프트에 들어간다.
+        #
+        # 2026-08-07: "기존 파일은 Edit 를 쓰라"를 설명에 넣었다.
+        #   실측에서 모델이 파일 전문을 Write 인자로 넘기다 내용이 손상됐다
+        #   (단어 중간 공백, 줄바꿈 소실 → SyntaxError). 긴 리터럴을 통째로
+        #   재현하는 것이 그 자체로 취약한 동작이라, 조각 치환이 더 안전하다.
+        #   구문 검사가 .py/.json 손상은 잡지만 .md·.txt 는 잡을 수 없으므로,
+        #   애초에 통짜 쓰기를 덜 하도록 유도한다.
+        return (
+            "Create a new file, or overwrite one completely. "
+            "To change part of an existing file, prefer Edit — rewriting a whole "
+            "file risks corrupting content that was already correct."
+        )
 
     @property
     def group(self) -> str:

@@ -161,3 +161,31 @@ async def test_edit_still_applies_valid_change(tmp_path):
 
     assert not result.is_error
     assert "return 2" in target.read_text(encoding="utf-8")
+
+
+# ─────────────────────────────────────────────
+# 통짜 쓰기를 덜 하도록 유도 (2026-08-07)
+# ─────────────────────────────────────────────
+#
+# 구문 검사는 .py/.json 손상만 잡는다. .md·.txt·.sh 는 파서가 없어 못 잡으므로,
+# 애초에 파일 전문을 Write 인자로 넘기는 일 자체를 줄이는 편이 낫다.
+# 길이 상한 같은 마찰은 넣지 않았다 — 손상이 9회 중 0회 재현이라 근거가 부족하다.
+
+
+def test_write_description_steers_to_edit():
+    """도구 설명이 '기존 파일은 Edit' 를 가리켜야 한다(모델이 보는 문구)."""
+    description = WriteTool().description
+
+    assert "prefer Edit" in description
+    assert "existing file" in description
+
+
+def test_cli_prompt_prefers_edit_over_write():
+    """CLI 프롬프트에도 같은 방향이 있어야 한다."""
+    from core.bootstrap import _build_expanded_system_prompt
+
+    prompt = _build_expanded_system_prompt()
+
+    assert "Prefer Edit over Write" in prompt
+    # 기존 폴백 규칙(Edit 2회 실패 시 Write)과 모순되지 않아야 한다.
+    assert "use Write to rewrite it" in prompt

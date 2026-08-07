@@ -6273,3 +6273,40 @@ CLI 가 `web/` 을 import 하는 것은 의존성 방향 위반이라(cli·web �
 
 unit+integration **2171 passed**(+10), 전체 e2e 23/23, 드리프트 0건.
 영속화 `nexus-web:cliguard-20260807`(=latest).
+
+---
+
+## 2026-08-07 — 통짜 쓰기 억제 (마찰 없는 부분만)
+
+**요청**: "2 진행해줘 그리고 마무리 하자"
+
+### 근거가 약해진 것을 먼저 밝힌다
+
+원래 ②는 "Write 길이 상한 + Edit 우선"이었다. 그런데 ①(쓰기 전 구문 검사)이
+들어가면서 **관측된 손상은 이미 저장 단계에서 거부된다.** 남은 위험은 파서가 없는
+확장자(`.md`·`.txt`·`.sh`)뿐인데, 그 손상은 9회 중 0회 재현이라 발생률을 모른다.
+
+**모르는 위험에 마찰을 넣지 않았다.** 길이 상한은 정상적인 큰 파일 작성까지 막는데,
+그 대가를 정당화할 근거가 없다. 그래서 마찰이 0인 부분만 했다.
+
+### 한 것
+
+**Write 도구 설명**을 바꿨다. 모델이 도구 목록에서 보는 문구다.
+
+> Create a new file, or overwrite one completely.
+> **To change part of an existing file, prefer Edit** — rewriting a whole file
+> risks corrupting content that was already correct.
+
+**CLI 프롬프트**에 같은 방향을 넣었다.
+
+> Prefer Edit over Write when changing an existing file. … a change of three lines
+> should not put the other three hundred at risk.
+
+기존 폴백 규칙(Edit 2회 실패 시 Write)과 모순되지 않게 문장을 배치했고, 그 성질을
+테스트로 고정했다.
+
+### 검증
+
+단위 테스트 2건 추가(도구 설명·프롬프트 문구, 폴백 규칙 공존 확인).
+unit+integration **2173 passed**, 전체 e2e 23/23, 드리프트 0건(B200 포함).
+영속화 `nexus-web:final-20260807`(=latest).
