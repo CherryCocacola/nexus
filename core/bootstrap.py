@@ -863,6 +863,83 @@ async def _create_redis_client(config: Any) -> Any:
         return None
 
 
+# 신원 로그가 확인하는 "이 DB가 맞는지"의 근거 테이블들.
+# 지식 RAG·장기기억·심볼 검색이 각각 여기에 의존하므로, 셋이 다 비어 있으면
+# 서버는 떠 있어도 실질 기능이 없다.
+_DB_SIGNATURE_TABLES = ("tb_knowledge", "tb_memories", "tb_symbols")
+# 이 크기 미만이면 "사실상 빈 테이블"로 본다(빈 테이블도 페이지 몇 개는 차지한다).
+_EMPTY_TABLE_BYTES = 65536
+
+
+async def _log_db_identity(pool: Any) -> None:
+    """붙은 DB가 **무엇인지**를 한 줄로 남긴다 (2026-08-07).
+
+    [왜 필요한가 — 실제 사고에서 나왔다]
+      재부팅 때 호스트에 설치돼 있던 다른 PostgreSQL이 같은 포트를 4초 먼저
+      선점해, NOVA가 34GB 운영 DB가 아니라 46MB짜리 엉뚱한 DB에 붙었다.
+      그런데 로그에는 "PostgreSQL 연결 성공"이 찍히고 /health도 200이라,
+      지식 RAG도 장기기억도 없는 상태로 48분을 정상처럼 돌았다.
+
+      "붙었다"는 "올바른 것에 붙었다"가 아니다. 그래서 주소·DB명만이 아니라
+      **내용물(크기·행수)**을 함께 남긴다. 46MB와 34GB는 한눈에 구분된다.
+
+    [비용]
+      카탈로그 조회 두 번뿐이다. 행수는 reltuples(추정치)라 실제 스캔을 하지
+      않는다. 크기는 정확하고 즉시 나온다 — 비어 있는지 판정은 크기로 한다
+      (ANALYZE 전이면 reltuples가 -1이라 행수만으로는 판정할 수 없다).
+
+    [실패 시]
+      권한 부족 등으로 조회가 안 되면 조용히 넘어간다. 진단용 로그가
+      부트스트랩을 막아서는 안 된다(fail-soft).
+    """
+    try:
+        async with pool.acquire() as conn:
+            db_name, db_size = await conn.fetchrow(
+                "SELECT current_database(), pg_size_pretty(pg_database_size(current_database()))"
+            )
+            rows = await conn.fetch(
+                """
+                SELECT n.nspname AS schema, c.relname AS name,
+                       c.reltuples::bigint AS est_rows,
+                       pg_total_relation_size(c.oid) AS bytes
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE c.relkind = 'r' AND c.relname = ANY($1::text[])
+                ORDER BY c.relname
+                """,
+                list(_DB_SIGNATURE_TABLES),
+            )
+    except Exception as e:  # noqa: BLE001 — 진단 로그 실패는 무시(fail-soft)
+        logger.debug("[Phase 2] DB 신원 조회 생략: %s", e)
+        return
+
+    if not rows:
+        logger.warning(
+            "[Phase 2] ★DB 신원: %s(%s) — 지식·기억 테이블이 하나도 없습니다. "
+            "신규 DB라면 정상이지만, 기존 데이터에 붙을 의도였다면 접속 대상이 "
+            "잘못된 것입니다.",
+            db_name,
+            db_size,
+        )
+        return
+
+    parts = []
+    for r in rows:
+        est = r["est_rows"]
+        # reltuples는 ANALYZE 전 -1이다. 모르는 값을 숫자인 척 적지 않는다.
+        shown = f"{est:,}행" if est >= 0 else "행수미상"
+        parts.append(f"{r['schema']}.{r['name']}≈{shown}")
+    logger.info("[Phase 2] DB 신원: %s(%s) · %s", db_name, db_size, " · ".join(parts))
+
+    # 테이블은 있는데 전부 비었다면, 붙은 DB가 의도한 대상이 아닐 가능성이 크다.
+    if all(r["bytes"] < _EMPTY_TABLE_BYTES for r in rows):
+        logger.warning(
+            "[Phase 2] ★DB가 비어 있습니다(%s) — 지식 RAG·장기기억이 동작하지 "
+            "않습니다. 접속 대상이 의도한 DB가 맞는지 확인하세요.",
+            db_size,
+        )
+
+
 async def _create_pg_pool(config: Any) -> Any:
     """PostgreSQL 커넥션 풀(asyncpg)을 생성한다.
 
@@ -892,6 +969,7 @@ async def _create_pg_pool(config: Any) -> Any:
             config.postgresql.port,
             config.postgresql.database,
         )
+        await _log_db_identity(pool)
         return pool
     except ImportError:
         logger.warning("[Phase 2] asyncpg 패키지 미설치 — 인메모리 폴백")
