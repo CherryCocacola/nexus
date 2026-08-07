@@ -192,6 +192,9 @@ async def init_phase2(state: GlobalState) -> dict:
         logger.info("[Phase 2] 코딩 ModelProvider 초기화: %s", _coder_url)
     components["coder_provider"] = coder_provider
 
+    # ①-c 모델 서버 신원 확인(2026-08-07) — 주소만 맞는지가 아니라 무엇을 서빙하는지 본다.
+    await _verify_model_endpoints(config)
+
     # ② ToolRegistry — 23개 도구 등록 (실측: _create_tool_registry 등록 개수)
     registry = _create_tool_registry()
     components["tool_registry"] = registry
@@ -861,6 +864,108 @@ async def _create_redis_client(config: Any) -> Any:
     except Exception as e:
         logger.warning("[Phase 2] Redis 연결 실패 — 인메모리 폴백: %s", e)
         return None
+
+
+# ─────────────────────────────────────────────
+# 부팅 자가검증 — 모델 서버가 "무엇을 서빙하는지"를 설정과 대조한다
+# ─────────────────────────────────────────────
+# [왜 필요한가 — 2026-08-07 하루에 두 번 같은 모양으로 당했다]
+#   ① 재부팅 때 다른 PostgreSQL 이 포트를 선점해 NOVA 가 46MB 짜리 엉뚱한 DB 에
+#      붙었는데, 로그에는 "PostgreSQL 연결 성공"만 찍히고 /health 도 200 이었다.
+#   ② 비전·이미지 설정이 B200 이관 후에도 옛 주소를 가리켜 두 도구가 죽어 있었는데,
+#      부팅 로그는 깨끗했다. 게다가 vision_model 이름까지 실제 서빙명과 달랐다
+#      (gemma-4-12b vs gemma-3-27b) — 그 상태로 호출하면 vLLM 이 400 을 낸다.
+#
+#   공통점은 **살아있음(liveness)만 검사하고 정합성(identity)은 아무도 보지 않았다**는
+#   것이다. 그래서 두 실패가 전부 조용했고, 사용자가 기능을 쓸 때까지 드러나지 않았다.
+#   이 함수가 그 구멍을 메운다 — 뜬 것과 제대로 붙은 것은 다르다.
+#
+# [비용] 설정된 엔드포인트에만 GET 한 번씩, 전부 동시에 던지고 3초에 끊는다.
+#        정상이면 수십 ms 다. 죽어 있을 때만 3초 걸리는데, 그때가 알아야 할 때다.
+_ENDPOINT_TIMEOUT_SEC = 3.0
+
+
+async def _probe_openai_endpoint(client: Any, url: str) -> str:
+    """OpenAI 호환 서버가 실제로 서빙 중인 모델명을 돌려준다."""
+    resp = await client.get(f"{url.rstrip('/')}/v1/models")
+    resp.raise_for_status()
+    data = resp.json().get("data") or []
+    if not data:
+        raise ValueError("모델 목록이 비어 있음")
+    return str(data[0].get("id", ""))
+
+
+async def _probe_health_endpoint(client: Any, url: str) -> str:
+    """/health 형식 서버(이미지·임베딩)의 상태와 모델을 한 줄로 만든다."""
+    resp = await client.get(f"{url.rstrip('/')}/health")
+    resp.raise_for_status()
+    body = resp.json()
+    if body.get("status") != "ok":
+        raise ValueError(f"status={body.get('status')}")
+    # 경로형 모델명은 마지막 조각만 쓴다(로그 한 줄에 담기게).
+    model = str(body.get("model", "?")).rstrip("/").split("/")[-1]
+    dim = body.get("dimension")
+    return f"{model}({dim})" if dim else model
+
+
+async def _verify_model_endpoints(config: Any) -> None:
+    """설정된 모델 서버들이 기대한 모델을 서빙하는지 확인해 로그로 남긴다.
+
+    일치하면 한 줄 요약(INFO), 어긋나거나 닿지 않으면 항목마다 WARNING 을 낸다.
+    어떤 실패도 부트스트랩을 막지 않는다(fail-soft) — 진단이 서비스를 죽이면 안 된다.
+    """
+    gs = config.gpu_server
+    # (표시명, 주소, 기대 모델명 또는 None, 검사 방식)
+    targets = [
+        ("추론", config.gpu_server_url, config.model.primary_model, "openai"),
+        ("비전", getattr(gs, "vision_url", ""), getattr(gs, "vision_model", ""), "openai"),
+        ("코딩", getattr(gs, "coder_url", ""), getattr(gs, "coder_model", ""), "openai"),
+        ("이미지", getattr(gs, "image_url", ""), None, "health"),
+        ("임베딩", getattr(gs, "embedding_url", ""), None, "health"),
+    ]
+    targets = [t for t in targets if t[1]]
+    if not targets:
+        return
+
+    try:
+        import httpx
+    except ImportError:  # pragma: no cover - 런타임엔 항상 설치돼 있다
+        return
+
+    async def check(label: str, url: str, expected: str | None, kind: str) -> tuple[str, str]:
+        """(요약문, 경고문) — 경고문이 비어 있으면 정상."""
+        try:
+            async with httpx.AsyncClient(timeout=_ENDPOINT_TIMEOUT_SEC) as client:
+                if kind == "openai":
+                    served = await _probe_openai_endpoint(client, url)
+                else:
+                    served = await _probe_health_endpoint(client, url)
+        except Exception as e:  # noqa: BLE001 — 어떤 실패든 경고로 바꾼다
+            reason = type(e).__name__
+            return f"{label}=닿지않음", f"★{label} 서버에 연결할 수 없습니다: {url} ({reason})"
+
+        if expected and served != expected:
+            return (
+                f"{label}={served}(불일치)",
+                f"★{label} 서버 신원 불일치: 설정={expected}, 실제={served} ({url}) "
+                "— 이 상태로 호출하면 서버가 400을 낸다",
+            )
+        return f"{label}={served}", ""
+
+    results = await asyncio.gather(*(check(*t) for t in targets), return_exceptions=True)
+
+    summary, warnings = [], []
+    for r in results:
+        if isinstance(r, BaseException):  # 방어적 — check()는 자체적으로 다 잡는다
+            continue
+        summary.append(r[0])
+        if r[1]:
+            warnings.append(r[1])
+
+    if summary:
+        logger.info("[Phase 2] 모델 서버 신원: %s", " · ".join(summary))
+    for w in warnings:
+        logger.warning("[Phase 2] %s", w)
 
 
 # 신원 로그가 확인하는 "이 DB가 맞는지"의 근거 테이블들.
