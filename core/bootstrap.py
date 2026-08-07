@@ -1250,8 +1250,27 @@ def _create_web_tool_registry(tier: Any = None):  # noqa: ANN202
     """
     웹 Worker용 도구 레지스트리 (하드웨어 티어 연동, B200 Phase 2).
 
-    ── TIER_S (RTX 5090, 8K ctx) — 현행 그대로(무회귀) ──
-    실행 전용 5개: Edit / Write / Bash / Agent / SymbolSearch.
+    ── ★Bash 제외 (2026-08-07 보안 결정) ──
+    웹 표면에서 BashTool 을 **제거한다**. 실측으로 확인한 사고 경로다.
+
+      유효한 테넌트 키 하나(coding)로 Bash 를 호출해
+        · /app/config/tenants.yaml  → **모든 테넌트의 API 키 평문**
+        · env                        → NEXUS_PG_PASSWORD / NEXUS_REDIS_PASSWORD
+        · /app/data/exports          → 다른 테넌트가 만든 산출물
+      을 모두 읽어냈다. 세션 cwd(/app/.nexus/sessions/{id}/workspace)는 격리돼
+      있지만 Bash 가 그 안에 갇혀 있지 않아 격리가 형식뿐이었다.
+
+    영향: 키를 가진 테넌트가 **다른 모든 테넌트로 사칭**할 수 있고, DB 비밀번호로
+    전체 데이터에 직접 접근할 수 있다. /v1/memories 에 IDOR 방어를 붙여 둔 것이
+    이 옆문 때문에 무의미해진다(같은 날 오전 작업). 인증 자체는 필요하므로
+    익명 접근은 불가하며, 테넌트→테넌트 권한 상승이다.
+
+    되돌리는 조건: Bash 를 세션 workspace 에 가두는 격리(별도 컨테이너·bwrap 등)를
+    구현한 뒤. 경로 차단 규칙만으로는 $(...)·심볼릭 링크·인코딩 우회를 다 막았다고
+    보장할 수 없어 방어선으로 삼지 않는다. CLI 는 로컬 운영자 도구라 그대로 둔다.
+
+    ── TIER_S (RTX 5090, 8K ctx) ──
+    실행 전용 4개: Edit / Write / Agent / SymbolSearch.
     CLI보다 보수적으로 구성한다 — 파일 탐색(Read/Glob/Grep/LS)은 Scout 전용이며
     Agent(subagent_type="scout")로 위임한다. 8K 컨텍스트에 큰 데이터가 직접
     적재되는 상황을 구조적으로 차단하기 위함이다.
@@ -1277,7 +1296,6 @@ def _create_web_tool_registry(tier: Any = None):  # noqa: ANN202
     """
     from core.model.hardware_tier import HardwareTier
     from core.tools.implementations.agent_tool import AgentTool
-    from core.tools.implementations.bash_tool import BashTool
     from core.tools.implementations.edit_tool import EditTool
     from core.tools.implementations.symbol_search_tool import SymbolSearchTool
     from core.tools.implementations.todo_tools import TodoReadTool, TodoWriteTool
@@ -1293,7 +1311,7 @@ def _create_web_tool_registry(tier: Any = None):  # noqa: ANN202
         [
             EditTool(),  # 편집 (~325 토큰)
             WriteTool(),  # 쓰기 (~225 토큰)
-            BashTool(),  # 실행 (~275 토큰)
+            # ※ BashTool 은 웹 표면에서 제외한다 — 위 docstring 의 보안 결정 참조.
             AgentTool(),  # 서브에이전트 호출 (~300 토큰)
             SymbolSearchTool(),  # Phase 10.0 심볼 검색 (~200 토큰)
             TodoWriteTool(),  # 계획 체크리스트 갱신 (전체 목록 원자 교체)
