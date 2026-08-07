@@ -75,12 +75,14 @@ B200_SSH = (
 
 # 배포본과 대조할 코드 확장자(파이썬 캐시·바이너리는 제외).
 CODE_SUFFIXES = (".py", ".html", ".css", ".js", ".md")
+# 컨테이너로 배포되는 디렉토리 전부. 하나라도 빠지면 그만큼이 사각지대가 된다.
+CODE_DIRS = ("core", "web", "cli", "training", "deployment")
 
 # 컨테이너 안에서 실행할 해시 스크립트.
 #   CR 을 지운 내용으로 md5 를 낸다 — 로컬의 content_hash() 와 같은 기준이라야
 #   줄바꿈 차이가 거짓 양성이 되지 않는다(배포본에 CRLF/LF 가 섞여 있다).
 REMOTE_HASH_SCRIPT = r"""cd /app || exit 1
-find core web -type f ! -path '*/__pycache__/*' | while read -r f; do
+find core web cli training deployment -type f ! -path '*/__pycache__/*' | while read -r f; do
   h=$(tr -d '\r' < "$f" | md5sum | cut -d' ' -f1)
   printf '%s %s\n' "$h" "$f"
 done
@@ -161,7 +163,10 @@ def check_code_hashes(r: Remote, rep: Report) -> None:
     실제 사고: config.py 를 커밋만 하고 docker cp 하지 않아 배포본이 뒤처져 있었다.
     """
     root = Path(__file__).resolve().parent.parent
-    git_cmd = ["git", "ls-files", "core", "web"]  # 고정 리터럴 — 사용자 입력 없음
+    # 대조할 디렉토리. 2026-08-07: 처음엔 core·web 만 봤는데 **cli/ 가 사각지대였다** —
+    #   `nexus ask`(비대화형)가 컨테이너에서 AttributeError 로 죽는데도 점검은 "드리프트
+    #   없음"이라고 답했다. 배포되는 코드는 전부 봐야 한다.
+    git_cmd = ["git", "ls-files", *CODE_DIRS]  # 고정 리터럴 — 사용자 입력 없음
     tracked = subprocess.run(  # noqa: S603
         git_cmd,
         cwd=root, capture_output=True, text=True, check=False,
