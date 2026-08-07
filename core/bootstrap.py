@@ -1296,6 +1296,7 @@ def _create_web_tool_registry(tier: Any = None):  # noqa: ANN202
     """
     from core.model.hardware_tier import HardwareTier
     from core.tools.implementations.agent_tool import AgentTool
+    from core.tools.implementations.calculate_tool import CalculateTool
     from core.tools.implementations.edit_tool import EditTool
     from core.tools.implementations.symbol_search_tool import SymbolSearchTool
     from core.tools.implementations.todo_tools import TodoReadTool, TodoWriteTool
@@ -1312,6 +1313,9 @@ def _create_web_tool_registry(tier: Any = None):  # noqa: ANN202
             EditTool(),  # 편집 (~325 토큰)
             WriteTool(),  # 쓰기 (~225 토큰)
             # ※ BashTool 은 웹 표면에서 제외한다 — 위 docstring 의 보안 결정 참조.
+            # Bash 제거로 함께 사라진 "정확한 계산" 수단을 대신한다. 임의 명령 실행
+            # 권한을 되돌리지 않고 산술만 허용하는 순수 계산기다(부작용 없음).
+            CalculateTool(),  # 산술 계산 (~150 토큰)
             AgentTool(),  # 서브에이전트 호출 (~300 토큰)
             SymbolSearchTool(),  # Phase 10.0 심볼 검색 (~200 토큰)
             TodoWriteTool(),  # 계획 체크리스트 갱신 (전체 목록 원자 교체)
