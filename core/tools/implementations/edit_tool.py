@@ -44,6 +44,10 @@ from core.tools.base import (
     ToolResult,
     ToolUseContext,
 )
+from core.tools.validation.syntax_validator import (
+    rejection_message,
+    syntax_error,
+)
 
 logger = logging.getLogger("nexus.tools.edit")
 
@@ -220,6 +224,13 @@ class EditTool(BaseTool):
             if span is not None:
                 start, end = span
                 new_content = content[:start] + new_string + content[end:]
+                # 쓰기 전 구문 검사 — Write 와 같은 이유다(syntax_validator 참조).
+                #   Edit 는 조각 치환이라 손상 위험이 낮지만, Write 가 거부되면
+                #   모델을 이쪽으로 유도하므로 여기도 막아 두지 않으면 구멍이 남는다.
+                detail = syntax_error(file_path, new_content)
+                if detail is not None:
+                    logger.warning("Edit 거부(구문 오류) %s: %s", file_path, detail)
+                    return ToolResult.error(rejection_message(detail))
                 try:
                     _atomic_write(path, new_content)
                 except OSError as e:
@@ -261,7 +272,11 @@ class EditTool(BaseTool):
             # 유일하게 검증된 첫 번째 발생만 교체(세 번째 인자 1 = 최대 1회).
             new_content = content.replace(old_string, new_string, 1)
 
-        # 5단계: 원자적 쓰기로 파일을 교체. 실패 시 원본은 그대로 보존된다.
+        # 5단계: 쓰기 전 구문 검사 → 원자적 쓰기. 실패 시 원본은 그대로 보존된다.
+        detail = syntax_error(file_path, new_content)
+        if detail is not None:
+            logger.warning("Edit 거부(구문 오류) %s: %s", file_path, detail)
+            return ToolResult.error(rejection_message(detail))
         try:
             _atomic_write(path, new_content)
         except OSError as e:

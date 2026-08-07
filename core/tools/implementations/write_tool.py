@@ -36,6 +36,7 @@ from core.tools.base import (
     ToolResult,
     ToolUseContext,
 )
+from core.tools.validation.syntax_validator import rejection_message, syntax_error
 
 # 이 모듈 전용 로거. "nexus.tools.write" 네임스페이스로 로그를 남겨
 # 전체 로깅 설정에서 도구별로 필터링/레벨 조정이 가능하도록 한다.
@@ -161,6 +162,14 @@ class WriteTool(BaseTool):
         content = input_data["content"]
 
         path = Path(file_path)
+
+        # 0단계: 구문 검사 — 디스크에 닿기 전에 막는다.
+        #   깨진 내용을 그대로 저장하고 성공이라 보고하면, 기존 파일은 이미 사라지고
+        #   아무도 손상을 모른다. 여기서 걸면 모델이 그 자리에서 다시 쓴다.
+        detail = syntax_error(file_path, content)
+        if detail is not None:
+            logger.warning("Write 거부(구문 오류) %s: %s", file_path, detail)
+            return ToolResult.error(rejection_message(detail))
 
         # 1단계: 부모 디렉토리 자동 생성
         # parents=True로 중간 경로까지 한 번에 만들고, exist_ok=True로 이미
