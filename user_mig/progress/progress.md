@@ -5446,3 +5446,68 @@ GPU 확인이 실패해도 중단하지 않고 진행한다. watchdog이 계속 
 
 **후속 과제**: 비밀번호를 `.env`(600)로 분리하고 스크립트가 그것을 읽게 바꾼 뒤 본문만
 버전관리로 옮긴다. 그전까지 B200 재구축 시 스크립트를 다시 만들어야 한다.
+
+---
+
+## 2026-08-07 — B200 자격증명 분리 및 스크립트 버전관리 이관
+
+**요청**: "비밀번호 .env 분리해서 나머지 스크립트도 버전관리로 옮겨줘"
+
+### 조사 — 예상보다 상황이 나았다
+
+`.env` 가 **이미 존재**했다(`/NHNHOME/nexus/.env`, `NEXUS_PG_PASSWORD`·`NEXUS_REDIS_PASSWORD`).
+다만 스크립트들이 그것을 쓰지 않고 값을 본문에 다시 적고 있었고, 파일 권한도 **644** 였다.
+
+자격증명 전수 조사 결과(venv 제외).
+
+| 파일 | 자격증명 |
+|---|---|
+| `.env` | 두 비밀번호 (권한 644 → **600으로 조임**) |
+| `start_all.sh` | 본문에 평문 export ×2 |
+| `setup_db.sh` | PG role 비밀번호 + redis.conf 생성 + redis-cli 인증 (3곳) |
+| `redis.conf` | `requirepass` (권한 644 → **600**) |
+| `run_vllm_fp8.sh`·`run_vision.sh`·`run_coder.sh`·`watchdog.sh`·`install_db.sh`·`dl_embed.sh` | **없음** |
+
+### `#` 이 비밀번호를 자를 뻔한 문제
+
+비밀번호가 `...!@#$` 라 `.env` 를 source 할 때 `#` 이후가 주석으로 잘릴 것을 우려해
+**먼저 실측**했다. 결과는 안전했다 — bash 는 `#` 이 **단어 중간**에 있으면 주석으로
+보지 않는다. source 후 길이 9, Redis 인증 PONG, 기존 인라인 값과 일치.
+(값이 아니라 길이와 인증 성공 여부만 확인해 로그에 비밀번호가 남지 않게 했다.)
+
+### 두 스크립트의 실패 방식을 일부러 다르게 했다
+
+| 스크립트 | `.env` 없을 때 | 이유 |
+|---|---|---|
+| `start_all.sh` | 경고만 남기고 **계속 진행** | 이게 곧 크래시 복구 수단이다. Redis 인증 하나 때문에 vLLM·비전·이미지 복구까지 멈추면 손해가 더 크다 |
+| `setup_db.sh` | **즉시 중단**(fail-closed) | 빈 비밀번호로 role 을 만들면 그 순간 DB 가 무인증으로 열린다 |
+
+`setup_db.sh` 는 비밀번호를 SQL 본문에 끼워 넣지 않고 **psql 변수**(`-v pw=… / :'pw'`)로
+넘긴다 — 특수문자에서 따옴표가 깨지고 `ps` 출력에도 노출되기 때문이다.
+`redis.conf` 생성은 `umask 077` 로 감싸 600 을 보장한다(기본 umask 면 644 가 된다).
+
+### 검증
+
+| 항목 | 결과 |
+|---|---|
+| `.env` source 후 값 온전성 | 길이 9/9, Redis PONG, 인라인 값과 일치 |
+| 새 `start_all.sh` cron 환경 실행 | 종료코드 0, 세션 6→6 |
+| **`.env` 없을 때** | 경고 출력 + 종료코드 0 (복구 계속) — 실제로 `.env` 를 잠시 치우고 확인 |
+| 배포본에 비밀번호 리터럴 | `grep -cF` **0건** (남은 `idino` 4건은 전부 계정명 `idino_user`) |
+| 리포에 비밀번호 유출 | 0건 (변수 참조·플레이스홀더만) |
+| 문법 검사 | 9개 스크립트 전부 `bash -n` 통과 |
+| 리포↔서버 해시 | **9개 전부 일치** |
+
+원본은 `start_all.sh.bak-20260807`·`setup_db.sh.bak-20260807` 로 백업했다.
+
+### 결과 — B200 재구축이 가능해졌다
+
+이제 `deployment/b200/` 만으로 GPU 백엔드를 세울 수 있다.
+
+```bash
+cp env.example /NHNHOME/nexus/.env && chmod 600 /NHNHOME/nexus/.env
+bash install_db.sh && bash setup_db.sh && bash dl_embed.sh && bash start_all.sh
+```
+
+서버에만 남는 것은 `.env`·`redis.conf`(둘 다 600)와 `scripts/embed_server.py`·
+`scripts/image_server.py`, 모델 캐시다. **후속 과제**: 두 파이썬 서버도 버전관리로 옮길 것.

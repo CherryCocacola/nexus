@@ -22,9 +22,22 @@ B200(GPU 서버)에서 도는 것들을 재부팅 후 스스로 살아나게 하
                                       watchdog.sh 가 60초마다 start_all.sh 재호출
 ```
 
-- `boot_start.sh` (이 디렉토리) — @reboot 진입점. **이 파일만 리포에 있다.**
-- `start_all.sh`, `run_vllm_fp8.sh`, `run_vision.sh`, `run_coder.sh`, `watchdog.sh`
-  — B200의 `/NHNHOME/nexus/` 에만 있다. 아래 "리포에 없는 이유" 참고.
+### 이 디렉토리의 파일 (전부 `/NHNHOME/nexus/` 로 배포된다)
+
+| 파일 | 역할 |
+|---|---|
+| `boot_start.sh` | `@reboot` 진입점. 마운트·GPU 준비를 기다렸다 `start_all.sh` 호출 |
+| `start_all.sh` | **멱등** 기동기. 포트를 확인해 죽은 것만 띄운다 |
+| `watchdog.sh` | 60초마다 `start_all.sh` 재호출 — 크래시 자가복구 |
+| `run_vllm_fp8.sh` | A.X-4.0 FP8 (GPU0:8001, util 0.70) |
+| `run_vision.sh` | Gemma 3 27B 비전 (GPU1:8004, util 0.42) |
+| `run_coder.sh` | Devstral Small (GPU0:8005, util 0.20) |
+| `setup_db.sh` | PG17+Redis 최초 구성(1회성) |
+| `install_db.sh` / `dl_embed.sh` | 패키지 설치 / 임베딩 모델 내려받기 |
+| `env.example` / `redis.conf.example` | 자격증명 템플릿 — 아래 참고 |
+
+**서버에만 있는 것**: `.env`(600), `redis.conf`(600), `scripts/embed_server.py`,
+`scripts/image_server.py`, 모델 캐시. 앞의 둘은 자격증명이라 버전관리에 올리지 않는다.
 
 `boot_start.sh` 가 start_all.sh 를 그냥 부르지 않고 감싸는 이유는, `@reboot` 가
 부팅 아주 이른 시점에 돌기 때문이다. 그때는 `/NHNHOME` 마운트나 NVIDIA 드라이버가
@@ -63,16 +76,35 @@ tmux ls                          # 6개 세션(vllm·embed·image·vision·coder
 `/tmp/nexus_boot.log` 를 확인**할 것. 파일이 없으면 @reboot 가 돌지 않은 것이므로
 수동으로 `bash /NHNHOME/nexus/start_all.sh` 를 실행하고 원인을 봐야 한다.
 
-## 리포에 없는 이유 — `start_all.sh` 의 자격증명
+## 자격증명 분리 (2026-08-07)
 
-`start_all.sh` 는 PG·Redis 비밀번호를 **평문으로 export** 한다.
+전에는 `start_all.sh` 와 `setup_db.sh` 가 PG·Redis 비밀번호를 **본문에 평문으로** 갖고
+있었다. 그래서 이 스크립트들을 버전관리에 올릴 수 없었고, 서버가 재구축되면 GPU
+백엔드를 살리는 수단 자체가 사라지는 상태였다. 보안 문제이자 **복구 가능성 문제**였다.
+
+지금은 `/NHNHOME/nexus/.env`(600)에서 읽는다.
 
 ```bash
-export NEXUS_PG_PASSWORD="…"
-export NEXUS_REDIS_PASSWORD="…"
+set -a; . "$N/.env"; set +a     # 읽는 동안만 자동 export → 자식 tmux 세션이 물려받는다
 ```
 
-그대로 커밋하면 자격증명이 git 이력에 영구히 남는다(프로젝트 규칙: 비밀번호 커밋 금지).
-그래서 이 파일은 서버에만 두었다. **후속 과제**: 비밀번호를 별도 파일(`.env`, 600)로
-빼고 `start_all.sh` 가 그것을 읽게 바꾼 뒤, 스크립트 본문만 여기로 옮긴다.
-그전까지 B200 이 재구축되면 이 스크립트들을 다시 만들어야 한다.
+값에 따옴표는 필요 없다. `#` 이 단어 중간에 있으면 주석이 아니기 때문이다
+(`NEXUS_PG_PASSWORD=abc!@#$` 는 온전히 읽힌다 — 실측 확인). 공백이 있으면 감싸야 한다.
+
+**두 스크립트의 실패 방식이 다르다. 의도된 것이다.**
+
+| 스크립트 | `.env` 없을 때 | 왜 |
+|---|---|---|
+| `start_all.sh` | 경고만 남기고 **계속 진행** | 이게 곧 크래시 복구 수단이다. Redis 인증 하나 때문에 vLLM·비전·이미지 복구까지 멈추면 손해가 더 크다 |
+| `setup_db.sh` | **즉시 중단**(fail-closed) | 빈 비밀번호로 role 을 만들면 그 순간 DB 가 무인증으로 열린다 |
+
+`redis.conf` 는 `requirepass` 를 담으므로 서버에만 둔다. `setup_db.sh` 가 `.env` 값으로
+생성하며 `umask 077` 로 600 을 보장한다(기본 umask 로 두면 644 가 된다).
+
+### 새 서버에서
+
+```bash
+cp env.example /NHNHOME/nexus/.env && chmod 600 /NHNHOME/nexus/.env   # 값 채우기
+bash install_db.sh && bash setup_db.sh && bash dl_embed.sh
+bash start_all.sh
+```

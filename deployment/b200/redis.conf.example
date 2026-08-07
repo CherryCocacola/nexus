@@ -1,0 +1,8 @@
+# B200 로컬 Redis 설정 템플릿. 실제 파일(/NHNHOME/nexus/redis.conf)은
+# setup_db.sh 가 .env 의 NEXUS_REDIS_PASSWORD 로 생성하며 600 으로 조인다.
+# requirepass 가 들어가므로 실제 파일은 버전관리에 올리지 않는다.
+port 6340
+bind 127.0.0.1
+requirepass <NEXUS_REDIS_PASSWORD>
+dir /NHNHOME/nexus/redis_data
+appendonly no
