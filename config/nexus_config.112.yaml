@@ -42,9 +42,13 @@
 gpu_server:
   url: "http://127.0.0.1:18001"            # B200 vLLM(A.X-4.0, 65536창) — 112 상주 SSH 터널 로컬포트(18001→bastion→B200:8001)
   embedding_url: "http://192.168.21.112:8002"  # 임베딩은 112 로컬 e5-large 유지(3단계 e2e 검증, 터널 부담 최소화)
-  image_url: "http://192.168.21.112:8003"      # 112 로컬(현재 llama-server) — 텍스트 e2e에선 미사용
-  vision_url: "http://192.168.21.112:8004"     # 112 로컬 비전(있으면) — 텍스트 e2e에선 미사용
-  vision_model: "gemma-4-12b"              # 비전 요청 body의 served-model-name(vLLM --served-model-name과 일치)
+  # 2026-08-07 수정: 이미지·비전은 112 로컬이 아니라 **B200 터널 포트**다.
+  #   B200 이관 때 서버는 옮겼는데 이 두 줄이 옛 112 로컬 주소로 남아 있었고,
+  #   실측 결과 192.168.21.112:8003/8004 에는 아무것도 리슨하지 않아
+  #   ImageGenerate·AnalyzeImage 가 연결 실패 상태였다(터널 포트로는 정상 응답).
+  image_url: "http://127.0.0.1:18003"      # SD 3.5 Large 이미지 서버(터널 18003→B200:8003)
+  vision_url: "http://127.0.0.1:18004"     # 비전 VLM(터널 18004→B200:8004)
+  vision_model: "gemma-3-27b"              # 요청 body의 served-model-name — 실제 서빙명과 일치해야 400이 안 난다
   coder_url: "http://127.0.0.1:18005"      # Devstral 코딩 서브모델(터널 로컬포트, 2026-08-05)
   coder_model: "devstral-small"           # served-model-name과 일치
   timeout_seconds: 120.0     # 단일 요청 타임아웃 — 장문 생성 여유까지 고려한 값
