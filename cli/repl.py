@@ -647,6 +647,8 @@ class NexusREPL:
         self._formatter.reset_stream_state()
         # /copy가 "직전 답변"만 담도록 매 턴 초기화한다.
         self._last_response = ""
+        # 사후 검증이 볼 구간의 시작점 — 이번 턴에 추가된 메시지만 근거로 삼는다.
+        turn_start = len(getattr(self._query_engine, "_messages", []))
 
         # ── 스트리밍 + 진행 스피너 ──
         # QueryEngine.submit_message()는 AsyncGenerator로 이벤트를 하나씩 흘려준다.
@@ -711,6 +713,22 @@ class NexusREPL:
             # 어떤 경로로 끝나든(정상/취소/예외) 스피너가 남아있지 않도록 최종 안전 장치.
             # 예: TEXT_DELTA가 한 번도 안 와서 스피너가 계속 떠 있는 상태로 끝난 경우.
             self._suspend_spinner()
+
+        # ── 사후 검증 ──
+        # 이미 흘려보낸 본문은 고치지 않고, 확인이 필요한 것만 뒤에 덧붙인다.
+        #   왜 CLI 에도 필요한가: 숫자 자릿수 오류와 "실행하지 않고 통과했다고 단정"이
+        #   실측된 곳이 바로 CLI 였다. 검증기가 웹에만 있으면 정작 문제가 나는 표면이
+        #   무방비다.
+        #   _last_response 는 /copy 용으로 이미 이번 턴 본문만 담고 있어 그대로 쓴다.
+        if self._last_response:
+            from core.verification.post_check import build_answer_warnings
+
+            warning = build_answer_warnings(
+                self._last_response,
+                getattr(self._query_engine, "_messages", [])[turn_start:],
+            )
+            if warning:
+                self.console.print(warning)
 
     def _suspend_spinner(self) -> None:
         """진행 스피너가 떠 있으면 닫는다(멱등). 없으면 아무것도 하지 않는다.

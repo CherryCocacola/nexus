@@ -327,6 +327,13 @@ def ask(query: str, log_level: str) -> None:
         saw_text = False   # 답변 텍스트(TEXT_DELTA)를 한 조각이라도 받았는가
         had_error = False  # 스트림 도중 ERROR 이벤트가 있었는가
 
+        # 사후 검증용 — 흘려보낸 답변을 모아 두고, 이번 턴 구간의 시작을 기억한다.
+        #   왜 CLI 에도 필요한가: 숫자 자릿수 오류와 "실행하지 않고 통과했다고 단정"이
+        #   실측된 곳이 바로 CLI 였다. 검증기가 웹에만 있으면 정작 문제가 나는 표면이
+        #   무방비다.
+        answer_parts: list[str] = []
+        turn_start = len(getattr(engine, "_messages", []))
+
         async for event in engine.submit_message(query):
             if not isinstance(event, StreamEvent):
                 continue
@@ -338,6 +345,7 @@ def ask(query: str, log_level: str) -> None:
                 continue
             if event.type == StreamEventType.TEXT_DELTA and event.text:
                 saw_text = True
+                answer_parts.append(event.text)
                 out = fmt.format_text_delta(event.text)
                 if out:
                     # end="" 로 조각을 이어붙여 스트리밍이 자연스럽게 흐르도록 한다.
@@ -345,6 +353,18 @@ def ask(query: str, log_level: str) -> None:
 
         if saw_text:
             console.print()  # 마지막 개행 — 파이프·터미널 모두에서 줄이 끊기지 않게
+
+        # 사후 검증 — 이미 흘려보낸 본문은 고치지 않고 경고만 뒤에 덧붙인다.
+        #   답변을 되돌려 고치는 것은 스트리밍에서 불가능하고, 조용한 자동 교정은
+        #   틀렸을 때 발견조차 안 된다. 사실만 붙여 사람이 판단하게 한다.
+        if saw_text:
+            from core.verification.post_check import build_answer_warnings
+
+            warning = build_answer_warnings(
+                "".join(answer_parts), getattr(engine, "_messages", [])[turn_start:]
+            )
+            if warning:
+                console.print(warning)
 
         # 실패(연결·컨텍스트 초과 등)나 빈 응답을 성공(exit 0)으로 오인하면 CI가 무너진다.
         if had_error or not saw_text:
