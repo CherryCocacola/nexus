@@ -41,6 +41,12 @@ _GROUPED_NUMBER = re.compile(r"\d{1,3}(?:,\d{3})+")
 # 경고를 붙일 최대 개수 — 답변 끝에 목록이 길게 붙어 본문을 가리지 않게 한다.
 _MAX_WARNINGS = 5
 
+# '전사 오염' 판정에 허용하는 편집 거리(2026-08-07 추가).
+#   2 로 둔 근거: 실측된 오염 `506,628` → `500,662` 가 거리 2 다(삽입 1 + 삭제 1).
+#   3 이상으로 넓히면 서로 무관한 값끼리 걸려 오탐이 는다. 자릿수가 같아야 한다는
+#   조건과 함께 걸어 "베낀 값이 어긋난 경우"만 좁게 잡는다.
+_NEAR_MISS_EDITS = 2
+
 
 @dataclass(frozen=True)
 class UncitedNumber:
@@ -59,6 +65,30 @@ class UncitedNumber:
 def _digits(value: str) -> str:
     """쉼표를 뗀 숫자 문자열."""
     return value.replace(",", "")
+
+
+def _edit_distance_at_most(a: str, b: str, limit: int) -> bool:
+    """편집 거리가 limit 이하인지 판정한다(그 이상은 값을 계산하지 않고 False).
+
+    자릿수가 같은데 몇 글자만 다른 값을 찾기 위한 것이다. 숫자 문자열이라
+    길이가 짧아(보통 15자 이하) 단순 DP 로 충분하다.
+    """
+    if abs(len(a) - len(b)) > limit:
+        return False
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, start=1):
+        cur = [i] + [0] * len(b)
+        for j, cb in enumerate(b, start=1):
+            cur[j] = min(
+                prev[j] + 1,  # 삭제
+                cur[j - 1] + 1,  # 삽입
+                prev[j - 1] + (ca != cb),  # 치환
+            )
+        # 이 행의 최솟값이 이미 limit 을 넘으면 더 볼 필요가 없다.
+        if min(cur) > limit:
+            return False
+        prev = cur
+    return prev[-1] <= limit
 
 
 def _significant(value: str) -> str:
@@ -89,11 +119,15 @@ def find_uncited_numbers(answer: str, sources: list[str]) -> list[UncitedNumber]
     if not source_text:
         return []
 
-    # 근거 자료에 있는 숫자들을 '유효 숫자 부분' 기준으로 묶어 둔다.
+    # 근거 자료에 있는 숫자들을 두 가지로 색인해 둔다.
+    #   ① 유효 숫자 부분 — 자릿수(scale)만 틀린 값을 찾는다.
+    #   ② 자릿수 길이     — 같은 길이인데 몇 글자만 다른 값(전사 오염)을 찾는다.
     source_numbers = _GROUPED_NUMBER.findall(source_text)
     by_significant: dict[str, list[str]] = {}
+    by_length: dict[int, list[str]] = {}
     for number in source_numbers:
         by_significant.setdefault(_significant(number), []).append(number)
+        by_length.setdefault(len(_digits(number)), []).append(number)
 
     found: list[UncitedNumber] = []
     seen: set[str] = set()
@@ -104,8 +138,23 @@ def find_uncited_numbers(answer: str, sources: list[str]) -> list[UncitedNumber]
         # 원문에 그대로 있으면 정상이다.
         if number in source_text:
             continue
-        # 자릿수만 다른 비슷한 값이 원문에 있을 때만 경고한다(계산값 오탐 방지).
+
+        # 규칙 ① 자릿수만 다른 값 — 150,000,000 → 1,500,000,000 형태(10·100배 오독).
         similar = [s for s in by_significant.get(_significant(number), []) if s != number]
+
+        # 규칙 ② 전사 오염 — 자릿수는 같은데 몇 글자만 다른 값.
+        #   실측(2026-08-07): Calculate 도구가 `506,628` 을 정확히 돌려줬는데 모델이
+        #   답변에 `500,662` 라고 옮겨 적었다(2/2 재현). 유효 숫자가 달라 규칙 ①에
+        #   걸리지 않는다. 자릿수가 같을 것을 요구해 오탐을 억제한다 —
+        #   모델이 실제로 계산한 파생값(부가세·합계 등)은 대개 자릿수가 다르다.
+        if not similar:
+            digits = _digits(number)
+            similar = [
+                s
+                for s in by_length.get(len(digits), [])
+                if s != number and _edit_distance_at_most(digits, _digits(s), _NEAR_MISS_EDITS)
+            ]
+
         if not similar:
             continue
         # 중복 제거하되 원문 등장 순서를 지킨다.

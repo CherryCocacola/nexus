@@ -122,3 +122,55 @@ def test_warning_caps_the_list():
 
     assert text.count("→ 문서에 있는 값") <= 5
     assert "그 외" in text
+
+
+# ─────────────────────────────────────────────
+# 규칙② 전사 오염 — 자릿수는 같은데 몇 글자만 다른 값 (2026-08-07)
+# ─────────────────────────────────────────────
+#
+# 실측: Calculate 도구가 `506,628` 을 정확히 돌려줬는데 모델이 답변에 `500,662` 라고
+# 옮겨 적었다(2/2 재현). 유효 숫자가 달라 규칙①(자릿수만 틀린 값)에 걸리지 않는다.
+# 도구가 정답을 준 턴에는 서버에 정답이 있으므로, 이 형태를 잡을 수 있어야 한다.
+
+
+def test_transcription_corruption_is_caught():
+    """★실측 재현 — 도구 결과 506,628 을 답변이 500,662 로 옮겼다."""
+    from core.verification.number_citation import find_uncited_numbers
+
+    found = find_uncited_numbers(
+        "18,764 곱하기 27은 500,662입니다.", ["18764 * 27 = 506,628"]
+    )
+
+    assert [f.value for f in found] == ["500,662"]
+    assert found[0].similar == ("506,628",)
+
+
+def test_different_digit_length_does_not_trigger_rule2():
+    """자릿수가 다르면 규칙②는 발동하지 않는다 — 오탐 억제의 핵심 조건.
+
+    모델이 실제로 계산한 파생값(부가세·1/10 등)은 대개 자릿수가 다르다.
+    """
+    from core.verification.number_citation import _digits, _significant
+
+    # 1,500,000(7자리)과 15,000,000(8자리) — 길이가 달라 규칙② 대상이 아니다.
+    assert len(_digits("1,500,000")) != len(_digits("15,000,000"))
+    # (이 조합은 규칙①이 잡는다 — 유효 숫자가 둘 다 "15" 이므로.)
+    assert _significant("1,500,000") == _significant("15,000,000")
+
+
+def test_far_numbers_of_same_length_are_not_flagged():
+    """자릿수가 같아도 충분히 다르면 경고하지 않는다(무관한 값 오탐 방지)."""
+    from core.verification.number_citation import find_uncited_numbers
+
+    assert find_uncited_numbers("직원 123,456명", ["매출 987,654원"]) == []
+    assert find_uncited_numbers("약 1,235,000원", ["정확히 1,234,567원"]) == []
+
+
+def test_edit_distance_helper_bounds():
+    """편집 거리 계산기가 상한을 지키는지 — 넘으면 계산을 이어가지 않는다."""
+    from core.verification.number_citation import _edit_distance_at_most
+
+    assert _edit_distance_at_most("506628", "500662", 2) is True  # 실측 케이스
+    assert _edit_distance_at_most("506628", "506628", 2) is True  # 동일
+    assert _edit_distance_at_most("123456", "987654", 2) is False  # 완전히 다름
+    assert _edit_distance_at_most("1234567", "123456", 0) is False  # 길이 차 > 한계
