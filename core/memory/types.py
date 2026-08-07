@@ -33,6 +33,7 @@ Nexus는 대화·지식·습관 등을 '기억'으로 저장한다. 이 모듈�
 
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import UTC, datetime
 from enum import Enum
@@ -163,6 +164,47 @@ def is_rag_chunk(entry: MemoryEntry) -> bool:
     대화 회상 쪽은 이 함수가 True인 항목을 제외해 코드 조각이 섞이지 않게 한다.
     """
     return entry.metadata.get("source") == _RAG_SOURCE or _RAG_TAG in entry.tags
+
+
+# ─────────────────────────────────────────────
+# 기계 봉투(protocol envelope) 판별 — 기억으로 남길 값이 없는 것
+# ─────────────────────────────────────────────
+# 왜 필요한가 (2026-08-07 실측):
+#   VSCode 플러그인 같은 클라이언트는 사용자 발화를 그대로 보내지 않고,
+#   "[COMPANY_CODING_AGENT_REQUEST] 당신은 VSCode 안에서 동작하는 코딩 Agent입니다…"
+#   같은 지시문 봉투로 감싸 보낸다. 도구 결과도 "[AGENT_TOOL_RESULTS] …" 로 들어오고,
+#   플러그인 응답은 {"type": "chat_response", …} JSON이다.
+#   이것들은 길고 키워드가 많아 중요도 평가를 쉽게 통과한다. 실측에서 소유자 있는
+#   대화 기억 14건 중 **7건(50%)**이 이 봉투였다. 플러그인은 요청마다 이걸 만들므로
+#   방치하면 그 테넌트의 기억이 통째로 스캐폴딩으로 채워지고, 회상이 그 쓰레기를
+#   다음 프롬프트에 도로 주입한다(오늘 고친 회상 되먹임과 같은 형태의 오염이다).
+#
+#   판별은 **접두 일치**로만 한다. 사용자가 대화 중에 이런 문자열을 인용할 수도 있어
+#   "포함"으로 잡으면 정상 발화까지 버리게 된다. 봉투는 항상 맨 앞에서 시작한다.
+_ENVELOPE_PREFIXES = (
+    "[COMPANY_CODING_AGENT_REQUEST]",
+    "[AGENT_TOOL_RESULTS]",
+)
+
+
+def is_machine_envelope(content: str) -> bool:
+    """클라이언트가 씌운 프로토콜 봉투인지 판별한다(기억 승격 제외 대상).
+
+    사용자가 말한 내용이 아니라 통합 계층이 만든 형식이므로, 나중에 회상해 봐야
+    도움이 되지 않고 오히려 컨텍스트만 차지한다.
+    """
+    text = (content or "").lstrip()
+    if text.startswith(_ENVELOPE_PREFIXES):
+        return True
+    # 플러그인 응답 JSON — `{"type": "...")` 형태로 시작하는 것만 본다.
+    # 사용자가 JSON을 붙여넣어 질문하는 경우까지 막지 않도록 조건을 좁게 둔다.
+    if text.startswith("{"):
+        try:
+            parsed = json.loads(text)
+        except (ValueError, TypeError):
+            return False
+        return isinstance(parsed, dict) and "type" in parsed
+    return False
 
 
 # ─────────────────────────────────────────────

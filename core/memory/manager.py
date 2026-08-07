@@ -40,7 +40,12 @@ from typing import TYPE_CHECKING
 from core.memory.importance import ImportanceAssessor
 from core.memory.long_term import LongTermMemory
 from core.memory.short_term import ShortTermMemory
-from core.memory.types import MemoryEntry, MemoryType, is_rag_chunk
+from core.memory.types import (
+    MemoryEntry,
+    MemoryType,
+    is_machine_envelope,
+    is_rag_chunk,
+)
 
 if TYPE_CHECKING:
     from core.message import Message
@@ -245,6 +250,15 @@ class MemoryManager:
             content = msg.text_content
             # 내용이 비었거나 너무 짧으면(20자 미만) 저장 가치가 낮아 건너뛴다.
             if not content or len(content) < 20:
+                continue
+
+            # 클라이언트가 씌운 프로토콜 봉투는 승격하지 않는다(2026-08-07).
+            #   VSCode 플러그인의 "[COMPANY_CODING_AGENT_REQUEST] …" 지시문이나
+            #   "[AGENT_TOOL_RESULTS] …", 응답 JSON 같은 것들이다. 길고 키워드가
+            #   많아 중요도 평가를 쉽게 통과하는데(실측: 대화 기억의 50%가 이것),
+            #   사용자가 말한 내용이 아니라 회상해 봐야 컨텍스트만 차지한다.
+            if is_machine_envelope(content):
+                logger.debug("승격 제외(기계 봉투): %s…", content[:40])
                 continue
 
             # 중요도 평가 — EPISODIC(일화 기억) 타입 기준으로 점수를 매긴다.

@@ -313,3 +313,57 @@ def test_english_memory_request_is_promoted():
     _score, promoted = _assessed("My team standup is at 10am. Please remember this.")
 
     assert promoted is True
+
+
+# ─────────────────────────────────────────────
+# 기계 봉투 제외 — 클라이언트가 씌운 형식은 기억이 아니다
+# ─────────────────────────────────────────────
+#
+# 실측(2026-08-07): 소유자 있는 대화 기억 14건 중 7건(50%)이 VSCode 플러그인이 씌운
+# "[COMPANY_CODING_AGENT_REQUEST] …" 지시문 봉투와 "[AGENT_TOOL_RESULTS] …" 였다.
+# 길고 코딩 어휘가 많아 중요도 평가를 쉽게 통과한다. 플러그인은 요청마다 이걸 만들어
+# 보내므로, 막지 않으면 그 테넌트의 기억이 통째로 스캐폴딩이 되고 회상이 그것을
+# 다음 프롬프트에 도로 주입한다.
+
+
+def test_plugin_request_envelope_is_not_memory():
+    """VSCode 플러그인 지시문 봉투는 기억 대상이 아니다."""
+    from core.memory.types import is_machine_envelope
+
+    assert is_machine_envelope(
+        "[COMPANY_CODING_AGENT_REQUEST]\n당신은 VSCode 안에서 동작하는 코딩 Agent입니다."
+    )
+
+
+def test_agent_tool_results_envelope_is_not_memory():
+    """도구 결과 봉투도 마찬가지다."""
+    from core.memory.types import is_machine_envelope
+
+    assert is_machine_envelope("[AGENT_TOOL_RESULTS]\n아래 결과는 참고 데이터입니다.")
+
+
+def test_plugin_response_json_is_not_memory():
+    """`type` 키를 가진 응답 JSON도 제외한다."""
+    from core.memory.types import is_machine_envelope
+
+    assert is_machine_envelope('{"type": "chat_response", "content": "개선사항을 적용"}')
+
+
+def test_user_utterance_is_still_memory():
+    """★사람이 말한 것은 그대로 통과해야 한다(과잉 차단 방지)."""
+    from core.memory.types import is_machine_envelope
+
+    for text in (
+        "제 소속은 정보전산원입니다. 기억해 주세요.",
+        "이 함수를 리팩터링해줘",
+        "[중요] 내일 회의는 10시입니다. 기억해 주세요.",  # 대괄호로 시작해도 봉투는 아니다
+    ):
+        assert is_machine_envelope(text) is False, f"정상 발화가 차단됨: {text}"
+
+
+def test_pasted_json_without_type_is_still_memory():
+    """사용자가 붙여넣은 JSON은 막지 않는다 — 조건을 좁게 뒀다."""
+    from core.memory.types import is_machine_envelope
+
+    assert is_machine_envelope('{"name": "홍길동", "dept": "정보전산원"}') is False
+    assert is_machine_envelope("{ 이건 JSON이 아니라 그냥 중괄호") is False
