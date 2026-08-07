@@ -1591,6 +1591,31 @@ def _build_expanded_system_prompt(tool_names: set[str] | None = None) -> str:
     else:
         verify_rule = ""
 
+    # 코드 자가검증(2026-08-07 실측 근거):
+    #   같은 코딩 과제 6개를 CLI(도구 26개)로 돌렸더니 **전부 tool_use=0** 이었다.
+    #   Bash·Write 를 쥐고도 한 턴에 답만 쓰고 끝냈다. 디버깅·리팩터링은 그래도
+    #   통과했지만 테스트 작성은 실패했다 — 기대값을 머릿속으로 계산해 적었기
+    #   때문이다(`1h30m15s` 를 5415 가 아니라 5115 로 적는 식).
+    #   위 verify_rule 은 "서버 기동·설치" 같은 상태 변경만 다뤄 코드에는 걸리지 않았다.
+    #   그래서 "실행해 볼 수 있는 코드를 썼으면 실행하라"를 따로 명시한다.
+    #
+    #   상한을 함께 둔다 — 같은 날 렌더 자가검증 루프가 종료 조건 없이 4회를 돌았다.
+    if {"Bash", "Write"} <= names:
+        code_verify_rule = (
+            "- When you write code that CAN be run (a test file, a script, a small "
+            "function you can exercise), actually RUN it with Bash before you "
+            "answer, and report what it printed. Do NOT predict what it would "
+            "output.\n"
+            "  This matters most for tests: never write an expected value you "
+            "computed in your head (e.g. asserting `parse_duration('1h30m15s') == "
+            "5115` when it is 5415). Write the test, run it, and fix whichever "
+            "side is actually wrong.\n"
+            "  Bound the loop: at most 2 fix-and-rerun cycles. If it still fails, "
+            "stop and report the failure honestly with the real output.\n"
+        )
+    else:
+        code_verify_rule = ""
+
     return (
         "You are IDINO NOVA, an AI assistant in an air-gapped environment.\n"
         "You have a large context window and direct access to your tools — "
@@ -1611,6 +1636,7 @@ def _build_expanded_system_prompt(tool_names: set[str] | None = None) -> str:
         "- NEVER call a tool that is not in the list above.\n"
         + observe_rule
         + verify_rule
+        + code_verify_rule
         + "- Simple conversational questions → answer directly, no tools.\n"
     )
 

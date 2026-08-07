@@ -75,3 +75,40 @@ def test_web_prompt_does_not_advertise_removed_tools():
     for name in ("worker_system.md", "worker_system_full.md"):
         text = (root / "web" / "prompts" / name).read_text(encoding="utf-8")
         assert "- Bash:" not in text, f"{name} 이 아직 Bash 를 도구로 안내한다"
+
+
+# ─────────────────────────────────────────────
+# 코드 자가검증 규칙 (2026-08-07)
+# ─────────────────────────────────────────────
+#
+# 실측: 같은 코딩 과제 6개를 CLI(도구 26개)로 돌렸더니 전부 tool_use=0 이었다.
+# Bash·Write 를 쥐고도 한 턴에 답만 쓰고 끝냈고, 테스트 작성은 기대값을 머릿속으로
+# 계산해 적어 실패했다. 기존 verify_rule 은 "서버 기동·설치" 같은 상태 변경만
+# 다뤄 코드에는 걸리지 않았다.
+
+
+def test_cli_prompt_tells_model_to_run_code_it_writes():
+    """CLI 프롬프트에 '쓴 코드를 실행해 확인하라'가 들어 있어야 한다."""
+    from core.bootstrap import _build_expanded_system_prompt
+
+    prompt = _build_expanded_system_prompt()
+
+    assert "actually RUN it with Bash" in prompt
+    # 머릿속 계산으로 기대값을 적지 말라는 지시가 함께 있어야 한다(실패의 직접 원인).
+    assert "computed in your head" in prompt
+
+
+def test_code_verify_rule_bounds_the_loop():
+    """루프 상한이 명시돼야 한다 — 같은 날 렌더 루프가 종료 조건 없이 4회를 돌았다."""
+    from core.bootstrap import _build_expanded_system_prompt
+
+    assert "at most 2 fix-and-rerun cycles" in _build_expanded_system_prompt()
+
+
+def test_code_verify_rule_absent_without_tools():
+    """Bash·Write 가 없는 도구 풀에서는 이 지시를 넣지 않는다(없는 도구 호출 방지)."""
+    from core.bootstrap import _build_expanded_system_prompt
+
+    prompt = _build_expanded_system_prompt(tool_names={"Read", "Glob"})
+
+    assert "actually RUN it with Bash" not in prompt
