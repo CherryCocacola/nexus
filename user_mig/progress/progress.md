@@ -5370,3 +5370,79 @@ unit+integration **2090 passed**(+6), 전체 e2e **23/23**.
 HEAD 시점의 `core/bootstrap.py`가 **원래** 포맷 미준수였다 — 기존 드리프트다.
 HEAD 원본에 내 블록만 다시 얹어 **순수 추가 78줄**로 되돌렸다. 무관한 재포맷을 커밋에
 섞으면 나중에 이 커밋을 되돌릴 때 관계없는 것까지 딸려간다.
+
+---
+
+## 2026-08-07 — B200 재부팅 자동기동
+
+**요청**: "진행" (B200 systemd 등록)
+
+112는 systemd로 정리돼 있는데 B200에는 유닛이 **하나도 없었다**. vLLM 3개(A.X·Gemma·
+Devstral)와 비전·이미지·watchdog이 전부 tmux 수동 기동이라, 재부팅하면 전부 손으로
+살려야 하는 상태였다.
+
+### systemd 는 불가능했다
+
+| 시도 | 결과 |
+|---|---|
+| 시스템 유닛 | `sudo: a password is required` — 키 인증만 가능해 root 작업 불가 |
+| 사용자 유닛 | `Failed to connect to bus: No medium found` — 사용자 systemd 버스 없음 |
+
+애초 계획(systemd 등록)을 그대로 밀 수 없어 **cron `@reboot`** 로 방향을 바꿨다.
+비root로 재부팅 자동기동을 거는 유일한 수단이다.
+
+### 이미 있던 것 — start_all.sh 와 watchdog
+
+조사해 보니 `/NHNHOME/nexus/start_all.sh` 가 **이미 멱등**이었다. 포트를 하나씩 확인해
+죽은 것만 띄운다(PG·Redis·embed 8002·vLLM 8001·vision 8004·image 8003·coder 8005).
+`watchdog.sh` 는 60초마다 그것을 재호출해 **크래시 자가복구까지 이미 돌고 있었다.**
+
+빠진 것은 **부팅 최초 1회를 걸어 주는 방아쇠**뿐이었다. 새로 만들 것이 적어 다행이다.
+
+### boot_start.sh — start_all.sh 를 그냥 부르지 않은 이유
+
+`@reboot` 는 부팅 아주 이른 시점에 돈다. 그때 `/NHNHOME` 마운트나 NVIDIA 드라이버가
+아직 준비되지 않았을 수 있는데, **거기서 한 번 실패하고 끝나면 watchdog 조차 뜨지
+않는다** — watchdog을 띄우는 것이 start_all.sh이므로 자가복구 자체가 시작되지 않는다.
+
+그래서 감싸는 스크립트를 만들었다.
+1. `/NHNHOME/nexus/start_all.sh` 가 보일 때까지 최대 10분 대기(마운트 대기)
+2. `nvidia-smi -L` 이 통할 때까지 최대 5분 대기(드라이버 대기)
+3. start_all.sh 를 30초 간격 3회 호출 — 한 번만 성공하면 watchdog이 이어받는다
+4. 전 과정을 `/tmp/nexus_boot.log` 에 남긴다(`/NHNHOME` 이 없을 수 있어 항상 쓸 수 있는 곳)
+
+GPU 확인이 실패해도 중단하지 않고 진행한다. watchdog이 계속 재시도하므로 멈추는 것보다
+낫다.
+
+### 검증
+
+**cron의 빈약한 환경이 최대 변수**라, `env -i` 로 cron 환경을 재현해 실제로 돌렸다.
+
+| 항목 | 결과 |
+|---|---|
+| 실행파일이 cron 기본 PATH에 있는지 | tmux·redis-cli·redis-server 모두 `/usr/bin` ✓ |
+| `start_all.sh` cron 환경 실행 | 종료코드 0, 세션 6→6 (멱등, 중복 생성 없음) |
+| `boot_start.sh` cron 환경 실행 | 로그 정상, 포트·세션 무영향 |
+| cron 구현의 `@reboot` 지원 | cron 3.0pl1 (vixie-cron) ✓ |
+| 기존 crontab 항목 보존 | ✓ (`crontab.bak-20260807` 백업) |
+
+### 남은 위험 — 정직하게
+
+**`@reboot` 트리거 자체는 실제 재부팅 전까지 검증할 수 없다.** 그 아래 단계는 전부
+확인했지만 방아쇠만은 못 당겨 봤다. 오늘 112에서 겪은 "유닛 파일과 실행 프로세스가
+달랐던" 함정과 같은 종류의 미검증 구간이다.
+
+**다음 B200 재부팅 시 가장 먼저 `/tmp/nexus_boot.log` 를 확인할 것.** 파일이 없으면
+@reboot가 돌지 않은 것이므로 수동으로 `bash /NHNHOME/nexus/start_all.sh` 를 실행한다.
+
+### 부수 발견 — 복구 스크립트가 리포에 없었다
+
+`start_all.sh`·`run_vllm_fp8.sh`·`watchdog.sh` 등이 **B200 서버에만** 있고 버전관리
+밖이었다. B200이 재구축되면 GPU 백엔드를 살리는 수단 자체가 사라진다.
+
+새로 만든 `boot_start.sh` 는 `deployment/b200/` 에 넣었다(서버에서 되받아와 해시 일치
+확인 — 전사 오류 방지). 나머지는 **넣지 않았다**: `start_all.sh` 가 PG·Redis 비밀번호를
+평문으로 export 하기 때문이다. 그대로 커밋하면 자격증명이 git 이력에 영구히 남는다.
+
+**후속 과제**: 비밀번호를 `.env`(600)로 분리하고 스크립트가 그것을 읽게 바꾼 뒤 본문만
+버전관리로 옮긴다. 그전까지 B200 재구축 시 스크립트를 다시 만들어야 한다.
