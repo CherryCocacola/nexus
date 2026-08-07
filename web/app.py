@@ -211,6 +211,31 @@ def _number_warning_for(answer: str, messages: list) -> str:
         return ""
 
 
+def _execution_warning_for(answer: str, messages: list) -> str:
+    """"실행해서 확인했다"는 주장이 실제 도구 실행으로 뒷받침되는지 대조한다.
+
+    실측(2026-08-07): 모델이 도구를 하나도 쓰지 않은 채 "모든 테스트가 통과했습니다"
+    라고 답했다. 예측을 관측인 양 쓴 것이다. 같은 날 시스템 프롬프트에 "실제로
+    실행하고 출력한 것을 보고하라"를 넣었는데도 나온 답이라, 지시가 아니라 코드로
+    대조한다(숫자 인용 검증과 같은 판단). 자세한 근거는
+    core/verification/execution_claim.py 참조.
+
+    답변을 고치지는 않고 "확인이 필요하다"고만 덧붙인다 — 사용자가 로그를 붙여넣어
+    그것을 근거로 말한 정상적인 경우도 있기 때문이다.
+    """
+    try:
+        from core.verification.execution_claim import (
+            build_execution_warning,
+            find_execution_claims,
+        )
+
+        sources = _collect_tool_result_texts(messages)
+        return build_execution_warning(find_execution_claims(answer), len(sources))
+    except Exception as e:  # noqa: BLE001 — 검증 실패가 응답을 막지 않게 한다
+        logger.warning("실행 주장 검증 실패(무시): %s", e)
+        return ""
+
+
 # sha256 계산 시 파일을 한 번에 읽지 않고 스트리밍하는 청크 크기(64KB).
 _SHA256_CHUNK = 64 * 1024
 # sha256을 계산할 파일 크기 상한(8MB). 이보다 큰 파일은 성능을 위해 해시를 생략한다.
@@ -1749,6 +1774,10 @@ async def chat(
         response_text += _number_warning_for(
             response_text, engine._messages[dl_start_idx:]
         )
+        # 실행 주장 검증 — 도구를 하나도 쓰지 않고 "통과했습니다"라고 단정한 경우만 잡는다.
+        response_text += _execution_warning_for(
+            response_text, engine._messages[dl_start_idx:]
+        )
 
     return ChatResponse(
         session_id=response_session_id,
@@ -2132,6 +2161,9 @@ async def chat_stream(
         # 숫자 인용 검증 — 스트림으로 이미 나간 본문은 고치지 않고, 확인이 필요한
         # 숫자가 있으면 경고만 별도 text 프레임으로 덧붙인다(사용자가 판단하도록).
         _warning = _number_warning_for(
+            "".join(answer_parts), engine._messages[dl_start_idx:]
+        )
+        _warning += _execution_warning_for(
             "".join(answer_parts), engine._messages[dl_start_idx:]
         )
         if _warning:
@@ -2532,6 +2564,7 @@ async def chat_completions(
     content = "".join(response_text_parts)
     # 숫자 인용 검증 — 문서에서 옮긴 금액·수량의 자릿수가 원문과 다르면 경고를 덧붙인다.
     content += _number_warning_for(content, engine._messages[dl_start_idx:])
+    content += _execution_warning_for(content, engine._messages[dl_start_idx:])
     # 표준 클라이언트도 링크를 볼 수 있게 content 끝에 마크다운으로 덧붙인다.
     content += _downloads_markdown(downloads)
 
@@ -2694,6 +2727,9 @@ async def _openai_stream_generate(
 
     # 숫자 인용 검증 — 이미 흘려보낸 본문은 고치지 않고 경고만 마지막 청크로 덧붙인다.
     _num_warning = _number_warning_for(
+        "".join(answer_parts), engine._messages[dl_start_idx:]
+    )
+    _num_warning += _execution_warning_for(
         "".join(answer_parts), engine._messages[dl_start_idx:]
     )
     if _num_warning:
