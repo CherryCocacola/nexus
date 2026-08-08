@@ -186,6 +186,25 @@ def _answer_warnings_for(answer: str, messages: list) -> str:
     return build_answer_warnings(answer, messages)
 
 
+def _uploads_dir() -> Any:
+    """설정된 업로드 디렉토리를 돌려준다(없으면 런타임 폴백).
+
+    [왜 헬퍼로 뺐나 — 2026-08-08]
+      `resolve_uploads_dir(configured)` 는 설정값을 받을 수 있게 만들어져 있었는데,
+      웹의 세 호출부가 **전부 인자 없이** 부르고 있었다. 그래서 설정에 무엇을 넣든 항상
+      `{tempdir}/nexus_uploads` 로 폴백했다 — 컨테이너에서는 `/tmp` 라 재시작하면
+      업로드가 통째로 사라진다(실측).
+
+      호출부마다 config 를 꺼내 쓰게 두면 또 한 곳을 빠뜨린다. 한 자리에서만
+      결정하게 한다(사후 검증기를 post_check 하나로 묶은 것과 같은 이유).
+    """
+    from core.config import UploadConfig
+    from core.tools.implementations.analyze_image_tool import resolve_uploads_dir
+
+    upload_cfg = getattr(_app_state.get("config"), "upload", None) or UploadConfig()
+    return resolve_uploads_dir(getattr(upload_cfg, "uploads_dir", "") or None)
+
+
 # sha256 계산 시 파일을 한 번에 읽지 않고 스트리밍하는 청크 크기(64KB).
 _SHA256_CHUNK = 64 * 1024
 # sha256을 계산할 파일 크기 상한(8MB). 이보다 큰 파일은 성능을 위해 해시를 생략한다.
@@ -840,10 +859,6 @@ def _build_web_engine_parts(components: dict, state: Any) -> dict:
 
     # AgentTool·SymbolSearchTool이 해석할 의존성 일체 — tenant를 제외한 '공용' 옵션.
     # 세션별 assemble에서 {**base_options, "tenant": tenant}로 얕은 복제해 격리한다.
-    # 업로드 디렉토리 해석 함수 — /v1/upload 라우트와 AnalyzeImage 도구가 같은
-    # 폴더를 가리키도록 단일 소스(resolve_uploads_dir)를 공유한다.
-    from core.tools.implementations.analyze_image_tool import resolve_uploads_dir
-
     base_options = {
         "memory_manager": components.get("memory_manager"),
         "task_manager": components.get("task_manager"),
@@ -883,8 +898,8 @@ def _build_web_engine_parts(components: dict, state: Any) -> dict:
         "vision_url": getattr(getattr(state.config, "gpu_server", None), "vision_url", ""),
         "vision_model": getattr(getattr(state.config, "gpu_server", None), "vision_model", ""),
         # 업로드 첨부 저장 디렉토리 — AnalyzeImage 가 "이 디렉토리 하위" 이미지만 읽도록
-        # 제한하는 기준. /v1/upload 라우트와 같은 resolve_uploads_dir 로 단일 소스를 공유한다.
-        "uploads_dir": str(resolve_uploads_dir()),
+        # 제한하는 기준. /v1/upload 라우트와 같은 _uploads_dir() 로 단일 소스를 공유한다.
+        "uploads_dir": str(_uploads_dir()),
     }
 
     # 시스템 프롬프트는 파일 읽기 + 서브에이전트 가이드 조립이라 비교적 무겁다 →
@@ -1415,17 +1430,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     # 업로드 정리 잡 기동 — 업로드본이 무한히 쌓이는 것을 막는다.
     # 부트스트랩 성공/실패와 무관하게 띄운다(설정을 못 읽으면 기본값 사용).
-    # 저장 경로는 업로드 라우트와 같은 resolve_uploads_dir 단일 소스를 쓴다.
+    # 저장 경로는 업로드 라우트와 같은 _uploads_dir() 단일 소스를 쓴다.
     try:
         from core.config import UploadConfig
-        from core.tools.implementations.analyze_image_tool import resolve_uploads_dir
 
         upload_cfg = getattr(_app_state.get("config"), "upload", None) or UploadConfig()
         interval = upload_cfg.cleanup_interval_minutes
         if interval > 0 and upload_cfg.retention_hours > 0:
             _app_state["uploads_cleanup_task"] = asyncio.create_task(
                 _uploads_cleanup_loop(
-                    resolve_uploads_dir(), upload_cfg.retention_hours, interval
+                    _uploads_dir(), upload_cfg.retention_hours, interval
                 )
             )
             logger.info(
@@ -4297,17 +4311,16 @@ async def upload_file(file: UploadFile) -> dict[str, Any]:
       - 크기가 상한을 넘으면 413으로 거절한다. 이때 전체를 메모리에 올린 뒤
         재는 것이 아니라 조각 단위로 읽으며 넘는 즉시 중단한다(메모리 폭주 방지).
     """
-    # 업로드 저장 위치 — AnalyzeImage 도구의 경로 검증과 같은 resolve_uploads_dir 로
-    # 단일 소스를 공유한다({tempdir}/nexus_uploads). 저장 경로와 분석 허용 경로가
-    # 어긋나지 않도록 하기 위함이다.
+    # 업로드 저장 위치 — AnalyzeImage 도구의 경로 검증과 같은 _uploads_dir() 로
+    # 단일 소스를 공유한다. 저장 경로와 분석 허용 경로가 어긋나지 않도록 하기 위함이다.
+    # (설정 upload.uploads_dir 이 비어 있으면 {tempdir}/nexus_uploads 로 폴백하는데,
+    #  컨테이너에서 그 자리는 재시작에 사라진다 — 배포는 영속 경로를 지정할 것.)
     import uuid
     from pathlib import Path as _Path
 
     from fastapi import HTTPException
 
-    from core.tools.implementations.analyze_image_tool import resolve_uploads_dir
-
-    upload_dir = resolve_uploads_dir()
+    upload_dir = _uploads_dir()
 
     # 업로드 한계값은 설정에서 읽는다(하드코딩 금지). 설정이 없는 경량 경로에서도
     # 동작해야 하므로 UploadConfig 기본값으로 폴백한다.

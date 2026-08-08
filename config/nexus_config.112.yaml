@@ -333,6 +333,9 @@ document_export:
 # max_size_bytes 초과 → 413, allowed_extensions 밖 확장자 → 415로 거절한다.
 # 목록을 생략하면 코드 기본값(UploadConfig)이 그대로 적용된다.
 upload:
+  # 영속 경로 — 호스트 /home/idino/nexus-data/uploads 가 여기로 bind mount 된다.
+  # 비워 두면 /tmp 로 폴백해 컨테이너 재시작마다 업로드가 사라진다(2026-08-08 실측).
+  uploads_dir: "/app/data/uploads"
   max_size_bytes: 20971520        # 20MB — 스캔 PDF·발표자료 수용선
   retention_hours: 24             # 업로드 파일 보존 시간(이보다 오래되면 삭제)
   cleanup_interval_minutes: 60    # 정리 주기(분). 기동 직후 1회 + 이후 반복. 0이면 정리 끔

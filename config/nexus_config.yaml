@@ -332,6 +332,11 @@ document_export:
 # max_size_bytes 초과 → 413, allowed_extensions 밖 확장자 → 415로 거절한다.
 # allowed_extensions 를 비우면 확장자 검사를 하지 않는다(임시 완화용).
 upload:
+  # 업로드 저장 위치. 빈 값이면 {tempdir}/nexus_uploads 로 폴백한다.
+  # ★배포(컨테이너)에서는 반드시 영속 경로로 지정할 것 — 폴백 자리는 /tmp 라
+  #   재시작하면 사용자가 올린 파일이 통째로 사라진다(2026-08-08 실측).
+  #   exports_dir 과 같은 관례이며, bind mount 안쪽 경로여야 한다.
+  uploads_dir: ""                 # 예: /app/data/uploads (호스트 bind mount)
   max_size_bytes: 20971520        # 20MB — 스캔 PDF·발표자료 수용선
   retention_hours: 24             # 업로드 파일 보존 시간(이보다 오래되면 삭제)
   cleanup_interval_minutes: 60    # 정리 주기(분). 기동 직후 1회 + 이후 반복. 0이면 정리 끔

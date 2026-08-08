@@ -1011,9 +1011,16 @@ class UploadConfig(BaseModel):
       - cleanup_interval_minutes: 정리 잡을 몇 분마다 돌릴지. 웹 서버가 기동 직후
         한 번 쓸어내고, 이후 이 간격으로 반복한다. 0 이하이면 정리 잡을 아예
         띄우지 않는다(정리 기능 끄기).
+      - uploads_dir: 업로드 파일을 둘 디렉토리. **빈 값이면 {tempdir}/nexus_uploads**
+        로 폴백하는데, 컨테이너에서 그 자리는 `/tmp` 라 **재시작하면 사라진다.**
+        2026-08-08 에 실제로 겪었다 — 컨테이너를 재시작하자 업로드가 전부 비워져
+        비전 도구가 "이미지 없음"으로 떨어졌다. 배포에서는 반드시 영속 경로(bind
+        mount 안)를 지정할 것. exports_dir 과 같은 관례다.
     """
 
     max_size_bytes: int = 20 * 1024 * 1024  # 20MB — 스캔 PDF·발표자료를 수용하는 선
+    # 빈 값이면 런타임 폴백({tempdir}/nexus_uploads). 배포는 영속 경로로 덮어쓴다.
+    uploads_dir: str = ""
     allowed_extensions: list[str] = Field(
         default_factory=lambda: [
             # 문서 — DocumentProcess 가 파싱 가능한 형식
