@@ -6726,3 +6726,33 @@ mount 는 실행 중 추가할 수 없어 재생성했다. 구성은 `docker ins
 
 `ruff check` 신규 0건(기존 7건 = E402×6 + S110 그대로), 관련 테스트 33 passed.
 경고 문구·건수·400 거부·첫 프레임 위치를 각각 고정했다.
+
+### 배포 (112) — 실서버 e2e 9/10 → 실제로는 전부 통과
+
+코드 2개(`web/app.py`, `client_tool.py`)만 바뀌어 mount·설정 변경이 없으므로
+컨테이너 재생성 없이 `docker cp` + 재시작으로 올렸다. 해시 대조 후 재시작.
+
+**기능 e2e** — 모델 출력이 아니라 **응답 구조**만 본다(경고·400 은 코드가 만드는
+값이라 모델 상태와 무관해야 정상이다).
+
+| 항목 | 결과 |
+|---|---|
+| E1 상한 초과 3건이 경고에 정확히 뜬다 | PASS `도구 개수 상한(64)을 넘어 제외된 도구 3건: t64, t65, t66` |
+| E2 중복·형식오류가 사유별로 뜬다 | PASS (2개 경고가 따로 뜸) |
+| E3 유효 0개는 400 | PASS |
+| E4 스트림 **첫 프레임**에 warnings | PASS |
+| E5 정상 요청은 경고 없음 | PASS |
+| E6 도구 루프 종전대로 `tool_calls` | PASS |
+| E7 도구 안 보낸 소비자 무회귀 | PASS |
+
+스냅샷 `nexus-web:toolwarn-20260808` (= `nexus-web:latest`, cd1750cdec91).
+드리프트 0(코드 해시 160개 일치).
+
+**내 검사가 낸 오탐 하나** — "부트스트랩 예외 없음"이 FAIL 로 떴다. 로그 `--tail 60`
+을 통째로 grep 했더니 **직전 프로세스의 종료 경로**(SIGTERM → `_shutdown_handler`
+의 `sys.exit(0)` → uvloop 신호 처리 중 SystemExit → lifespan 의 CancelledError)가
+걸린 것이었다. 마지막 `Started server process` **이후** 구간만 잘라 보면 Traceback 0,
+`Application startup complete`, 도구 26개로 정상이었다.
+
+재시작 검증에서 로그를 볼 때는 **기동 이후 구간만** 봐야 한다 — 종료 traceback 은
+정상 경로라서, 안 자르면 재시작할 때마다 오탐이 난다.
