@@ -847,6 +847,19 @@ body.resizing { cursor: col-resize; user-select: none; }
 }
 .attach-chip .remove:hover { color: var(--error); }
 
+/* 첨부 이미지 썸네일 — 무엇을 붙였는지 보내기 전에 눈으로 확인하는 용도.
+   파일명만 보이면 붙여넣기(Ctrl+V)로 들어온 이미지는 이름이 무의미해서
+   (예: image.png) 무엇인지 알 수가 없다. */
+.attach-chip .thumb {
+  width: 28px;
+  height: 28px;
+  object-fit: cover;      /* 비율 유지하며 정사각형으로 채움 */
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--bg-secondary);
+  flex-shrink: 0;
+}
+
 /* 숨겨진 파일 입력 */
 #fileInput { display: none; }
 
@@ -1374,9 +1387,10 @@ body.resizing { cursor: col-resize; user-select: none; }
           </button>
           <input type="file" id="fileInput" multiple accept=".txt,.py,.js,.ts,.json,.yaml,.yml,.md,.csv,.html,.css,.sql,.xml,.log,.pdf,.docx,.doc,.hwp,.hwpx,.xlsx,.xls,.pptx,.jpg,.jpeg,.png,.gif,.webp,.bmp" onchange="handleFileSelect(event)">
           <textarea id="userInput"
-                    placeholder="메시지를 입력하세요..."
+                    placeholder="메시지를 입력하세요... (이미지는 Ctrl+V 로 붙여넣기)"
                     rows="1"
                     onkeydown="handleKeyDown(event)"
+                    onpaste="handlePasteFiles(event)"
                     oninput="autoResize(this); onInputForPrompt()"></textarea>
           <button class="send-btn" id="sendBtn" onclick="sendMessage()">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -2464,6 +2478,29 @@ function handleFileSelect(event) {
   event.target.value = '';
 }
 
+// 첨부 이미지의 미리보기 URL 캐시 — key: File 객체, value: objectURL.
+// 매번 새로 만들면 렌더할 때마다 URL 이 쌓여 메모리를 흘린다(revoke 대상을 잃는다).
+// File 을 키로 잡아 한 번만 만들고, 제거·전송 때 확실히 해제한다.
+const _attachThumbs = new WeakMap();
+
+function _isImageFile(f) {
+  // MIME 우선(붙여넣기 이미지는 이름이 없을 수 있다), 없으면 확장자로 판단.
+  if (f.type && f.type.startsWith('image/')) return true;
+  return /\.(jpe?g|png|gif|webp|bmp)$/i.test(f.name || '');
+}
+
+function _thumbUrl(f) {
+  if (!_isImageFile(f)) return null;
+  let url = _attachThumbs.get(f);
+  if (!url) { url = URL.createObjectURL(f); _attachThumbs.set(f, url); }
+  return url;
+}
+
+function _releaseThumb(f) {
+  const url = _attachThumbs.get(f);
+  if (url) { URL.revokeObjectURL(url); _attachThumbs.delete(f); }
+}
+
 function renderAttachPreview() {
   const preview = document.getElementById('attachPreview');
   if (attachedFiles.length === 0) {
@@ -2472,17 +2509,57 @@ function renderAttachPreview() {
     return;
   }
   preview.className = 'attach-preview visible';
-  preview.innerHTML = attachedFiles.map((f, i) =>
-    `<div class="attach-chip">
-      <span>${f.name} (${(f.size / 1024).toFixed(1)}KB)</span>
+  preview.innerHTML = attachedFiles.map((f, i) => {
+    const url = _thumbUrl(f);
+    // 이미지면 썸네일을 앞에 붙인다. 이름은 escapeHtml — 파일명이 그대로 HTML 로
+    // 조립되므로 <img onerror=...> 같은 이름이 실행되지 않게 막는다.
+    const thumb = url ? `<img class="thumb" src="${url}" alt="">` : '';
+    return `<div class="attach-chip">
+      ${thumb}
+      <span>${escapeHtml(f.name)} (${(f.size / 1024).toFixed(1)}KB)</span>
       <span class="remove" onclick="removeFile(${i})">&times;</span>
-    </div>`
-  ).join('');
+    </div>`;
+  }).join('');
 }
 
 function removeFile(index) {
-  attachedFiles.splice(index, 1);
+  const [gone] = attachedFiles.splice(index, 1);
+  if (gone) _releaseThumb(gone);   // 미리보기 URL 해제(누수 방지)
   renderAttachPreview();
+}
+
+// ─── 클립보드 이미지 붙여넣기 ───
+// 다른 곳에서 이미지를 복사(Ctrl+C)한 뒤 대화창에 Ctrl+V 하면 첨부로 들어간다.
+// 캡처 도구·브라우저 이미지 복사가 주 용도라, 파일로 저장했다가 다시 고르는
+// 두 단계를 없애는 것이 목적이다.
+//
+// 주의: 텍스트 붙여넣기는 절대 건드리지 않는다. 이미지 항목이 하나도 없으면
+// 그냥 두어 브라우저 기본 동작(텍스트 삽입)이 그대로 일어나게 한다.
+function handlePasteFiles(event) {
+  const items = (event.clipboardData && event.clipboardData.items) || [];
+  const images = [];
+  for (const it of items) {
+    if (it.kind !== 'file') continue;
+    const f = it.getAsFile();
+    if (f && _isImageFile(f)) images.push(f);
+  }
+  if (images.length === 0) return;   // 텍스트 붙여넣기 — 기본 동작 유지
+
+  event.preventDefault();            // 이미지일 때만 기본 동작을 막는다
+  let added = 0;
+  for (const f of images) {
+    if (f.size > 20 * 1024 * 1024) { // 서버 상한(20MB)과 동일한 사전 안내
+      alert(`이미지가 너무 큽니다 (20MB 제한): ${f.name || '붙여넣은 이미지'}`);
+      continue;
+    }
+    // 붙여넣은 이미지는 이름이 없거나 'image.png' 로 겹친다. 시각을 붙여 구분한다.
+    const named = f.name && f.name !== 'image.png'
+      ? f
+      : new File([f], `pasted-${Date.now()}.${(f.type.split('/')[1] || 'png')}`, { type: f.type });
+    attachedFiles.push(named);
+    added++;
+  }
+  if (added > 0) renderAttachPreview();
 }
 
 async function readFileContents() {
@@ -3609,6 +3686,7 @@ async function sendMessage() {
   if (attachedFiles.length > 0) {
     const fileContents = await readFileContents();
     text = fileContents + (text ? '\n\n' + text : '\n\n위 첨부파일을 분석해 주세요.');
+    attachedFiles.forEach(_releaseThumb);   // 미리보기 objectURL 해제(누수 방지)
     attachedFiles = [];
     renderAttachPreview();
   }
