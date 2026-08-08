@@ -27,6 +27,9 @@ _LAZY_EXPORTS: dict[str, str] = {
     "build_execution_warning": "core.verification.execution_claim",
     "build_answer_warnings": "core.verification.post_check",
     "collect_tool_result_texts": "core.verification.post_check",
+    "build_injection_refusal": "core.verification.injection_guard",
+    "find_dictated_compliance": "core.verification.injection_guard",
+    "InjectionFinding": "core.verification.injection_guard",
 }
 
 

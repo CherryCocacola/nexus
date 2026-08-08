@@ -297,6 +297,20 @@ class QueryEngine:
             self._session_id, len(self._messages), user_input[:80],
         )
 
+        # ─── 프롬프트 인젝션 순응 차단 (2026-08-08) ────────
+        # 모델을 부르기 **전에** 판정한다. 사후 경고로는 못 막기 때문이다 —
+        # 순응 문자열 자체가 피해이고, CLI·스트리밍은 본문을 이미 흘려보낸 뒤라
+        # 되돌릴 수도 없다. 판정 근거와 오탐 방지책은 injection_guard 문서 참조.
+        # 웹·CLI·OpenAI 호환 경로가 모두 이 Tier 1 을 지나므로 여기 한 곳이면 된다.
+        if append_user_message:
+            refusal = self._injection_refusal(user_input)
+            if refusal is not None:
+                yield StreamEvent(type=StreamEventType.TEXT_DELTA, text=refusal)
+                assistant_msg = Message.assistant(refusal)
+                self._messages.append(assistant_msg)
+                yield assistant_msg
+                return
+
         # ─── 라우팅 결정 (RoutingResolver) ─────────────────
         tenant = self._context.options.get("tenant") if self._context else None
         decision = self._router.resolve(user_input, tenant)
@@ -495,6 +509,34 @@ class QueryEngine:
         # 테넌트는 객체(.id)일 수도, 이미 문자열일 수도 있다.
         owner = getattr(tenant, "id", tenant)
         return str(owner) if owner else None
+
+    def _injection_refusal(self, user_input: str) -> str | None:
+        """프롬프트 인젝션 순응 시도면 거절문을, 아니면 None 을 돌려준다.
+
+        판정은 `core.verification.injection_guard` 가 한다. 여기서는 호출과 로깅만
+        맡는다 — 웹·CLI 가 같은 판정을 받아야 하고, 판정 규칙이 늘어도 이 자리는
+        그대로여야 하기 때문이다.
+
+        fail-soft: 가드가 예외를 내면 차단하지 않고 통과시킨다. 보호 장치가 정상
+        대화를 막는 쪽이 더 나쁘다. 다만 그 사실은 로그로 남긴다.
+        """
+        try:
+            from core.verification.injection_guard import (
+                build_injection_refusal,
+                find_dictated_compliance,
+            )
+
+            finding = find_dictated_compliance(user_input)
+            if finding is None:
+                return None
+            logger.warning(
+                "프롬프트 인젝션 차단: session=%s, 받아쓰기='%s', 탈취어구='%s'",
+                self._session_id, finding.dictated[:40], finding.override_hit,
+            )
+            return build_injection_refusal(finding)
+        except Exception as e:  # noqa: BLE001 — 가드 오류가 대화를 막지 않게 한다
+            logger.warning("인젝션 가드 실패(통과시킴): %s", e)
+            return None
 
     async def _recall_memories(self, user_input: str) -> str:
         """이번 입력과 관련된 과거 기억을 찾아 주입용 블록으로 만든다.
