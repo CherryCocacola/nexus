@@ -655,6 +655,15 @@ async def query_loop(
     # (하드코딩 외부화 무회귀: config 미주입 경로/기존 테스트는 상수 그대로 사용)
     escalation_steps = output_token_escalation or OUTPUT_TOKEN_ESCALATION
 
+    # 클라이언트가 실행하는 도구 이름 집합(2026-08-08).
+    #   OpenAI `tools` 규약으로 호출자가 자기 도구를 선언한 경우, 그 실행 주체는
+    #   서버가 아니라 호출자다(예: VSCode 플러그인이 개발자 PC 의 파일을 읽는다).
+    #   서버가 대신 실행하면 ①엉뚱한 파일시스템을 만지고 ②테넌트 간 유출 경로가 된다.
+    #   여기서 이름을 미리 뽑아 두고, 아래에서 실행 대기열 진입을 막는다.
+    client_tool_names = {
+        t.name for t in tools if getattr(t, "is_client_executed", False)
+    }
+
     # 반복 실패 도구 호출 추적 — 서명(도구+입력)별 연속 실패 턴 수.
     # query_loop 1회 호출 동안만 유지되는 지역 상태다(서브에이전트/세션 간 격리).
     tool_failure_streak: dict[str, int] = {}
@@ -806,6 +815,8 @@ async def query_loop(
         # 이번 턴 동안 스트림에서 수집할 정보들. 매 턴 새로 초기화한다.
         assistant_text_parts: list[str] = []  # TEXT_DELTA 누적
         tool_use_blocks: list[dict[str, Any]] = []  # 완성된 tool_use 블록
+        # 클라이언트가 실행할 도구 호출 — 서버는 모아만 두고 실행하지 않는다.
+        client_tool_calls: list[dict[str, Any]] = []
         # 인자 JSON 파싱이 실패한 도구 이름들(parse_error=True). 이 도구는 빈 인자로
         # 실행하지 않고(오답 방지), 스트림 종료 후 guided 재시도 판정에 쓴다.
         parse_failed_tools: list[str] = []
@@ -920,7 +931,13 @@ async def query_loop(
                                 "input": event.tool_use.input,
                             }
                             tool_use_blocks.append(tu_dict)
-                            streaming_executor.add_tool(tu_dict)
+                            # 클라이언트가 실행하는 도구는 서버가 돌리지 않는다.
+                            #   실행 주체가 호출자(예: VSCode 플러그인)이기 때문이다.
+                            #   대기열에 넣지 않고 따로 모아 두었다가 이번 턴을 끝낸다.
+                            if event.tool_use.name in client_tool_names:
+                                client_tool_calls.append(tu_dict)
+                            else:
+                                streaming_executor.add_tool(tu_dict)
 
                 elif event_type == StreamEventType.MESSAGE_STOP.value:
                     # 모델 응답 종료
@@ -1180,6 +1197,22 @@ async def query_loop(
         )
         state.messages.append(assistant_msg)
         yield assistant_msg
+
+        # ─── 클라이언트 실행 도구 → 여기서 턴을 끝낸다 ───
+        # 서버가 실행할 것이 없으므로 다음 턴으로 넘어갈 근거가 없다. 호출자가
+        # tool_calls 를 받아 자기 쪽에서 실행하고, 결과를 다음 요청에 실어 보낸다.
+        # (OpenAI `tools` 규약의 본래 동작 — 루프의 주인은 클라이언트다.)
+        if client_tool_calls:
+            # 정상 종료 경로와 같이 continue_reason 은 건드리지 않고 그대로 빠져나간다
+            # (ContinueReason 에는 '완료' 값이 없다 — 종료는 return 으로 표현한다).
+            await streaming_executor.cancel_all()
+            state.last_stop_reason = StopReason.TOOL_USE
+            logger.info(
+                "클라이언트 실행 도구 %d건 — 서버 실행 없이 턴 종료: %s",
+                len(client_tool_calls),
+                [c["name"] for c in client_tool_calls],
+            )
+            return
 
         state.last_stop_reason = stop_reason
 
