@@ -6372,3 +6372,46 @@ unit+integration **2173 passed**, 전체 e2e 23/23, 드리프트 0건(B200 포�
 unit+integration **2199 passed, 1 skipped**(기존 2173 → 회귀 0). ruff 신규 지적 0건.
 
 **미배포·미커밋.** 실서버 e2e 는 배포 후.
+
+### 배포 (2026-08-08) — 112 nexus-web
+
+작업 중 개발 PC 가 재시작됐다. 작업본은 온전했고 전체 스위트를 다시 돌려
+**2200 passed, 1 skipped** 로 확인한 뒤 커밋 4건으로 나눴다
+(`9a684b0` ClientTool / `09bc55b` query_loop 배선 / `507893d` append_user_message /
+`9b1ec02` web API).
+
+**배포 4파일** — `client_tool.py`(신규)·`query_loop.py`·`query_engine.py`·`web/app.py`.
+W8 때 파서를 통째로 죽였던 **패키지 `__init__` 즉시 import** 문제가 없는지 먼저 봤다.
+`client_tool.py` 는 `core.tools.base` 만 import 하고 `web/app.py` 에서 함수 안 지연
+import 로 부른다. `core/tools/implementations/__init__.py` 는 빈 파일이다 — 해당 없음.
+
+절차는 종전 수칙대로. SFTP 스테이징(경로 평탄화·CRLF→LF) → `docker cp` →
+**리포↔배포본 해시 대조(4/4 일치, 불일치면 재시작 없이 중단)** → 재시작 →
+부트스트랩 로그 → `health=200`·**무인증=401**·인증=200 삼중 확인.
+health 200 만으로 판정하지 않는 이유는 [[feedback_deploy_import_graph]] 사고 때문이다.
+
+### 실서버 e2e
+
+**기능 e2e 16/16** (`e2e_client_tools.py` 신규).
+
+| 축 | 확인 |
+|---|---|
+| 무회귀 | `tools` 없음 → `finish_reason=stop`, tool_calls 없음, 웹 도구 12개 그대로 |
+| 도구 반환 | `tools` 있음 → `finish_reason=tool_calls`, id·arguments(유효 JSON) 정상, 클라이언트가 선언한 이름으로 호출(`read_workspace_file`) |
+| **이어 돌기** | `user→assistant(tool_calls)→tool(결과)` 히스토리로 **400 이 아니라 200**. 답변이 도구 결과를 실제로 반영(`DATABASE_URL`·`MAX_RETRIES` 인용) |
+| 스트림 | `delta.tool_calls[].index` 존재, `finish_reason=tool_calls` |
+| 미실행 증거 | 서버 로그 `클라이언트 실행 도구 1건 — 서버 실행 없이 턴 종료: ['read_workspace_file']` |
+
+마지막 항목이 이번 작업의 핵심이다. **서버가 실행하지 않았다는 것을 로그로 확인**했다.
+"tool_calls 가 왔다"만 보면 서버가 몰래 실행하고 결과까지 냈어도 구분이 안 된다.
+
+**회귀 e2e 22/23 + 재확인 1** — AnalyzeImage 가 `SKIP (이미지 없음)` 으로 떨어졌다.
+SKIP 을 통과로 적으면 진짜 고장을 놓치므로 실제 이미지를 만들어 도구를 직접 불렀고,
+`이미지에는 흰색 배경에 빨간색 사각형이 있습니다` 로 정상 응답했다.
+원인은 코드가 아니라 **재시작으로 `/tmp/nexus_uploads` 가 비워진 것**(PNG_COUNT: 0).
+
+> **남은 위험(이번 변경과 무관, 기록만)**: 업로드 폴더가 컨테이너 `/tmp` 라
+> 재시작하면 사라진다. 생성물은 `tb_artifacts` 로 영속화했지만 업로드 원본은 아직이다.
+
+드리프트 점검 **0건**(코드 해시 159개 일치, 터널·포트·컨테이너·모델·DB·B200 전부).
+영속화 `nexus-web:clienttools-20260808`(=latest, 768MB).
