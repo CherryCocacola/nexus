@@ -315,6 +315,61 @@ body.resizing { cursor: col-resize; user-select: none; }
 }
 .folder-header:hover { background: var(--bg-hover); }
 .folder-caret { flex-shrink: 0; font-size: 10px; color: var(--text-muted); }
+
+/* ─── 폴더 드래그·다중선택 (2026-08-08) ─── */
+/* 드롭 대상 강조 — 어디에 놓이는지 보이지 않으면 드래그는 추측 게임이 된다. */
+.folder-header.drop-target,
+.drop-zone-ungrouped.drop-target {
+  background: var(--bg-hover);
+  outline: 2px dashed var(--accent, #6366f1);
+  outline-offset: -2px;
+}
+
+/* 선택된 대화 — active(현재 열린 대화)와 구분되어야 한다. */
+.session-item.selected {
+  background: color-mix(in srgb, var(--accent, #6366f1) 18%, transparent);
+  box-shadow: inset 2px 0 0 var(--accent, #6366f1);
+}
+
+.session-item.dragging { opacity: .45; }
+
+/* 미분류 드롭 영역 — 폴더에서 빼내는 자리. 평소엔 조용히, 드래그 중에만 보인다. */
+.drop-zone-ungrouped {
+  display: none;
+  padding: 6px 10px;
+  margin: 2px 0 4px;
+  font-size: 11px;
+  color: var(--text-muted);
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  text-align: center;
+}
+.sidebar.dragging-session .drop-zone-ungrouped { display: block; }
+
+/* 다중선택 안내 — 선택이 있을 때만 뜬다. */
+.selection-bar {
+  display: none;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 10px;
+  margin-bottom: 4px;
+  font-size: 12px;
+  background: var(--bg-tertiary);
+  border-radius: 6px;
+  color: var(--text-secondary);
+}
+.selection-bar.visible { display: flex; }
+.selection-bar button {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 11px;
+  padding: 2px 8px;
+}
+.selection-bar button:hover { background: var(--bg-hover); }
 .folder-name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: 600; }
 .folder-count { flex-shrink: 0; font-size: 11px; color: var(--text-muted); }
 .folder-items { padding-left: 8px; }
@@ -1608,7 +1663,14 @@ function setupSessionListDelegation() {
       if (sid) exportSession(sid, 'md');
       return;
     }
-    // 폴더로 이동 버튼
+    // 선택 해제 버튼(선택 안내 막대)
+    const clearBtn = target.closest && target.closest('[data-action="clear-selection"]');
+    if (clearBtn) {
+      ev.stopPropagation();
+      _clearSelection();
+      return;
+    }
+    // 폴더로 이동 버튼 — 선택이 있으면 선택 전체에 적용한다.
     const folderBtn = target.closest && target.closest('.session-folder-btn');
     if (folderBtn) {
       const sid = folderBtn.getAttribute('data-sid');
@@ -1626,10 +1688,24 @@ function setupSessionListDelegation() {
     const item = target.closest && target.closest('.session-item');
     if (item) {
       const sid = item.getAttribute('data-sid');
+      if (!sid) return;
+      // Ctrl(⌘)·Shift 는 "고르기"이지 "열기"가 아니다. 여기서 갈라 주지 않으면
+      // 여러 개를 고르는 동안 대화가 계속 바뀌어 선택 자체가 불가능하다.
+      if (ev.ctrlKey || ev.metaKey || ev.shiftKey) {
+        ev.preventDefault();
+        _handleSelectionClick(sid, ev);
+        return;
+      }
+      _clearSelection(false);            // 평범한 클릭이면 선택은 정리하고 연다
       console.log('[session] switch click sid=', sid);
-      if (sid) switchSession(sid);
+      switchSession(sid);
+      return;
     }
+    // 목록의 빈 곳을 누르면 선택 해제 — 빠져나갈 길을 항상 둔다.
+    _clearSelection();
   });
+
+  _initSidebarDnd();
 }
 
 // 세션 메타(제목·핀)를 서버에 PATCH하고 로컬 상태·사이드바를 갱신하는 공용 헬퍼.
@@ -1678,16 +1754,17 @@ async function togglePin(id) {
 // 대화를 폴더로 이동 — prompt로 폴더명을 받아 서버(meta.json)에 저장하고 목록을 다시 그린다.
 // 빈 값이면 '미분류'로 되돌린다.
 async function setFolder(id) {
+  // 선택이 있고 그 안에 이 대화가 들어 있으면 **선택 전체**에 적용한다.
+  // 여러 개를 골라 놓고 📁 를 눌렀는데 하나만 옮겨지면 고른 의미가 없다.
+  const targets = _selectedSids.has(id) ? Array.from(_selectedSids) : [id];
   const session = sessions.find(s => s.id === id);
   const cur = (session && session.folder) || '';
-  const next = window.prompt('폴더명을 입력하세요 (비우면 미분류로):', cur);
+  const label = targets.length > 1
+    ? `선택한 ${targets.length}개 대화를 옮길 폴더명 (비우면 미분류로):`
+    : '폴더명을 입력하세요 (비우면 미분류로):';
+  const next = window.prompt(label, cur);
   if (next === null) return;                     // 취소
-  const folder = next.trim().slice(0, 60);
-  const res = await patchSessionMeta(id, { folder });
-  if (res && session) {
-    session.folder = res.folder || '';
-    renderSessionList();
-  }
+  await _moveSessionsToFolder(targets, next);
 }
 
 // 대화 내보내기 — 서버가 md/txt로 조립해 준 텍스트를 파일로 저장한다.
@@ -2352,13 +2429,14 @@ function sessionSortKey(s) {
 
 // 세션 항목 하나의 HTML(폴더 그룹·미분류 공용). 위임 클릭은 data-sid로 처리.
 function sessionItemHtml(s) {
-  const cls = (s.id === currentSessionId ? 'active' : '') + (s.pinned ? ' pinned' : '');
+  const cls = (s.id === currentSessionId ? 'active' : '') + (s.pinned ? ' pinned' : '')
+    + (_selectedSids.has(s.id) ? ' selected' : '');
   const title = escapeHtml(s.title || s.id);
   const sid = escapeHtml(s.id);
   const pinTitle = s.pinned ? '핀 해제' : '핀 고정';
   const pinIcon = s.pinned ? '📌' : '📍';
   return (
-    `<div class="session-item ${cls}" data-sid="${sid}">
+    `<div class="session-item ${cls}" data-sid="${sid}" draggable="true">
       ${s.pinned ? '<span class="session-pin-mark" aria-hidden="true">📌</span>' : ''}
       <span class="session-title">${title}</span>
       <button class="session-pin-btn" title="${pinTitle}" data-sid="${sid}">${pinIcon}</button>
@@ -2368,6 +2446,120 @@ function sessionItemHtml(s) {
       <button class="session-delete-btn" title="대화 삭제" data-sid="${sid}">×</button>
      </div>`
   );
+}
+
+// ─── 대화 다중선택 + 폴더 드래그 (2026-08-08) ───
+// 왜 넣었나: 폴더 지정이 대화 하나씩 📁 버튼으로만 가능해, 여러 개를 옮기려면
+// 같은 폴더명을 반복해서 타이핑해야 했다. 사용자 눈검증에서 "Ctrl 로 여럿 골라
+// 옮기거나 폴더로 끌어다 넣는 게 안 된다"로 나온 항목이다.
+//
+// 선택은 **화면 상태일 뿐** 서버에 저장하지 않는다. 새로고침하면 사라지는 것이 맞다.
+const _selectedSids = new Set();
+
+function _clearSelection(rerender) {
+  if (_selectedSids.size === 0) return;
+  _selectedSids.clear();
+  if (rerender !== false) renderSessionList();
+}
+
+// Ctrl(⌘)=토글, Shift=범위. 화면에 보이는 순서를 기준으로 범위를 잡아야
+// 사용자가 본 것과 결과가 일치한다(정렬·폴더 분류 후 순서).
+let _lastClickedSid = null;
+
+function _visibleSidsInOrder() {
+  return Array.from(document.querySelectorAll('.session-item'))
+    .map(el => el.getAttribute('data-sid'))
+    .filter(Boolean);
+}
+
+function _handleSelectionClick(sid, ev) {
+  if (ev.shiftKey && _lastClickedSid) {
+    const order = _visibleSidsInOrder();
+    const a = order.indexOf(_lastClickedSid);
+    const b = order.indexOf(sid);
+    if (a >= 0 && b >= 0) {
+      const [lo, hi] = a <= b ? [a, b] : [b, a];
+      for (let i = lo; i <= hi; i++) _selectedSids.add(order[i]);
+    }
+  } else {
+    if (_selectedSids.has(sid)) _selectedSids.delete(sid);
+    else _selectedSids.add(sid);
+    _lastClickedSid = sid;
+  }
+  renderSessionList();
+}
+
+// 드래그로 옮길 대상 — 끌기 시작한 항목이 선택에 포함돼 있으면 **선택 전체**를,
+// 아니면 그 항목 하나만 옮긴다(윈도우 탐색기와 같은 관례).
+function _dragTargets(sid) {
+  return _selectedSids.has(sid) ? Array.from(_selectedSids) : [sid];
+}
+
+async function _moveSessionsToFolder(sids, folder) {
+  const clean = (folder || '').trim().slice(0, 60);
+  let moved = 0;
+  for (const sid of sids) {
+    const session = sessions.find(s => s.id === sid);
+    if (!session) continue;
+    if ((session.folder || '') === clean) continue;   // 이미 그 폴더면 왕복 낭비
+    const res = await patchSessionMeta(sid, { folder: clean });
+    if (res) { session.folder = res.folder || ''; moved++; }
+  }
+  if (moved > 0) { _selectedSids.clear(); renderSessionList(); }
+  return moved;
+}
+
+function _initSidebarDnd() {
+  const list = document.getElementById('sessionList');
+  const sidebar = document.querySelector('.sidebar');
+  if (!list) return;
+
+  list.addEventListener('dragstart', (ev) => {
+    const item = ev.target.closest && ev.target.closest('.session-item');
+    if (!item) return;
+    const sid = item.getAttribute('data-sid');
+    if (!sid) return;
+    const targets = _dragTargets(sid);
+    // 텍스트로도 실어 둔다 — 일부 브라우저가 빈 dataTransfer 를 드래그로 안 친다.
+    ev.dataTransfer.setData('text/plain', targets.join('\n'));
+    ev.dataTransfer.effectAllowed = 'move';
+    item.classList.add('dragging');
+    if (sidebar) sidebar.classList.add('dragging-session');
+  });
+
+  list.addEventListener('dragend', () => {
+    document.querySelectorAll('.session-item.dragging')
+      .forEach(el => el.classList.remove('dragging'));
+    document.querySelectorAll('.drop-target')
+      .forEach(el => el.classList.remove('drop-target'));
+    if (sidebar) sidebar.classList.remove('dragging-session');
+  });
+
+  const dropZone = (t) => (t.closest && (t.closest('.folder-header') || t.closest('.drop-zone-ungrouped'))) || null;
+
+  list.addEventListener('dragover', (ev) => {
+    const zone = dropZone(ev.target);
+    if (!zone) return;
+    ev.preventDefault();                 // 이걸 안 부르면 drop 이 아예 안 뜬다
+    ev.dataTransfer.dropEffect = 'move';
+    zone.classList.add('drop-target');
+  });
+
+  list.addEventListener('dragleave', (ev) => {
+    const zone = dropZone(ev.target);
+    if (zone) zone.classList.remove('drop-target');
+  });
+
+  list.addEventListener('drop', async (ev) => {
+    const zone = dropZone(ev.target);
+    if (!zone) return;
+    ev.preventDefault();
+    zone.classList.remove('drop-target');
+    const folder = zone.getAttribute('data-folder') || '';
+    const raw = ev.dataTransfer.getData('text/plain') || '';
+    const sids = raw.split('\n').filter(Boolean);
+    if (sids.length) await _moveSessionsToFolder(sids, folder);
+  });
 }
 
 // 폴더 접힘 상태(localStorage) — 폴더명별로 접힘 여부를 기억한다.
@@ -2400,6 +2592,13 @@ function renderSessionList() {
   }
   const folderNames = Object.keys(folders).sort((a, b) => a.localeCompare(b));
   let html = '';
+  // 선택 안내 막대 — 선택이 있을 때만 보인다(평소 UI 를 어지럽히지 않는다).
+  html += `<div class="selection-bar${_selectedSids.size ? ' visible' : ''}">
+    <span>${_selectedSids.size}개 선택됨 — 폴더로 끌어 놓으세요</span>
+    <button type="button" data-action="clear-selection">선택 해제</button>
+  </div>`;
+  // 미분류로 되돌리는 드롭 자리 — 드래그 중에만 나타난다.
+  html += '<div class="drop-zone-ungrouped" data-folder="">📂 미분류로 이동</div>';
   // 폴더 섹션(상단, 접이식).
   for (const fname of folderNames) {
     const collapsed = _folderCollapsed(fname);
