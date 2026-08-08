@@ -870,9 +870,19 @@ def _session_sandbox_cwd(parts: dict, session_id: str) -> str:
     return base_cwd
 
 
-def _assemble_session_engine(parts: dict, session_id: str, tenant: Any) -> tuple[Any, Any]:
+def _assemble_session_engine(
+    parts: dict,
+    session_id: str,
+    tenant: Any,
+    client_tools: list[Any] | None = None,
+) -> tuple[Any, Any]:
     """
     공유 부품(parts)으로 '세션 전용' QueryEngine을 가볍게 조립한다.
+
+    client_tools 가 오면 이번 세션의 도구 목록을 그것으로 **통째로 교체**한다
+    (서버 도구는 하나도 노출하지 않는다). 섞으면 서버 파일시스템을 만지는 도구가
+    다시 열려 웹에서 Bash 를 제거한 조치가 무의미해진다 — 그래서 부분 혼합이 아니라
+    전체 교체다. 교체된 도구는 서버가 실행하지 않고 tool_calls 로 돌려준다.
 
     반환: (engine, dispatcher). dispatcher를 engine.model_dispatcher로 되꺼내지 않고
     직접 돌려주는 이유는, engine을 mock으로 대체하는 단위 테스트에서도 실제 조립된
@@ -903,10 +913,13 @@ def _assemble_session_engine(parts: dict, session_id: str, tenant: Any) -> tuple
         options={**parts["base_options"], "tenant": tenant},
     )
 
+    # 클라이언트 도구가 오면 전체 교체(위 docstring 참고), 아니면 종전 웹 도구 풀.
+    session_tools = client_tools if client_tools else parts["web_tools"]
+
     dispatcher = ModelDispatcher(
         tier=parts["tier"],
         worker_provider=parts["worker_provider"],
-        worker_tools=parts["web_tools"],
+        worker_tools=session_tools,
         context=context,
         scout_provider=parts["scout_provider"],
         scout_tools=parts["scout_tools"],
@@ -915,7 +928,7 @@ def _assemble_session_engine(parts: dict, session_id: str, tenant: Any) -> tuple
 
     engine = QueryEngine(
         model_provider=parts["worker_provider"],
-        tools=parts["web_tools"],
+        tools=session_tools,
         context=context,
         model_dispatcher=dispatcher,
         context_manager=parts["context_manager"],
@@ -1043,8 +1056,19 @@ class OpenAIChatMessage(BaseModel):
 
     model_config = {"extra": "ignore"}
 
-    role: str = Field(description="메시지 역할 (system/user/assistant 등)")
+    role: str = Field(description="메시지 역할 (system/user/assistant/tool)")
     content: str | None = Field(default=None, description="메시지 본문 텍스트")
+    # ── 클라이언트 실행 도구 루프용(2026-08-08) ──────────────
+    # 클라이언트(VSCode 플러그인 등)가 도구를 직접 실행하는 방식에서는 대화가
+    # `user → assistant(tool_calls) → tool(결과) → assistant …` 로 흐른다.
+    # 이 두 필드가 없으면 그 히스토리를 서버가 재현할 수 없어, 모델이 자기가 무엇을
+    # 요청했고 무엇을 돌려받았는지 모른 채 같은 도구를 반복 호출한다.
+    tool_calls: list[dict[str, Any]] | None = Field(
+        default=None, description="assistant가 요청한 도구 호출 목록(OpenAI 규격)"
+    )
+    tool_call_id: str | None = Field(
+        default=None, description="role='tool'일 때 어느 호출의 결과인지 가리키는 id"
+    )
 
 
 class OpenAIChatCompletionRequest(BaseModel):
@@ -1078,16 +1102,37 @@ class OpenAIChatCompletionRequest(BaseModel):
     response_format: dict[str, Any] | None = Field(
         default=None, description="구조화 출력 스펙(OpenAI response_format)"
     )
+    # ── 클라이언트 실행 도구(2026-08-08) ─────────────────────
+    # 클라이언트가 자기 도구 스키마를 보내면 모델에게 그대로 보여 주고, 호출 결정을
+    # tool_calls로 돌려준다. **서버는 이 도구를 실행하지 않는다.**
+    #
+    # 왜 실행하지 않나 — 두 가지 모두 실행하면 안 되는 이유다.
+    #   ① 보안: 서버 도구는 서버 파일시스템을 만진다. 실측으로 테넌트 키 하나에
+    #      /app/config/tenants.yaml(전 테넌트 API 키)이 읽혔다(그래서 웹에서 Bash를
+    #      제거했다). 코딩용이라고 서버 도구를 되돌려 주면 같은 구멍이 다시 열린다.
+    #   ② 쓸모: 개발자의 코드는 개발자 PC에 있다. 서버의 Read는 /app을 읽는다.
+    #
+    # 이 필드가 오면 이번 요청의 도구 목록은 **클라이언트 도구로 전부 교체**된다
+    # (서버 도구는 하나도 노출되지 않는다 — 부분 혼합은 위 ①을 다시 연다).
+    tools: list[dict[str, Any]] | None = Field(
+        default=None, description="클라이언트가 실행할 도구 스키마(OpenAI tools)"
+    )
+    tool_choice: Any | None = Field(
+        default=None, description='도구 사용 방식("none"이면 도구 없이 답한다)'
+    )
 
 
 class OpenAIResponseMessage(BaseModel):
     """OpenAI 비스트림 응답에서 assistant가 낸 메시지 한 개.
 
     role은 관례상 항상 "assistant", content는 최종 텍스트(+다운로드 마크다운)이다.
+    tool_calls는 클라이언트 실행 도구를 쓸 때만 채워진다(그 외에는 null). OpenAI
+    규격도 도구를 안 쓰면 이 필드가 비어 있으므로 기존 소비자에 영향이 없다.
     """
 
     role: str = "assistant"
     content: str = ""
+    tool_calls: list[dict[str, Any]] | None = None
 
 
 class OpenAIChoice(BaseModel):
@@ -1500,7 +1545,9 @@ def _get_session_lock(session_id: str) -> asyncio.Lock:
     return lock
 
 
-def _acquire_session_engine(session_id: str, tenant: Any) -> Any:
+def _acquire_session_engine(
+    session_id: str, tenant: Any, client_tools: list[Any] | None = None
+) -> Any:
     """요청/세션별로 격리된 QueryEngine을 반환한다.
 
     - 프로덕션(부트스트랩 성공 → web_engine_parts 존재): 세션 전용 엔진을 새로
@@ -1510,7 +1557,9 @@ def _acquire_session_engine(session_id: str, tenant: Any) -> Any:
     """
     parts = _app_state.get("web_engine_parts")
     if parts is not None:
-        engine, _dispatcher = _assemble_session_engine(parts, session_id, tenant)
+        engine, _dispatcher = _assemble_session_engine(
+            parts, session_id, tenant, client_tools=client_tools
+        )
         return engine
     return _app_state.get("query_engine")
 
@@ -2183,8 +2232,9 @@ async def chat_stream(
 # yield하는 StreamEvent만 소비)도 절대 우회하지 않는다.
 def _split_openai_messages(
     messages: list[OpenAIChatMessage],
-) -> tuple[str | None, list[Any], str]:
-    """OpenAI messages 배열을 (system_content, prior_messages, last_user_text)로 분해한다.
+) -> tuple[str | None, list[Any], str, bool]:
+    """OpenAI messages 배열을
+    (system_content, prior_messages, last_user_text, is_tool_continuation)로 분해한다.
 
     - system 메시지: 여러 개면 순서대로 이어붙여 하나의 지시문으로 만든다(없으면 None).
     - system 을 제외한 user/assistant 는 순서대로 core.Message 로 변환해 히스토리로 쓴다.
@@ -2192,7 +2242,15 @@ def _split_openai_messages(
       마지막이 user 가 아니면 400 (OpenAI 관례상 마지막은 사용자 발화).
 
     반환된 prior_messages 에는 '마지막 user'는 포함하지 않는다(그건 last_user_text).
-    tool 역할 메시지는 이 텍스트 파이프라인에서 재현 불가하므로 건너뛴다.
+
+    [도구 결과로 이어 도는 호출 — 2026-08-08]
+    클라이언트가 도구를 직접 실행하는 방식에서는 대화가 user 로 끝나지 않는다.
+
+        user → assistant(tool_calls) → tool(결과)   ← 여기서 다시 호출한다
+
+    이때는 '마지막은 user' 규칙을 적용하지 않는다(적용하면 표준 도구 루프가
+    400 으로 막힌다). 대신 히스토리 전체를 재현하고 새 user 발화 없이 이어 돌린다.
+    반환 튜플의 마지막 값은 그 판정 결과(is_tool_continuation)다.
     """
     from core.message import Message
 
@@ -2205,27 +2263,140 @@ def _split_openai_messages(
 
     # 2) system 을 제외한 대화 흐름.
     convo = [m for m in messages if m.role != "system"]
-    if not convo or convo[-1].role != "user":
-        raise HTTPException(
-            status_code=400,
-            detail="마지막 메시지는 role='user' 여야 합니다.",
+    if not convo:
+        raise HTTPException(status_code=400, detail="messages 배열이 비어 있습니다.")
+
+    # 도구 결과로 끝나면 '이어 도는 호출'이다(새 user 발화 없음).
+    is_tool_continuation = convo[-1].role == "tool"
+
+    if is_tool_continuation:
+        # 히스토리를 하나도 빼지 않고 전부 재현한다. 라우팅 판정에 쓸 텍스트로는
+        # 가장 최근 user 발화를 그대로 넘긴다(히스토리에 다시 추가하지는 않는다).
+        history_src = convo
+        last_user_text = next(
+            (m.content or "" for m in reversed(convo) if m.role == "user"), ""
         )
-    last_user_text = convo[-1].content or ""
-    if not last_user_text.strip():
-        raise HTTPException(status_code=400, detail="마지막 user 메시지 content가 비어 있습니다.")
+    else:
+        if convo[-1].role != "user":
+            raise HTTPException(
+                status_code=400,
+                detail="마지막 메시지는 role='user' 또는 role='tool' 이어야 합니다.",
+            )
+        last_user_text = convo[-1].content or ""
+        if not last_user_text.strip():
+            raise HTTPException(
+                status_code=400, detail="마지막 user 메시지 content가 비어 있습니다."
+            )
+        history_src = convo[:-1]
 
-    # 3) 마지막 user 를 제외한 이전 대화를 core.Message 로 변환.
+    # 3) 이전 대화를 core.Message 로 변환.
     prior_messages: list[Any] = []
-    for m in convo[:-1]:
-        if not m.content:
-            continue
+    for m in history_src:
         if m.role == "user":
-            prior_messages.append(Message.user(m.content))
+            if m.content:
+                prior_messages.append(Message.user(m.content))
         elif m.role == "assistant":
-            prior_messages.append(Message.assistant(m.content))
-        # 그 외 역할(tool 등)은 이 파이프라인에서 재현하지 않는다.
+            # 도구를 요청한 assistant 턴은 content 가 비어 있는 것이 정상이다
+            # (모델이 말 대신 도구를 불렀다). content 만 보고 건너뛰면 모델이
+            # 자기가 무엇을 요청했는지 잊고 같은 도구를 다시 부른다.
+            tool_uses = _openai_tool_calls_to_uses(m.tool_calls)
+            if tool_uses or m.content:
+                prior_messages.append(
+                    Message.assistant(m.content or "", tool_uses=tool_uses or None)
+                )
+        elif m.role == "tool" and m.tool_call_id:
+            prior_messages.append(
+                Message.tool_result(
+                    tool_use_id=m.tool_call_id,
+                    content=m.content or "",
+                )
+            )
 
-    return system_content, prior_messages, last_user_text
+    return system_content, prior_messages, last_user_text, is_tool_continuation
+
+
+def _openai_tool_calls_to_uses(
+    tool_calls: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """OpenAI `tool_calls` → `Message.assistant(tool_uses=...)` 가 받는 dict 목록.
+
+    OpenAI 규격은 인자를 **JSON 문자열**로 싣지만(`function.arguments`) 내부 계약은
+    파싱된 dict 다. 여기서 한 번만 변환해 둔다.
+
+    파싱에 실패하면 그 호출을 버리지 않고 인자를 빈 dict 로 둔다 — 모델이 "이 도구를
+    불렀다"는 사실 자체는 남아야 같은 호출을 반복하지 않기 때문이다.
+    """
+    uses: list[dict[str, Any]] = []
+    for call in tool_calls or []:
+        if not isinstance(call, dict):
+            continue
+        fn = call.get("function") if isinstance(call.get("function"), dict) else {}
+        name = str(fn.get("name") or call.get("name") or "").strip()
+        if not name:
+            continue
+        raw_args = fn.get("arguments", call.get("arguments"))
+        if isinstance(raw_args, dict):
+            parsed = raw_args
+        else:
+            try:
+                parsed = json.loads(raw_args) if raw_args else {}
+            except (TypeError, ValueError):
+                parsed = {}
+            if not isinstance(parsed, dict):
+                parsed = {}
+        uses.append(
+            {
+                "id": str(call.get("id") or f"call_{uuid.uuid4().hex[:12]}"),
+                "name": name,
+                "input": parsed,
+            }
+        )
+    return uses
+
+
+def _tool_uses_to_openai_tool_calls(
+    tool_uses: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """내부 도구 호출 → OpenAI `tool_calls` 응답 형식.
+
+    인자는 규격대로 JSON **문자열**로 직렬화한다. `ensure_ascii=False` 로 한글을
+    이스케이프하지 않는다 — 클라이언트가 로그에 그대로 찍어 읽을 수 있어야 한다.
+    """
+    return [
+        {
+            "id": use.get("id") or f"call_{uuid.uuid4().hex[:12]}",
+            "type": "function",
+            "function": {
+                "name": use.get("name") or "",
+                "arguments": json.dumps(use.get("input") or {}, ensure_ascii=False),
+            },
+        }
+        for use in tool_uses
+    ]
+
+
+def _client_tools_instruction(client_tools: list[Any]) -> str:
+    """클라이언트 도구로 교체했을 때 프롬프트를 실제 도구 목록에 맞춘다.
+
+    기본 웹 프롬프트는 Read/Write/Edit 같은 **서버 도구**를 안내한다. 도구 풀을
+    클라이언트 도구로 통째로 바꾸면 그 안내가 거짓이 되고, 모델은 없는 도구를
+    부르려다 실패한다. 이 리포에서 이미 같은 원인으로 `알 수 없는 도구: 'Agent'`
+    버그가 났었다 — 그래서 프롬프트를 실제 목록에서 유도한다.
+
+    session_instruction 으로 들어가 기본 프롬프트 뒤에 붙으므로 앞의 안내를 덮는다.
+    """
+    if not client_tools:
+        return ""
+    names = ", ".join(t.name for t in client_tools)
+    return (
+        "## Available tools (overrides any tool list above)\n"
+        f"You have exactly these tools: {names}.\n"
+        "Any other tool mentioned earlier is NOT available in this session — "
+        "do not attempt to call it.\n"
+        "These tools run on the user's own machine, so they see the user's project "
+        "files, not the server's. Call them to inspect and change real code rather "
+        "than guessing or printing code blocks and asking the user to apply them."
+    )
 
 
 def _inject_openai_context(
@@ -2408,7 +2579,26 @@ async def chat_completions(
 
     # 요청 검증/분해는 StreamingResponse 생성 '이전'에 수행해야 400을 정상 반환한다
     # (제너레이터 안에서 raise 하면 이미 200 스트림이 시작된 뒤라 400이 안 나감).
-    system_content, prior_messages, last_user_text = _split_openai_messages(request.messages)
+    (
+        system_content,
+        prior_messages,
+        last_user_text,
+        is_tool_continuation,
+    ) = _split_openai_messages(request.messages)
+
+    # 클라이언트가 실행할 도구 스키마(있으면 이번 요청의 도구 목록을 전부 교체한다).
+    # tool_choice="none" 은 "도구 쓰지 말고 답하라"이므로 아예 만들지 않는다.
+    from core.tools.implementations.client_tool import build_client_tools
+
+    client_tools = (
+        build_client_tools(request.tools)
+        if request.tools and request.tool_choice != "none"
+        else []
+    )
+    # 도구를 교체했으면 프롬프트도 실제 목록에 맞춘다(불일치 방지 — 위 함수 설명 참고).
+    _tools_note = _client_tools_instruction(client_tools)
+    if _tools_note:
+        system_content = f"{system_content}\n\n{_tools_note}" if system_content else _tools_note
 
     # 구조화 출력 스펙 변환 — StreamingResponse '이전'에 수행해야 400을 정상 반환한다
     # (제너레이터 안에서 raise하면 이미 200 스트림이 시작된 뒤라 400이 안 나감).
@@ -2436,6 +2626,8 @@ async def chat_completions(
                 last_user_text=last_user_text,
                 structured_output=structured_output,
                 max_tokens=request.max_tokens,
+                client_tools=client_tools,
+                is_tool_continuation=is_tool_continuation,
             ),
             media_type="text/event-stream",
             headers={
@@ -2445,7 +2637,7 @@ async def chat_completions(
         )
 
     # ── 비스트림 응답 ─────────────────────────────
-    engine = _acquire_session_engine(session_id, tenant)
+    engine = _acquire_session_engine(session_id, tenant, client_tools=client_tools)
     if engine is None:
         # 엔진 미초기화(부트스트랩 실패/테스트) — OpenAI 규격의 최소 응답으로 폴백.
         return OpenAIChatCompletionResponse(
@@ -2471,6 +2663,9 @@ async def chat_completions(
     usage = OpenAIUsage()
     # 마지막 종료 이유 — 토큰 한도로 잘렸는지(finish_reason="length") 판정에 쓴다.
     last_stop_reason: Any = None
+    # 클라이언트가 실행해야 할 도구 호출(서버는 실행하지 않고 그대로 돌려준다).
+    client_tool_names = {t.name for t in client_tools}
+    pending_tool_uses: list[dict[str, Any]] = []
 
     # 4-Tier 체인 우회 금지: submit_message 가 yield 하는 StreamEvent 만 소비한다.
     # 요청의 max_tokens를 엔진까지 전달한다(2026-08-05). 이전에는 무시되어
@@ -2480,11 +2675,27 @@ async def chat_completions(
         last_user_text,
         structured_output=structured_output,
         max_tokens_override=_max_tokens_req,
+        # 도구 결과로 이어 도는 호출이면 새 user 발화를 만들지 않는다.
+        append_user_message=not is_tool_continuation,
     ):
         if not isinstance(event, StreamEvent):
             continue
         if event.type == StreamEventType.TEXT_DELTA and event.text:
             response_text_parts.append(event.text)
+        elif (
+            event.type == StreamEventType.TOOL_USE_STOP
+            and event.tool_use
+            and event.tool_use.name in client_tool_names
+        ):
+            # 클라이언트 실행 도구만 수집한다. 서버 도구(DocumentExport 등)는 서버가
+            # 이미 실행했으므로 클라이언트에 넘기면 두 번 실행된다.
+            pending_tool_uses.append(
+                {
+                    "id": event.tool_use.id,
+                    "name": event.tool_use.name,
+                    "input": event.tool_use.input or {},
+                }
+            )
         elif event.type == StreamEventType.USAGE_UPDATE and event.usage:
             usage = OpenAIUsage(
                 prompt_tokens=event.usage.input_tokens,
@@ -2512,6 +2723,14 @@ async def chat_completions(
     # 토큰 한도로 잘렸으면 "length"로 정직하게 알린다(하드코딩 "stop" 제거).
     finish_reason = _map_finish_reason(last_stop_reason)
 
+    # 클라이언트가 실행할 도구가 있으면 규격대로 알린다 — 이 신호를 보고 클라이언트가
+    # 도구를 실행한 뒤 결과를 붙여 다시 호출한다(루프의 주인은 클라이언트다).
+    response_tool_calls = (
+        _tool_uses_to_openai_tool_calls(pending_tool_uses) if pending_tool_uses else None
+    )
+    if response_tool_calls:
+        finish_reason = "tool_calls"
+
     # 구조화 출력(JSON) 요청이면 서버가 먼저 파싱해 본다. 깨진 JSON을 그대로
     # 200으로 흘려보내면 클라이언트는 원인을 알 수 없다(실측: 플러그인 파싱 실패).
     # 실패 원인 대부분은 "잘림"이므로 finish_reason과 함께 경고를 남긴다.
@@ -2537,7 +2756,9 @@ async def chat_completions(
         model=model_name,
         choices=[
             OpenAIChoice(
-                message=OpenAIResponseMessage(content=content),
+                message=OpenAIResponseMessage(
+                    content=content, tool_calls=response_tool_calls
+                ),
                 finish_reason=finish_reason,
             )
         ],
@@ -2555,6 +2776,8 @@ async def _openai_stream_generate(
     last_user_text: str,
     structured_output: Any = None,
     max_tokens: int | None = None,
+    client_tools: list[Any] | None = None,
+    is_tool_continuation: bool = False,
 ) -> AsyncGenerator[str, None]:
     """OpenAI `chat.completion.chunk` SSE 프레임을 생성한다.
 
@@ -2577,7 +2800,7 @@ async def _openai_stream_generate(
         }
         return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
-    engine = _acquire_session_engine(session_id, tenant)
+    engine = _acquire_session_engine(session_id, tenant, client_tools=client_tools)
     if engine is None:
         # 엔진 미초기화 — 관례상 role 프레임 → 안내 content → 종료 순으로 최소 스트림.
         yield _chunk({"role": "assistant"})
@@ -2593,6 +2816,9 @@ async def _openai_stream_generate(
     )
     # 스트림으로 내보낸 본문을 모아 둔다 — 끝난 뒤 숫자 인용 검증에 쓴다.
     answer_parts: list[str] = []
+    # 클라이언트가 실행할 도구 호출(서버는 실행하지 않고 종료 직전에 실어 보낸다).
+    client_tool_names = {t.name for t in (client_tools or [])}
+    pending_tool_uses: list[dict[str, Any]] = []
 
     # OpenAI 관례: 첫 프레임에 delta.role='assistant' 를 실어 스트림 시작을 알린다.
     yield _chunk({"role": "assistant"})
@@ -2611,6 +2837,8 @@ async def _openai_stream_generate(
                 last_user_text,
                 structured_output=structured_output,
                 max_tokens_override=(max_tokens if (max_tokens or 0) > 0 else None),
+                # 도구 결과로 이어 도는 호출이면 새 user 발화를 만들지 않는다.
+                append_user_message=not is_tool_continuation,
             ):
                 await event_queue.put(("event", ev))
         except BaseException as e:  # noqa: BLE001 — 모든 예외를 에러 프레임/종료로 수렴
@@ -2647,6 +2875,19 @@ async def _openai_stream_generate(
                     # 스트림이 끝난 뒤 숫자 인용 검증에 쓰려고 본문을 함께 모아 둔다.
                     answer_parts.append(event.text)
                     yield _chunk({"content": event.text})
+                elif (
+                    event.type == StreamEventType.TOOL_USE_STOP
+                    and event.tool_use
+                    and event.tool_use.name in client_tool_names
+                ):
+                    # 클라이언트 실행 도구만 모은다(서버 도구는 서버가 이미 실행했다).
+                    pending_tool_uses.append(
+                        {
+                            "id": event.tool_use.id,
+                            "name": event.tool_use.name,
+                            "input": event.tool_use.input or {},
+                        }
+                    )
                 elif event.type == StreamEventType.MESSAGE_STOP and event.stop_reason:
                     # 턴마다 갱신 — 마지막 값이 이 응답의 최종 종료 이유다.
                     stream_stop_reason = event.stop_reason
@@ -2683,9 +2924,22 @@ async def _openai_stream_generate(
     if dl_md:
         yield _chunk({"content": dl_md})
 
+    # 클라이언트가 실행할 도구가 있으면 종료 직전에 실어 보낸다.
+    # OpenAI 규격은 tool_call 을 여러 delta 로 쪼개 보내는 것도, 한 delta 에 통째로
+    # 싣는 것도 허용한다. 여기서는 통째로 싣는다 — 서버가 이미 완성된 인자를 갖고
+    # 있어 굳이 쪼갤 이유가 없고, 쪼개면 클라이언트가 조각을 잇는 코드를 더 써야 한다.
+    # (스트림 delta 에서는 각 호출에 index 가 필요하다 — 클라이언트가 조각을 잇는
+    #  자리를 알아야 하기 때문이다. 비스트림 응답에는 index 가 없다.)
+    if pending_tool_uses:
+        _calls = _tool_uses_to_openai_tool_calls(pending_tool_uses)
+        for i, call in enumerate(_calls):
+            call["index"] = i
+        yield _chunk({"tool_calls": _calls})
+
     # 종료 프레임 → OpenAI 관례상 빈 delta + finish_reason, 이어서 [DONE].
     # 토큰 한도로 잘렸으면 "length"를 실어 클라이언트가 미완결을 알 수 있게 한다.
-    yield _chunk({}, finish=_map_finish_reason(stream_stop_reason))
+    _finish = "tool_calls" if pending_tool_uses else _map_finish_reason(stream_stop_reason)
+    yield _chunk({}, finish=_finish)
     yield "data: [DONE]\n\n"
 
 

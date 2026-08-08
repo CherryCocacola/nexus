@@ -6310,3 +6310,65 @@ unit+integration **2171 passed**(+10), 전체 e2e 23/23, 드리프트 0건.
 단위 테스트 2건 추가(도구 설명·프롬프트 문구, 폴백 규칙 공존 확인).
 unit+integration **2173 passed**, 전체 e2e 23/23, 드리프트 0건(B200 포함).
 영속화 `nexus-web:final-20260807`(=latest).
+
+## 2026-08-08 — 코딩용 API 분리: 서버 쪽 표준 tool_calls 지원
+
+### 무엇을 나눴나
+사용자 요청은 "web 용 API 는 현재 유지, coding 용(VSCode 플러그인) API 는 CLI 와
+동일한 능력". 그래서 **키로 나누지 않고 요청 내용으로 나눴다**.
+
+- 요청에 `tools` 가 없으면 → 종전 웹 도구 풀(12개) 그대로. 무회귀.
+- 요청에 `tools` 가 있으면 → 이번 요청의 도구 목록을 **클라이언트 도구로 전체 교체**.
+
+키로 나누지 않은 이유는 두 가지다. ① 같은 키로 웹 대화와 플러그인 대화를 둘 다
+할 수 있어야 한다. ② `tools` 유무는 OpenAI 규약이 이미 정의한 신호라 클라이언트가
+따로 배울 것이 없다.
+
+### 왜 서버가 도구를 실행하지 않나
+"코딩용이니 서버 도구를 되돌려 주자"는 안을 먼저 검토했고 **두 가지 이유로 폐기**했다.
+
+1. **보안** — 08-07 실측에서 테넌트 키 하나로 `/app/config/tenants.yaml`(전 테넌트
+   API 키)이 읽혔다. 그래서 웹에서 Bash 를 제거했는데, 코딩용이라고 서버 도구를
+   되돌려 주면 같은 구멍이 그대로 다시 열린다.
+2. **쓸모** — 개발자의 코드는 개발자 PC 에 있다. 서버의 Read 는 `/app` 을 읽지
+   VSCode 에서 열어 놓은 프로젝트를 읽지 않는다. 실행해도 맞는 파일을 못 본다.
+
+그래서 실행 주체를 클라이언트로 둔다. 서버는 "이 도구를 이 인자로 부르라"까지만
+정하고 `tool_calls` 로 돌려준다. 이것이 OpenAI 규약의 본래 동작이기도 하다 —
+루프의 주인은 클라이언트다. **보안 노출 증가분 0.**
+
+부분 혼합(서버 도구 + 클라이언트 도구)은 하지 않았다. 섞는 순간 위 ①이 다시 열린다.
+
+### 구현
+- `core/tools/implementations/client_tool.py` (신규) — `ClientTool`(`is_client_executed=True`),
+  `build_client_tools()`. 모델에게는 여느 도구로 보이지만 서버는 실행하지 않는다.
+  `call()` 이 불리면 조용히 넘어가지 않고 **오류를 낸다** — 불렸다는 것 자체가 차단
+  배선이 깨졌다는 뜻이고, 빈 결과를 주면 "서버가 실행한 척"이 되어 문제가 숨는다.
+- `core/orchestrator/query_loop.py` — `is_client_executed` 도구는 실행 대기열
+  (`streaming_executor.add_tool`)에 넣지 않고, 나오면 대기 중인 실행을 취소하고
+  `stop_reason=TOOL_USE` 로 턴을 끝낸다.
+- `core/orchestrator/query_engine.py` — `submit_message(append_user_message=)` 추가.
+  도구 결과로 이어 도는 호출에는 **새 사용자 발화가 없다**. 그런데도 user 메시지를
+  만들면 모델이 사용자가 같은 말을 두 번 한 것으로 읽는다.
+- `web/app.py` — `tools`/`tool_choice` 입력, `tool_calls` 응답, `finish_reason="tool_calls"`,
+  `role:"tool"`·assistant `tool_calls` 히스토리 재현, 스트림 delta(index 포함).
+
+### 막힐 뻔한 곳 두 군데
+1. **`_split_openai_messages` 의 "마지막은 user" 규칙** — 표준 도구 루프는
+   `user → assistant(tool_calls) → tool(결과)` 로 끝난다. 규칙을 그대로 뒀으면
+   이어 도는 호출이 전부 400 이었다. `tool` 로 끝나는 경우를 별도 판정으로 뺐다.
+2. **프롬프트↔도구 불일치** — 기본 웹 프롬프트가 Read/Write/Edit(서버 도구)를
+   안내한다. 도구를 교체하면 그 안내가 거짓이 되고 모델이 없는 도구를 부른다.
+   이 리포에서 이미 같은 원인으로 `알 수 없는 도구: 'Agent'` 버그가 났었다.
+   `_client_tools_instruction()` 으로 실제 목록을 프롬프트 뒤에 덮어쓴다.
+
+`ContinueReason.COMPLETED` 를 쓰려다 잡았다 — 그런 멤버는 없다(런타임에 죽었을 것).
+정상 종료 경로와 똑같이 `return` 으로 끝낸다.
+
+### 검증
+`tests/unit/test_client_tool.py` 9건 + `tests/unit/test_openai_client_tools.py` 18건 신규.
+서버 도구에 `is_client_executed` 가 새어 들어가면 서버 실행이 통째로 멈추므로,
+레지스트리 전수로 그 플래그가 없음을 고정했다.
+unit+integration **2199 passed, 1 skipped**(기존 2173 → 회귀 0). ruff 신규 지적 0건.
+
+**미배포·미커밋.** 실서버 e2e 는 배포 후.
