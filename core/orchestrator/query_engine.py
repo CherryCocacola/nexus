@@ -236,6 +236,7 @@ class QueryEngine:
         user_input: str,
         structured_output: StructuredOutputSpec | None = None,
         max_tokens_override: int | None = None,
+        append_user_message: bool = True,
     ) -> AsyncGenerator[StreamEvent | Message, None]:
         """
         사용자 메시지를 제출하고 스트리밍 응답을 반환한다.
@@ -265,6 +266,14 @@ class QueryEngine:
                 아니라 "호출 단위 인자"로 받는다 — 세션에 붙이면 다음 턴까지 스키마가
                 잔류해 일반 대화가 오염되기 때문이다(리스크 R8). dispatcher/폴백
                 query_loop 양쪽 경로로 그대로 전달한다.
+            append_user_message: user_input을 히스토리에 새 user 메시지로 추가할지
+                여부(기본 True — 종전 동작). False로 주는 경우는 하나뿐이다.
+                클라이언트가 도구를 실행하고 그 결과를 들고 다시 호출했을 때다.
+                이때 대화는 `user → assistant(tool_calls) → tool(결과)` 로 끝나므로
+                **새 사용자 발화가 없다**. 그런데도 user 메시지를 만들어 붙이면
+                모델이 사용자가 같은 말을 두 번 한 것으로 읽어 답이 흔들린다.
+                False일 때 user_input은 히스토리에 들어가지 않고 라우팅 판정과
+                로그에만 쓰인다(라우팅은 "무엇을 하려는 대화인지"를 알아야 한다).
 
         Yields:
             StreamEvent: 스트리밍 이벤트 (UI 업데이트용 — 텍스트 델타/도구 등)
@@ -276,9 +285,12 @@ class QueryEngine:
         if self._turn_state_store is not None:
             self._messages.clear()
 
-        # 사용자 메시지를 대화 히스토리에 추가
-        user_msg = Message.user(user_input)
-        self._messages.append(user_msg)
+        # 사용자 메시지를 대화 히스토리에 추가.
+        # (append_user_message=False면 건너뛴다 — 도구 결과로 이어 도는 호출이라
+        #  새 사용자 발화가 없다. 자세한 이유는 위 Args 설명 참고.)
+        if append_user_message:
+            user_msg = Message.user(user_input)
+            self._messages.append(user_msg)
 
         logger.info(
             "메시지 제출: session=%s, messages=%d개, input='%s'",

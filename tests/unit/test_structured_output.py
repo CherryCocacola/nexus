@@ -266,12 +266,19 @@ class _FakeOpenAIEngine:
         self._messages.clear()
 
     async def submit_message(
-        self, message: str, structured_output: Any = None, max_tokens_override: Any = None
+        self,
+        message: str,
+        structured_output: Any = None,
+        max_tokens_override: Any = None,
+        append_user_message: bool = True,
     ):
         # max_tokens_override: OpenAI 요청의 max_tokens를 엔진까지 전달하는 통로
         # (2026-08-05 신설). 여기서는 받기만 하고 검증은 별도 테스트에서 한다.
+        # append_user_message: 클라이언트 도구 루프에서 도구 결과로 이어 도는 호출이면
+        # False (2026-08-08). 실제 엔진 시그니처와 맞춰 두어야 웹 경로가 깨지지 않는다.
         self.received_structured_output = structured_output
         self.received_max_tokens = max_tokens_override
+        self.received_append_user_message = append_user_message
         # 텍스트를 흘려 200 응답이 구성되게 한다.
         yield StreamEvent(type=StreamEventType.TEXT_DELTA, text="{}")
 
