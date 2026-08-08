@@ -56,6 +56,7 @@ import uuid
 from collections import OrderedDict
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -295,10 +296,26 @@ async def _attach_session_artifacts(
       기록해 둔 생성물을 세션 기준으로 끌어와, turn 값으로 정확한 메시지에 매칭해
       `downloads` 필드로 실어 준다(프론트가 라이브 때와 동일하게 렌더).
 
-    [매칭 규칙]
-      - turn이 일치하는 assistant 메시지에 붙인다(라이브 기록과 같은 turn 값).
-      - turn이 없는(레거시) 생성물이나 매칭 실패분은 마지막 assistant 메시지에
-        모아 붙인다(가용성 우선 — 하나도 잃지 않는다).
+    [매칭 규칙 — 2026-08-08 turn → 시각 기준으로 교체]
+      각 생성물을 **생성 시각 직전의 assistant 메시지**에 붙인다. 즉 생성물의
+      created_at보다 작거나 같은 ts 중 가장 큰 것을 고른다.
+
+      왜 turn을 버렸나: turn은 **항상 1이다.** 웹은 요청마다 엔진을 새로 만들어
+      턴 카운터가 매번 리셋되기 때문이다. 실측으로 확인했다 —
+
+        transcript : 10:50:18 turn=1 user/assistant  (이미지 요청)
+                     10:50:20 turn=1 user/assistant  (문서 요청)
+        tb_artifacts: 사과.png turn=1 / document.docx turn=1
+
+      그래서 turn 매칭은 **성립할 수가 없었고**, 전부 "매칭 실패" 경로로 떨어져
+      마지막 assistant 메시지 한 줄에 뭉쳤다(사용자 관측 C2). 시각은 두 기록 모두
+      단조 증가하므로 신뢰할 수 있다.
+
+      - ts가 없는 경우: Redis 복원 경로는 ts를 버린다(직렬화가 role/content만 담음).
+        그때는 durable 기록인 트랜스크립트에서 ts를 보충한다. 길이가 다르면
+        **뒤에서부터 맞춘다** — Redis는 최신 구간만 들고 있을 수 있어서다.
+      - 그래도 자리를 못 정한 생성물(fork 상속분 등 created_at 없음)은 종전대로
+        마지막 assistant 메시지에 모아 붙인다(가용성 우선 — 하나도 잃지 않는다).
 
     fail-soft: pg_pool이 없거나 생성물이 없으면 messages를 그대로 돌려준다.
     """
@@ -336,33 +353,81 @@ async def _attach_session_artifacts(
         ext = fn.rsplit(".", 1)[-1].lower() if "." in fn else ""
         return {"url": f"/v1/download/{fn}", "filename": fn, "format": ext}
 
-    # 생성물을 turn별로 묶고, turn이 없는 것은 레거시 버킷에 모은다(생성순 보존).
-    by_turn: dict[int, list[dict[str, str]]] = {}
+    assistant_msgs = [m for m in messages if m.get("role") == "assistant"]
+    if not assistant_msgs:
+        return messages
+
+    # ── assistant 메시지의 시각을 확보한다 ──
+    # Redis 복원 경로는 ts를 버리므로(직렬화가 role/content만 담는다) 그때는
+    # durable 기록인 트랜스크립트에서 보충한다. 길이가 다르면 뒤에서부터 맞춘다.
+    ts_list = [_parse_ts(m.get("ts")) for m in assistant_msgs]
+    if all(t is None for t in ts_list):
+        from core.memory.transcript import read_transcript_messages
+
+        tr = read_transcript_messages(sessions_dir, session_id, channel="web")
+        tr_ts = [_parse_ts(m.get("ts")) for m in tr if m.get("role") == "assistant"]
+        if len(tr_ts) >= len(assistant_msgs):
+            ts_list = tr_ts[len(tr_ts) - len(assistant_msgs) :]
+
+    # ── 생성물을 "생성 시각 직전의 assistant" 자리에 담는다 ──
+    buckets: dict[int, list[dict[str, str]]] = {}
     leftovers: list[dict[str, str]] = []
     for a in arts:
-        t = a.get("turn")
-        if t is None:
+        created = a.get("created_at")
+        idx = _index_for_created_at(ts_list, created)
+        if idx is None:
             leftovers.append(_to_download(a))
         else:
-            by_turn.setdefault(t, []).append(_to_download(a))
+            buckets.setdefault(idx, []).append(_to_download(a))
 
-    assistant_msgs = [m for m in messages if m.get("role") == "assistant"]
-    matched: set[int] = set()
-    for m in assistant_msgs:
-        t = m.get("turn")
-        if t is not None and t in by_turn:
-            m["downloads"] = by_turn[t]
-            matched.add(t)
+    for idx, dls in buckets.items():
+        assistant_msgs[idx]["downloads"] = dls
 
-    # 매칭 실패한 turn 버킷은 레거시와 함께 마지막 assistant에 모아 붙인다.
-    for t, dls in by_turn.items():
-        if t not in matched:
-            leftovers.extend(dls)
-    if leftovers and assistant_msgs:
+    # 자리를 못 정한 것(fork 상속분 등 created_at 없음)은 마지막에 모아 붙인다.
+    if leftovers:
         last = assistant_msgs[-1]
         last["downloads"] = list(last.get("downloads", [])) + leftovers
 
     return messages
+
+
+def _parse_ts(value: Any) -> datetime | None:
+    """ISO-8601 문자열이나 datetime을 tz-aware datetime으로 정규화한다.
+
+    두 기록의 시각 표현이 다르다 — 트랜스크립트는 ISO 문자열, tb_artifacts는
+    asyncpg가 준 datetime이다. 비교하려면 한 종류로 맞춰야 한다. tz가 없는 값은
+    UTC로 간주한다(두 기록 모두 UTC로 남긴다).
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=UTC)
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def _index_for_created_at(
+    ts_list: list[datetime | None], created: Any
+) -> int | None:
+    """생성 시각이 속하는 assistant 메시지의 인덱스를 고른다.
+
+    규칙은 "created_at보다 작거나 같은 ts 중 가장 큰 것". 생성물은 assistant
+    기록이 남은 **직후** 삽입되므로(실측 0.5~1ms 차) 이 규칙이 정확히 그 턴을 집는다.
+
+    맞는 자리가 없으면(시각 정보가 없거나 첫 메시지보다 이른 생성물) None을 돌려
+    호출부가 레거시 경로로 보내게 한다 — 링크를 잃는 것보다 낫다.
+    """
+    created_dt = _parse_ts(created)
+    if created_dt is None:
+        return None
+    best: int | None = None
+    for i, t in enumerate(ts_list):
+        if t is not None and t <= created_dt:
+            best = i
+    return best
 
 
 def _build_todo_update_frame(engine: Any, session_id: str) -> dict[str, Any] | None:

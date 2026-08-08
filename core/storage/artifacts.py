@@ -197,21 +197,31 @@ async def list_session_artifacts(pool: Any | None, session_id: str) -> list[dict
 
     [반환]
       created_at 오름차순 정렬된 리스트. 각 원소:
-        {"filename": str, "mime": str|None, "turn": int|None}
+        {"filename": str, "mime": str|None, "turn": int|None, "created_at": datetime|None}
       pool이 None이거나 조회가 실패하면 빈 리스트(가용성 우선 — 복원 실패가
       세션 열람 자체를 막지 않는다).
+
+      created_at을 값으로도 돌려주는 이유(2026-08-08): 되붙일 메시지를 고르는 키가
+      turn에서 **시각**으로 바뀌었다. turn은 요청마다 엔진이 새로 뜨면서 항상 1로
+      리셋돼(실측) 매칭 키로 쓸 수 없다. 정렬에만 쓰고 버리면 호출부가 시각 비교를
+      할 수 없으므로 함께 반환한다.
     """
     if pool is None:
         return []
     try:
         async with pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT filename, mime, turn FROM tb_artifacts "
+                "SELECT filename, mime, turn, created_at FROM tb_artifacts "
                 "WHERE session_id = $1 ORDER BY created_at ASC",
                 session_id,
             )
         return [
-            {"filename": r["filename"], "mime": r["mime"], "turn": r["turn"]}
+            {
+                "filename": r["filename"],
+                "mime": r["mime"],
+                "turn": r["turn"],
+                "created_at": r["created_at"],
+            }
             for r in rows
         ]
     except Exception as e:  # noqa: BLE001 — fail-soft: 복원 실패가 세션 열람을 막지 않는다

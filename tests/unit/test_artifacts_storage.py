@@ -23,6 +23,7 @@ core/storage/artifacts.py 단위 테스트.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -59,7 +60,12 @@ class _FakeConn:
             filename = args[0]
             # ON CONFLICT (filename) DO NOTHING — 이미 있으면 무시(멱등).
             if filename not in self._store:
+                # created_at은 DB 기본값이라 INSERT 인자에 없다. 여기서는 기록 순서대로
+                # 1초씩 증가시켜 흉내 낸다 — ORDER BY created_at 과 되붙이기 시각 매칭이
+                # 의미를 가지려면 이 값이 단조 증가해야 한다(2026-08-08).
                 self._store[filename] = {
+                    "created_at": datetime(2026, 1, 1, tzinfo=UTC)
+                    + timedelta(seconds=len(self._store)),
                     "filename": filename,
                     "tenant_id": args[1],
                     "user_id": args[2],
@@ -83,12 +89,21 @@ class _FakeConn:
     async def fetch(self, sql: str, *args: Any) -> list[dict[str, Any]]:
         s = sql.strip().upper()
         if "WHERE SESSION_ID" in s:
-            # list_session_artifacts — 세션별 생성물을 filename/mime/turn으로 반환.
+            # list_session_artifacts — filename/mime/turn + created_at 을 반환한다.
+            # created_at 은 되붙이기가 "어느 답변에 붙일지" 고르는 키다(turn 은 항상 1로
+            # 리셋돼 못 쓴다 — 2026-08-08). 여기서 빠뜨리면 실제 함수가 KeyError 로
+            # fail-soft 되어 **빈 목록**이 되고, 그러면 생성물이 통째로 사라진다.
             sid = args[0]
+            rows = [r for r in self._store.values() if r.get("session_id") == sid]
+            rows.sort(key=lambda r: r.get("created_at") or datetime(2026, 1, 1, tzinfo=UTC))
             return [
-                {"filename": r["filename"], "mime": r.get("mime"), "turn": r.get("turn")}
-                for r in self._store.values()
-                if r.get("session_id") == sid
+                {
+                    "filename": r["filename"],
+                    "mime": r.get("mime"),
+                    "turn": r.get("turn"),
+                    "created_at": r.get("created_at"),
+                }
+                for r in rows
             ]
         # cleanup 만료 SELECT — 단순화를 위해 전체를 '만료'로 간주해 돌려준다.
         return [{"filename": fn} for fn in list(self._store.keys())]
@@ -317,6 +332,10 @@ async def test_list_session_artifacts_filters_by_session_with_turn():
     assert by_name["a.png"]["turn"] == 3
     assert by_name["b.docx"]["turn"] == 5
     assert by_name["a.png"]["mime"] == "image/png"
+    # created_at 은 되붙이기의 매칭 키다 — 빠지면 생성물이 엉뚱한 답변에 몰린다(C2).
+    assert by_name["a.png"]["created_at"] is not None
+    assert by_name["a.png"]["created_at"] < by_name["b.docx"]["created_at"]
+    assert [a["filename"] for a in arts] == ["a.png", "b.docx"]  # 생성순 유지
 
 
 async def test_list_session_artifacts_pool_none_returns_empty():
