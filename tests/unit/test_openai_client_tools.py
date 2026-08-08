@@ -259,7 +259,7 @@ def test_prompt_is_rewritten_to_the_actual_tool_list():
     from web.app import _client_tools_instruction
 
     note = _client_tools_instruction(
-        build_client_tools([{"function": {"name": "read_file", "parameters": {}}}])
+        build_client_tools([{"function": {"name": "read_file", "parameters": {}}}])[0]
     )
 
     assert "read_file" in note
@@ -311,6 +311,83 @@ async def test_no_tools_response_is_unchanged(_tool_engine):
     )
 
     assert resp.choices[0].message.tool_calls is None
+
+
+# ─────────────────────────────────────────────
+# ★버려진 도구를 응답으로 알린다 (2026-08-08)
+# ─────────────────────────────────────────────
+
+
+async def test_dropped_tools_are_reported_in_response(_tool_engine):
+    """상한을 넘겨 빠진 도구가 있으면 응답에 그 사실이 실린다.
+
+    예전에는 조용히 잘라서, 플러그인 개발자가 "왜 내 도구를 안 쓰지?" 만 보고
+    원인을 찾을 방법이 없었다. 도구 결과가 잘릴 때와 달리 도구 목록에는
+    `…[중략]…` 같은 표식을 남길 자리가 없어 더더욱 알 수 없었다.
+    """
+    from core.tools.implementations.client_tool import MAX_CLIENT_TOOLS
+    from web.app import OpenAIChatCompletionRequest, chat_completions
+
+    resp = await chat_completions(
+        OpenAIChatCompletionRequest(
+            messages=[{"role": "user", "content": "버그 고쳐줘"}],
+            tools=[
+                {"type": "function", "function": {"name": f"t{i}", "parameters": {}}}
+                for i in range(MAX_CLIENT_TOOLS + 3)
+            ],
+        )
+    )
+
+    assert resp.warnings, "무엇이 빠졌는지 응답에 남아야 한다"
+    assert any("3건" in w for w in resp.warnings)
+
+
+async def test_clean_request_has_no_warnings(_tool_engine):
+    """무회귀 — 버린 것이 없으면 경고 필드는 빈 목록이다."""
+    from web.app import OpenAIChatCompletionRequest, chat_completions
+
+    resp = await chat_completions(
+        OpenAIChatCompletionRequest(
+            messages=[{"role": "user", "content": "버그 고쳐줘"}],
+            tools=[{"type": "function", "function": {"name": "read_file", "parameters": {}}}],
+        )
+    )
+
+    assert resp.warnings == []
+
+
+async def test_all_tools_invalid_is_rejected_not_silently_ignored(_tool_engine):
+    """★`tools` 를 보냈는데 유효 0개면 400 — 조용히 도구 없이 돌지 않는다.
+
+    도구 없이 돌면 모델이 "파일을 읽을 수 없다"는 엉뚱한 답을 내고, 클라이언트는
+    자기가 보낸 스키마가 통째로 무시됐다는 사실조차 모른다.
+    """
+    from web.app import OpenAIChatCompletionRequest, chat_completions
+
+    with pytest.raises(HTTPException) as ei:
+        await chat_completions(
+            OpenAIChatCompletionRequest(
+                messages=[{"role": "user", "content": "버그 고쳐줘"}],
+                tools=[{"function": {"name": ""}}, {"nope": 1}],
+            )
+        )
+
+    assert ei.value.status_code == 400
+    assert "형식이 올바르지 않아" in str(ei.value.detail)
+
+
+def test_stream_puts_warnings_on_the_first_frame():
+    """스트림은 되돌릴 수 없다 — 경고는 **첫 프레임**에 실려야 의미가 있다.
+
+    끝에 붙이면 클라이언트가 이미 tool_calls 를 처리한 뒤라 손쓸 수 없다.
+    """
+    import inspect
+
+    from web import app as webapp
+
+    src = inspect.getsource(webapp._openai_stream_generate)
+    assert '_chunk({"role": "assistant"}, warnings=tool_warnings)' in src
+    assert "tool_warnings" in inspect.signature(webapp._openai_stream_generate).parameters
 
 
 async def test_continuation_does_not_add_a_user_message(_tool_engine):

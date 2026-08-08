@@ -117,26 +117,61 @@ class ClientTool(BaseTool):
         )
 
 
-def build_client_tools(specs: list[dict[str, Any]]) -> list[ClientTool]:
-    """OpenAI `tools` 배열을 ClientTool 목록으로 바꾼다.
+def build_client_tools(
+    specs: list[dict[str, Any]],
+) -> tuple[list[ClientTool], list[str]]:
+    """OpenAI `tools` 배열을 ClientTool 목록으로 바꾸고, **버린 것을 함께 돌려준다**.
 
-    형식이 어긋난 항목은 조용히 건너뛴다 — 외부 클라이언트가 보내는 값이라
-    하나가 이상하다고 요청 전체를 실패시키면 연동이 취약해진다.
+    [왜 경고를 함께 돌려주나 — 2026-08-08]
+      예전에는 형식이 어긋나거나 상한을 넘은 항목을 **조용히 건너뛰었다.** 요청 전체를
+      실패시키지 않으려는 의도였는데, 그 대가가 컸다. 빠진 도구는 모델이 **보지도 부르지도
+      못하고**, 잘렸다는 표식을 남길 자리도 없다. 도구 결과가 잘릴 때는 본문에
+      `…[중략]…` 을 넣어 모델이 "여기 더 있었다"를 알 수 있지만, 도구 목록에는 그런
+      자리가 없다 — 그냥 존재하지 않는 것이 된다.
+
+      그래서 플러그인 개발자는 "왜 내 도구를 안 쓰지?" 만 보고 원인을 찾을 방법이 없었다.
+      이 리포가 반복해서 문제 삼아 온 조용한 실패다(구조화 출력이 꺼져 있을 때 조용히
+      무시하지 않고 400 으로 거부하는 것과 같은 이유).
+
+      **자르는 것 자체는 유지한다** — 상한은 폭주 방지 백스톱으로 필요하다. 다만 소리를
+      낸다. 판단은 호출부가 한다(경고만 실을지, 유효 0건이면 거부할지).
 
     Args:
         specs: `[{"type": "function", "function": {"name", "description", "parameters"}}]`
 
     Returns:
-        ClientTool 목록(중복 이름 제거, 최대 MAX_CLIENT_TOOLS 개).
+        (ClientTool 목록, 경고 문구 목록). 버린 것이 없으면 경고는 빈 목록.
+        목록은 중복 이름 제거 + 최대 MAX_CLIENT_TOOLS 개.
     """
     tools: list[ClientTool] = []
     seen: set[str] = set()
+    warnings: list[str] = []
+
+    # 버린 것을 사유별로 모은다 — 개발자가 무엇을 고쳐야 하는지 바로 알 수 있게.
+    malformed = 0  # dict 가 아니거나 이름이 없는 항목
+    too_long: list[str] = []  # 이름이 상한을 넘은 항목
+    duplicated: list[str] = []  # 같은 이름이 두 번 온 항목
+    over_limit: list[str] = []  # 개수 상한을 넘어 못 들어간 항목
+
     for spec in specs or []:
         if not isinstance(spec, dict):
+            malformed += 1
             continue
         fn = spec.get("function") if isinstance(spec.get("function"), dict) else spec
         name = str(fn.get("name") or "").strip()
-        if not name or len(name) > MAX_TOOL_NAME_CHARS or name in seen:
+        if not name:
+            malformed += 1
+            continue
+        if len(name) > MAX_TOOL_NAME_CHARS:
+            too_long.append(name[:MAX_TOOL_NAME_CHARS])
+            continue
+        if name in seen:
+            duplicated.append(name)
+            continue
+        # 상한에 도달했으면 **중단하지 않고** 남은 이름을 모은다. 예전에는 break 로
+        # 빠져나가 "몇 개가 더 있었는지"조차 알 수 없었다.
+        if len(tools) >= MAX_CLIENT_TOOLS:
+            over_limit.append(name)
             continue
         seen.add(name)
         tools.append(
@@ -146,6 +181,28 @@ def build_client_tools(specs: list[dict[str, Any]]) -> list[ClientTool]:
                 input_schema=fn.get("parameters") or fn.get("input_schema") or {},
             )
         )
-        if len(tools) >= MAX_CLIENT_TOOLS:
-            break
-    return tools
+
+    if malformed:
+        warnings.append(
+            f"형식이 올바르지 않아 제외된 도구 {malformed}건 "
+            "(객체가 아니거나 function.name 이 없음)."
+        )
+    if too_long:
+        warnings.append(
+            f"이름이 {MAX_TOOL_NAME_CHARS}자를 넘어 제외된 도구 "
+            f"{len(too_long)}건: {', '.join(too_long[:5])}" + (" 외" if len(too_long) > 5 else "")
+        )
+    if duplicated:
+        warnings.append(
+            f"이름이 중복되어 제외된 도구 {len(duplicated)}건: "
+            f"{', '.join(duplicated[:5])}" + (" 외" if len(duplicated) > 5 else "")
+        )
+    if over_limit:
+        warnings.append(
+            f"도구 개수 상한({MAX_CLIENT_TOOLS})을 넘어 제외된 도구 "
+            f"{len(over_limit)}건: {', '.join(over_limit[:5])}"
+            + (" 외" if len(over_limit) > 5 else "")
+            + ". 이번 작업에 필요한 도구만 선언하면 프롬프트 여유도 늘어납니다."
+        )
+
+    return tools, warnings

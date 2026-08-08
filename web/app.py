@@ -1249,6 +1249,10 @@ class OpenAIChatCompletionResponse(BaseModel):
     # 비표준 확장 필드 — 문서 생성 도구의 다운로드 정보를 표준 클라이언트가 무시해도
     # 되도록 별도 배열로도 노출한다(표준 클라이언트는 content의 마크다운 링크를 본다).
     downloads: list[dict[str, str]] = Field(default_factory=list)
+    # 비표준 확장 필드 — 요청을 처리하며 **버린 것**을 알린다(현재는 제외된 클라이언트
+    # 도구). 표준 클라이언트는 모르는 필드를 무시하고, 우리 플러그인은 읽어서 개발자에게
+    # 보여줄 수 있다. 조용히 버리면 "왜 내 도구를 안 쓰지?"의 원인을 찾을 수 없다.
+    warnings: list[str] = Field(default_factory=list)
 
 
 class ToolInfo(BaseModel):
@@ -2669,11 +2673,24 @@ async def chat_completions(
     # tool_choice="none" 은 "도구 쓰지 말고 답하라"이므로 아예 만들지 않는다.
     from core.tools.implementations.client_tool import build_client_tools
 
-    client_tools = (
-        build_client_tools(request.tools)
-        if request.tools and request.tool_choice != "none"
-        else []
-    )
+    # 버려진 도구가 있으면 경고를 함께 받는다. 조용히 버리면 플러그인 개발자가
+    # "왜 내 도구를 안 쓰지?"의 원인을 찾을 수 없다(2026-08-08).
+    tool_warnings: list[str] = []
+    if request.tools and request.tool_choice != "none":
+        client_tools, tool_warnings = build_client_tools(request.tools)
+        if not client_tools:
+            # 도구를 보냈는데 하나도 쓸 수 없다 — 조용히 도구 없는 대화로 강등하면
+            # 클라이언트는 루프가 성립하지 않는 이유를 영영 모른다. 명시적으로 거부한다
+            # (구조화 출력 비활성 시 400 으로 거부하는 것과 같은 원칙).
+            raise HTTPException(
+                status_code=400,
+                detail="tools 를 보냈으나 사용할 수 있는 도구가 없습니다. "
+                + (" / ".join(tool_warnings) if tool_warnings else "형식을 확인하세요."),
+            )
+        for _w in tool_warnings:
+            logger.warning("클라이언트 도구 경고: session=%s, %s", "openai", _w)
+    else:
+        client_tools = []
     # 도구를 교체했으면 프롬프트도 실제 목록에 맞춘다(불일치 방지 — 위 함수 설명 참고).
     _tools_note = _client_tools_instruction(client_tools)
     if _tools_note:
@@ -2707,6 +2724,7 @@ async def chat_completions(
                 max_tokens=request.max_tokens,
                 client_tools=client_tools,
                 is_tool_continuation=is_tool_continuation,
+                tool_warnings=tool_warnings,
             ),
             media_type="text/event-stream",
             headers={
@@ -2843,6 +2861,7 @@ async def chat_completions(
         ],
         usage=usage,
         downloads=downloads,
+        warnings=tool_warnings,
     )
 
 
@@ -2857,6 +2876,7 @@ async def _openai_stream_generate(
     max_tokens: int | None = None,
     client_tools: list[Any] | None = None,
     is_tool_continuation: bool = False,
+    tool_warnings: list[str] | None = None,
 ) -> AsyncGenerator[str, None]:
     """OpenAI `chat.completion.chunk` SSE 프레임을 생성한다.
 
@@ -2868,15 +2888,25 @@ async def _openai_stream_generate(
     created = int(time.time())
     chatcmpl_id = f"chatcmpl-{uuid.uuid4().hex}"
 
-    def _chunk(delta: dict[str, Any], finish: str | None = None) -> str:
-        """OpenAI chunk 한 프레임을 SSE `data: {...}` 문자열로 만든다."""
-        payload = {
+    def _chunk(
+        delta: dict[str, Any],
+        finish: str | None = None,
+        warnings: list[str] | None = None,
+    ) -> str:
+        """OpenAI chunk 한 프레임을 SSE `data: {...}` 문자열로 만든다.
+
+        warnings 가 있으면 비표준 최상위 필드로 싣는다(비스트림 응답의 `warnings` 와
+        같은 의미). 표준 클라이언트는 모르는 필드를 무시한다.
+        """
+        payload: dict[str, Any] = {
             "id": chatcmpl_id,
             "object": "chat.completion.chunk",
             "created": created,
             "model": model_name,
             "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
         }
+        if warnings:
+            payload["warnings"] = warnings
         return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
     engine = _acquire_session_engine(session_id, tenant, client_tools=client_tools)
@@ -2900,7 +2930,9 @@ async def _openai_stream_generate(
     pending_tool_uses: list[dict[str, Any]] = []
 
     # OpenAI 관례: 첫 프레임에 delta.role='assistant' 를 실어 스트림 시작을 알린다.
-    yield _chunk({"role": "assistant"})
+    # 제외된 도구가 있으면 이 첫 프레임에 함께 싣는다 — 스트림은 되돌릴 수 없으므로
+    # 끝에 붙이면 클라이언트가 이미 결과를 처리한 뒤가 된다.
+    yield _chunk({"role": "assistant"}, warnings=tool_warnings)
 
     # ── Producer/Queue/Heartbeat (기존 /v1/chat/stream 구조 미러링) ──
     # 이벤트 공백(Scout 호출 등)에 프록시가 끊지 않도록 주기적으로 SSE 주석(`: ping`)을

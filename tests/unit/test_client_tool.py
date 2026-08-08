@@ -22,6 +22,7 @@ import pytest
 from core.tools.base import PermissionBehavior, ToolUseContext
 from core.tools.implementations.client_tool import (
     MAX_CLIENT_TOOLS,
+    MAX_TOOL_NAME_CHARS,
     ClientTool,
     build_client_tools,
 )
@@ -50,36 +51,71 @@ OPENAI_SPEC = [
 
 
 def test_builds_from_openai_tool_spec():
-    tools = build_client_tools(OPENAI_SPEC)
+    tools, warnings = build_client_tools(OPENAI_SPEC)
 
     assert len(tools) == 1
     assert tools[0].name == "read_file"
     assert tools[0].input_schema["properties"]["path"]["type"] == "string"
+    assert warnings == [], "버린 것이 없으면 경고도 없어야 한다"
 
 
 def test_malformed_entries_are_skipped_not_fatal():
     """외부 클라이언트가 보내는 값이라, 하나 이상하다고 요청 전체를 죽이지 않는다."""
-    tools = build_client_tools(
+    tools, warnings = build_client_tools(
         [*OPENAI_SPEC, {"function": {"name": ""}}, "문자열", None, {"function": {}}]
     )
 
     assert [t.name for t in tools] == ["read_file"]
+    # ★건너뛰되 조용히는 아니다 — 4건이 빠졌다는 사실이 남아야 한다.
+    assert len(warnings) == 1
+    assert "4건" in warnings[0]
 
 
 def test_duplicate_names_are_deduped():
-    tools = build_client_tools(OPENAI_SPEC + OPENAI_SPEC)
+    tools, warnings = build_client_tools(OPENAI_SPEC + OPENAI_SPEC)
 
     assert len(tools) == 1
+    assert any("중복" in w for w in warnings)
+    assert any("read_file" in w for w in warnings), "어떤 도구가 빠졌는지 이름이 있어야 한다"
 
 
 def test_tool_count_is_capped():
     """무제한이면 프롬프트가 도구 목록으로 채워져 본래 작업이 밀린다."""
-    many = [
-        {"function": {"name": f"t{i}", "parameters": {}}}
-        for i in range(MAX_CLIENT_TOOLS + 20)
-    ]
+    many = [{"function": {"name": f"t{i}", "parameters": {}}} for i in range(MAX_CLIENT_TOOLS + 20)]
 
-    assert len(build_client_tools(many)) == MAX_CLIENT_TOOLS
+    tools, warnings = build_client_tools(many)
+
+    assert len(tools) == MAX_CLIENT_TOOLS
+    # ★상한을 넘긴 20건이 몇 건인지 정확히 세어 알린다. 예전에는 break 로 빠져나가
+    #   "몇 개가 더 있었는지"조차 알 수 없었다.
+    assert any("20건" in w for w in warnings)
+    assert any(str(MAX_CLIENT_TOOLS) in w for w in warnings)
+
+
+def test_long_name_is_reported():
+    """이름 상한 초과도 조용히 사라지지 않는다."""
+    tools, warnings = build_client_tools(
+        [*OPENAI_SPEC, {"function": {"name": "n" * (MAX_TOOL_NAME_CHARS + 1)}}]
+    )
+
+    assert [t.name for t in tools] == ["read_file"]
+    assert any("자를 넘어" in w for w in warnings)
+
+
+def test_warning_lists_at_most_five_names():
+    """이름을 전부 나열하면 경고가 프롬프트만큼 길어진다 — 앞 5개 + '외'."""
+    many = [{"function": {"name": f"dup{i}"}} for i in range(3)]
+    tools, warnings = build_client_tools(many + many)  # 3개가 중복으로 빠짐
+
+    # "외" 는 "제외된" 안에도 들어 있으므로 **접미사**로 판정한다.
+    dup = next(w for w in warnings if "중복" in w)
+    assert dup.endswith("dup2"), "3건이면 전부 나열한다"
+
+    many10 = [{"function": {"name": f"d{i}"}} for i in range(10)]
+    _, warnings10 = build_client_tools(many10 + many10)
+    dup10 = next(w for w in warnings10 if "중복" in w)
+    assert dup10.endswith(" 외"), "10건이면 앞 5개만 나열하고 '외'로 줄인다"
+    assert "d9" not in dup10
 
 
 # ─────────────────────────────────────────────
@@ -120,7 +156,7 @@ def test_query_loop_collects_client_tool_names():
     """
     from core.tools.implementations.write_tool import WriteTool
 
-    tools = [WriteTool(), *build_client_tools(OPENAI_SPEC)]
+    tools = [WriteTool(), *build_client_tools(OPENAI_SPEC)[0]]
     client_names = {t.name for t in tools if getattr(t, "is_client_executed", False)}
 
     assert client_names == {"read_file"}
