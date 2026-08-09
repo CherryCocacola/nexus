@@ -517,6 +517,24 @@ body.resizing { cursor: col-resize; user-select: none; }
 .modal-btn-primary { background: var(--accent, #00479d); color: #fff; border-color: var(--accent, #00479d); }
 .modal-btn-primary:hover { background: var(--accent-hover, #003a80); }
 
+/* 공용 대화상자(alert/confirm/prompt 대체) — 위 .modal-* 를 그대로 쓰고 여기서는
+   본문 텍스트와 입력줄만 더한다. 브라우저 기본 대화상자는 UI 톤이 어긋날 뿐 아니라
+   렌더러를 통째로 멈춰 자동화·검증이 그 지점에서 막힌다. */
+.dialog { width: min(420px, 100%); }
+.dialog-message {
+  font-size: 13px; color: var(--text-primary); line-height: 1.6;
+  white-space: pre-wrap;          /* 기존 문구가 \n 으로 줄을 나눈다 */
+  word-break: break-word;         /* 파일명·URL 이 길어도 창을 밀지 않게 */
+}
+.dialog-input {
+  width: 100%; box-sizing: border-box; margin-top: 12px;
+  padding: 9px 12px;
+  border: 1px solid var(--border); border-radius: 8px;
+  background: var(--bg-input); color: var(--text-primary);
+  font-size: 13px; font-family: inherit; outline: none;
+}
+.dialog-input:focus { border-color: var(--accent-light, #1a73e8); }
+
 /* 설정 섹션 — 커스텀 인스트럭션 / 프롬프트 템플릿 */
 .settings-section-title { font-size: 13px; font-weight: 600; color: var(--text-primary); margin-bottom: 6px; }
 .settings-hint { font-size: 11px; font-weight: 400; color: var(--text-muted); margin-left: 6px; }
@@ -1475,6 +1493,24 @@ body.resizing { cursor: col-resize; user-select: none; }
   </aside>
 </div>
 
+<!-- 공용 대화상자 — alert/confirm/prompt 를 대신한다.
+     하나만 두고 novaAlert/novaConfirm/novaPrompt 가 내용만 바꿔 쓴다. -->
+<div class="modal-overlay" id="dialogOverlay" hidden>
+  <div class="modal dialog" role="dialog" aria-modal="true" aria-labelledby="dialogTitle">
+    <div class="modal-header">
+      <span class="modal-title" id="dialogTitle">알림</span>
+    </div>
+    <div class="modal-body">
+      <div class="dialog-message" id="dialogMessage"></div>
+      <input class="dialog-input" id="dialogInput" hidden>
+    </div>
+    <div class="modal-footer">
+      <button class="modal-btn-secondary" id="dialogCancel" hidden>취소</button>
+      <button class="modal-btn-primary" id="dialogOk">확인</button>
+    </div>
+  </div>
+</div>
+
 <!-- 설정 모달 — 커스텀 인스트럭션 편집 (P2-2) -->
 <div class="modal-overlay" id="settingsOverlay" hidden>
   <div class="modal">
@@ -1546,6 +1582,88 @@ body.resizing { cursor: col-resize; user-select: none; }
   };
 })();
 
+// ─── 공용 대화상자(alert/confirm/prompt 대체) ───
+// [왜 바꿨나 — 2026-08-08]
+//   브라우저 기본 대화상자는 두 가지가 걸린다.
+//     ① UI 톤 — 크롬이 그리는 회색 상자가 제품 화면과 따로 논다.
+//     ② ★렌더러 정지 — alert/confirm/prompt 는 페이지 전체를 **동기 차단**한다.
+//        실측으로, 편집 버튼을 누르는 순간 자동화가 통째로 막혀 그 지점부터
+//        어떤 검증도 이어갈 수 없었다(사용자에게는 정상 동작이라 더 늦게 발견된다).
+//   그래서 같은 의미를 Promise 로 돌려주는 대화상자로 바꾼다. 호출부는 `await` 만
+//   붙이면 되고, 취소 규약(prompt=null, confirm=false)은 그대로 유지한다.
+let _dialogClose = null;   // 열려 있는 대화상자를 닫는 함수(중첩 호출 방지용)
+
+function _openDialog({ title, message, withInput, defaultValue, withCancel, okLabel }) {
+  const overlay = document.getElementById('dialogOverlay');
+  const elTitle = document.getElementById('dialogTitle');
+  const elMsg = document.getElementById('dialogMessage');
+  const elInput = document.getElementById('dialogInput');
+  const btnOk = document.getElementById('dialogOk');
+  const btnCancel = document.getElementById('dialogCancel');
+  // 요소는 이 파일 안에 함께 있으므로 없을 수 없다. 그래도 없다면 마크업이 깨진
+  // 것이므로 **차단 대화상자로 되돌리지 않고** 조용히 취소로 처리한다.
+  //   · 되돌리면 방금 없앤 렌더러 정지가 그대로 살아난다.
+  //   · 취소(null/false)는 fail-closed — 확인을 못 받은 삭제는 진행하지 않는다.
+  if (!overlay || !elMsg || !btnOk) {
+    console.error('[dialog] 대화상자 요소를 찾지 못했습니다 — 마크업 확인 필요');
+    return Promise.resolve(withInput ? null : (withCancel ? false : undefined));
+  }
+  // 이미 열려 있으면 앞의 것을 취소로 닫는다 — 상자가 겹쳐 쌓이면 빠져나갈 길이 없다.
+  if (_dialogClose) _dialogClose(withInput ? null : false);
+
+  elTitle.textContent = title;
+  elMsg.textContent = message;
+  elInput.hidden = !withInput;
+  elInput.value = withInput ? (defaultValue || '') : '';
+  btnCancel.hidden = !withCancel && !withInput;
+  btnOk.textContent = okLabel || '확인';
+  overlay.hidden = false;
+  setTimeout(() => (withInput ? elInput : btnOk).focus(), 0);
+
+  return new Promise((resolve) => {
+    const finish = (value) => {
+      overlay.hidden = true;
+      overlay.removeEventListener('click', onBackdrop);
+      document.removeEventListener('keydown', onKey, true);
+      btnOk.onclick = null;
+      btnCancel.onclick = null;
+      _dialogClose = null;
+      resolve(value);
+    };
+    const accept = () => finish(withInput ? elInput.value : (withCancel ? true : undefined));
+    const cancel = () => finish(withInput ? null : (withCancel ? false : undefined));
+    const onBackdrop = (e) => { if (e.target === overlay) cancel(); };
+    const onKey = (e) => {
+      if (e.key === 'Escape') { e.preventDefault(); cancel(); }
+      // 입력창에서 Enter 는 "확인" — 기본 prompt 와 같은 손놀림을 유지한다.
+      else if (e.key === 'Enter' && (!withInput || document.activeElement === elInput)) {
+        e.preventDefault(); accept();
+      }
+    };
+    _dialogClose = finish;
+    btnOk.onclick = accept;
+    btnCancel.onclick = cancel;
+    overlay.addEventListener('click', onBackdrop);
+    document.addEventListener('keydown', onKey, true);
+  });
+}
+
+// window.alert 대체 — 확인 버튼 하나. 반환값 없음.
+function novaAlert(message, title) {
+  return _openDialog({ title: title || '알림', message: String(message) });
+}
+// window.confirm 대체 — true/false.
+function novaConfirm(message, title) {
+  return _openDialog({ title: title || '확인', message: String(message), withCancel: true });
+}
+// window.prompt 대체 — 입력 문자열 또는 취소 시 null(기본 prompt 와 동일 규약).
+function novaPrompt(message, defaultValue, title) {
+  return _openDialog({
+    title: title || '입력', message: String(message),
+    withInput: true, defaultValue: defaultValue || '', withCancel: true,
+  });
+}
+
 // ─── 인증 fetch → blob → objectURL 헬퍼 ───
 // web_auth 로 보호된 /v1/download 링크와 생성 이미지 fetch 가 공통으로 쓴다.
 // 위 window.fetch 오버라이드가 상대경로(/...)에 Authorization: Bearer 헤더를
@@ -1577,7 +1695,7 @@ document.addEventListener('click', async (e) => {
     tmp.remove();
     URL.revokeObjectURL(objUrl);  // 다운로드용은 즉시 해제 (이미지 미리보기와 달리 재사용 없음)
   } catch (err) {
-    alert('다운로드 실패: ' + err.message);
+    await novaAlert('다운로드 실패: ' + err.message);
   }
 });
 
@@ -1729,7 +1847,7 @@ async function patchSessionMeta(id, patch) {
 async function renameSession(id) {
   const session = sessions.find(s => s.id === id);
   const cur = (session && (session.customTitle || session.title)) || '';
-  const next = window.prompt('새 대화 제목을 입력하세요 (비우면 자동 제목):', cur);
+  const next = await novaPrompt('새 대화 제목을 입력하세요 (비우면 자동 제목):', cur, '대화 이름 변경');
   if (next === null) return;                     // 취소
   const title = next.trim().slice(0, 200);
   const res = await patchSessionMeta(id, { title });
@@ -1762,7 +1880,7 @@ async function setFolder(id) {
   const label = targets.length > 1
     ? `선택한 ${targets.length}개 대화를 옮길 폴더명 (비우면 미분류로):`
     : '폴더명을 입력하세요 (비우면 미분류로):';
-  const next = window.prompt(label, cur);
+  const next = await novaPrompt(label, cur, '폴더로 이동');
   if (next === null) return;                     // 취소
   await _moveSessionsToFolder(targets, next);
 }
@@ -1773,7 +1891,7 @@ async function exportSession(id, fmt) {
   fmt = fmt || 'md';
   try {
     const res = await fetch(`/v1/sessions/${encodeURIComponent(id)}/export?fmt=${fmt}`);
-    if (!res.ok) { alert('내보내기 실패 (HTTP ' + res.status + ')'); return; }
+    if (!res.ok) { await novaAlert('내보내기 실패 (HTTP ' + res.status + ')'); return; }
     const blob = await res.blob();
     // 파일명은 서버가 준 Content-Disposition(UTF-8)에서 뽑고, 없으면 기본값.
     let filename = `conversation.${fmt}`;
@@ -1789,7 +1907,7 @@ async function exportSession(id, fmt) {
     document.body.removeChild(a);
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   } catch (err) {
-    alert('내보내기 오류: ' + (err && err.message));
+    await novaAlert('내보내기 오류: ' + (err && err.message));
   }
 }
 
@@ -1856,7 +1974,7 @@ async function loadMemories() {
 }
 
 async function deleteMemory(id, rowEl) {
-  if (!confirm('이 기억을 지울까요? 다음 대화부터 참고하지 않습니다.')) return;
+  if (!await novaConfirm('이 기억을 지울까요? 다음 대화부터 참고하지 않습니다.', '기억 삭제')) return;
   try {
     const resp = await fetch('/v1/memories/' + encodeURIComponent(id), { method: 'DELETE' });
     if (!resp.ok) throw new Error('HTTP ' + resp.status);
@@ -1868,7 +1986,7 @@ async function deleteMemory(id, rowEl) {
     }
   } catch (e) {
     console.error('기억 삭제 실패:', e);
-    alert('기억을 지우지 못했습니다.');
+    await novaAlert('기억을 지우지 못했습니다.');
   }
 }
 
@@ -2098,7 +2216,8 @@ async function editMessage(msgDiv) {
   const idx = idxAttr === null ? -1 : parseInt(idxAttr, 10);
   if (isNaN(idx) || idx < 0 || idx >= session.messages.length) return;
   const cur = session.messages[idx].content || '';
-  const next = window.prompt('메시지를 편집하면 이 지점에서 새 분기(대화)가 만들어집니다:', cur);
+  const next = await novaPrompt(
+    '메시지를 편집하면 이 지점에서 새 분기(대화)가 만들어집니다:', cur, '메시지 편집');
   if (next === null) return;
   const edited = next.trim();
   if (!edited) return;
@@ -2110,9 +2229,9 @@ async function editMessage(msgDiv) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ at_index: idx }),
     });
-    if (!resp.ok) { alert('분기 생성 실패 (HTTP ' + resp.status + ')'); return; }
+    if (!resp.ok) { await novaAlert('분기 생성 실패 (HTTP ' + resp.status + ')'); return; }
     forkData = await resp.json();
-  } catch (err) { alert('분기 오류: ' + (err && err.message)); return; }
+  } catch (err) { await novaAlert('분기 오류: ' + (err && err.message)); return; }
   // 새 세션을 로컬 목록에 추가.
   const newId = forkData.new_session_id;
   const prefix = (forkData.messages || []).map(m => ({ role: m.role, content: m.content }));
@@ -2383,7 +2502,7 @@ async function deleteSession(id, event) {
   }
   const session = sessions.find(s => s.id === id);
   const label = session ? (session.title || id) : id;
-  if (!confirm(`대화를 삭제하시겠습니까?\n\n${label}`)) return;
+  if (!await novaConfirm(`대화를 삭제하시겠습니까?\n\n${label}`, '대화 삭제')) return;
 
   // 서버 세션(과 로컬에서 이미 서버에 저장된 대화)은 DELETE 호출이 필요.
   // 빈 로컬 세션(아직 서버에 저장된 적 없는 "새 대화")은 서버 호출 생략.
@@ -2392,11 +2511,11 @@ async function deleteSession(id, event) {
     try {
       const resp = await fetch(`/v1/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' });
       if (!resp.ok && resp.status !== 404) {
-        alert(`삭제 실패 (HTTP ${resp.status})`);
+        await novaAlert(`삭제 실패 (HTTP ${resp.status})`);
         return;
       }
     } catch (err) {
-      alert(`삭제 오류: ${err.message}`);
+      await novaAlert(`삭제 오류: ${err.message}`);
       return;
     }
   }
@@ -2664,17 +2783,21 @@ function updateTokenDisplay() {
 // ─── 첨부파일 ───
 function handleFileSelect(event) {
   const files = Array.from(event.target.files);
+  // 상한을 넘긴 파일은 모아 두었다가 **한 번만** 알린다. 파일마다 띄우면 여러 개를
+  // 고른 경우 상자가 겹쳐 쌓여 빠져나가기 어렵다.
+  const tooBig = [];
   files.forEach(file => {
     // 서버 상한(config upload.max_size_bytes, 기본 20MB)과 맞춘 사전 안내다.
     // 실제 차단은 서버가 하며(413), 여기서는 헛된 업로드를 미리 줄이는 용도다.
     if (file.size > 20 * 1024 * 1024) {
-      alert(`파일이 너무 큽니다 (20MB 제한): ${file.name}`);
+      tooBig.push(file.name);
       return;
     }
     attachedFiles.push(file);
   });
   renderAttachPreview();
   event.target.value = '';
+  if (tooBig.length) novaAlert(`파일이 너무 큽니다 (20MB 제한):\n${tooBig.join('\n')}`);
 }
 
 // 첨부 이미지의 미리보기 URL 캐시 — key: File 객체, value: objectURL.
@@ -2746,9 +2869,10 @@ function handlePasteFiles(event) {
 
   event.preventDefault();            // 이미지일 때만 기본 동작을 막는다
   let added = 0;
+  const tooBig = [];                 // 모아서 한 번만 알린다(상자가 겹치지 않게)
   for (const f of images) {
     if (f.size > 20 * 1024 * 1024) { // 서버 상한(20MB)과 동일한 사전 안내
-      alert(`이미지가 너무 큽니다 (20MB 제한): ${f.name || '붙여넣은 이미지'}`);
+      tooBig.push(f.name || '붙여넣은 이미지');
       continue;
     }
     // 붙여넣은 이미지는 이름이 없거나 'image.png' 로 겹친다. 시각을 붙여 구분한다.
@@ -2759,6 +2883,7 @@ function handlePasteFiles(event) {
     added++;
   }
   if (added > 0) renderAttachPreview();
+  if (tooBig.length) novaAlert(`이미지가 너무 큽니다 (20MB 제한):\n${tooBig.join('\n')}`);
 }
 
 async function readFileContents() {
@@ -2793,7 +2918,7 @@ async function readFileContents() {
         );
       } else {
         // 거절 사유를 사용자에게도 즉시 알리고(알림), 모델 맥락에도 남긴다.
-        alert(`첨부 실패: ${file.name}\n${uploaded.error}`);
+        await novaAlert(`첨부 실패: ${file.name}\n${uploaded.error}`);
         contents.push(`[첨부파일 업로드 실패: ${file.name} — ${uploaded.error}]`);
       }
       continue;
