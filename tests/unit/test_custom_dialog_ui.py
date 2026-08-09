@@ -40,6 +40,19 @@ def test_fallback_does_not_reintroduce_native_dialogs() -> None:
     assert "window.alert" not in body
 
 
+def test_overlap_cancel_uses_the_closing_dialogs_own_rule() -> None:
+    """겹침 정리 시 취소값은 **닫히는 상자** 기준이어야 한다.
+
+    새 상자 기준으로 정하면(예전 코드) prompt 가 null 대신 false 를 돌려주고,
+    호출부의 `next === null` 검사를 통과한 뒤 `false.trim()` 에서 터진다.
+    jsdom 실측으로 잡은 실제 결함이라 여기서 고정한다.
+    """
+    body = _CODE[_CODE.index("function _openDialog(") :]
+    body = body[: body.index("\nfunction novaAlert")]
+    assert "if (_dialogClose) _dialogClose();" in body, "취소값을 인자로 넘기면 안 된다"
+    assert "_dialogClose = cancel;" in body, "겹침 정리는 그 상자의 cancel 이어야 한다"
+
+
 def test_missing_markup_fails_closed() -> None:
     """확인을 못 받았으면 진행하지 않는다 — 삭제가 조용히 실행되면 안 된다."""
     body = _CODE[_CODE.index("function _openDialog(") :]

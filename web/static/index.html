@@ -1609,7 +1609,10 @@ function _openDialog({ title, message, withInput, defaultValue, withCancel, okLa
     return Promise.resolve(withInput ? null : (withCancel ? false : undefined));
   }
   // 이미 열려 있으면 앞의 것을 취소로 닫는다 — 상자가 겹쳐 쌓이면 빠져나갈 길이 없다.
-  if (_dialogClose) _dialogClose(withInput ? null : false);
+  // ★취소값은 **닫히는 상자** 기준이어야 한다. 새 상자 기준으로 정하면 prompt 가
+  //   null 대신 false 를 돌려줘, 호출부의 `next === null` 검사를 통과한 뒤
+  //   `false.trim()` 에서 터진다(jsdom 검증에서 잡은 실제 결함).
+  if (_dialogClose) _dialogClose();
 
   elTitle.textContent = title;
   elMsg.textContent = message;
@@ -1640,7 +1643,8 @@ function _openDialog({ title, message, withInput, defaultValue, withCancel, okLa
         e.preventDefault(); accept();
       }
     };
-    _dialogClose = finish;
+    // 겹침 정리용으로는 **이 상자의 cancel** 을 넘긴다(취소 규약을 이 상자가 안다).
+    _dialogClose = cancel;
     btnOk.onclick = accept;
     btnCancel.onclick = cancel;
     overlay.addEventListener('click', onBackdrop);
