@@ -970,6 +970,37 @@ def _session_sandbox_cwd(parts: dict, session_id: str) -> str:
     return base_cwd
 
 
+def _mixed_tool_pool(client_tools: list[Any] | None, web_tools: list[Any]) -> list[Any]:
+    """클라이언트 도구가 오면 그것으로 교체하되, 화이트리스트 서버 도구만 남긴다.
+
+    [왜 완전 교체가 아닌가 — 2026-08-12]
+      전부 교체하면 `AnalyzeImage` 가 사라져 플러그인 요청에서 **이미지를 영영 볼 수
+      없다.** 클라이언트가 대신 실행할 수도 없다 — 비전 서버는 서버에만 있다.
+
+    [왜 화이트리스트인가]
+      "필요하면 남긴다" 로 두면 목록이 조용히 늘어난다. 서버 도구를 다시 여는 것은
+      보안 결정이므로 상수 하나로 못 박고 테스트로 고정한다.
+
+    Returns:
+        client_tools 가 없으면 web_tools 그대로(무회귀). 있으면
+        client_tools + 화이트리스트에 해당하는 서버 도구.
+    """
+    if not client_tools:
+        return web_tools
+
+    from core.tools.implementations.client_tool import SERVER_TOOLS_KEPT_WITH_CLIENT_TOOLS
+
+    taken = {t.name for t in client_tools}
+    kept = [
+        t
+        for t in web_tools
+        # 이름이 겹치면 **클라이언트 것이 이긴다** — 호출자가 자기 구현을 선언했다면
+        # 그쪽을 존중한다(서버가 몰래 가로채면 디버깅이 불가능해진다).
+        if t.name in SERVER_TOOLS_KEPT_WITH_CLIENT_TOOLS and t.name not in taken
+    ]
+    return [*client_tools, *kept]
+
+
 def _assemble_session_engine(
     parts: dict,
     session_id: str,
@@ -979,10 +1010,18 @@ def _assemble_session_engine(
     """
     공유 부품(parts)으로 '세션 전용' QueryEngine을 가볍게 조립한다.
 
-    client_tools 가 오면 이번 세션의 도구 목록을 그것으로 **통째로 교체**한다
-    (서버 도구는 하나도 노출하지 않는다). 섞으면 서버 파일시스템을 만지는 도구가
-    다시 열려 웹에서 Bash 를 제거한 조치가 무의미해진다 — 그래서 부분 혼합이 아니라
-    전체 교체다. 교체된 도구는 서버가 실행하지 않고 tool_calls 로 돌려준다.
+    client_tools 가 오면 이번 세션의 도구 목록을 그것으로 교체한다. 섞으면 서버
+    파일시스템을 만지는 도구가 다시 열려 웹에서 Bash 를 제거한 조치가 무의미해지기
+    때문이다. 교체된 도구는 서버가 실행하지 않고 tool_calls 로 돌려준다.
+
+    **예외 하나 — 비전 분석(2026-08-12).**
+      A.X-4.0 은 텍스트 전용이고 비전은 별도 서버에 있다. 그 서버를 부르는 것은
+      `AnalyzeImage` 뿐인데, 전부 교체하면 플러그인 요청에 이 도구가 없어 이미지를
+      영영 볼 수 없다. 클라이언트가 대신 실행할 수도 없다(개발자 PC 에 비전 서버가
+      없다). 그래서 `SERVER_TOOLS_KEPT_WITH_CLIENT_TOOLS` 에 열거된 도구만 남긴다.
+
+      이 예외가 안전한 이유는 그 도구가 read-only 이고 업로드 디렉토리 밖 경로를
+      DENY 하기 때문이다. 목록을 늘리는 것은 보안 결정이므로 테스트로 고정돼 있다.
 
     반환: (engine, dispatcher). dispatcher를 engine.model_dispatcher로 되꺼내지 않고
     직접 돌려주는 이유는, engine을 mock으로 대체하는 단위 테스트에서도 실제 조립된
@@ -1014,7 +1053,7 @@ def _assemble_session_engine(
     )
 
     # 클라이언트 도구가 오면 전체 교체(위 docstring 참고), 아니면 종전 웹 도구 풀.
-    session_tools = client_tools if client_tools else parts["web_tools"]
+    session_tools = _mixed_tool_pool(client_tools, parts["web_tools"])
 
     dispatcher = ModelDispatcher(
         tier=parts["tier"],
@@ -2564,10 +2603,19 @@ def _client_tools_instruction(client_tools: list[Any]) -> str:
     버그가 났었다 — 그래서 프롬프트를 실제 목록에서 유도한다.
 
     session_instruction 으로 들어가 기본 프롬프트 뒤에 붙으므로 앞의 안내를 덮는다.
+
+    [잔류 서버 도구도 함께 안내한다 — 2026-08-12]
+      혼합 풀(_mixed_tool_pool)이 `AnalyzeImage` 를 남기는데 여기서 "정확히 이것들뿐"
+      이라고 말하면 **프롬프트가 실제 풀보다 좁아진다.** 모델은 있는 도구를 안 쓰게
+      되고, 이미지를 받아 놓고도 분석하지 않는다. 위 `알 수 없는 도구: 'Agent'` 와
+      정확히 대칭인 불일치다(그때는 넓게 말해 없는 도구를 불렀다).
     """
     if not client_tools:
         return ""
+    from core.tools.implementations.client_tool import SERVER_TOOLS_KEPT_WITH_CLIENT_TOOLS
+
     names = ", ".join(t.name for t in client_tools)
+    kept = ", ".join(SERVER_TOOLS_KEPT_WITH_CLIENT_TOOLS)
     return (
         "## Available tools (overrides any tool list above)\n"
         f"You have exactly these tools: {names}.\n"
@@ -2575,7 +2623,11 @@ def _client_tools_instruction(client_tools: list[Any]) -> str:
         "do not attempt to call it.\n"
         "These tools run on the user's own machine, so they see the user's project "
         "files, not the server's. Call them to inspect and change real code rather "
-        "than guessing or printing code blocks and asking the user to apply them."
+        "than guessing or printing code blocks and asking the user to apply them.\n"
+        f"\nOne server-side tool is also available: {kept}. "
+        "Use it whenever the conversation contains an uploaded image path and the "
+        "user asks anything about that image. Call it again for each new question — "
+        "an earlier summary may not contain the answer."
     )
 
 
