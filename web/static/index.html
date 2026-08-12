@@ -2917,7 +2917,7 @@ async function readFileContents() {
           `파일명: ${file.name}\n` +
           `서버 경로: ${uploaded.path}\n` +
           (isImage
-            ? `이 이미지의 내용을 분석·설명·요약·읽기(OCR)해 달라는 요청이면 AnalyzeImage 도구로 분석하세요. 이 이미지를 바탕으로(참고해서) 그리거나 수정해 달라는 요청이면(표현이 '그려줘'여도) ImageGenerate 도구를 호출하되 input_image를 위 서버 경로로 설정하세요(원본을 반영하는 img2img).`
+            ? `이 이미지의 내용을 분석·설명·요약·읽기(OCR)해 달라는 요청이면 AnalyzeImage 도구로 분석하세요. 이미 분석한 이미지라도 **새로운 질문이면 다시 호출하세요** — 앞선 요약에는 그 질문의 답이 없을 수 있습니다. 이 이미지를 바탕으로(참고해서) 그리거나 수정해 달라는 요청이면(표현이 '그려줘'여도) ImageGenerate 도구를 호출하되 input_image를 위 서버 경로로 설정하세요(원본을 반영하는 img2img).`
             : `위 서버 경로의 문서를 분석해 주세요.`)
         );
       } else {

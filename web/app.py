@@ -920,6 +920,11 @@ def _build_web_engine_parts(components: dict, state: Any) -> dict:
         # 주입하지 않으면 도구가 10MB 로 폴백해, 20MB 로 올라간 파일이 업로드는
         # 통과하고 분석에서만 거부되는 불일치가 난다(실측 F10).
         "vision_max_image_mb": _vision_max_bytes() // (1024 * 1024),
+        # 파일이 없을 때 "만료됐다"고 알려 주기 위한 값(2026-08-12). 그냥 "없다"고만
+        # 하면 모델이 경로를 고쳐 가며 재시도해 턴을 낭비한다.
+        "upload_retention_hours": getattr(
+            getattr(state.config, "upload", None), "retention_hours", 0
+        ),
     }
 
     # 시스템 프롬프트는 파일 읽기 + 서브에이전트 가이드 조립이라 비교적 무겁다 →

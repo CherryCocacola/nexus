@@ -252,17 +252,23 @@ class AnalyzeImageTool(BaseTool):
 
         # 업로드 샌드박스 하위가 아니면 거부(경로 순회·임의 파일 읽기 차단).
         if not target.is_relative_to(uploads_dir):
-            return None, (
-                f"허용된 업로드 디렉토리 하위 경로만 분석할 수 있습니다: {image_path}"
-            )
+            return None, (f"허용된 업로드 디렉토리 하위 경로만 분석할 수 있습니다: {image_path}")
         if not target.is_file():
-            return None, f"이미지 파일을 찾을 수 없습니다: {image_path}"
+            # 대부분의 원인은 오타가 아니라 **보존 기간 만료**다(정리 잡이 지운다).
+            # 그냥 "없다"고만 하면 모델이 경로를 고쳐 가며 재시도해 턴을 낭비하고,
+            # 사용자는 왜 어제 되던 것이 오늘 안 되는지 알 수 없다.
+            hours = context.options.get("upload_retention_hours")
+            when = f"업로드 후 {hours}시간" if hours else "일정 시간"
+            return None, (
+                f"이미지 파일을 찾을 수 없습니다: {image_path}. "
+                f"업로드 파일은 {when}이 지나면 정리되므로, 오래된 이미지는 "
+                "다시 올려야 분석할 수 있습니다(경로를 바꿔 재시도하지 마세요)."
+            )
 
         ext = target.suffix.lower()
         if ext not in _MIME_BY_EXT:
             return None, (
-                f"지원하지 않는 이미지 형식입니다: '{ext}'. "
-                f"지원: {', '.join(sorted(_MIME_BY_EXT))}"
+                f"지원하지 않는 이미지 형식입니다: '{ext}'. 지원: {', '.join(sorted(_MIME_BY_EXT))}"
             )
 
         # 크기 상한 검사(fail-closed). 큰 이미지는 전송 지연·토큰 폭증·타임아웃을
@@ -361,9 +367,7 @@ class AnalyzeImageTool(BaseTool):
         #    bare except 금지 — 예외 종류별로 구체적으로 잡아 원인을 구분해 안내한다.
         try:
             async with httpx.AsyncClient(timeout=120.0) as client:
-                response = await client.post(
-                    f"{vision_url}/v1/chat/completions", json=payload
-                )
+                response = await client.post(f"{vision_url}/v1/chat/completions", json=payload)
                 response.raise_for_status()
                 body = response.json()
         except httpx.ConnectError as e:
