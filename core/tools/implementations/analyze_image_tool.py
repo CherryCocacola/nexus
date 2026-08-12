@@ -181,6 +181,20 @@ class AnalyzeImageTool(BaseTool):
                         f"미지정 시 기본값 '{DEFAULT_QUESTION}' 을 사용한다."
                     ),
                 },
+                "region": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "minItems": 4,
+                    "maxItems": 4,
+                    "description": (
+                        "Optional [x, y, width, height] as RATIOS of 0~1 to crop before "
+                        "analysis. Use when the text or detail is small and a full-image "
+                        "read was wrong or unreadable — cropping spends the model's pixel "
+                        "budget on that area instead of the whole picture. "
+                        "예: 왼쪽 위 [0,0,0.5,0.5] · 오른쪽 아래 [0.5,0.5,0.5,0.5] · "
+                        "가운데 가로띠 [0,0.4,1,0.2]. 비율이므로 원본 크기를 몰라도 된다."
+                    ),
+                },
             },
             "required": ["image_path"],
         }
@@ -282,6 +296,77 @@ class AnalyzeImageTool(BaseTool):
             )
         return target, None
 
+    def _crop_region(
+        self, image_bytes: bytes, mime: str, region: Any
+    ) -> tuple[bytes, str, str | None]:
+        """비율 좌표 [x, y, w, h](0~1)로 이미지를 잘라 돌려준다.
+
+        [왜 비율인가]
+          모델은 원본 픽셀 크기를 모른다. "왼쪽 위" 를 픽셀로 말하라고 하면 찍어야 하고,
+          그 값이 이미지마다 틀린다. 비율이면 [0, 0, 0.5, 0.5] 하나로 통한다.
+
+        [왜 잘라서 보내면 잘 읽히나]
+          VLM 은 입력을 자체 해상도로 줄여서 본다. 전체를 보내면 그 축소가 작은 글씨를
+          지우지만, 잘라 보내면 같은 픽셀 예산이 그 영역에만 쓰인다.
+
+        Returns:
+            (바이트, MIME, 오류메시지). 오류가 있으면 앞의 둘은 원본 그대로다.
+        """
+        try:
+            from PIL import Image
+        except ImportError:  # 선언은 했지만 환경이 깨진 경우 — 원본으로 진행하지 않는다
+            return (
+                image_bytes,
+                mime,
+                (
+                    "이미지 크롭에 필요한 Pillow 가 설치돼 있지 않습니다. "
+                    "region 없이 다시 호출하세요."
+                ),
+            )
+
+        # 좌표 검증 — 모델이 만든 값이라 범위를 벗어나거나 개수가 틀릴 수 있다.
+        if not isinstance(region, (list, tuple)) or len(region) != 4:
+            return image_bytes, mime, "region 은 [x, y, width, height] 네 개의 숫자여야 합니다."
+        try:
+            x, y, w, h = (float(v) for v in region)
+        except (TypeError, ValueError):
+            return image_bytes, mime, "region 값은 모두 숫자여야 합니다."
+        if w <= 0 or h <= 0:
+            return image_bytes, mime, "region 의 width/height 는 0보다 커야 합니다."
+        if not all(0.0 <= v <= 1.0 for v in (x, y, w, h)):
+            return (
+                image_bytes,
+                mime,
+                (
+                    "region 은 0~1 사이의 **비율**입니다(픽셀 좌표가 아닙니다). "
+                    "예: 오른쪽 아래 [0.5, 0.5, 0.5, 0.5]"
+                ),
+            )
+
+        try:
+            import io
+
+            with Image.open(io.BytesIO(image_bytes)) as img:
+                # verify() 는 파일 포인터를 소모하므로 크롭 전에 따로 열어 검사하지 않고,
+                # 여기서 실제 디코딩이 되는 것 자체로 무결성을 확인한다(압축 폭탄은
+                # Pillow 의 DecompressionBombWarning/Error 가 잡는다).
+                img = img.convert("RGB")
+                width_px, height_px = img.size
+                # 비율 → 픽셀. 경계를 넘지 않게 자르고, 최소 1픽셀은 남긴다.
+                left = max(0, min(width_px - 1, int(x * width_px)))
+                top = max(0, min(height_px - 1, int(y * height_px)))
+                right = max(left + 1, min(width_px, int((x + w) * width_px)))
+                bottom = max(top + 1, min(height_px, int((y + h) * height_px)))
+                cropped = img.crop((left, top, right, bottom))
+
+                buf = io.BytesIO()
+                # PNG 로 통일한다 — 잘린 조각을 JPEG 로 다시 압축하면 글자 경계에
+                # 블록 노이즈가 생겨, 정확히 읽으려고 자른 의미가 줄어든다.
+                cropped.save(buf, format="PNG")
+                return buf.getvalue(), "image/png", None
+        except Exception as e:  # noqa: BLE001 — Pillow 예외 종류가 넓다(폭탄/손상/포맷)
+            return image_bytes, mime, f"이미지를 자르지 못했습니다: {e}"
+
     async def check_permissions(
         self, input_data: dict[str, Any], context: ToolUseContext
     ) -> PermissionResult:
@@ -338,6 +423,18 @@ class AnalyzeImageTool(BaseTool):
         except OSError as e:
             return ToolResult.error(f"이미지 파일을 읽을 수 없습니다: {e}")
         mime = _MIME_BY_EXT[target.suffix.lower()]
+
+        # 2-b) region 이 있으면 그 부분만 잘라 보낸다(2026-08-12).
+        #      VLM 은 입력 이미지를 자체 해상도로 줄여서 본다. 전체를 보내면 작은 글씨가
+        #      뭉개지지만, 잘라 보내면 **같은 픽셀 예산이 그 영역에 쓰여** 읽힌다.
+        #      (실측: 640x400 이미지의 우하단 'OMEGA77' 을 전체 분석에서 'OMEGA777' 로
+        #       오독했다 — 재질의가 되는 것과 정확히 읽는 것은 다른 문제였다.)
+        region = input_data.get("region")
+        if region:
+            image_bytes, mime, crop_error = self._crop_region(image_bytes, mime, region)
+            if crop_error is not None:
+                return ToolResult.error(crop_error)
+
         image_b64 = base64.b64encode(image_bytes).decode("ascii")
         data_url = f"data:{mime};base64,{image_b64}"
 
