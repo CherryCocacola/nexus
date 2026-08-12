@@ -205,6 +205,22 @@ def _uploads_dir() -> Any:
     return resolve_uploads_dir(getattr(upload_cfg, "uploads_dir", "") or None)
 
 
+def _vision_max_bytes() -> int:
+    """비전 입력 크기 상한 — **업로드 상한과 같은 값**을 단일 출처에서 읽는다.
+
+    [왜 하나로 묶었나 — 2026-08-12]
+      업로드는 20MB 를 받는데 AnalyzeImage 는 10MB 로 폴백하고 있었다
+      (`vision_max_image_mb` 를 아무도 주입하지 않았다). 그래서 15MB 이미지가
+      업로드는 성공하고 **분석에서만** 거부됐다 — 사용자에게는 원인이 안 보인다.
+
+      상수를 두 개 두면 반드시 갈라진다. 업로드 상한 하나만 두고 여기서 파생시킨다.
+    """
+    from core.config import UploadConfig
+
+    upload_cfg = getattr(_app_state.get("config"), "upload", None) or UploadConfig()
+    return int(getattr(upload_cfg, "max_size_bytes", 0) or UploadConfig().max_size_bytes)
+
+
 # sha256 계산 시 파일을 한 번에 읽지 않고 스트리밍하는 청크 크기(64KB).
 _SHA256_CHUNK = 64 * 1024
 # sha256을 계산할 파일 크기 상한(8MB). 이보다 큰 파일은 성능을 위해 해시를 생략한다.
@@ -900,6 +916,10 @@ def _build_web_engine_parts(components: dict, state: Any) -> dict:
         # 업로드 첨부 저장 디렉토리 — AnalyzeImage 가 "이 디렉토리 하위" 이미지만 읽도록
         # 제한하는 기준. /v1/upload 라우트와 같은 _uploads_dir() 로 단일 소스를 공유한다.
         "uploads_dir": str(_uploads_dir()),
+        # 비전 입력 크기 상한 — 업로드 상한과 **같은 값**을 쓴다(2026-08-12).
+        # 주입하지 않으면 도구가 10MB 로 폴백해, 20MB 로 올라간 파일이 업로드는
+        # 통과하고 분석에서만 거부되는 불일치가 난다(실측 F10).
+        "vision_max_image_mb": _vision_max_bytes() // (1024 * 1024),
     }
 
     # 시스템 프롬프트는 파일 읽기 + 서브에이전트 가이드 조립이라 비교적 무겁다 →
@@ -1137,7 +1157,17 @@ class OpenAIChatMessage(BaseModel):
     model_config = {"extra": "ignore"}
 
     role: str = Field(description="메시지 역할 (system/user/assistant/tool)")
-    content: str | None = Field(default=None, description="메시지 본문 텍스트")
+    # 배열도 받는다(2026-08-12). OpenAI 비전 규격은 content 를 파트 배열로 보낸다.
+    #   [{"type":"text",...}, {"type":"image_url","image_url":{"url":"data:..."}}]
+    # 예전에는 문자열만 받아 **이미지가 아니라 배열이라서** 422 가 났다(텍스트만 든
+    # 배열도 마찬가지였다). _normalize_openai_content 가 여기서 문자열로 되돌린다.
+    # 원소 타입은 `Any` 로 둔다 — `list[dict]` 로 좁히면 파트 하나가 이상할 때
+    # Pydantic 이 **요청 전체를 422** 로 거부한다. 이 엔드포인트의 관례는 그 반대다
+    # (build_client_tools: "하나 이상하다고 요청 전체를 죽이지 않는다"). 이상한 파트는
+    # 정규화기가 건너뛰고 경고로 알린다.
+    content: str | list[Any] | None = Field(
+        default=None, description="메시지 본문. 문자열 또는 OpenAI 파트 배열."
+    )
     # ── 클라이언트 실행 도구 루프용(2026-08-08) ──────────────
     # 클라이언트(VSCode 플러그인 등)가 도구를 직접 실행하는 방식에서는 대화가
     # `user → assistant(tool_calls) → tool(결과) → assistant …` 로 흐른다.
@@ -2313,6 +2343,73 @@ async def chat_stream(
 # 이 엔드포인트를 붙이면 그들이 base_url만 Nexus로 바꿔 커스텀 코드 없이 붙을 수 있다.
 # 기존 /v1/chat·/v1/chat/stream 은 그대로 두고(무손상), 4-Tier 체인(submit_message가
 # yield하는 StreamEvent만 소비)도 절대 우회하지 않는다.
+def _normalize_openai_content(
+    messages: list[OpenAIChatMessage],
+) -> tuple[list[OpenAIChatMessage], list[str]]:
+    """`content` 파트 배열을 문자열로 되돌린다. 이미지는 파일로 내리고 핸들만 남긴다.
+
+    [왜 여기서 하나 — 2026-08-12]
+      Pydantic 검증기에 넣고 싶지만 이미지 저장은 I/O 이고 설정(uploads_dir)이 필요해
+      모델 안에 둘 수 없다. 그래서 `_split_openai_messages` **앞**에서 한 번 돌린다.
+      이 아래 파이프라인은 종전대로 문자열 content 만 보게 되므로 무회귀다.
+
+    Returns:
+        (정규화된 메시지, 경고 목록). 경고는 응답의 `warnings` 로 나간다 —
+        도구를 조용히 버리지 않기로 한 것과 같은 이유로, 이미지도 조용히 버리지 않는다.
+    """
+    from core.storage.inline_images import (
+        InlineImageError,
+        build_image_handle,
+        parse_data_url,
+        save_inline_image,
+    )
+
+    warnings: list[str] = []
+    # 이미지가 하나도 없으면 디렉토리 생성조차 하지 않는다(불필요한 부작용 회피).
+    uploads_dir: Path | None = None
+    max_bytes = _vision_max_bytes()
+    img_index = 0
+    out: list[OpenAIChatMessage] = []
+
+    for msg in messages:
+        if not isinstance(msg.content, list):
+            out.append(msg)
+            continue
+
+        texts: list[str] = []
+        handles: list[str] = []
+        for part in msg.content:
+            if not isinstance(part, dict):
+                warnings.append("형식이 올바르지 않은 content 파트를 건너뛰었습니다.")
+                continue
+            ptype = str(part.get("type") or "")
+            if ptype == "text":
+                texts.append(str(part.get("text") or ""))
+            elif ptype == "image_url":
+                raw_url = part.get("image_url")
+                url = raw_url.get("url") if isinstance(raw_url, dict) else raw_url
+                try:
+                    mime, raw = parse_data_url(str(url or ""), max_bytes)
+                    if uploads_dir is None:
+                        uploads_dir = _uploads_dir()
+                    path = save_inline_image(raw, mime, uploads_dir)
+                except InlineImageError as e:
+                    # 이미지 하나가 이상하다고 대화 전체를 죽이지 않는다. 다만 조용히
+                    # 넘기지도 않는다 — 왜 못 봤는지 모델과 사용자 둘 다 알아야 한다.
+                    warnings.append(f"이미지를 받아들이지 못했습니다: {e}")
+                    texts.append(f"[이미지 첨부 실패: {e}]")
+                    continue
+                img_index += 1
+                handles.append(build_image_handle(path, img_index))
+            else:
+                warnings.append(f"지원하지 않는 content 파트를 건너뛰었습니다: {ptype}")
+
+        merged = "\n\n".join([t for t in texts if t] + handles)
+        out.append(msg.model_copy(update={"content": merged}))
+
+    return out, warnings
+
+
 def _split_openai_messages(
     messages: list[OpenAIChatMessage],
 ) -> tuple[str | None, list[Any], str, bool]:
@@ -2662,12 +2759,16 @@ async def chat_completions(
 
     # 요청 검증/분해는 StreamingResponse 생성 '이전'에 수행해야 400을 정상 반환한다
     # (제너레이터 안에서 raise 하면 이미 200 스트림이 시작된 뒤라 400이 안 나감).
+    # content 파트 배열(OpenAI 비전 규격)을 문자열로 되돌린다. 이미지는 파일로 내리고
+    # 대화에는 서버 경로 핸들만 남는다 — 아래 파이프라인은 종전대로 문자열만 본다.
+    normalized_messages, image_warnings = _normalize_openai_content(request.messages)
+
     (
         system_content,
         prior_messages,
         last_user_text,
         is_tool_continuation,
-    ) = _split_openai_messages(request.messages)
+    ) = _split_openai_messages(normalized_messages)
 
     # 클라이언트가 실행할 도구 스키마(있으면 이번 요청의 도구 목록을 전부 교체한다).
     # tool_choice="none" 은 "도구 쓰지 말고 답하라"이므로 아예 만들지 않는다.
@@ -2675,9 +2776,12 @@ async def chat_completions(
 
     # 버려진 도구가 있으면 경고를 함께 받는다. 조용히 버리면 플러그인 개발자가
     # "왜 내 도구를 안 쓰지?"의 원인을 찾을 수 없다(2026-08-08).
-    tool_warnings: list[str] = []
+    # 이미지 경고도 같은 통로로 내보낸다 — 조용히 버리지 않는다는 원칙은 도구와 같다.
+    tool_warnings: list[str] = list(image_warnings)
     if request.tools and request.tool_choice != "none":
-        client_tools, tool_warnings = build_client_tools(request.tools)
+        # ★재대입하지 않는다 — 위에서 담은 이미지 경고가 덮여 사라진다.
+        client_tools, _tool_w = build_client_tools(request.tools)
+        tool_warnings.extend(_tool_w)
         if not client_tools:
             # 도구를 보냈는데 하나도 쓸 수 없다 — 조용히 도구 없는 대화로 강등하면
             # 클라이언트는 루프가 성립하지 않는 이유를 영영 모른다. 명시적으로 거부한다
