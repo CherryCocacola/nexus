@@ -98,9 +98,10 @@ def _sanitize_history_inplace(history: list) -> None:
                 )
 
 
-from fastapi import FastAPI, Header, HTTPException, Request, UploadFile
+from fastapi import FastAPI, Header, HTTPException, Request, Response, UploadFile
+from fastapi.exceptions import RequestValidationError  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -613,6 +614,66 @@ def _sanitize_client_id(raw: Any) -> str | None:
         return None
     cleaned = "".join(ch for ch in raw.strip() if ch.isalnum() or ch in "-_")
     return cleaned[:32] or None
+
+
+def _sanitize_request_id(raw: Any) -> str | None:
+    """X-Request-ID 헤더를 로그에 안전한 형태로 정규화한다 (2026-08-13).
+
+    왜 필요한가:
+      VSCode 플러그인은 요청마다 UUID를 만들어 `X-Request-ID`로 보내고, 사용자에게도
+      그 값을 보여 준다. 그런데 서버가 이 헤더를 **읽지도 남기지도 않아서**, 사용자가
+      "요청 ID xxxx가 실패했다"고 알려 와도 로그에서 찾을 수 없었다. 실제로
+      2026-08-13 문의에서 두 건 모두 grep 0건이 나와 발생 시각으로 더듬어야 했다.
+
+    안전 규칙:
+      로그에 그대로 찍히므로 영문자·숫자·`-`·`_`만 남긴다(개행·제어문자로 로그 한 줄을
+      위조하는 것을 막는다). UUID가 36자라 상한은 64자로 둔다.
+
+    Returns:
+        정규화된 요청 ID. 값이 없거나 남는 문자가 없으면 None.
+    """
+    if not raw or not isinstance(raw, str):
+        return None
+    cleaned = "".join(ch for ch in raw.strip() if ch.isalnum() or ch in "-_")
+    return cleaned[:64] or None
+
+
+# 검증 실패 응답·로그에 실을 오류 개수와 입력값 길이의 상한.
+# 왜 자르나: Pydantic 오류의 `input`에는 **요청 본문 값이 그대로** 들어간다.
+# 20MB base64 이미지가 들어오면 그게 통째로 로그와 응답으로 되돌아간다(증폭).
+_MAX_VALIDATION_ERRORS = 20
+_MAX_VALIDATION_INPUT_CHARS = 200
+
+
+def _summarize_validation_errors(errors: Any) -> list[dict[str, Any]]:
+    """Pydantic 검증 오류를 로그·응답에 싣기 안전한 크기로 줄인다 (2026-08-13).
+
+    각 오류에서 `loc`(어느 필드)·`msg`(왜)·`type`(무슨 규칙)만 남기고, `input`은
+    길이를 잘라 붙인다. 문자열이 아닌 입력(dict/list 등)은 **repr조차 만들지 않고**
+    타입 이름만 남긴다 — 거대한 본문을 repr하는 순간 그 크기만큼 메모리를 쓴다.
+    """
+    out: list[dict[str, Any]] = []
+    for err in list(errors)[:_MAX_VALIDATION_ERRORS]:
+        if not isinstance(err, dict):
+            continue
+        item: dict[str, Any] = {
+            "loc": [str(p) for p in err.get("loc", ())],
+            "msg": str(err.get("msg", ""))[:300],
+            "type": str(err.get("type", "")),
+        }
+        if "input" in err:
+            raw = err["input"]
+            if isinstance(raw, str):
+                item["input"] = raw[:_MAX_VALIDATION_INPUT_CHARS] + (
+                    "…(잘림)" if len(raw) > _MAX_VALIDATION_INPUT_CHARS else ""
+                )
+            elif raw is None or isinstance(raw, (bool, int, float)):
+                item["input"] = str(raw)
+            else:
+                # dict/list 등 — 크기를 알 수 없으므로 타입만 알린다.
+                item["input"] = f"<{type(raw).__name__}>"
+        out.append(item)
+    return out
 
 
 def _record_client_meta(
@@ -1301,6 +1362,26 @@ class OpenAIChoice(BaseModel):
     finish_reason: str = "stop"
 
 
+class FinishDetail(BaseModel):
+    """finish_reason 만으로는 구분되지 않는 종료 사유를 기계가 읽을 수 있게 싣는다 (2026-08-13).
+
+    왜 필요한가:
+      OpenAI 규격의 finish_reason 은 값이 다섯 개뿐이라(stop/length/tool_calls/
+      content_filter/function_call) "구조화 출력 JSON 이 깨졌다"를 담을 칸이 없다.
+      그래서 2026-08-05 에 가장 가까운 칸인 `content_filter` 를 빌려 썼는데, 그 이름
+      때문에 **콘텐츠 정책에 차단당했다는 오해**가 생겼다(2026-08-13 문의).
+      이 서버에는 콘텐츠 정책 필터가 존재하지 않는다.
+
+    왜 finish_reason 값 자체를 바꾸지 않았나:
+      OpenAI SDK 들은 이 필드를 Literal 로 검증한다. 규격에 없는 값을 넣으면 표준
+      클라이언트가 응답 파싱 단계에서 깨진다. 값은 유지하고 **사유를 따로 싣는다**.
+      표준 클라이언트는 모르는 최상위 필드를 무시하므로 안전하다.
+    """
+
+    code: str = Field(description="기계가 분기할 사유 코드")
+    message: str = Field(description="사람이 읽을 설명")
+
+
 class OpenAIUsage(BaseModel):
     """OpenAI 규격 토큰 사용량(prompt/completion/total)."""
 
@@ -1327,6 +1408,9 @@ class OpenAIChatCompletionResponse(BaseModel):
     # 도구). 표준 클라이언트는 모르는 필드를 무시하고, 우리 플러그인은 읽어서 개발자에게
     # 보여줄 수 있다. 조용히 버리면 "왜 내 도구를 안 쓰지?"의 원인을 찾을 수 없다.
     warnings: list[str] = Field(default_factory=list)
+    # 비표준 확장 필드 — finish_reason 이 담지 못하는 종료 사유(FinishDetail 참고).
+    # 정상 종료면 None 이므로 기존 응답과 달라지지 않는다(무회귀).
+    finish_detail: FinishDetail | None = None
 
 
 class ToolInfo(BaseModel):
@@ -1596,6 +1680,53 @@ app.add_middleware(
     get_auth_config=_get_web_auth_config,
     get_tenant_registry=_get_tenant_registry,
 )
+
+@app.exception_handler(RequestValidationError)
+async def _handle_validation_error(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    """요청 검증 실패(422)의 **사유를 로그에 남긴다** (2026-08-13).
+
+    왜 필요한가:
+      기본 동작은 422 본문에만 사유를 담고 서버 로그에는 접근 로그 한 줄
+      (`"POST /v1/chat/completions" 422 Unprocessable Entity`)만 남긴다. 그래서
+      2026-08-12 플러그인 422 를 조사할 때 **어느 필드가 왜 걸렸는지 로그로는 알 수
+      없어** 요청을 직접 재현해야 했다. 검증 실패는 클라이언트 개발자가 고쳐야 하는
+      문제이므로, 원인을 서버가 먼저 알고 있어야 한다.
+
+    함께 하는 일:
+      - 응답 본문의 `input` 을 잘라 되돌린다. 자르지 않으면 20MB base64 이미지를
+        보냈다가 실패했을 때 그 20MB 가 로그와 응답으로 **그대로 증폭**된다.
+      - X-Request-ID 를 로그와 응답 헤더 양쪽에 싣는다(요청 ID 추적).
+    """
+    detail = _summarize_validation_errors(exc.errors())
+    rid = _sanitize_request_id(request.headers.get("X-Request-ID"))
+    logger.warning(
+        "[요청검증실패] 422 %s %s request_id=%s detail=%s",
+        request.method,
+        request.url.path,
+        rid or "-",
+        json.dumps(detail, ensure_ascii=False)[:2000],
+    )
+    return JSONResponse(status_code=422, content={"detail": detail})
+
+
+@app.middleware("http")
+async def _echo_request_id(request: Request, call_next: Any) -> Response:
+    """클라이언트가 보낸 X-Request-ID 를 응답에 되돌려준다 (2026-08-13).
+
+    왜 엔드포인트가 아니라 미들웨어인가:
+      ① 상태 코드를 가리지 않는다 — 200 뿐 아니라 400/422/500 응답에도 실린다.
+         정작 필요한 건 실패했을 때인데, 핸들러 안에서 세팅하면 예외 경로를 놓친다.
+      ② StreamingResponse 를 직접 반환하는 경로도 자동으로 덮는다.
+      ③ 핸들러 시그니처를 건드리지 않는다(엔드포인트 함수를 직접 부르는 테스트가 있다).
+    """
+    response: Response = await call_next(request)
+    rid = _sanitize_request_id(request.headers.get("X-Request-ID"))
+    if rid:
+        response.headers["X-Request-ID"] = rid
+    return response
+
 
 # 요청 로깅 미들웨어 적용
 _logging_middleware = RequestLoggingMiddleware(app)
@@ -2805,6 +2936,7 @@ async def chat_completions(
     x_tenant_id: str | None = Header(default=None, alias="X-Tenant-ID"),
     authorization: str | None = Header(default=None),
     x_client_id: str | None = Header(default=None, alias="X-Client-Id"),
+    x_request_id: str | None = Header(default=None, alias="X-Request-ID"),
 ) -> Any:
     """OpenAI 호환 채팅 완성 엔드포인트.
 
@@ -2813,6 +2945,23 @@ async def chat_completions(
     4-Tier 체인은 submit_message 이벤트만 소비하여 우회하지 않는다.
     """
     tenant = _resolve_tenant(request.tenant_id, x_tenant_id, authorization)
+
+    # ── 요청 ID 추적 (2026-08-13) ────────────────────────────────
+    # 세션 ID 를 여기서 먼저 만든다. 아래 도구 검증에서 400 으로 빠지는 경로가 있는데,
+    # 그 전에 로그 한 줄을 남겨야 "요청 ID xxxx 가 실패했다"는 문의를 추적할 수 있다.
+    # (실측: 2026-08-13 문의의 요청 ID 두 건 모두 로그 grep 0건이었다.)
+    session_id = str(uuid.uuid4())
+    _request_id = _sanitize_request_id(x_request_id)
+    logger.info(
+        "[요청추적] session=%s request_id=%s client=%s tenant=%s stream=%s",
+        session_id,
+        _request_id or "-",
+        _sanitize_client_id(x_client_id) or "-",
+        # TenantConfig 의 식별자 필드는 `id` 다(`tenant_id` 가 아니다 — 요청 본문의
+        # 필드명과 달라서, 틀리면 getattr 기본값 때문에 조용히 "-" 로만 찍힌다).
+        getattr(tenant, "id", None) or "-",
+        request.stream,
+    )
 
     # 요청 검증/분해는 StreamingResponse 생성 '이전'에 수행해야 400을 정상 반환한다
     # (제너레이터 안에서 raise 하면 이미 200 스트림이 시작된 뒤라 400이 안 나감).
@@ -2849,7 +2998,8 @@ async def chat_completions(
                 + (" / ".join(tool_warnings) if tool_warnings else "형식을 확인하세요."),
             )
         for _w in tool_warnings:
-            logger.warning("클라이언트 도구 경고: session=%s, %s", "openai", _w)
+            # 세션 ID 를 실어야 위의 [요청추적] 줄과 이어붙일 수 있다("openai" 고정값이었다).
+            logger.warning("클라이언트 도구 경고: session=%s, %s", session_id, _w)
     else:
         client_tools = []
     # 도구를 교체했으면 프롬프트도 실제 목록에 맞춘다(불일치 방지 — 위 함수 설명 참고).
@@ -2861,8 +3011,8 @@ async def chat_completions(
     # (제너레이터 안에서 raise하면 이미 200 스트림이 시작된 뒤라 400이 안 나감).
     structured_output = _build_structured_output_spec(request.response_format)
 
-    # OpenAI 에는 session_id 개념이 없다 → 요청마다 임시 세션으로 무상태 처리.
-    session_id = str(uuid.uuid4())
+    # session_id 는 위(요청 ID 추적)에서 이미 만들었다 — OpenAI 에는 session_id
+    # 개념이 없어 요청마다 임시 세션으로 무상태 처리한다.
     # 소비자 식별(2026-08-05) — api 채널에는 여러 외부 클라이언트의 대화가 함께
     # 쌓여 구분이 불가능했다. 헤더를 준 클라이언트만 메타에 남긴다(선택 사항).
     _client_id = _sanitize_client_id(x_client_id)
@@ -2992,6 +3142,7 @@ async def chat_completions(
     # 구조화 출력(JSON) 요청이면 서버가 먼저 파싱해 본다. 깨진 JSON을 그대로
     # 200으로 흘려보내면 클라이언트는 원인을 알 수 없다(실측: 플러그인 파싱 실패).
     # 실패 원인 대부분은 "잘림"이므로 finish_reason과 함께 경고를 남긴다.
+    finish_detail: FinishDetail | None = None
     if structured_output is not None and content:
         try:
             json.loads(content)
@@ -3005,8 +3156,29 @@ async def chat_completions(
                 session_id,
             )
             # 잘림이 아닌데도 깨졌다면 클라이언트가 구분할 수 있도록 신호를 준다.
-            if finish_reason == "stop":
+            # finish_reason 값은 OpenAI 규격 안에 머물러야 표준 SDK 가 깨지지 않으므로
+            # `content_filter` 를 유지하되, **왜 그런지는 finish_detail 로 분리해 싣는다**
+            # (2026-08-13 — "정책에 차단당했다"는 오해가 실제로 발생했다).
+            if finish_reason == "length":
+                finish_detail = FinishDetail(
+                    code="RESPONSE_TRUNCATED",
+                    message=(
+                        "출력 토큰 한도에 걸려 응답이 잘렸고 그래서 JSON 이 완성되지 "
+                        "않았습니다. max_tokens 를 늘리거나 요청을 분할하세요."
+                    ),
+                )
+            elif finish_reason == "stop":
                 finish_reason = "content_filter"
+                finish_detail = FinishDetail(
+                    code="INVALID_STRUCTURED_OUTPUT",
+                    message=(
+                        "구조화 출력(JSON) 요청인데 응답이 유효한 JSON 이 아닙니다. "
+                        "콘텐츠 정책에 의한 차단이 아닙니다 — 이 서버에는 프롬프트·"
+                        "도구 결과·모델 출력을 검사하는 콘텐츠 정책 필터가 없습니다. "
+                        "생성이 도중에 끊겼을 때(반복 붕괴 조기 절단 포함) 주로 "
+                        "발생하므로 다시 시도하거나 요청 범위를 줄이세요."
+                    ),
+                )
 
     return OpenAIChatCompletionResponse(
         id=f"chatcmpl-{uuid.uuid4().hex}",
@@ -3023,6 +3195,7 @@ async def chat_completions(
         usage=usage,
         downloads=downloads,
         warnings=tool_warnings,
+        finish_detail=finish_detail,
     )
 
 

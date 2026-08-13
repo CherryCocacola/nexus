@@ -325,6 +325,13 @@ class CORSConfig:
         "X-Request-ID",
     ]
 
+    # 응답에서 클라이언트가 **읽을 수 있게** 노출할 헤더.
+    # allow_headers(요청에 실어도 되는 헤더)와는 다른 목록이다 — 둘을 혼동하면
+    # "보내기는 되는데 돌려받은 값은 안 보이는" 상태가 된다.
+    EXPOSED_HEADERS: list[str] = [
+        "X-Request-ID",
+    ]
+
     @classmethod
     def get_cors_kwargs(cls) -> dict[str, Any]:
         """
@@ -339,6 +346,10 @@ class CORSConfig:
             "allow_credentials": True,
             "allow_methods": cls.ALLOWED_METHODS,
             "allow_headers": cls.ALLOWED_HEADERS,
+            # 브라우저 클라이언트는 노출(expose)되지 않은 응답 헤더를 읽지 못한다.
+            # 서버가 X-Request-ID를 되돌려줘도 여기 없으면 JS에서 보이지 않아
+            # "요청 ID로 문의" 자체가 성립하지 않는다 (2026-08-13).
+            "expose_headers": cls.EXPOSED_HEADERS,
         }
 
     @classmethod
