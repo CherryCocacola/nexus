@@ -176,7 +176,7 @@ def _collect_downloads(messages: list) -> list[dict[str, str]]:
 
 
 def _answer_warnings_for(answer: str, messages: list) -> str:
-    """답변에 덧붙일 사후 검증 경고를 만든다(숫자 인용 + 실행 주장).
+    """답변에 덧붙일 사후 검증 경고를 만든다(숫자 인용 + 리터럴 표기 + 실행 주장).
 
     실제 판단은 core/verification/post_check.py 가 한다. 웹과 CLI 가 같은 검증을
     받아야 하는데 CLI 는 web/ 을 import 할 수 없으므로(의존성 방향), 로직을 core 로

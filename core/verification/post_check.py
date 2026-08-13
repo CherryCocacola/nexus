@@ -62,6 +62,10 @@ def build_answer_warnings(answer: str, messages: list) -> str:
             build_execution_warning,
             find_execution_claims,
         )
+        from core.verification.literal_citation import (
+            build_literal_warning,
+            find_misquoted_literals,
+        )
         from core.verification.number_citation import (
             build_number_warning,
             find_uncited_numbers,
@@ -69,6 +73,10 @@ def build_answer_warnings(answer: str, messages: list) -> str:
 
         sources = collect_tool_result_texts(messages)
         warning = build_number_warning(find_uncited_numbers(answer, sources))
+        # 리터럴(식별자·코드) 대조 — 숫자 검증과 대상이 겹치지 않는다. 숫자 쪽은
+        # 자릿수 구분 쉼표가 있는 값만, 이쪽은 글자+숫자가 섞인 식별자만 본다
+        # (2026-08-13, `OMEGA77` → `오메가77` 실측).
+        warning += build_literal_warning(find_misquoted_literals(answer, sources))
         warning += build_execution_warning(find_execution_claims(answer), len(sources))
         return warning
     except Exception as e:  # noqa: BLE001 — 검증 실패가 응답을 막지 않게 한다
