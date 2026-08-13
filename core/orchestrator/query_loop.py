@@ -136,6 +136,13 @@ class LoopState:
     force_tool_choice: str | None = None
     compact_retry_count: int = 0
     collapse_drain_count: int = 0
+    # degeneration 재생성 예산(2026-08-13). 붕괴로 스트림이 조기 절단됐을 때 샘플링을
+    # 바꿔 한 번만 다시 만든다. 붕괴 없이 스트림이 끝나면 0으로 되돌려, "붕괴 1건당
+    # 1회"가 되게 한다(누적 소진으로 이후 붕괴가 무방비가 되는 것을 막는다).
+    degen_retry_count: int = 0
+    # one-shot 플래그 — 다음 stream() 호출에만 보정 샘플링을 적용하고 즉시 내린다.
+    # (force_tool_choice 와 같은 규약. 안 내리면 이후 모든 턴의 온도가 올라간다.)
+    degen_retry_pending: bool = False
 
     # 마지막 종료 이유
     last_stop_reason: StopReason | None = None
@@ -162,6 +169,22 @@ MAX_COMPACT_RETRY = 2  # prompt-too-long 압축 재시도 횟수
 # 품질 114건 실증) 스트리밍 워치독에 붕괴 감지·절단을 켠다. 임계값은 stream_watchdog의
 # DegenerationMonitor 기본값(정상 표/목록/코드는 통과하도록 넉넉히 설정).
 DEGEN_GUARD_ENABLED = True  # False로 두면 종전 동작(감지 없음)과 100% 동일(무회귀)
+
+# ── 붕괴 감지 후 재생성 (2026-08-13) ─────────────────────────────
+# 종전에는 붕괴를 감지하면 **자르고 끝**이었다. 실측(2026-08-13 14:33): 8,944자를
+# 만들고 잘린 뒤 그 상태로 사용자에게 나갔고, 구조화 출력 요청이라 JSON 이 깨져
+# finish_reason 까지 오염됐다. 잘린 쓰레기를 그대로 주느니 한 번 다시 만든다.
+#
+# 왜 하필 temperature 를 올리나 — 이 리포의 실측이 두 페널티를 모두 배제한다.
+#   · repetition_penalty 1.15 → 종결어미·조사까지 억눌러 EOS 붕괴(2026-07-20 사고)
+#   · frequency_penalty 0.3   → 등장횟수 선형비례라 긴 생성일수록 억압이 누적(붕괴 주범,
+#                               그래서 knowledge_mode 에서 0.3→0.1 로 내렸다)
+# 즉 붕괴는 긴 생성에서 나는데 두 페널티는 긴 생성에서 되레 붕괴를 키운다. 반면
+# temperature 상향은 반복 끌개(attractor)에서 빠져나오게 하면서 누적 억압이 없다.
+# ★이 값은 아직 실측되지 않았다. 재생성 자체의 효과와 함께 측정 대상이다.
+DEGEN_MAX_RETRY = 1  # 붕괴 1건당 재생성 횟수. 2 이상은 지연이 배로 늘어 사용자가 먼저 떠난다
+DEGEN_RETRY_TEMPERATURE_DELTA = 0.2  # 재생성 시 온도 가산
+DEGEN_RETRY_TEMPERATURE_MAX = 0.9  # 가산 후 상한(그 이상은 사실성이 흔들린다)
 MAX_COLLAPSE_DRAIN = 1  # 긴급 압축 최대 횟수
 # 반복 실패 도구 호출 가드 — 모델이 같은 도구를 같은 입력으로 계속 호출하는데
 # 매번 실패하는(예: 깨진 Bash 명령을 못 고치고 반복하는) 상황을 조기에 끊는다.
@@ -855,7 +878,24 @@ async def query_loop(
             # Tier 3 호출: model_provider.stream()
             # StreamWatchdog (Ch.7.2)로 감싸서 스트림 무응답을 감지한다.
             # idle 30초, total 300초 초과 시 StreamWatchdogTimeout 발생 → 재시도
-            from core.orchestrator.stream_watchdog import stream_with_watchdog
+            from core.orchestrator.stream_watchdog import (
+                DegenerationMonitor,
+                stream_with_watchdog,
+            )
+
+            # 붕괴 감지기를 **우리가 만들어 넘긴다**. 워치독은 붕괴를 감지하면 예외가
+            # 아니라 정상 종료로 스트림을 끊으므로(재시도 경로에서 붕괴가 재발하는 것을
+            # 막기 위한 의도된 설계), 밖에서는 "짧게 끝났다"와 구분할 방법이 없다.
+            # 같은 인스턴스를 들고 있으면 스트림이 끝난 뒤 물어볼 수 있다.
+            degen_monitor = DegenerationMonitor() if DEGEN_GUARD_ENABLED else None
+
+            # 붕괴 재생성 시도라면 이번 호출에만 온도를 올린다(상수 주석의 근거 참고).
+            effective_temperature = temperature
+            if state.degen_retry_pending:
+                effective_temperature = min(
+                    DEGEN_RETRY_TEMPERATURE_MAX,
+                    temperature + DEGEN_RETRY_TEMPERATURE_DELTA,
+                )
 
             # v7.0 Part 2.5: 라우팅에서 결정된 model_override/temperature/
             # enable_thinking을 Tier 3로 전달한다. None/기본값인 경우 프로바이더의
@@ -866,7 +906,7 @@ async def query_loop(
                 # tool_schemas는 구조화 출력 모드에서 []로 비워지므로 tools=None이 된다
                 # (Tier 3의 tools 상호배타 ValueError를 애초에 유발하지 않음).
                 tools=tool_schemas if tool_schemas else None,
-                temperature=temperature,
+                temperature=effective_temperature,
                 max_tokens=max_tokens,
                 model_override=model_override,
                 enable_thinking=enable_thinking,
@@ -887,11 +927,14 @@ async def query_loop(
             # one-shot 리셋 — 이 턴에만 강제하고, 다음 턴은 다시 auto로 돌아간다.
             # (재시도 응답도 실패하면 Phase 3에서 다시 세팅된다.)
             state.force_tool_choice = None
+            # 온도 보정도 one-shot 이다 — 안 내리면 이후 모든 턴이 올라간 채로 돈다.
+            state.degen_retry_pending = False
             async for event in stream_with_watchdog(
                 _raw_stream,
                 idle_timeout=30.0,
                 total_timeout=300.0,
                 detect_degeneration=DEGEN_GUARD_ENABLED,
+                degen_monitor=degen_monitor,
             ):
                 # 이벤트 처리 — type이 enum이거나 문자열일 수 있음
                 # 프로바이더 구현에 따라 둘 중 무엇이 와도 동작하도록 .value로 정규화한다.
@@ -993,6 +1036,54 @@ async def query_loop(
                 # 흘려보내, 모델 응답과 도구 실행을 겹쳐 전체 시간을 단축한다.
                 for completed in streaming_executor.get_completed():
                     yield completed
+
+            # ── 붕괴 조기 절단 → 샘플링을 바꿔 1회 재생성 (2026-08-13) ──
+            # 워치독이 붕괴로 스트림을 끊었으면 여기 남은 텍스트는 쓸 수 없다.
+            # 예전에는 그대로 사용자에게 나갔다(2026-08-13 14:33 실측: 8,944자 절단본).
+            #
+            # continue 로 턴을 다시 도는 것은 스트림 타임아웃 재시도와 같은 경로다.
+            # 이 시점에는 assistant 메시지를 아직 대화에 넣지 않았으므로, 다음 턴이
+            # **같은 입력으로 다시 생성**한다. 턴 머리에서 누적 버퍼가 새로 초기화되니
+            # 절단본은 서버 쪽에서 사라진다.
+            #
+            # 이미 흘려보낸 TEXT_DELTA 는 되돌릴 수 없다(스트리밍 소비자는 절단본을
+            # 봤다). 그래서 무슨 일이 일어났는지 SYSTEM_WARNING 으로 알린다. 반면
+            # **비스트리밍 소비자(코딩 API 등)는 아직 아무것도 못 봤으므로 완전히
+            # 깨끗하게 교체된다** — 오늘 문제가 관측된 표면이 정확히 그쪽이다.
+            if degen_monitor is not None and degen_monitor.was_cut:
+                if state.degen_retry_count < DEGEN_MAX_RETRY:
+                    state.degen_retry_count += 1
+                    state.degen_retry_pending = True
+                    logger.warning(
+                        "degeneration 재생성 %d/%d (절단 %d자, 온도 %.2f→%.2f)",
+                        state.degen_retry_count,
+                        DEGEN_MAX_RETRY,
+                        degen_monitor.length,
+                        temperature,
+                        min(
+                            DEGEN_RETRY_TEMPERATURE_MAX,
+                            temperature + DEGEN_RETRY_TEMPERATURE_DELTA,
+                        ),
+                    )
+                    yield StreamEvent(
+                        type=StreamEventType.SYSTEM_WARNING,
+                        message=(
+                            "[생성 붕괴 감지] 앞의 출력은 버리고 다시 생성합니다 "
+                            f"({state.degen_retry_count}/{DEGEN_MAX_RETRY})"
+                        ),
+                    )
+                    state.continue_reason = ContinueReason.NEXT_TURN
+                    # 절단본이 부른 도구는 취소한다 — 쓰레기 출력에서 나온 호출이다.
+                    await streaming_executor.cancel_all()
+                    continue
+                # 예산 소진 — 재생성해도 또 붕괴했다. 절단본을 그대로 쓰되 기록은 남긴다.
+                logger.warning(
+                    "degeneration 재생성 예산 소진 — 절단본을 그대로 사용한다(%d자)",
+                    degen_monitor.length,
+                )
+            elif state.degen_retry_count:
+                # 붕괴 없이 끝났다 → 예산을 되돌려 다음 붕괴도 1회 재생성을 받는다.
+                state.degen_retry_count = 0
 
         # ── 스트림 도중 발생한 예외를 종류별로 분기 처리 ──
         # 일부는 복구(압축/재시도) 후 continue로 다음 턴을, 일부는 return으로 종료한다.

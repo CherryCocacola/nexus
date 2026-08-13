@@ -112,6 +112,12 @@ class DegenerationMonitor:
         self._seg_buf = ""
         self._global_segs: Counter[str] = Counter()
         self._global_hit = False
+        # 워치독이 이 감시기의 판정으로 스트림을 실제로 끊었는지 (2026-08-13).
+        # ★is_degenerate() 를 다시 불러 알아내려 하면 안 된다 — 그 함수는
+        #   `_last_check_len` 을 갱신하는 부작용이 있어, 두 번째 호출은
+        #   `_len - _last_check_len < check_every` 에 걸려 **False 를 돌려준다.**
+        #   "판정"을 다시 묻는 대신 "절단했다"는 사실을 기록해 둔다.
+        self._cut = False
 
     def feed(self, text: str) -> None:
         """TEXT_DELTA 조각을 누적한다(최근 window + 전역 구절빈도 갱신)."""
@@ -133,6 +139,15 @@ class DegenerationMonitor:
     def length(self) -> int:
         """지금까지 누적한 전체 생성 글자 수(로그용)."""
         return self._len
+
+    @property
+    def was_cut(self) -> bool:
+        """이 감시기의 판정으로 스트림이 조기 절단됐는지 (호출해도 상태가 변하지 않는다)."""
+        return self._cut
+
+    def mark_cut(self) -> None:
+        """워치독이 절단을 실행했음을 기록한다(워치독 전용)."""
+        self._cut = True
 
     def is_degenerate(self) -> bool:
         """현재 누적 상태가 붕괴 징후를 보이는지 판정(비용 절감 위해 간헐 검사)."""
@@ -463,6 +478,10 @@ async def stream_with_watchdog(
             if monitor is not None and is_text and event.text:
                 monitor.feed(event.text)
                 if monitor.is_degenerate():
+                    # 절단 사실을 감시기에 남긴다 — 호출부(query_loop)가 재생성 여부를
+                    # 판단할 유일한 신호다. 여기서 예외를 던지지 않기 때문에 밖에서는
+                    # "짧게 끝났다"와 구분할 방법이 이것뿐이다.
+                    monitor.mark_cut()
                     logger.warning(
                         "degeneration 감지 — 스트림 조기 절단(%d자 생성 후)", monitor.length
                     )
