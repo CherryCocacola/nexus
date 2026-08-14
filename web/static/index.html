@@ -1675,7 +1675,7 @@ body.resizing { cursor: col-resize; user-select: none; }
   border-radius: 6px;
   text-align: center;
 }
-.folder-header.drop-target, .drop-zone-ungrouped.drop-target {
+.folder-header.drop-target, .drop-zone-ungrouped.drop-target, .folder-group.drop-target {
   background: var(--bg-hover);
   outline: 2px dashed var(--accent, #6366f1);
   outline-offset: -2px;
@@ -1711,6 +1711,22 @@ body.resizing { cursor: col-resize; user-select: none; }
 .message-avatar.assistant { background: #fff; object-fit: cover; }
 .message-avatar.user { background: var(--bg-message-user); color: #fff; }
 .message-sender { font-size: 13px; font-weight: 600; color: var(--text-primary); }
+
+/* ─── PC 파일 드롭 안내막 (2026-08-14 신규) ─────────────────────────
+   파일을 창 안으로 끌고 오면 "여기에 놓으세요"를 덮어 보여 준다. 안내가 없으면
+   놓을 수 있는지 알 수 없어 사용자가 시도 자체를 포기한다(실제 지적 사항). */
+.chat-drop-overlay {
+  position: absolute; inset: 0;
+  display: none;
+  align-items: center; justify-content: center;
+  background: color-mix(in srgb, var(--bg-secondary) 88%, transparent);
+  border: 2px dashed var(--accent);
+  border-radius: 18px;
+  z-index: 40;
+  pointer-events: none;              /* 막이 드롭 이벤트를 가로채지 않게 한다 */
+  font-size: 15px; font-weight: 600; color: var(--accent);
+}
+.chat-drop-overlay.visible { display: flex; }
 </style>
 </head>
 <body>
@@ -1750,6 +1766,7 @@ body.resizing { cursor: col-resize; user-select: none; }
 
   <!-- 메인 -->
   <div class="main">
+    <div class="chat-drop-overlay" id="chatDropOverlay">파일을 여기에 놓으면 첨부됩니다</div>
     <!-- 헤더 -->
     <div class="header">
       <div class="header-left">
@@ -3043,7 +3060,14 @@ function _initSidebarDnd() {
     if (sidebar) sidebar.classList.remove('dragging-session');
   });
 
-  const dropZone = (t) => (t.closest && (t.closest('.folder-header') || t.closest('.drop-zone-ungrouped'))) || null;
+  // 드롭 대상 판정. 폴더 '이름 줄' 만 받으면 실사용에서 거의 못 맞춘다 —
+  // 사용자는 폴더 블록 아무 데나(그 안의 대화 위에도) 놓으려 하기 때문이다.
+  // 그래서 folder-group 전체를 받되, 좁은 것부터 확인해 의도를 우선한다.
+  const dropZone = (t) => (t.closest && (
+    t.closest('.folder-header') ||
+    t.closest('.drop-zone-ungrouped') ||
+    t.closest('.folder-group')
+  )) || null;
 
   list.addEventListener('dragover', (ev) => {
     const zone = dropZone(ev.target);
@@ -3111,7 +3135,7 @@ function renderSessionList() {
   for (const fname of folderNames) {
     const collapsed = _folderCollapsed(fname);
     const items = bySort(folders[fname]);
-    html += `<div class="folder-group">
+    html += `<div class="folder-group" data-folder="${escapeHtml(fname)}">
       <div class="folder-header" data-folder="${escapeHtml(fname)}">
         <span class="folder-caret">${collapsed
           ? '<i class="bi bi-chevron-right" style="font-size:10px"></i>'
@@ -4768,6 +4792,58 @@ initPanelResizers();
     hide();
   });
   document.addEventListener('click', hide);
+})();
+
+
+// ─── PC 파일을 대화 영역에 끌어다 놓아 첨부 (2026-08-14 신규) ───
+// 종전에는 클립 버튼이나 Ctrl+V 로만 첨부할 수 있었다. 탐색기에서 끌어다 놓는 것이
+// 자연스러운 기대인데 아무 반응이 없었다(사용자 지적).
+//
+// 사이드바의 대화 드래그와 충돌하지 않게 **dataTransfer 에 Files 가 있을 때만** 반응한다
+// (대화 드래그는 text/plain 만 싣는다). 기존 첨부 경로(handleFileSelect·
+// handlePasteFiles)는 건드리지 않는다 — 동작하는 코드를 고쳐 위험을 만들 이유가 없다.
+(function initChatFileDrop() {
+  const main = document.querySelector('.main');
+  const overlay = document.getElementById('chatDropOverlay');
+  if (!main || !overlay) return;
+
+  const hasFiles = (ev) => {
+    const t = ev.dataTransfer && ev.dataTransfer.types;
+    return !!t && Array.prototype.indexOf.call(t, 'Files') !== -1;
+  };
+
+  main.addEventListener('dragover', (ev) => {
+    if (!hasFiles(ev)) return;
+    ev.preventDefault();                 // 이걸 안 부르면 drop 이 아예 안 뜬다
+    ev.dataTransfer.dropEffect = 'copy';
+    overlay.classList.add('visible');
+  });
+
+  // 자식 요소 사이를 지날 때도 dragleave 가 뜬다. 창 밖으로 나간 경우만 숨긴다.
+  main.addEventListener('dragleave', (ev) => {
+    if (!ev.relatedTarget || !main.contains(ev.relatedTarget)) overlay.classList.remove('visible');
+  });
+
+  main.addEventListener('drop', (ev) => {
+    if (!hasFiles(ev)) return;
+    ev.preventDefault();
+    overlay.classList.remove('visible');
+    const files = Array.from(ev.dataTransfer.files || []);
+    if (!files.length) return;
+
+    const tooBig = [];                   // 모아서 한 번만 알린다(상자가 겹치지 않게)
+    let added = 0;
+    for (const f of files) {
+      if (f.size > 20 * 1024 * 1024) {   // 서버 상한(upload.max_size_bytes)과 같은 사전 안내
+        tooBig.push(f.name);
+        continue;
+      }
+      attachedFiles.push(f);
+      added++;
+    }
+    if (added > 0) renderAttachPreview();
+    if (tooBig.length) novaAlert(`파일이 너무 큽니다 (20MB 제한):\n${tooBig.join('\n')}`);
+  });
 })();
 
 </script>
