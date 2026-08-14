@@ -314,6 +314,46 @@ class CORSConfig:
         "http://127.0.0.1:8080",
     ]
 
+    # 프런트를 별도 서버(IIS 등)로 분리 배포할 때 그 오리진을 여기에 더한다 (2026-08-14).
+    #   NEXUS_EXTRA_CORS_ORIGINS="http://192.168.10.215,http://nova.example.lan"
+    # 왜 환경변수인가: 배포처 주소는 설치 현장마다 다른데, 코드에 박으면 현장마다
+    # 파일을 고쳐야 한다. 그리고 오리진을 넓히는 것은 보안 결정이라 **명시적으로
+    # 주입할 때만** 열리게 한다(빈 값이면 종전과 동일 = fail-closed).
+    #
+    # ★에어갭 규칙: LAN 주소(사설 대역)와 localhost 만 받는다. 공인 주소를 넣으면
+    # 조용히 무시하고 경고를 남긴다 — 실수로 외부에 문을 여는 것을 막는다.
+    EXTRA_ORIGINS_ENV = "NEXUS_EXTRA_CORS_ORIGINS"
+
+    @classmethod
+    def _extra_origins(cls) -> list[str]:
+        """환경변수로 주입된 추가 오리진 중 LAN/로컬만 돌려준다."""
+        import ipaddress
+        import os
+        from urllib.parse import urlparse
+
+        raw = os.environ.get(cls.EXTRA_ORIGINS_ENV, "")
+        out: list[str] = []
+        for item in raw.split(","):
+            origin = item.strip().rstrip("/")
+            if not origin:
+                continue
+            host = urlparse(origin).hostname or ""
+            allowed = host in ("localhost", "127.0.0.1")
+            if not allowed:
+                try:
+                    ip = ipaddress.ip_address(host)
+                    allowed = ip.is_private or ip.is_loopback
+                except ValueError:
+                    # 호스트명(IP 가 아님) — LAN DNS 이름일 수 있으므로 허용하되 기록한다.
+                    allowed = "." not in host or host.endswith((".lan", ".local", ".internal"))
+            if allowed:
+                out.append(origin)
+            else:
+                logger.warning(
+                    "[CORS] LAN 주소가 아니라 무시합니다(에어갭 규칙): %s", origin
+                )
+        return out
+
     # 허용할 HTTP 메서드
     ALLOWED_METHODS: list[str] = ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
 
@@ -342,7 +382,7 @@ class CORSConfig:
             app.add_middleware(CORSMiddleware, **CORSConfig.get_cors_kwargs())
         """
         return {
-            "allow_origins": cls.ALLOWED_ORIGINS,
+            "allow_origins": cls.ALLOWED_ORIGINS + cls._extra_origins(),
             "allow_credentials": True,
             "allow_methods": cls.ALLOWED_METHODS,
             "allow_headers": cls.ALLOWED_HEADERS,

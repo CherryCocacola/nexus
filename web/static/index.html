@@ -5,6 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>IDINO NOVA — AI Assistant</title>
 <link rel="manifest" href="/static/manifest.json">
+<!-- 배포 환경 설정(분리 배포용). 통합 배포(112)에는 없어도 되며, 없으면
+     NOVA_CONFIG 가 undefined 라 상대경로 그대로 동작한다. -->
+<script src="/static/config.js"></script>
 <meta name="theme-color" content="#ffffff">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -1914,17 +1917,33 @@ body.resizing { cursor: col-resize; user-select: none; }
 </div>
 
 <script>
-// ─── API 키 자동 주입 (분리구조 데모: web_auth 유지한 채 브라우저서 바로 채팅) ───
-// 왜: 이 UI 의 fetch 는 원래 Authorization 헤더를 안 보내서 web_auth 가 켜져 있으면
-//     401 이 난다. 같은 오리진(/v1/..., /health 등) 요청에만 API 키를 자동으로 붙여
-//     인증을 끄지 않고도 브라우저에서 바로 채팅되게 한다.
+// ─── API 베이스 + 키 자동 주입 ───
+// 왜 키를 붙이나: 이 UI 의 fetch 는 원래 Authorization 헤더를 안 보내서 web_auth 가
+//   켜져 있으면 401 이 난다. 내부 API 경로(/v1/..., /health)에만 키를 붙여, 인증을
+//   끄지 않고도 브라우저에서 바로 채팅되게 한다.
+//
+// 왜 베이스를 붙이나 (2026-08-14): 프런트를 별도 서버(IIS)로 분리 배포하면 API 는
+//   다른 호스트에 있다. 앱 코드의 fetch 는 27곳 전부 상대경로라, **여기 한 곳에서**
+//   앞에 베이스를 붙이면 나머지를 손대지 않아도 된다.
+//   window.NOVA_API_BASE 는 배포 폴더의 config.js 가 정한다. 없으면(=112 통합 배포)
+//   빈 문자열이라 종전과 완전히 동일하게 동작한다(무회귀).
 (function () {
   const _origFetch = window.fetch;
-  const API_KEY = 'nexus-b200-test-key-001';  // config/tenants.yaml 의 default 테넌트 키
+  const CFG = window.NOVA_CONFIG || {};
+  const API_BASE = (CFG.apiBase || '').replace(/\/$/, '');   // 끝 슬래시 제거
+  const API_KEY = CFG.apiKey || 'nexus-b200-test-key-001';    // config/tenants.yaml 테넌트 키
+  window.NOVA_API_BASE = API_BASE;
+
   window.fetch = function (input, init) {
     init = init || {};
-    const url = (typeof input === 'string') ? input : (input && input.url) || '';
-    if (url.startsWith('/')) {  // 외부 URL 로는 키가 새지 않도록 상대경로만
+    let url = (typeof input === 'string') ? input : (input && input.url) || '';
+    if (url.startsWith('/')) {  // 외부 URL 로는 키·베이스가 새지 않도록 상대경로만
+      if (API_BASE) {
+        url = API_BASE + url;
+        input = (typeof input === 'string') ? url : new Request(url, input);
+        // 교차 오리진에서는 쿠키를 보내지 않는다 — 인증은 Authorization 헤더로 한다.
+        if (!init.credentials) init.credentials = 'omit';
+      }
       const h = new Headers(init.headers || {});
       if (!h.has('Authorization')) h.set('Authorization', 'Bearer ' + API_KEY);
       init.headers = h;
