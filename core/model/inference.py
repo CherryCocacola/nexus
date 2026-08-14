@@ -117,6 +117,11 @@ class StructuredOutputSpec(BaseModel):
 # ─────────────────────────────────────────────
 # ModelProvider ABC (추상 인터페이스)
 # ─────────────────────────────────────────────
+# /tokenize 호출 제한 시간(초). 토크나이즈는 추론이 아니라 빠르므로 짧게 둔다
+# (실측: 20만 자 0.267초). 초과하면 폴백 추정으로 넘어간다.
+_TOKENIZE_TIMEOUT_SECONDS = 15.0
+
+
 class ModelProvider(ABC):
     """
     LLM 추상 인터페이스.
@@ -887,6 +892,59 @@ class LocalModelProvider(ModelProvider):
         return self._config
 
     # ─── 내부: 메시지 변환 ───
+
+    async def count_prompt_tokens(
+        self,
+        messages: list[Message],
+        system_prompt: str,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> int | None:
+        """이번 요청의 프롬프트 토큰 수를 vLLM `/tokenize` 로 **정확히 센다** (2026-08-14).
+
+        왜 필요한가:
+          Tier 2 는 종전에 입력을 `총글자수 // 3` 으로 추정했다. A.X-4.0 토크나이저
+          실측 결과 문자 종류에 따라 0.0078 ~ 1.3333 토큰/글자로 100배 넘게 벌어져,
+          문서체 한국어를 15% 과소추정했다. 그래서 컨텍스트 예산을 크게 남겨 둘 수밖에
+          없었고 창의 상당 부분이 놀았다. 추정 대신 세면 그 여유가 필요 없다.
+
+          `/tokenize` 는 `messages` + `tools` 를 받아 **채팅 템플릿을 적용한 뒤** 센다.
+          즉 역할 표시·특수 토큰·도구 스키마 주입까지 포함한 실제 프롬프트 길이다.
+          실측: 20만 자 요청을 0.267초에 센다(추론이 아니라 토크나이즈만 하므로 싸다).
+
+        Returns:
+            정확한 토큰 수. **실패하면 None** — 호출부가 폴백 추정으로 넘어간다.
+            진단용 부가 기능이 본 요청을 막으면 안 되므로 예외를 밖으로 내지 않는다.
+        """
+        payload: dict[str, Any] = {
+            "model": self.model_id,
+            "messages": self._convert_messages(messages, system_prompt),
+        }
+        if tools:
+            # ★stream() 과 **같은 변환기**를 쓴다. 내부 스키마
+            # ({name, description, input_schema})를 그대로 보내면 vLLM 이 400 을 낸다
+            # (실측: "2 validation errors ... 'prompt' Field required" — tools 형식이
+            # 안 맞아 요청 전체가 다른 스키마로 해석된다). 같은 실수를 두 번 하지 않도록
+            # 변환을 여기서 새로 쓰지 않고 재사용한다.
+            payload["tools"] = [self._convert_tool_schema(t) for t in tools]
+
+        try:
+            response = await self._client.post(
+                f"{self.base_url}/tokenize",
+                json=payload,
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                # 생성용 read timeout(300초)을 그대로 쓰면 안 된다 — 토크나이즈는
+                # 추론이 아니라 빠르고(20만 자 0.267초), 여기서 오래 매달리면 그만큼
+                # 턴 전체가 늦어진다. 실패하면 폴백 추정으로 넘어가면 그만이다.
+                timeout=_TOKENIZE_TIMEOUT_SECONDS,
+            )
+            if response.status_code != 200:
+                logger.debug("[tokenize] 비200 응답: %s", response.status_code)
+                return None
+            count = response.json().get("count")
+            return int(count) if isinstance(count, int) else None
+        except Exception as e:  # noqa: BLE001 — 세기 실패가 요청을 막지 않게 한다
+            logger.debug("[tokenize] 호출 실패(폴백 추정 사용): %s", e)
+            return None
 
     def _convert_messages(
         self, messages: list[Message], system_prompt: str

@@ -302,6 +302,52 @@ def _shrink_text(text: str, max_chars: int) -> str:
     return result
 
 
+# 이 글자 수 아래면 어떤 문자 구성이라도 컨텍스트를 위협하지 못하므로 세지 않는다.
+# 가장 비싼 문자(한자 1.3333 토큰/글자)로 쳐도 5300 토큰 남짓이라, 어떤 티어의
+# 컨텍스트에서도 truncate·출력 축소 판단에 영향을 주지 않는다. 짧은 대화가 대부분인
+# 표면(웹 채팅)에서 불필요한 왕복을 없애기 위한 것이다.
+EXACT_COUNT_MIN_CHARS = 4000
+
+
+async def _measure_input_tokens(
+    model_provider: Any,
+    api_messages: list[Message],
+    system_prompt: str,
+    tool_schemas: list[dict[str, Any]],
+    tool_schema_texts: list[str],
+    total_chars: int,
+) -> tuple[int, bool]:
+    """이번 요청의 입력 토큰 수를 구한다 — 되도록 **세고**, 안 되면 추정한다 (2026-08-14).
+
+    왜 두 경로인가:
+      정확한 값은 vLLM `/tokenize` 만 알 수 있다(채팅 템플릿·도구 스키마 주입까지
+      반영). 하지만 그 서버가 없거나(테스트·다른 프로바이더) 실패할 수 있으므로
+      문자 종류별 폴백 추정을 함께 둔다. 폴백은 **과소추정만 안 하면** 되도록
+      넉넉하게 잡혀 있다(core/model/token_estimate.py 참고).
+
+    Returns:
+        (토큰 수, 실측 여부). 실측 여부는 로그·판단 근거 표시에만 쓴다.
+    """
+    counter = getattr(model_provider, "count_prompt_tokens", None)
+    if counter is not None and total_chars >= EXACT_COUNT_MIN_CHARS:
+        try:
+            exact = await counter(api_messages, system_prompt, tool_schemas or None)
+        except Exception as e:  # noqa: BLE001 — 세기 실패가 턴을 막지 않게 한다
+            logger.debug("[tokenize] 예외(폴백 추정 사용): %s", e)
+            exact = None
+        if isinstance(exact, int) and exact > 0:
+            return exact, True
+
+    from core.model.token_estimate import estimate_prompt_tokens
+
+    estimated = estimate_prompt_tokens(
+        [str(m.content) for m in api_messages],
+        system_prompt=system_prompt,
+        tool_schema_texts=tool_schema_texts,
+    )
+    return estimated, False
+
+
 def _truncate_input_for_budget(
     api_messages: list[Message],
     msg_char_budget: int,
@@ -757,17 +803,33 @@ async def query_loop(
         if state.max_output_tokens_override:
             max_tokens = state.max_output_tokens_override
         else:
-            # 입력 토큰 추정: 시스템 프롬프트 + 도구 스키마 + 메시지
-            # 토큰 추정은 문자수/3 (보수적) — 한글/특수문자가 많으면 토큰이 더 많다
+            # 입력 토큰 계산: 시스템 프롬프트 + 도구 스키마 + 메시지
+            #
+            # ★2026-08-14 — 추정에서 '세기'로 바꿨다.
+            #   종전에는 `총글자수 // 3` 하나로 추정했다. A.X-4.0 토크나이저 실측 결과
+            #   문자 종류에 따라 0.0078(공백) ~ 1.3333(한자) 토큰/글자로 100배 넘게
+            #   벌어진다. 문서체 한국어를 15% 과소추정해 컨텍스트 예산을 크게 남겨
+            #   둘 수밖에 없었다.
+            #   이제 vLLM `/tokenize` 로 실제 프롬프트를 센다(채팅 템플릿·도구 스키마
+            #   포함). 세기가 실패하면 문자 종류별 폴백 추정으로 넘어간다.
             import json as _json
 
             # ensure_ascii=False로 직렬화해 한글이 \uXXXX로 부풀려지지 않게 한다
             # (그래야 실제 전송될 토큰 양에 가까운 문자수를 얻는다).
-            tool_chars = sum(len(_json.dumps(s, ensure_ascii=False)) for s in tool_schemas)
+            tool_schema_texts = [_json.dumps(s, ensure_ascii=False) for s in tool_schemas]
+            tool_chars = sum(len(t) for t in tool_schema_texts)
             msg_chars = sum(len(str(m.content)) for m in api_messages)
             prompt_chars = len(system_prompt)
             total_chars = tool_chars + msg_chars + prompt_chars
-            estimated_input = total_chars // 3  # 보수적 추정 (영어 /4, 한글 /2 → 평균 /3)
+
+            estimated_input, input_is_exact = await _measure_input_tokens(
+                model_provider=model_provider,
+                api_messages=api_messages,
+                system_prompt=system_prompt,
+                tool_schemas=tool_schemas,
+                tool_schema_texts=tool_schema_texts,
+                total_chars=total_chars,
+            )
 
             max_context = model_cfg.max_context_tokens
 
@@ -782,32 +844,41 @@ async def query_loop(
                 # 그래서 "메시지 content가 통틀어 써도 되는 글자 예산"을 역산해,
                 # 입력이 어디에 몰려 있든 그 예산 이하로 확실히 낮춘다.
                 #
-                # estimated_input = (tool_chars + msg_chars + prompt_chars) // 3 이므로,
-                # 목표 estimated_input <= input_limit 을 만족시키려면
-                #   tool_chars + msg_chars + prompt_chars <= input_limit * 3
-                # 이어야 한다. 고정 오버헤드(tool_chars=도구 스키마,
-                # prompt_chars=시스템 프롬프트)는 줄일 수 없으므로, 메시지가 쓸 수 있는
-                # 글자 예산만 역산한다:
-                #   msg_char_budget = input_limit*3 - (tool_chars + prompt_chars)
-                msg_char_budget = input_limit * 3 - (tool_chars + prompt_chars)
+                # 자를 글자 예산은 "이번 입력의 실제 글자당 토큰"에서 역산한다.
+                # 종전에는 1/3 을 가정해 `input_limit * 3` 으로 역산했는데, 그 상수가
+                # 틀린 것이 이번 수정의 출발점이다. 이제는 방금 센(또는 추정한) 값에서
+                #   글자당 토큰 = estimated_input / total_chars
+                # 를 얻어 쓰므로, 한글 문서든 코드든 그 입력에 맞는 비율이 적용된다.
+                tokens_per_char = estimated_input / max(1, total_chars)
+                budget_chars = int(input_limit / max(tokens_per_char, 1e-6))
+                msg_char_budget = budget_chars - (tool_chars + prompt_chars)
 
                 # 헬퍼가 원본을 훼손하지 않고 '이번 호출용 사본 리스트'를 돌려준다.
                 # (줄일 메시지는 팩토리로 새로 만들고, 나머지는 원본 참조 재사용)
+                before_input = estimated_input
                 api_messages, before_msg_chars, after_msg_chars = (
                     _truncate_input_for_budget(api_messages, msg_char_budget)
                 )
 
-                # 자른 뒤 입력 토큰을 '실제로' 다시 추정한다.
-                # (예전의 오해를 주는 26524 → 26524 로그를 진짜 before→after로 교정)
-                before_input = (tool_chars + before_msg_chars + prompt_chars) // 3
+                # 자른 뒤 입력 토큰을 **다시 센다.** 글자당 토큰은 자르는 위치에 따라
+                # 달라지므로(앞부분이 한글, 뒷부분이 코드일 수 있다) 재계산이 필요하다.
                 msg_chars = after_msg_chars
                 total_chars = tool_chars + msg_chars + prompt_chars
-                estimated_input = total_chars // 3
+                estimated_input, input_is_exact = await _measure_input_tokens(
+                    model_provider=model_provider,
+                    api_messages=api_messages,
+                    system_prompt=system_prompt,
+                    tool_schemas=tool_schemas,
+                    tool_schema_texts=tool_schema_texts,
+                    total_chars=total_chars,
+                )
 
                 logger.info(
-                    "입력 truncate: %d → %d 토큰 "
+                    "입력 truncate: %d → %d 토큰 (%s) "
                     "(컨텍스트 %d의 85%%=%d, 메시지 글자 %d → %d)",
-                    before_input, estimated_input, max_context, input_limit,
+                    before_input, estimated_input,
+                    "실측" if input_is_exact else "추정",
+                    max_context, input_limit,
                     before_msg_chars, after_msg_chars,
                 )
 
