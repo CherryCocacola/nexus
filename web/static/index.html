@@ -12,31 +12,12 @@
 <!-- 코드 하이라이트 — 에어갭 로컬 vendor 번들(외부 CDN 금지). 파일 부재 시에도 복사·라벨은 동작. -->
 <link rel="stylesheet" href="/static/vendor/highlight/github.min.css">
 <script src="/static/vendor/highlight/highlight.min.js" defer></script>
-<!-- 수식 렌더(W5) — 에어갭이므로 CDN이 아닌 로컬 벤더를 쓴다. -->
+<!-- Bootstrap Icons — 에어갭 로컬 vendor 번들(icons.getbootstrap.com, 외부 CDN 금지) -->
+<link rel="stylesheet" href="/static/vendor/bootstrap-icons/bootstrap-icons.css">
+<!-- 수식 렌더 — 에어갭 로컬 vendor 번들(외부 CDN 금지) -->
 <link rel="stylesheet" href="/static/vendor/katex/katex.min.css">
 <script src="/static/vendor/katex/katex.min.js" defer></script>
 <script src="/static/vendor/katex/auto-render.min.js" defer></script>
-<style>
-  /* KaTeX 레이아웃 보정 — 본문에 걸린 line-height가 분수·루트의 세로 조판을 눌러
-     글리프가 잘려 보인다(실측). KaTeX 내부는 자체 조판을 쓰므로 normal로 되돌린다. */
-  .katex, .katex * { line-height: normal; }
-  /* 긴 수식은 잘라내지 말고 가로 스크롤로 흘린다.
-     주의(실측 2026-08-06): 여기에 overflow-y: visible 을 적어도 계산값은 auto 가 된다.
-     CSS 스펙상 한 축이 auto/scroll 이면 다른 축의 visible 은 auto 로 승격되기 때문이다
-     (한 축만 스크롤 가능하게 만들 수 없다). 다만 auto 는 넘칠 때 '스크롤'이지 '잘라내기'가
-     아니고, 실측에서 세로 넘침은 0이었다(scrollHeight == clientHeight). 그래서 그대로 둔다.
-     세로 여유가 필요해지면 padding 을 키워 넘침 자체를 없애는 편이 안전하다. */
-  .katex-display { overflow-x: auto; padding: 6px 0; margin: 8px 0; }
-  /* 다이어그램(W4 Mermaid) — 넓은 그림은 가로 스크롤로 흘리고, 폭은 말풍선에 맞춘다. */
-  .mermaid-figure {
-    margin: 12px 0; padding: 12px; overflow-x: auto;
-    background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 8px;
-  }
-  /* SVG를 말풍선 폭에 맞춰 줄이지 않는다. 줄이면 글자가 뭉개져 읽을 수 없다(실측: 자연
-     너비 1817px 다이어그램이 622px로 눌려 높이 68px가 됐다). 자연 크기를 유지하고
-     넘치는 만큼만 위 컨테이너에서 가로 스크롤한다. */
-  .mermaid-figure svg { max-width: none; width: auto; height: auto; display: block; margin: 0 auto; }
-</style>
 <style>
 /* ─── idino 컬러 팔레트 ─── */
 :root {
@@ -63,9 +44,21 @@
   --scrollbar: #c6cfdd;
   --success: #209445;
   --error: #DA017F;
+
+  /* ── 네이버 AI탭 스타일 사이드바(왼쪽 채팅 리스트) 전용 팔레트 ── */
+  --nv-bg: #F3F4FA;
+  --nv-hover: #E9EBF4;
+  --nv-active: #E2E5F0;
+  --nv-border: #E6E8F0;
+  --nv-text: #33363F;
+  --nv-text-secondary: #6E7180;
+  --nv-text-muted: #9A9CAA;
 }
 
 *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+/* 부트스트랩 아이콘(icons.getbootstrap.com) — 텍스트 옆에 붙는 인라인 아이콘 공용 정렬 */
+.icon-inline { vertical-align: -0.125em; margin-right: 4px; flex-shrink: 0; }
 
 body {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
@@ -84,12 +77,13 @@ body {
 
 /* ─── 헤더 ─── */
 .header {
+  position: relative;
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-start;
   padding: 12px 20px;
-  background: var(--bg-secondary);
-  border-bottom: 1px solid var(--border);
+  /*background: var(--bg-secondary);*/
+  border-bottom: 1px solid var(--bg-page);
   flex-shrink: 0;
 }
 
@@ -99,24 +93,15 @@ body {
   gap: 10px;
 }
 
-.header-logo { width: 28px; height: 28px; border-radius: 6px; }
+.header-logo { width: 28px; height: 28px; border-radius: 6px; margin-right: 6px;}
 
-.header-title { font-size: 15px; font-weight: 600; }
+.header-title {display: none;}
 
 .header-subtitle { font-size: 12px; color: var(--text-muted); margin-left: 8px; }
 
 .header-right { display: flex; align-items: center; gap: 12px; }
 
-.header-btn {
-  background: none;
-  border: 1px solid var(--border-light);
-  color: var(--text-secondary);
-  padding: 6px 12px;
-  border-radius: 6px;
-  cursor: pointer;
-  font-size: 12px;
-  transition: all 0.15s;
-}
+.header-btn {position: absolute;top: 8px;left: -15px;background: #fff;border: 1px solid var(--border-light);color: var(--text-secondary);display: flex;border-radius: 6px;cursor: pointer;width: 35px;height: 35px;border-radius: 30px;font-size: 17px;padding-top: 2px;transition: all 0.15s;justify-content: center;align-items: center;box-shadow: 0 1px 11px 2px #0d489717;}
 
 .header-btn:hover {
   background: var(--bg-hover);
@@ -141,28 +126,44 @@ body {
   background: var(--bg-primary);
   border-radius: 4px;
   border: 1px solid var(--border);
+  margin-left: 20px;
 }
 
 .token-counter span { font-variant-numeric: tabular-nums; }
 
 /* ─── 사이드바 ─── */
-.layout { display: flex; flex: 1; overflow: hidden; position: relative; }
+.layout { display: flex; flex: 1; overflow: hidden; position: relative; margin: 20px;}
 
 .sidebar {
   width: var(--sidebar-w, 260px);
-  background: var(--bg-secondary);
-  border-right: 1px solid var(--border);
+  background: var(--nv-bg);
+  /*border-right: 1px solid var(--nv-border);*/
   display: flex;
   flex-direction: column;
   flex-shrink: 0;
   overflow: hidden;
   transition: width 0.22s ease;
+  margin-right: 10px;
 }
 
-/* 닫힘: 폭 0으로 접어 메인을 넓힌다(오버레이가 아니라 인-플로우 → 프롬프트를 가리지 않는다) */
+/* 닫힘(기본 상태): 완전히 숨기지 않고 아이콘 레일(56px)만 남긴다 — 네이버 AI탭 방식 */
 .sidebar.collapsed {
-  width: 0;
-  border-right: none;
+  width: 70px;
+}
+/* 접힘 상태에선 검색·새 대화 행·리스트·패널토글 버튼을 숨기고 아이콘 레일만 노출 */
+.sidebar.collapsed .sidebar-search,
+.sidebar.collapsed .new-chat-btn,
+.sidebar.collapsed .session-list,
+.sidebar.collapsed .sidebar-close-btn {
+  display: none;
+}
+.sidebar.collapsed .sidebar-header { justify-content: center; padding: 14px 0 10px; }
+.sidebar.collapsed .sidebar-footer { justify-content: center; padding: 10px 0; }
+.sidebar.collapsed .settings-btn { padding: 8px; }
+.sidebar.collapsed .settings-label,
+.sidebar.collapsed .footer-version,
+.sidebar.collapsed .sidebar-brand-text {
+  display: none;
 }
 
 /* 패널 사이 드래그 리사이저 (데스크톱에서 폭 조절) */
@@ -180,68 +181,169 @@ body {
   top: 0; bottom: 0; left: 2px;
   width: 1px;
   background: var(--border);
+  display: none;
 }
 .resizer:hover, .resizer.dragging { background: var(--border-light); }
 .resizer[hidden] { display: none; }
 body.resizing { cursor: col-resize; user-select: none; }
 
 .sidebar-header {
-  padding: 14px 16px;
-  border-bottom: 1px solid var(--border);
+  padding: 14px 14px 10px;
   display: flex;
-  gap: 8px;
+  align-items: center;
+  justify-content: space-between;
 }
 
+.sidebar-logo { width: 24px; height: 24px; border-radius: 6px; flex-shrink: 0; }
+
+/* 사이드바 열림 상태 — 로고 옆에 header와 같은 "IDINO NOVA" 워드마크를 붙인다 */
+.sidebar-brand { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.sidebar-brand-text {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--nv-text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 새로운 대화 — 네이버 AI탭처럼 채워진 버튼이 아니라 아이콘+텍스트의 납작한 행 */
 .new-chat-btn {
-  flex: 1;
-  padding: 10px;
-  background: var(--accent-grad);
-  color: #fff;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: calc(100% - 28px);
+  margin: 2px 14px 6px;
+  padding: 8px 6px;
+  background: transparent;
+  color: var(--nv-text);
   border: none;
   border-radius: 8px;
   cursor: pointer;
-  font-size: 13px;
+  font-size: 13.5px;
   font-weight: 500;
   transition: background 0.15s;
 }
-.new-chat-btn:hover { background: var(--accent-grad-hover); }
+.new-chat-btn::before {
+  content: "\f4ca";
+  font-family: "bootstrap-icons" !important;
+  font-style: normal;
+  width: 16px; height: 16px;
+  line-height: 16px;
+  text-align: center;
+  font-size: 16px;
+  flex-shrink: 0;
+  color: var(--accent-light);
+}
+.new-chat-btn:hover { background: var(--nv-hover); }
 
+/* 패널 접기 토글 — 사각형 두 칸 아이콘(네이버 방식) */
 .sidebar-close-btn {
-  background: none;
-  border: 1px solid var(--border-light);
-  color: var(--text-secondary);
+    display: none;
+}
+.sidebar-close-btn::before {
+  content: "\f45f";
+  font-family: "bootstrap-icons" !important;
+  font-style: normal;
+  position: absolute; inset: 0;
+  margin: auto;
+  width: 15px; height: 15px;
+  line-height: 15px;
+  text-align: center;
+  font-size: 14px;
+  color: var(--nv-text-secondary);
+}
+.sidebar-close-btn:hover { background: var(--nv-hover); color: var(--nv-text); }
+.sidebar-close-btn:hover::before { color: var(--nv-text); }
+
+/* 아이콘 레일 — 접힘 상태에서만 노출. flex:1 로 늘어나 하단 설정 버튼을 바닥에 붙인다 */
+.sidebar-rail {
+  display: none;
+  flex: 1;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding-top: 10px;
+}
+.sidebar.collapsed .sidebar-rail { display: flex; }
+
+.rail-btn {
   width: 36px;
+  height: 36px;
+  border: none;
+  background: transparent;
   border-radius: 8px;
   cursor: pointer;
-  font-size: 16px;
-  transition: all 0.15s;
+  position: relative;
+  transition: background 0.1s;
 }
-.sidebar-close-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
+.rail-btn:hover { background: var(--nv-hover); }
+.rail-btn::before {
+  content: "";
+  font-family: "bootstrap-icons" !important;
+  font-style: normal;
+  position: absolute; inset: 0;
+  margin: auto;
+  width: 17px; height: 17px;
+  line-height: 17px;
+  text-align: center;
+  font-size: 19px;
+  color: var(--nv-text-secondary);
+}
+.rail-new-btn::before { content: "\f4ca"; }
+.rail-history-btn::before { content: "\f292"; }
 
-.session-list { flex: 1; overflow-y: auto; padding: 8px; }
+/* 챗지피티 스타일 호버 툴팁 — JS(railTooltip)가 fixed 좌표로 위치시킨다(#railTooltip 참고) */
+.rail-tooltip {
+  position: fixed;
+  background: #1a1a1a;
+  color: #fff;
+  font-size: 12.5px;
+  font-weight: 500;
+  white-space: nowrap;
+  padding: 5px 10px;
+  border-radius: 999px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.28);
+  pointer-events: none;
+  transform: translateY(-50%);
+  z-index: 200;
+}
+.rail-tooltip[hidden] { display: none; }
+
+.session-tit {
+  padding: 4px 10px 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--nv-text-muted);
+  margin-top: 20px;
+}
+.session-tit:first-child { margin-top: 4px; }
+
+.session-list { flex: 1; overflow-y: auto; padding: 4px 8px 8px; }
 
 .session-item {
-  padding: 10px 12px;
+  padding: 5px 10px;
   border-radius: 8px;
   cursor: pointer;
-  font-size: 13px;
-  color: var(--text-secondary);
-  margin-bottom: 2px;
+  font-size: 15px;
+  color: var(--nv-text);
+  margin-bottom: 1px;
   transition: background 0.1s;
   display: flex;
   align-items: center;
   gap: 6px;
+  position: relative;
 }
-.session-item:hover { background: var(--bg-hover); }
-.session-item.active { background: var(--bg-tertiary); color: var(--text-primary); }
+.session-item:hover { background: var(--nv-hover); }
+.session-item.active { background: var(--nv-active); color: var(--nv-text); font-weight: 500; }
 
 /* 세션 항목의 제목 — 긴 텍스트는 말줄임 */
 .session-title {
-  flex: 1;
-  min-width: 0;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+    flex: 1;
+    min-width: 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 
 /* 세션 삭제 버튼 — 평소엔 숨기고 hover 시 노출 */
@@ -251,7 +353,7 @@ body.resizing { cursor: col-resize; user-select: none; }
   height: 22px;
   border: none;
   background: transparent;
-  color: var(--text-muted);
+  color: var(--nv-text-muted);
   cursor: pointer;
   border-radius: 4px;
   font-size: 14px;
@@ -265,7 +367,7 @@ body.resizing { cursor: col-resize; user-select: none; }
 }
 .session-delete-btn:hover {
   opacity: 1 !important;
-  background: rgba(220, 38, 38, 0.15);
+  background: rgba(220, 38, 38, 0.12);
   color: #ef4444;
 }
 
@@ -276,7 +378,7 @@ body.resizing { cursor: col-resize; user-select: none; }
   height: 22px;
   border: none;
   background: transparent;
-  color: var(--text-muted);
+  color: var(--nv-text-muted);
   cursor: pointer;
   border-radius: 4px;
   font-size: 12px;
@@ -297,8 +399,16 @@ body.resizing { cursor: col-resize; user-select: none; }
 .session-pin-btn:hover, .session-rename-btn:hover,
 .session-folder-btn:hover, .session-export-btn:hover {
   opacity: 1 !important;
-  background: var(--bg-hover);
-  color: var(--text-primary);
+  background: var(--nv-active);
+  color: var(--nv-text);
+}
+/* 드롭다운 메뉴(⋯)가 열려 있는 동안은 hover 여부와 무관하게 안의 버튼을 계속 보이게 한다 */
+.session-item.menu-open .session-pin-btn,
+.session-item.menu-open .session-rename-btn,
+.session-item.menu-open .session-folder-btn,
+.session-item.menu-open .session-export-btn,
+.session-item.menu-open .session-delete-btn {
+  opacity: 1;
 }
 /* 폴더 그룹 — 접이식 헤더 + 항목 */
 .folder-group { margin-bottom: 2px; }
@@ -309,138 +419,179 @@ body.resizing { cursor: col-resize; user-select: none; }
   padding: 6px 10px;
   cursor: pointer;
   font-size: 12px;
-  color: var(--text-secondary);
+  color: var(--nv-text-secondary);
   border-radius: 6px;
   user-select: none;
 }
-.folder-header:hover { background: var(--bg-hover); }
-.folder-caret { flex-shrink: 0; font-size: 10px; color: var(--text-muted); }
-
-/* ─── 폴더 드래그·다중선택 (2026-08-08) ─── */
-/* 드롭 대상 강조 — 어디에 놓이는지 보이지 않으면 드래그는 추측 게임이 된다. */
-.folder-header.drop-target,
-.drop-zone-ungrouped.drop-target {
-  background: var(--bg-hover);
-  outline: 2px dashed var(--accent, #6366f1);
-  outline-offset: -2px;
-}
-
-/* 선택된 대화 — active(현재 열린 대화)와 구분되어야 한다. */
-.session-item.selected {
-  background: color-mix(in srgb, var(--accent, #6366f1) 18%, transparent);
-  box-shadow: inset 2px 0 0 var(--accent, #6366f1);
-}
-
-.session-item.dragging { opacity: .45; }
-
-/* 미분류 드롭 영역 — 폴더에서 빼내는 자리. 평소엔 조용히, 드래그 중에만 보인다. */
-.drop-zone-ungrouped {
-  display: none;
-  padding: 6px 10px;
-  margin: 2px 0 4px;
-  font-size: 11px;
-  color: var(--text-muted);
-  border: 1px dashed var(--border);
-  border-radius: 6px;
-  text-align: center;
-}
-.sidebar.dragging-session .drop-zone-ungrouped { display: block; }
-
-/* 다중선택 안내 — 선택이 있을 때만 뜬다. */
-.selection-bar {
-  display: none;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  padding: 6px 10px;
-  margin-bottom: 4px;
-  font-size: 12px;
-  background: var(--bg-tertiary);
-  border-radius: 6px;
-  color: var(--text-secondary);
-}
-.selection-bar.visible { display: flex; }
-.selection-bar button {
-  background: none;
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  color: var(--text-secondary);
-  cursor: pointer;
-  font-size: 11px;
-  padding: 2px 8px;
-}
-.selection-bar button:hover { background: var(--bg-hover); }
-.folder-name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: 600; }
-.folder-count { flex-shrink: 0; font-size: 11px; color: var(--text-muted); }
+.folder-header:hover { background: var(--nv-hover); }
+.folder-caret { flex-shrink: 0; font-size: 10px; color: var(--nv-text-muted); }
+.folder-name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: 600;font-size: 15px;color: #444;}
+.folder-count {display: block;width: 15px;border-radius: 15px;text-align: center;flex-shrink: 0;font-size: 11px;color: #333;background: var(--nv-active);}
 .folder-items { padding-left: 8px; }
 /* 핀 고정된 세션은 핀 버튼을 항상 살짝 보이게(고정 상태 시각화) */
 .session-item.pinned .session-pin-btn { opacity: 0.55; }
 /* 제목 앞 핀 마크(고정 표시) */
 .session-pin-mark { flex-shrink: 0; font-size: 11px; margin-right: 2px; }
 
-/* 사이드바 검색 */
-.sidebar-search { padding: 8px 12px 4px; }
+/* 사이드바 검색 — 흰색 필(pill) 인풋 + 왼쪽 돋보기 아이콘 */
+.sidebar-search { padding: 20px 14px 10px; position: relative; }
+.sidebar-search::before {
+  content: "\f52a";
+  font-family: "bootstrap-icons" !important;
+  font-style: normal;
+  position: absolute;
+  left: 26px;
+  top: 35px;
+  transform: translateY(-50%);
+  font-size: 14px;
+  line-height: 1;
+  color: var(--nv-text-muted);
+  pointer-events: none;
+}
 .session-search-input {
   width: 100%;
   box-sizing: border-box;
-  padding: 7px 10px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--bg-primary);
-  color: var(--text-primary);
+  padding: 8px 10px 8px 32px;
+  border: none;
+  border-radius: 999px;
+  background: #fff;
+  color: var(--nv-text);
   font-size: 13px;
   outline: none;
-  transition: border-color 0.1s;
+  box-shadow: 0 1px 2px rgba(40, 44, 60, 0.06);
+  transition: box-shadow 0.1s;
 }
-.session-search-input:focus { border-color: var(--accent-light, #6b8afd); }
-.session-search-input::placeholder { color: var(--text-muted); }
+.session-search-input:focus { box-shadow: 0 0 0 2px var(--accent-light); }
+.session-search-input::placeholder { color: var(--nv-text-muted); }
 
 /* 검색 결과 항목 — 제목 + 스니펫(매치어 강조) */
 .search-result-item { flex-direction: column; align-items: stretch; gap: 3px; }
 .search-result-title {
   font-size: 13px;
-  color: var(--text-primary);
+  color: var(--nv-text);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 .search-snippet {
   font-size: 11px;
-  color: var(--text-secondary);
+  color: var(--nv-text-secondary);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 .search-snippet mark {
-  background: rgba(255, 214, 0, 0.35);
+  background: rgba(26, 115, 232, 0.18);
   color: inherit;
   border-radius: 2px;
   padding: 0 1px;
 }
-.search-empty { padding: 14px 16px; color: var(--text-muted); font-size: 13px; }
+.search-empty { padding: 14px 16px; color: var(--nv-text-muted); font-size: 13px; }
 
 .sidebar-footer {
-  padding: 10px 16px;
-  border-top: 1px solid var(--border);
+  padding: 10px 14px;
+  border-top: none;
   font-size: 11px;
-  color: var(--text-muted);
+  color: var(--nv-text-muted);
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
 }
 .settings-btn {
-  border: 1px solid var(--border);
-  background: var(--bg-secondary);
-  color: var(--text-secondary);
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  border: none;
+  background: transparent;
+  color: var(--nv-text-secondary);
   border-radius: 6px;
-  padding: 4px 10px;
+  padding: 5px 8px 5px 4px;
   font-size: 12px;
   cursor: pointer;
   transition: background 0.1s, color 0.1s;
 }
-.settings-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
+.settings-btn::before {
+  content: "\f3e5";
+  font-family: "bootstrap-icons" !important;
+  font-style: normal;
+  font-size: 15px;
+  line-height: 1;
+  flex-shrink: 0;
+  color: var(--nv-text-secondary);
+}
+.settings-btn:hover { background: var(--nv-hover); color: var(--nv-text); }
 .footer-version { flex-shrink: 0; }
+
+/* ─── 세션 메뉴(⋯) 드롭다운 팝업 ─── */
+.session-menu-btn {
+  position: absolute;
+  right: 0;
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: linear-gradient(90deg, rgb(226 229 240 / 75%) 0%, rgb(226 229 240) 100%);
+  color: #000;
+  cursor: pointer;
+  border-radius: 5px;
+  font-size: 14px;
+  line-height: 1;
+  opacity: 0;
+  transition: opacity 0.1s, background 0.1s, color 0.1s;
+}
+.session-item:hover .session-menu-btn,
+.session-item.active .session-menu-btn,
+.session-item.menu-open .session-menu-btn {
+  opacity: 0.8;
+}
+.session-menu-btn:hover, .session-item.menu-open .session-menu-btn {
+  opacity: 1 !important;
+  background: var(--nv-active);
+  color: var(--nv-text);
+}
+
+.session-menu-dropdown {
+  display: none;
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 4px;
+  min-width: 178px;
+  background: #fff;
+  border: 1px solid var(--nv-border);
+  border-radius: 10px;
+  box-shadow: 0 4px 18px rgba(40, 44, 60, 0.14);
+  padding: 4px;
+  z-index: 20;
+  cursor: default;
+}
+.session-item.menu-open .session-menu-dropdown { display: block; }
+
+.session-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 8px 10px;
+  border: none;
+  background: transparent;
+  border-radius: 6px;
+  color: var(--nv-text);
+  font-size: 14px;
+  text-align: left;
+  margin: 4px 0;
+  cursor: pointer;
+  transition: background 0.1s;
+}
+.session-menu-item:hover { background: var(--nv-hover); }
+.session-menu-item .mi-icon { flex-shrink: 0; width: 15px; display: inline-flex; align-items: center; justify-content: center; color: var(--nv-text-secondary); }
+.session-menu-divider { height: 1px; background: var(--nv-border); margin: 4px 2px; }
+.session-menu-item.danger { color: #dc2626; }
+.session-menu-item.danger .mi-icon { color: #dc2626; }
+.session-menu-item.danger:hover { background: rgba(220, 38, 38, 0.1); }
 
 /* ─── 설정 모달 ─── */
 .modal-overlay {
@@ -474,7 +625,8 @@ body.resizing { cursor: col-resize; user-select: none; }
 .modal-title { font-size: 15px; font-weight: 600; color: var(--text-primary); }
 .modal-close {
   border: none; background: transparent; color: var(--text-muted);
-  font-size: 22px; line-height: 1; cursor: pointer; padding: 0 4px;
+  line-height: 1; cursor: pointer; padding: 0 4px;
+  display: flex; align-items: center; justify-content: center;
 }
 .modal-close:hover { color: var(--text-primary); }
 .modal-body { padding: 16px 18px; overflow-y: auto; }
@@ -523,8 +675,8 @@ body.resizing { cursor: col-resize; user-select: none; }
 .dialog { width: min(420px, 100%); }
 .dialog-message {
   font-size: 13px; color: var(--text-primary); line-height: 1.6;
-  white-space: pre-wrap;          /* 기존 문구가 \n 으로 줄을 나눈다 */
-  word-break: break-word;         /* 파일명·URL 이 길어도 창을 밀지 않게 */
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 .dialog-input {
   width: 100%; box-sizing: border-box; margin-top: 12px;
@@ -557,7 +709,8 @@ body.resizing { cursor: col-resize; user-select: none; }
 .prompt-del-btn {
   flex-shrink: 0; width: 26px; height: 30px; border: 1px solid var(--border);
   background: var(--bg-secondary); color: var(--text-muted); border-radius: 6px;
-  cursor: pointer; font-size: 16px; line-height: 1;
+  cursor: pointer; line-height: 1;
+  display: flex; align-items: center; justify-content: center;
 }
 .prompt-del-btn:hover { background: rgba(220,38,38,0.12); color: #ef4444; }
 .prompt-add-btn {
@@ -565,31 +718,6 @@ body.resizing { cursor: col-resize; user-select: none; }
   border-radius: 6px; padding: 6px 12px; font-size: 12px; cursor: pointer;
 }
 .prompt-add-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
-
-/* ─── 저장된 기억(W3) ─── */
-.memory-list { display: flex; flex-direction: column; gap: 6px; max-height: 220px; overflow-y: auto; }
-.memory-row {
-  display: flex; gap: 8px; align-items: flex-start;
-  padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px;
-  background: var(--bg-primary);
-}
-.memory-text {
-  flex: 1; min-width: 0; font-size: 12px; line-height: 1.5; color: var(--text-primary);
-  word-break: break-word;
-}
-/* 본문은 3줄까지만 보여준다. 승격된 assistant 답변은 수천 자짜리도 있어서, 그대로 두면
-   기억 하나가 목록 전체를 덮는다(실측). 전문은 아래 툴팁(title)으로 확인한다. */
-.memory-body {
-  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical;
-  overflow: hidden;
-}
-.memory-meta { display: block; margin-top: 3px; font-size: 11px; color: var(--text-muted); }
-.memory-del {
-  flex-shrink: 0; border: 0; background: transparent; color: var(--text-muted);
-  cursor: pointer; font-size: 14px; line-height: 1; padding: 2px 4px;
-}
-.memory-del:hover { color: var(--error); }
-.memory-empty { font-size: 12px; color: var(--text-muted); padding: 6px 2px; }
 
 /* 프롬프트 / 삽입 팝업 — 입력창 위로 뜨는 드롭다운 */
 .input-container { position: relative; }
@@ -617,16 +745,25 @@ body.resizing { cursor: col-resize; user-select: none; }
 
 /* ─── 메인 영역 ─── */
 .main {
+  position: relative;
   flex: 1;
   display: flex;
   flex-direction: column;
   min-width: 0;
+  background: #fff;
+  border-radius: 15px;
 }
+
+/* 대화가 없어 환영 화면만 떠 있을 때: 인사말 + 입력창을 화면 중앙에 하나의 히어로로 묶는다 */
+/* header는 항상 맨 위 고정 — 아래 messages+input-area 쌍만 남는 공간에서 세로 중앙에 오도록
+   justify-content 대신 margin:auto 로 그 둘만 가운데로 밀어낸다(header는 영향 없음). */
+.main:has(.welcome) .messages { flex: 0 0 auto; overflow: visible; padding: 0; margin-top: auto; }
+.main:has(.welcome) .input-area { flex-shrink: 0; padding-top: 0; margin-bottom: auto; }
 
 .messages { flex: 1; overflow-y: auto; padding: 24px 0; }
 
 .messages-inner {
-  max-width: 720px;
+  max-width: 900px;
   margin: 0 auto;
   padding: 0 20px;
 }
@@ -637,24 +774,15 @@ body.resizing { cursor: col-resize; user-select: none; }
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  padding: 80px 20px;
+  padding: 0 20px 35px;
   text-align: center;
 }
 
-.welcome-logo {
-  /* 가로형 워드마크 로고 — 비율 유지(height:auto)로 찌그러짐 방지, 중앙 표시용 확대 */
-  width: 180px; height: auto;
-  margin-bottom: 20px;
-  opacity: 0.95;
-}
-
-.welcome h2 { font-size: 22px; font-weight: 600; margin-bottom: 8px; }
-
-.welcome p {
-  font-size: 14px;
-  color: var(--text-secondary);
-  max-width: 400px;
-  line-height: 1.6;
+.welcome h2 {
+  font-size: 30px;
+  font-weight: 700;
+  color: var(--accent-light);
+  letter-spacing: -0.01em;
 }
 
 /* ─── 메시지 버블 ─── */
@@ -665,35 +793,40 @@ body.resizing { cursor: col-resize; user-select: none; }
   to { opacity: 1; transform: translateY(0); }
 }
 
-.message-header {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 6px;
-}
-
-.message-avatar {
-  width: 24px; height: 24px;
-  border-radius: 50%;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 12px;
-  font-weight: 600;
-  flex-shrink: 0;
-}
-
-.message-avatar.user { background: var(--bg-message-user); color: #fff; }
-.message-avatar.assistant { background: #fff; color: #fff; object-fit: cover; }
-
-.message-sender { font-size: 13px; font-weight: 600; }
-
 .message-body {
-  padding-left: 32px;
-  font-size: 14px;
+  display: inline-block;
+  max-width: 90%;
+  box-sizing: border-box;
+  padding: 15px 20px;
+  border-radius: 15px;
+  /* background: var(--bg-message-assistant); */
+  /* border: 1px solid var(--border); */
+  font-size: 16px;
   line-height: 1.7;
   color: var(--text-primary);
   word-wrap: break-word;
+}
+
+/* 사용자는 오른쪽, 답변(IDINO NOVA)은 왼쪽에 배치 */
+.message.msg-user {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+}
+.message.msg-assistant {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+}
+.message.msg-user .message-body {
+  text-align: left;
+  background: var(--bg-primary);
+  color: #333;
+  /* border-color: var(--bg-message-user); */
+  border-bottom-right-radius: 4px;
+}
+.message.msg-assistant .message-body {
+  border-bottom-left-radius: 4px;
 }
 
 .message-body p { margin-bottom: 8px; }
@@ -748,6 +881,7 @@ body.resizing { cursor: col-resize; user-select: none; }
 .code-copy-btn:hover { background: var(--bg-tertiary); color: var(--text-primary); }
 /* HTML/SVG 미리보기 버튼 — 코드 헤더에 복사 버튼과 나란히 */
 .code-preview-btn {
+  display: inline-flex; align-items: center;
   border: none; background: transparent; color: var(--accent-light, #1a73e8);
   cursor: pointer; font-size: 11px; padding: 2px 8px; border-radius: 4px;
   margin-right: 4px; transition: background 0.1s, color 0.1s;
@@ -764,6 +898,8 @@ body.resizing { cursor: col-resize; user-select: none; }
 
 /* 재생성 버튼 — 마지막 answer 아래에 붙는다 */
 .regen-btn {
+  display: inline-flex;
+  align-items: center;
   margin-top: 8px;
   padding: 4px 10px;
   border: 1px solid var(--border);
@@ -778,19 +914,20 @@ body.resizing { cursor: col-resize; user-select: none; }
 
 /* 메시지 편집 버튼 — user 말풍선 hover 시 노출 */
 .msg-edit-btn {
-  display: inline-block;
+  display: inline-flex;
+  align-items: center;
   margin-top: 6px;
   padding: 3px 8px;
-  border: 1px solid var(--border);
+  border: 1px solid #777;
   background: transparent;
-  color: var(--text-muted);
+  color: #777;
   border-radius: 6px;
-  font-size: 11px;
+  font-size: 12px;
   cursor: pointer;
   opacity: 0;
   transition: opacity 0.1s, background 0.1s, color 0.1s;
 }
-.message:hover .msg-edit-btn { opacity: 0.6; }
+.message:hover .msg-edit-btn { opacity: 1; }
 .msg-edit-btn:hover { opacity: 1 !important; background: var(--bg-hover); color: var(--text-primary); }
 
 /* ─── 스트리밍 커서 ─── */
@@ -821,9 +958,42 @@ body.resizing { cursor: col-resize; user-select: none; }
   position: relative;
 }
 
+/* 입력창 글로우 — 192.168.20.175:8011 의 .inquiry-btn hover 효과를 그대로 가져와,
+   로딩 직후 잠깐 나타났다 사라지도록 JS(.glow-flash 토글)로 재생한다. */
+.input-glow {
+  position: relative;
+  z-index: 0;
+  border-radius: 12px;
+}
+.input-glow::before {
+  content: '';
+  position: absolute;
+  inset: -4px;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #0e6fff 0%, #33b4ff 25%, #0e6fff 55%, #00ffc2 80%, #0e6fff 100%);
+  background-size: 200% 200%;
+  opacity: 0;
+  filter: blur(40px);
+  animation: input-glow-gradient 6s ease infinite;
+  animation-play-state: paused;
+  transition: opacity 0.4s ease-in-out;
+  z-index: -1;
+  pointer-events: none;
+}
+.input-glow.glow-flash::before {
+  opacity: 1;
+  animation-play-state: running;
+}
+@keyframes input-glow-gradient {
+  0%   { background-position: 0% 50%; }
+  50%  { background-position: 100% 50%; }
+  100% { background-position: 0% 50%; }
+}
+.main:has(.welcome) .input-glow { border-radius: 24px; }
+
 .input-box {
   display: flex;
-  align-items: center;
+  align-items: flex-end;
   background: var(--bg-input);
   border: 1px solid var(--border-light);
   border-radius: 12px;
@@ -849,7 +1019,6 @@ body.resizing { cursor: col-resize; user-select: none; }
   transition: color 0.15s;
 }
 .attach-btn:hover { color: var(--text-primary); }
-.attach-btn svg { width: 18px; height: 18px; }
 
 .input-box textarea {
   flex: 1;
@@ -882,13 +1051,47 @@ body.resizing { cursor: col-resize; user-select: none; }
 }
 .send-btn:hover { background: var(--accent-grad-hover); }
 .send-btn:disabled { opacity: 0.4; cursor: not-allowed; }
-.send-btn svg { width: 16px; height: 16px; }
+
+/* 대화 시작 전 히어로 입력창 — 크고 둥근 카드에 버튼을 모서리로 뺀다(캡처 이미지 스타일) */
+.main:has(.welcome) .input-container { max-width: 700px; }
+.main:has(.welcome) .input-box {
+  display: block;
+  position: relative;
+  border-radius: 24px;
+  padding: 20px 60px 52px 20px;
+  min-height: 116px;
+  box-shadow: 0 2px 14px rgba(20, 24, 34, 0.06);
+}
+.main:has(.welcome) .input-box textarea {
+  width: 100%;
+  font-size: 15px;
+  line-height: 24px;
+  padding: 0;
+}
+.main:has(.welcome) .attach-btn { display: none; }
+.main:has(.welcome) .send-btn {
+  position: absolute;
+  right: 16px; bottom: 14px;
+  width: 40px; height: 40px;
+  border-radius: 50%;
+  background: var(--text-muted);
+}
+.main:has(.welcome) .send-btn:hover { background: var(--text-secondary); }
 
 .input-footer {
   text-align: center;
-  font-size: 11px;
+  font-size: 13px;
   color: var(--text-muted);
-  margin-top: 8px;
+  margin-top: 18px;
+}
+
+/* 웰컴(대화 시작 전) 화면에서는 인사말+입력창이 화면 정중앙으로 모이면서
+   이 문구도 같이 중앙으로 끌려간다 — 뷰포트 기준 fixed로 하단에 확실히 고정하되,
+   left/width는 JS(syncWelcomeFooterWidth)가 .main의 실제 폭에 맞춰 매번 갱신한다. */
+.main:has(.welcome) .input-footer {
+  position: fixed;
+  bottom: 50px;
+  margin-top: 0;
 }
 
 /* 첨부파일 프리뷰 */
@@ -920,19 +1123,6 @@ body.resizing { cursor: col-resize; user-select: none; }
 }
 .attach-chip .remove:hover { color: var(--error); }
 
-/* 첨부 이미지 썸네일 — 무엇을 붙였는지 보내기 전에 눈으로 확인하는 용도.
-   파일명만 보이면 붙여넣기(Ctrl+V)로 들어온 이미지는 이름이 무의미해서
-   (예: image.png) 무엇인지 알 수가 없다. */
-.attach-chip .thumb {
-  width: 28px;
-  height: 28px;
-  object-fit: cover;      /* 비율 유지하며 정사각형으로 채움 */
-  border-radius: 4px;
-  border: 1px solid var(--border);
-  background: var(--bg-secondary);
-  flex-shrink: 0;
-}
-
 /* 숨겨진 파일 입력 */
 #fileInput { display: none; }
 
@@ -941,7 +1131,6 @@ body.resizing { cursor: col-resize; user-select: none; }
   display: flex;
   align-items: center;
   gap: 6px;
-  padding-left: 32px;
   color: var(--text-muted);
   font-size: 13px;
   margin-bottom: 16px;
@@ -1007,7 +1196,6 @@ body.resizing { cursor: col-resize; user-select: none; }
    구성: (1) 완료 단계들의 muted 트레일 + (2) 진행 중 라이브 인디케이터.
    메시지 본문과 좌측 정렬을 맞추기 위해 padding-left 32px (아바타 폭 보정). */
 .activity-area {
-  padding-left: 32px;
   margin-bottom: 6px;
 }
 /* 턴이 끝난 뒤 최종 메시지에 남는 완료 트레일은 더 흐리게.
@@ -1243,7 +1431,7 @@ body.resizing { cursor: col-resize; user-select: none; }
   min-width: 0;
   overflow: hidden;
   background: var(--bg-secondary);
-  border-left: 1px solid var(--border);
+  /*border-left: 1px solid var(--border);*/
   display: flex;
   flex-direction: column;
   transition: width 0.28s ease;
@@ -1299,8 +1487,10 @@ body.resizing { cursor: col-resize; user-select: none; }
   height: 30px;
   border-radius: 8px;
   cursor: pointer;
-  font-size: 18px;
   line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   transition: all 0.15s;
 }
 .canvas-close:hover { background: var(--bg-hover); color: var(--text-primary); }
@@ -1337,6 +1527,9 @@ body.resizing { cursor: col-resize; user-select: none; }
 .canvas-body pre code { background: none; padding: 0; }
 
 /* ─── 반응형 ─── */
+@media (min-height: 900px) {
+  /*.main:has(.welcome) {margin-bottom: 210px;}*/
+}
 /* 태블릿: 캔버스 기본 폭을 조금 넓게, 여백 축소 */
 @media (max-width: 1024px) {
   .messages-inner { padding: 0 16px; }
@@ -1345,6 +1538,15 @@ body.resizing { cursor: col-resize; user-select: none; }
 
 /* 모바일: 사이드바는 오버레이(슬라이드), 리사이저 숨김, 글자 크기 축소 */
 @media (max-width: 768px) {
+  .header-title {display: inline-flex; align-items: center; font-size: 15px; font-weight: 600; }
+  .header-btn {
+      position: inherit;
+      background: #fff;
+      border: none;
+      color: var(--text-secondary);
+      display: flex;
+      box-shadow: none;
+  }
   .sidebar {
     position: absolute;
     left: 0; top: 0; bottom: 0;
@@ -1357,8 +1559,25 @@ body.resizing { cursor: col-resize; user-select: none; }
   .sidebar.collapsed {
     width: min(82vw, 300px);
     transform: translateX(-100%);
-    border-right: 1px solid var(--border);
+    border-right: 1px solid var(--nv-border);
   }
+  .sidebar-close-btn {
+    display: block;
+    background: none;
+    border: none;
+    color: var(--nv-text-secondary);
+    width: 28px;
+    height: 28px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 0;
+    transition: all 0.15s;
+    position: relative;
+  }
+  .header {
+      justify-content: space-between;
+  }
+  .token-counter {margin-left: 0px;}
   .resizer { display: none; }
   .messages-inner { padding: 0 12px; }
   .input-area { padding: 12px; }
@@ -1376,72 +1595,166 @@ body.resizing { cursor: col-resize; user-select: none; }
   .message-body h3, .canvas-body h3 { font-size: 15px; }
   .input-box textarea { font-size: 16px; }  /* iOS 자동 확대 방지 위해 16px 이상 */
   .input-footer { font-size: 11px; }
-  .welcome h2 { font-size: 20px; }
+  .welcome h2 { font-size: 22px; }
+  .main:has(.welcome) .input-container {
+    max-width: 90%;
+  }
 }
 
 /* 아주 좁은 화면 */
 @media (max-width: 420px) {
   .messages-inner { padding: 0 10px; }
   .message-body, .canvas-body { font-size: 13.5px; }
-  .welcome h2 { font-size: 18px; }
-  .welcome p { font-size: 13px; }
+  .welcome h2 { font-size: 19px; }
+}
+
+/* ─── 기능 전용 스타일 (디자인 이식 시 보존) ───────────────────────
+   디자인팀 시안은 아래 기능들이 없던 시점 파일에서 출발해 규칙이 빠져 있다.
+   시안 CSS 를 기준으로 삼되 이 규칙들은 되살려야 기능이 화면에서 동작한다.
+     수식(KaTeX) · 다이어그램(Mermaid) · 저장된 기억 목록 ·
+     세션 다중선택 바 · 폴더 드래그앤드롭 · 첨부 이미지 썸네일
+   2026-08-14 */
+.katex, .katex * { line-height: normal; }
+.katex-display { overflow-x: auto; padding: 6px 0; margin: 8px 0; }
+.mermaid-figure {
+    margin: 12px 0; padding: 12px; overflow-x: auto;
+    background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 8px;
+  }
+.mermaid-figure svg { max-width: none; width: auto; height: auto; display: block; margin: 0 auto; }
+.memory-list { display: flex; flex-direction: column; gap: 6px; max-height: 220px; overflow-y: auto; }
+.memory-row {
+  display: flex; gap: 8px; align-items: flex-start;
+  padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px;
+  background: var(--bg-primary);
+}
+.memory-body {
+  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.memory-text {
+  flex: 1; min-width: 0; font-size: 12px; line-height: 1.5; color: var(--text-primary);
+  word-break: break-word;
+}
+.memory-meta { display: block; margin-top: 3px; font-size: 11px; color: var(--text-muted); }
+.memory-del {
+  flex-shrink: 0; border: 0; background: transparent; color: var(--text-muted);
+  cursor: pointer; font-size: 14px; line-height: 1; padding: 2px 4px;
+}
+.memory-del:hover { color: var(--error); }
+.memory-empty { font-size: 12px; color: var(--text-muted); padding: 6px 2px; }
+.selection-bar {
+  display: none;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 10px;
+  margin-bottom: 4px;
+  font-size: 12px;
+  background: var(--bg-tertiary);
+  border-radius: 6px;
+  color: var(--text-secondary);
+}
+.selection-bar.visible { display: flex; }
+.selection-bar button {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 11px;
+  padding: 2px 8px;
+}
+.selection-bar button:hover { background: var(--bg-hover); }
+.drop-zone-ungrouped {
+  display: none;
+  padding: 6px 10px;
+  margin: 2px 0 4px;
+  font-size: 11px;
+  color: var(--text-muted);
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  text-align: center;
+}
+.folder-header.drop-target, .drop-zone-ungrouped.drop-target {
+  background: var(--bg-hover);
+  outline: 2px dashed var(--accent, #6366f1);
+  outline-offset: -2px;
+}
+.session-item.dragging { opacity: .45; }
+.session-item.selected {
+  background: color-mix(in srgb, var(--accent, #6366f1) 18%, transparent);
+  box-shadow: inset 2px 0 0 var(--accent, #6366f1);
+}
+.sidebar.dragging-session .drop-zone-ungrouped { display: block; }
+.attach-chip .thumb {
+  width: 28px;
+  height: 28px;
+  object-fit: cover;      
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--bg-secondary);
+  flex-shrink: 0;
 }
 </style>
 </head>
 <body>
 
-<!-- 헤더 -->
-<div class="header">
-  <div class="header-left">
-    <button class="header-btn" onclick="toggleSidebar()" title="세션 목록">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg>
-    </button>
-    <img src="/static/emblem.png" alt="IDINO NOVA" class="header-logo">
-    <span class="header-title">IDINO NOVA</span>
-    <span class="header-subtitle">by IDINO</span>
-  </div>
-  <div class="header-right">
-    <div class="token-counter" id="tokenCounter" title="누적 토큰 사용량">
-      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>
-      <span>IN: <b id="tokenIn">0</b></span>
-      <span>OUT: <b id="tokenOut">0</b></span>
-    </div>
-    <span class="status-dot" id="statusDot" title="GPU 서버 상태"></span>
-  </div>
-</div>
-
 <!-- 레이아웃 -->
 <div class="layout">
 
-  <!-- 사이드바 (기본 닫힘) -->
-  <div class="sidebar collapsed" id="sidebar">
+  <!-- 사이드바 (기본 열림) -->
+  <div class="sidebar" id="sidebar">
     <div class="sidebar-header">
-      <button class="new-chat-btn" onclick="newSession()">+ 새 대화</button>
-      <button class="sidebar-close-btn" onclick="toggleSidebar()">&times;</button>
+      <div class="sidebar-brand">
+        <img src="/static/emblem.png" alt="IDINO NOVA" class="sidebar-logo">
+        <span class="sidebar-brand-text">IDINO NOVA</span>
+      </div>
+      <button class="sidebar-close-btn" onclick="toggleSidebar()" title="사이드바 접기"></button>
+    </div>
+    <!-- 접힘(기본) 상태 전용 아이콘 레일 — 호버 시 챗지피티 스타일 커스텀 툴팁(data-tooltip) 노출 -->
+    <div class="sidebar-rail">
+      <button class="rail-btn rail-new-btn" onclick="newSession()" data-tooltip="새로운 대화" aria-label="새로운 대화"></button>
+      <button class="rail-btn rail-history-btn" onclick="toggleSidebar()" data-tooltip="대화 목록" aria-label="대화 목록"></button>
     </div>
     <div class="sidebar-search">
       <input type="text" id="sessionSearch" class="session-search-input"
-             placeholder="대화 검색..." autocomplete="off"
+             placeholder="대화 검색" autocomplete="off"
              oninput="onSessionSearchInput(this.value)">
     </div>
+    <button class="new-chat-btn" onclick="newSession()">새로운 대화</button>
     <div class="session-list" id="sessionList"></div>
     <div class="sidebar-footer">
-      <button class="settings-btn" onclick="openSettings()" title="설정">⚙ 설정</button>
+      <button class="settings-btn" onclick="openSettings()" title="설정"><span class="settings-label">설정</span></button>
       <span class="footer-version">IDINO NOVA v0.1.0</span>
     </div>
   </div>
 
   <!-- 사이드바↔메인 폭 조절 리사이저 (사이드바 열림 시에만 표시) -->
-  <div class="resizer" id="sidebarResizer" hidden></div>
+  <div class="resizer" id="sidebarResizer"></div>
 
   <!-- 메인 -->
   <div class="main">
+    <!-- 헤더 -->
+    <div class="header">
+      <div class="header-left">
+        <button class="header-btn" onclick="toggleSidebar()" title="세션 목록">
+          <i class="bi bi-layout-sidebar"></i>
+        </button>
+        <span class="header-title"><img src="/static/emblem.png" alt="IDINO NOVA" class="header-logo"> IDINO NOVA</span>
+      </div>
+      <div class="header-right">
+        <div class="token-counter" id="tokenCounter" title="누적 토큰 사용량">
+          <i class="bi bi-clock-history" style="font-size:12px"></i>
+          <span>IN: <b id="tokenIn">0</b></span>
+          <span>OUT: <b id="tokenOut">0</b></span>
+        </div>
+        <span class="status-dot" id="statusDot" title="GPU 서버 상태"></span>
+      </div>
+    </div>
     <div class="messages" id="messages">
       <div class="messages-inner" id="messagesInner">
         <div class="welcome" id="welcome">
-          <img src="/static/idino-nova.png" alt="IDINO NOVA" class="welcome-logo">
           <h2 id="welcomeGreeting">안녕하세요.</h2>
-          <p>무엇을 도와드릴까요?</p>
         </div>
       </div>
     </div>
@@ -1452,24 +1765,22 @@ body.resizing { cursor: col-resize; user-select: none; }
         <div class="attach-preview" id="attachPreview"></div>
         <!-- 프롬프트 템플릿 / 삽입 팝업 -->
         <div class="prompt-popup" id="promptPopup" hidden></div>
-        <div class="input-box">
-          <button class="attach-btn" onclick="document.getElementById('fileInput').click()" title="파일 첨부">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/>
-            </svg>
-          </button>
-          <input type="file" id="fileInput" multiple accept=".txt,.py,.js,.ts,.json,.yaml,.yml,.md,.csv,.html,.css,.sql,.xml,.log,.pdf,.docx,.doc,.hwp,.hwpx,.xlsx,.xls,.pptx,.jpg,.jpeg,.png,.gif,.webp,.bmp" onchange="handleFileSelect(event)">
-          <textarea id="userInput"
-                    placeholder="메시지를 입력하세요... (이미지는 Ctrl+V 로 붙여넣기)"
-                    rows="1"
-                    onkeydown="handleKeyDown(event)"
-                    onpaste="handlePasteFiles(event)"
-                    oninput="autoResize(this); onInputForPrompt()"></textarea>
-          <button class="send-btn" id="sendBtn" onclick="sendMessage()">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M22 2L11 13M22 2L15 22L11 13L2 9L22 2Z"/>
-            </svg>
-          </button>
+        <div class="input-glow" id="inputGlow">
+          <div class="input-box">
+            <button class="attach-btn" onclick="document.getElementById('fileInput').click()" title="파일 첨부">
+              <i class="bi bi-paperclip" style="font-size:18px"></i>
+            </button>
+            <input type="file" id="fileInput" multiple accept=".txt,.py,.js,.ts,.json,.yaml,.yml,.md,.csv,.html,.css,.sql,.xml,.log,.pdf,.docx,.doc,.hwp,.hwpx,.xlsx,.xls,.pptx,.jpg,.jpeg,.png,.gif,.webp,.bmp" onchange="handleFileSelect(event)">
+            <textarea id="userInput"
+                      placeholder="무엇이든 물어보세요"
+                      rows="1"
+                      onkeydown="handleKeyDown(event)"
+                      onpaste="handlePasteFiles(event)"
+                      oninput="autoResize(this); onInputForPrompt()"></textarea>
+            <button class="send-btn" id="sendBtn" onclick="sendMessage()">
+              <i class="bi bi-arrow-up" style="font-size:16px"></i>
+            </button>
+          </div>
         </div>
         <div class="input-footer">IDINO NOVA 는 AI이며 실수할 수 있습니다. 응답을 다시 한번 확인해 주세요.</div>
       </div>
@@ -1485,13 +1796,17 @@ body.resizing { cursor: col-resize; user-select: none; }
       <span class="canvas-filename" id="canvasFilename">문서</span>
       <span class="canvas-badge" id="canvasBadge" style="display:none"></span>
       <div class="canvas-header-actions">
-        <a class="dl-link canvas-dl" id="canvasDownload" href="#">⬇ 다운로드</a>
-        <button class="canvas-close" id="canvasClose" title="닫기" aria-label="미리보기 닫기">&times;</button>
+        <a class="dl-link canvas-dl" id="canvasDownload" href="#"><i class="bi bi-download icon-inline" style="font-size:13px"></i>다운로드</a>
+        <button class="canvas-close" id="canvasClose" title="닫기" aria-label="미리보기 닫기"><i class="bi bi-x-lg" style="font-size:14px"></i></button>
       </div>
     </div>
     <div class="canvas-body" id="canvasBody"></div>
   </aside>
 </div>
+
+<!-- 챗지피티 스타일 호버 툴팁 — 사이드바가 overflow:hidden 이라 안에서 절대배치하면 잘리므로
+     body 바로 아래(포탈)에 두고 fixed 좌표로 위치시킨다. -->
+<div class="rail-tooltip" id="railTooltip" hidden></div>
 
 <!-- 공용 대화상자 — alert/confirm/prompt 를 대신한다.
      하나만 두고 novaAlert/novaConfirm/novaPrompt 가 내용만 바꿔 쓴다. -->
@@ -1516,13 +1831,16 @@ body.resizing { cursor: col-resize; user-select: none; }
   <div class="modal">
     <div class="modal-header">
       <span class="modal-title">설정 — 커스텀 인스트럭션</span>
-      <button class="modal-close" onclick="closeSettings()" aria-label="닫기">&times;</button>
+      <button class="modal-close" onclick="closeSettings()" aria-label="닫기"><i class="bi bi-x-lg" style="font-size:16px"></i></button>
     </div>
     <div class="modal-body">
-      <!-- 응답 스타일(W1) — 프리셋 선택 + 직접 입력. 직접 입력이 프리셋보다 우선한다. -->
+      <!-- 응답 스타일(W1) — 프리셋 선택 + 직접 입력. 직접 입력이 프리셋보다 우선한다.
+           시안에는 이 절이 없었다(시안이 출발한 시점에 기능이 없었다). 되살리되
+           select 의 인라인 색상은 시안 팔레트 변수로 맞춘다 — 원본은 다크 테마
+           변수(--surface,#1e1e1e)를 쓰고 있어 라이트 디자인에서 검은 상자가 된다. -->
       <div class="settings-section-title">응답 스타일 <span class="settings-hint">답변의 길이와 어투를 정합니다</span></div>
       <select id="responseStyle" onchange="updateStyleDesc()"
-              style="width:100%;padding:8px 10px;border-radius:8px;border:1px solid var(--line,#3a3a3a);background:var(--surface,#1e1e1e);color:inherit;font:inherit;">
+              style="width:100%;padding:8px 10px;border-radius:8px;border:1px solid var(--border);background:var(--bg-input);color:var(--text-primary);font:inherit;">
         <option value="normal">기본</option>
       </select>
       <p class="modal-desc" id="responseStyleDesc" style="margin-top:6px;"></p>
@@ -1541,7 +1859,7 @@ body.resizing { cursor: col-resize; user-select: none; }
       <button class="prompt-add-btn" type="button" onclick="addPromptRow()">+ 템플릿 추가</button>
 
       <div class="settings-divider"></div>
-      <div class="settings-section-title">프로젝트 <span class="settings-hint">대화를 이 이름의 폴더(📁)에 넣으면 그 프로젝트의 지시문·지식소스가 적용됩니다</span></div>
+      <div class="settings-section-title">프로젝트 <span class="settings-hint">대화를 이 이름의 폴더(<i class="bi bi-folder icon-inline" style="font-size:11px;margin-right:1px"></i>)에 넣으면 그 프로젝트의 지시문·지식소스가 적용됩니다</span></div>
       <div id="projectList" class="prompt-list"></div>
       <button class="prompt-add-btn" type="button" onclick="addProjectRow()">+ 프로젝트 추가</button>
 
@@ -1741,6 +2059,17 @@ window.addEventListener('DOMContentLoaded', () => {
   const wg = document.getElementById('welcomeGreeting');
   if (wg) wg.textContent = greetingByHour();
   document.getElementById('userInput').focus();
+
+  // 로딩 직후 입력창 글로우를 한 번 재생했다 사라지게 한다(시안 연출).
+  // CSS(.input-glow / .glow-flash)와 마크업은 시안에서 왔는데 이 트리거만
+  // 빠져 있었다 — 스크립트를 우리 것으로 통째 교체할 때 함께 사라졌다.
+  const inputGlow = document.getElementById('inputGlow');
+  if (inputGlow) {
+    setTimeout(() => {
+      inputGlow.classList.add('glow-flash');
+      setTimeout(() => inputGlow.classList.remove('glow-flash'), 1400);
+    }, 400);
+  }
 });
 
 // 사이드바 컨테이너에 단일 click 리스너를 붙여
@@ -1752,12 +2081,23 @@ function setupSessionListDelegation() {
   if (!list) return;
   list.addEventListener('click', (ev) => {
     const target = ev.target;
+    // 메뉴(⋯) 버튼 — 드롭다운 토글(같은 항목 재클릭 시 닫힘). 시안 신규 UI.
+    const menuBtn = target.closest && target.closest('.session-menu-btn');
+    if (menuBtn) {
+      ev.stopPropagation();
+      const mItem = menuBtn.closest('.session-item');
+      const wasOpen = mItem && mItem.classList.contains('menu-open');
+      closeAllSessionMenus();
+      if (mItem && !wasOpen) mItem.classList.add('menu-open');
+      return;
+    }
     // 삭제 버튼이 우선
     const delBtn = target.closest && target.closest('.session-delete-btn');
     if (delBtn) {
       const sid = delBtn.getAttribute('data-sid');
       console.log('[session] delete click sid=', sid);
       ev.stopPropagation();
+      closeAllSessionMenus();
       if (sid) deleteSession(sid, ev);
       return;
     }
@@ -1766,6 +2106,7 @@ function setupSessionListDelegation() {
     if (pinBtn) {
       const sid = pinBtn.getAttribute('data-sid');
       ev.stopPropagation();
+      closeAllSessionMenus();
       if (sid) togglePin(sid);
       return;
     }
@@ -1774,6 +2115,7 @@ function setupSessionListDelegation() {
     if (renameBtn) {
       const sid = renameBtn.getAttribute('data-sid');
       ev.stopPropagation();
+      closeAllSessionMenus();
       if (sid) renameSession(sid);
       return;
     }
@@ -1782,6 +2124,7 @@ function setupSessionListDelegation() {
     if (exportBtn) {
       const sid = exportBtn.getAttribute('data-sid');
       ev.stopPropagation();
+      closeAllSessionMenus();
       if (sid) exportSession(sid, 'md');
       return;
     }
@@ -1797,6 +2140,7 @@ function setupSessionListDelegation() {
     if (folderBtn) {
       const sid = folderBtn.getAttribute('data-sid');
       ev.stopPropagation();
+      closeAllSessionMenus();
       if (sid) setFolder(sid);
       return;
     }
@@ -1805,6 +2149,11 @@ function setupSessionListDelegation() {
     if (folderHeader) {
       const fname = folderHeader.getAttribute('data-folder');
       if (fname) { _toggleFolderCollapsed(fname); renderSessionList(); }
+      return;
+    }
+    // 드롭다운 여백 클릭은 세션 전환으로 이어지지 않도록 차단
+    if (target.closest && target.closest('.session-menu-dropdown')) {
+      ev.stopPropagation();
       return;
     }
     const item = target.closest && target.closest('.session-item');
@@ -1832,6 +2181,13 @@ function setupSessionListDelegation() {
 
 // 세션 메타(제목·핀)를 서버에 PATCH하고 로컬 상태·사이드바를 갱신하는 공용 헬퍼.
 // 서버가 meta.json에 영속화하므로 새로고침·재접속 후에도 유지된다.
+// 열려있는 세션 메뉴 드롭다운을 모두 닫는다(바깥 클릭·다른 메뉴 열기·Esc 시 호출).
+function closeAllSessionMenus() {
+  document.querySelectorAll('.session-item.menu-open').forEach(el => el.classList.remove('menu-open'));
+}
+document.addEventListener('click', closeAllSessionMenus);
+document.addEventListener('keydown', (ev) => { if (ev.key === 'Escape') closeAllSessionMenus(); });
+
 async function patchSessionMeta(id, patch) {
   try {
     const resp = await fetch(`/v1/sessions/${encodeURIComponent(id)}`, {
@@ -1866,11 +2222,10 @@ async function renameSession(id) {
 async function togglePin(id) {
   const session = sessions.find(s => s.id === id);
   if (!session) return;
-  const res = await patchSessionMeta(id, { pinned: !session.pinned });
-  if (res) {
-    session.pinned = !!res.pinned;
-    renderSessionList();
-  }
+  session.pinned = !session.pinned;
+  renderSessionList();
+  const res = await patchSessionMeta(id, { pinned: session.pinned });
+  if (res) session.pinned = !!res.pinned;   // 서버 확정값과 다르면 보정
 }
 
 // 대화를 폴더로 이동 — prompt로 폴더명을 받아 서버(meta.json)에 저장하고 목록을 다시 그린다.
@@ -1964,7 +2319,7 @@ async function loadMemories() {
       del.className = 'memory-del';
       del.type = 'button';
       del.title = '이 기억 지우기';
-      del.textContent = '×';
+      del.innerHTML = '<i class="bi bi-trash3" style="font-size:13px"></i>';
       del.addEventListener('click', () => deleteMemory(m.id, row));
 
       row.appendChild(text);
@@ -2065,7 +2420,7 @@ function addPromptRow(title, text) {
   body.className = 'prompt-text-input'; body.placeholder = '삽입될 프롬프트 내용';
   body.maxLength = 2000; body.value = text || '';
   const del = document.createElement('button');
-  del.className = 'prompt-del-btn'; del.type = 'button'; del.textContent = '×'; del.title = '삭제';
+  del.className = 'prompt-del-btn'; del.type = 'button'; del.innerHTML = '<i class="bi bi-trash3" style="font-size:13px"></i>'; del.title = '삭제';
   del.addEventListener('click', () => row.remove());
   row.appendChild(t); row.appendChild(body); row.appendChild(del);
   plist.appendChild(row);
@@ -2104,7 +2459,7 @@ function addProjectRow(name, instruction, sources) {
   src.value = (sources || []).join(', ');
   mid.appendChild(instr); mid.appendChild(src);
   const del = document.createElement('button');
-  del.className = 'prompt-del-btn'; del.type = 'button'; del.textContent = '×'; del.title = '삭제';
+  del.className = 'prompt-del-btn'; del.type = 'button'; del.innerHTML = '<i class="bi bi-trash3" style="font-size:13px"></i>'; del.title = '삭제';
   del.addEventListener('click', () => row.remove());
   row.appendChild(nameI); row.appendChild(mid); row.appendChild(del);
   plist.appendChild(row);
@@ -2301,7 +2656,7 @@ function updateRegenerateButton() {
   const btn = document.createElement('button');
   btn.className = 'regen-btn';
   btn.type = 'button';
-  btn.textContent = '↻ 재생성';
+  btn.innerHTML = '<i class="bi bi-arrow-clockwise icon-inline" style="font-size:12px"></i>재생성';
   btn.addEventListener('click', regenerateLast);
   body.appendChild(btn);
 }
@@ -2551,22 +2906,36 @@ function sessionSortKey(s) {
 }
 
 // 세션 항목 하나의 HTML(폴더 그룹·미분류 공용). 위임 클릭은 data-sid로 처리.
+
+// 세션 항목 하나의 HTML(폴더 그룹·미분류 공용). 위임 클릭은 data-sid로 처리.
+// 부트스트랩 아이콘(icons.getbootstrap.com) — 세션 메뉴에서 재사용하는 인라인 아이콘 조각들.
+const ICON_PIN = '<i class="bi bi-pin-angle"></i>';
+const ICON_PIN_FILL = '<i class="bi bi-pin-angle-fill"></i>';
+const ICON_PENCIL = '<i class="bi bi-pencil"></i>';
+const ICON_FOLDER = '<i class="bi bi-folder"></i>';
+const ICON_DOWNLOAD = '<i class="bi bi-download"></i>';
+const ICON_TRASH = '<i class="bi bi-trash3"></i>';
+
 function sessionItemHtml(s) {
-  const cls = (s.id === currentSessionId ? 'active' : '') + (s.pinned ? ' pinned' : '')
-    + (_selectedSids.has(s.id) ? ' selected' : '');
+  const cls = (s.id === currentSessionId ? 'active' : '') + (s.pinned ? ' pinned' : '');
   const title = escapeHtml(s.title || s.id);
   const sid = escapeHtml(s.id);
-  const pinTitle = s.pinned ? '핀 해제' : '핀 고정';
-  const pinIcon = s.pinned ? '📌' : '📍';
+  const pinLabel = s.pinned ? '핀 해제' : '핀 고정';
+  const pinIcon = s.pinned ? ICON_PIN_FILL : ICON_PIN;
+  // 클로드 스타일: 항목별 액션은 "⋯" 버튼을 눌러야 나오는 드롭다운 메뉴로 묶는다.
   return (
     `<div class="session-item ${cls}" data-sid="${sid}" draggable="true">
-      ${s.pinned ? '<span class="session-pin-mark" aria-hidden="true">📌</span>' : ''}
+      ${s.pinned ? `<span class="session-pin-mark" aria-hidden="true">${ICON_PIN_FILL}</span>` : ''}
       <span class="session-title">${title}</span>
-      <button class="session-pin-btn" title="${pinTitle}" data-sid="${sid}">${pinIcon}</button>
-      <button class="session-rename-btn" title="이름 변경" data-sid="${sid}">✎</button>
-      <button class="session-folder-btn" title="폴더로 이동" data-sid="${sid}">📁</button>
-      <button class="session-export-btn" title="내보내기 (Markdown)" data-sid="${sid}">⬇</button>
-      <button class="session-delete-btn" title="대화 삭제" data-sid="${sid}">×</button>
+      <button class="session-menu-btn" title="더보기" data-sid="${sid}"><i class="bi bi-three-dots-vertical"></i></button>
+      <div class="session-menu-dropdown">
+        <button class="session-menu-item session-pin-btn" data-sid="${sid}"><span class="mi-icon">${pinIcon}</span>${pinLabel}</button>
+        <button class="session-menu-item session-rename-btn" data-sid="${sid}"><span class="mi-icon">${ICON_PENCIL}</span>이름 변경</button>
+        <button class="session-menu-item session-folder-btn" data-sid="${sid}"><span class="mi-icon">${ICON_FOLDER}</span>폴더로 이동</button>
+        <button class="session-menu-item session-export-btn" data-sid="${sid}"><span class="mi-icon">${ICON_DOWNLOAD}</span>내보내기</button>
+        <div class="session-menu-divider"></div>
+        <button class="session-menu-item danger session-delete-btn" data-sid="${sid}"><span class="mi-icon">${ICON_TRASH}</span>삭제</button>
+      </div>
      </div>`
   );
 }
@@ -2728,8 +3097,10 @@ function renderSessionList() {
     const items = bySort(folders[fname]);
     html += `<div class="folder-group">
       <div class="folder-header" data-folder="${escapeHtml(fname)}">
-        <span class="folder-caret">${collapsed ? '▸' : '▾'}</span>
-        <span class="folder-name">📁 ${escapeHtml(fname)}</span>
+        <span class="folder-caret">${collapsed
+          ? '<i class="bi bi-chevron-right" style="font-size:10px"></i>'
+          : '<i class="bi bi-chevron-down" style="font-size:10px"></i>'}</span>
+        <span class="folder-name">${ICON_FOLDER} ${escapeHtml(fname)}</span>
         <span class="folder-count">${items.length}</span>
       </div>
       <div class="folder-items"${collapsed ? ' hidden' : ''}>${items.map(sessionItemHtml).join('')}</div>
@@ -2744,9 +3115,7 @@ function clearMessages() {
   const inner = document.getElementById('messagesInner');
   inner.innerHTML = `
     <div class="welcome" id="welcome">
-      <img src="/static/idino-nova.png" alt="IDINO NOVA" class="welcome-logo">
       <h2 id="welcomeGreeting">${greetingByHour()}</h2>
-      <p>무엇을 도와드릴까요?</p>
     </div>`;
 }
 
@@ -2843,7 +3212,7 @@ function renderAttachPreview() {
     return `<div class="attach-chip">
       ${thumb}
       <span>${escapeHtml(f.name)} (${(f.size / 1024).toFixed(1)}KB)</span>
-      <span class="remove" onclick="removeFile(${i})">&times;</span>
+      <span class="remove" onclick="removeFile(${i})"><i class="bi bi-x" style="font-size:11px"></i></span>
     </div>`;
   }).join('');
 }
@@ -2968,16 +3337,7 @@ function appendMessage(role, content, save = true, index = null) {
   div.className = 'message msg-' + role;   // 역할 클래스(재생성 버튼 배치 등에 사용)
   if (index !== null) div.dataset.msgIndex = index;   // 편집·분기(fork)용 인덱스
 
-  const sender = role === 'user' ? '사용자' : 'IDINO NOVA';
-  const avatarHtml = role === 'user'
-    ? `<div class="message-avatar user">U</div>`
-    : `<img src="/static/emblem.png" alt="N" class="message-avatar assistant" style="object-fit:cover;">`;
-
   div.innerHTML = `
-    <div class="message-header">
-      ${avatarHtml}
-      <div class="message-sender">${sender}</div>
-    </div>
     <div class="message-body">${formatContent(content)}</div>`;
 
   // user 메시지엔 '편집' 버튼 — 클릭 시 이 지점에서 분기(fork)해 편집본으로 새 대화를 만든다.
@@ -2985,11 +3345,10 @@ function appendMessage(role, content, save = true, index = null) {
     const editBtn = document.createElement('button');
     editBtn.className = 'msg-edit-btn';
     editBtn.type = 'button';
-    editBtn.textContent = '✎ 편집';
+    editBtn.innerHTML = '<i class="bi bi-pencil icon-inline" style="font-size:11px"></i>편집';
     editBtn.title = '이 메시지를 편집해 새 분기 만들기';
     editBtn.addEventListener('click', () => editMessage(div));
-    const bodyEl = div.querySelector('.message-body');
-    if (bodyEl) bodyEl.appendChild(editBtn);
+    div.appendChild(editBtn);   // message-body 밖(바로 아래)에 배치
   }
 
   inner.appendChild(div);
@@ -3168,7 +3527,7 @@ function enhanceCodeBlocks(rootEl) {
       const prev = document.createElement('button');
       prev.className = 'code-preview-btn';
       prev.type = 'button';
-      prev.textContent = '▶ 미리보기';
+      prev.innerHTML = '<i class="bi bi-eye icon-inline" style="font-size:11px"></i>미리보기';
       prev.addEventListener('click', () => {
         const code = codeEl.innerText || codeEl.textContent || '';
         openCanvas({ html: code, filename: 'preview.' + lang, format: lang });
@@ -3628,13 +3987,13 @@ function activityStart(kind, toolName, toolDesc) {
   if (kind === 'thinking') {
     live.innerHTML =
       '<span class="activity-spinner"></span>' +
-      '<span class="activity-live-text">💭 생각 중…</span>';
+      '<span class="activity-live-text"><i class="bi bi-chat-dots icon-inline" style="font-size:12px"></i>생각 중…</span>';
   } else {
     // tool_desc 우선, 없으면 도구명 기반 한글 라벨
     const label = (toolDesc && toolDesc.trim()) ? toolDesc : activityToolLabel(toolName);
     live.innerHTML =
       '<span class="activity-spinner"></span>' +
-      '<span class="activity-live-text">🔧 ' + escapeHtml(label) +
+      '<span class="activity-live-text"><i class="bi bi-tools icon-inline" style="font-size:12px"></i>' + escapeHtml(label) +
       ' · <span class="activity-tool-name">' + escapeHtml(toolName || '') + '</span></span>';
   }
   live.style.display = 'flex';
@@ -3677,7 +4036,7 @@ function activityStop(kind, toolName, toolDesc) {
         step.setAttribute('data-activity-key', key);
         step.setAttribute('data-count', '1');
         step.innerHTML =
-          '<span class="activity-check">✓</span>' +
+          '<span class="activity-check"><i class="bi bi-check2" style="font-size:11px"></i></span>' +
           '<span class="activity-step-text">' + escapeHtml(label) +
           ' · <span class="activity-tool-name">' + escapeHtml(name) + '</span></span>';
         trail.appendChild(step);
@@ -3698,7 +4057,7 @@ function activityCompact(text) {
   const step = document.createElement('div');
   step.className = 'activity-step activity-compact';
   step.innerHTML =
-    '<span class="activity-compact-icon">🗜️</span>' +
+    '<span class="activity-compact-icon"><i class="bi bi-arrows-angle-contract" style="font-size:11px"></i></span>' +
     '<span class="activity-step-text">대화 압축 중' +
     (text ? ' · ' + escapeHtml(text) : '') + '</span>';
   trail.appendChild(step);
@@ -3728,7 +4087,7 @@ function renderToolResult(data) {
   // 요약 줄 — 모든 사용자/모델 문자열은 escapeHtml 경유(XSS 방지)
   const summary = document.createElement('summary');
   summary.innerHTML =
-    '<span class="tr-caret">▸</span>' +
+    '<span class="tr-caret"><i class="bi bi-chevron-right" style="font-size:10px"></i></span>' +
     '<span class="tr-label">' + escapeHtml(label) + '</span>' +
     (preview ? '<span class="tr-sep">·</span>' +
                '<span class="tr-preview">' + escapeHtml(preview) + '</span>' : '');
@@ -3765,7 +4124,11 @@ function renderTodoUpdate(data) {
   const total = st.total != null ? st.total : todos.length;
   const done = st.completed != null ? st.completed : 0;
 
-  const icon = { completed: '✔', in_progress: '◐', pending: '○' };
+  const icon = {
+    completed: '<i class="bi bi-check-circle-fill" style="font-size:12px"></i>',
+    in_progress: '<i class="bi bi-arrow-repeat" style="font-size:12px"></i>',
+    pending: '<i class="bi bi-circle" style="font-size:12px"></i>',
+  };
   let rows = '';
   for (const t of todos) {
     const status = t.status || 'pending';
@@ -3949,19 +4312,13 @@ function setSendButtonMode(mode) {
     btn.setAttribute('data-mode', 'cancel');
     btn.disabled = false;
     btn.onclick = cancelStream;
-    btn.innerHTML = `
-      <svg viewBox="0 0 24 24" fill="currentColor" stroke="none">
-        <rect x="6" y="6" width="12" height="12" rx="2"/>
-      </svg>`;
+    btn.innerHTML = `<i class="bi bi-square-fill" style="font-size:14px"></i>`;
   } else {
     btn.title = '전송';
     btn.setAttribute('data-mode', 'send');
     btn.disabled = false;
     btn.onclick = sendMessage;
-    btn.innerHTML = `
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-        <path d="M22 2L11 13M22 2L15 22L11 13L2 9L22 2Z"/>
-      </svg>`;
+    btn.innerHTML = `<i class="bi bi-arrow-up" style="font-size:16px"></i>`;
   }
 }
 
@@ -4328,6 +4685,65 @@ function initPanelResizers() {
   });
 }
 initPanelResizers();
+
+// ─── 웰컴 화면 input-footer 폭 동기화 ───
+// input-footer는 뷰포트 기준 position:fixed로 화면 맨 아래에 확실히 붙여두되(사이드바
+// 접힘/펼침·리사이즈와 무관하게 항상 하단 고정), 좌우 폭만 .main의 실제 사각형에 맞춰
+// JS로 갱신한다. ResizeObserver라 사이드바 폭 트랜지션 중에도 프레임마다 따라온다.
+// 웰컴이 사라지면(대화 시작) position:fixed 규칙 자체가 더 이상 걸리지 않으므로,
+// 남겨둔 인라인 left/width가 정적 배치를 오른쪽으로 밀어내지 않도록 함께 지워준다.
+(function initWelcomeFooterSync() {
+  const main = document.querySelector('.main');
+  const footer = document.querySelector('.input-footer');
+  const inner = document.getElementById('messagesInner');
+  if (!main || !footer || typeof ResizeObserver === 'undefined') return;
+  const sync = () => {
+    if (!document.getElementById('welcome')) {
+      footer.style.left = '';
+      footer.style.width = '';
+      return;
+    }
+    const r = main.getBoundingClientRect();
+    footer.style.left = r.left + 'px';
+    footer.style.width = r.width + 'px';
+  };
+  new ResizeObserver(sync).observe(main);
+  window.addEventListener('resize', sync);
+  // 웰컴 화면이 대화 시작으로 사라지는(또는 새 세션으로 되돌아와 다시 나타나는) 순간을 감지.
+  if (inner) new MutationObserver(sync).observe(inner, { childList: true });
+  sync();
+})();
+
+// ─── 챗지피티 스타일 호버 툴팁(접힌 사이드바 아이콘 레일) ───
+// .sidebar가 overflow:hidden이라 안에서 절대배치 툴팁을 두면 폭 밖으로 잘린다.
+// 그래서 body 직속 #railTooltip 하나를 포탈처럼 재사용하고, 호버한 버튼의
+// getBoundingClientRect로 매번 fixed 좌표를 계산해 옮겨 붙인다.
+(function initRailTooltip() {
+  const tip = document.getElementById('railTooltip');
+  if (!tip) return;
+  const show = (btn) => {
+    const label = btn.getAttribute('data-tooltip');
+    if (!label) return;
+    tip.textContent = label;
+    const r = btn.getBoundingClientRect();
+    tip.style.left = (r.right + 10) + 'px';
+    tip.style.top = (r.top + r.height / 2) + 'px';
+    tip.hidden = false;
+  };
+  const hide = () => { tip.hidden = true; };
+  document.addEventListener('mouseover', (ev) => {
+    const btn = ev.target.closest && ev.target.closest('[data-tooltip]');
+    if (btn) show(btn);
+  });
+  document.addEventListener('mouseout', (ev) => {
+    const btn = ev.target.closest && ev.target.closest('[data-tooltip]');
+    if (!btn) return;
+    if (ev.relatedTarget && btn.contains(ev.relatedTarget)) return;
+    hide();
+  });
+  document.addEventListener('click', hide);
+})();
+
 </script>
 </body>
 </html>
