@@ -1695,6 +1695,22 @@ body.resizing { cursor: col-resize; user-select: none; }
   background: var(--bg-secondary);
   flex-shrink: 0;
 }
+
+/* ─── 어시스턴트 머리말(아바타 + 이름) ──────────────────────────────
+   시안은 이 줄을 아예 뺐는데, 스트리밍·생각중 표시에는 마크업이 남아 있어
+   규칙 없이 원본 크기(엠블럼 원본 해상도)로 커다랗게 나왔다. 24px 로 고정해
+   "IDINO NOVA" 글자와 같은 줄에 놓는다. 2026-08-14 */
+.message-header { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.message-avatar {
+  width: 24px; height: 24px;
+  border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 12px; font-weight: 600;
+  flex-shrink: 0;
+}
+.message-avatar.assistant { background: #fff; object-fit: cover; }
+.message-avatar.user { background: var(--bg-message-user); color: #fff; }
+.message-sender { font-size: 13px; font-weight: 600; color: var(--text-primary); }
 </style>
 </head>
 <body>
@@ -3337,7 +3353,17 @@ function appendMessage(role, content, save = true, index = null) {
   div.className = 'message msg-' + role;   // 역할 클래스(재생성 버튼 배치 등에 사용)
   if (index !== null) div.dataset.msgIndex = index;   // 편집·분기(fork)용 인덱스
 
+  // 어시스턴트에만 머리말을 붙인다 — 스트리밍 중 보이던 줄이 답변 완료·새로고침
+  // 후에 사라지지 않게 맞춘다. 사용자 메시지는 시안대로 우측 말풍선만 쓴다.
+  const headerHtml = role === 'assistant'
+    ? `<div class="message-header">
+         <img src="/static/emblem.png" alt="N" class="message-avatar assistant">
+         <div class="message-sender">IDINO NOVA</div>
+       </div>`
+    : '';
+
   div.innerHTML = `
+    ${headerHtml}
     <div class="message-body">${formatContent(content)}</div>`;
 
   // user 메시지엔 '편집' 버튼 — 클릭 시 이 지점에서 분기(fork)해 편집본으로 새 대화를 만든다.
@@ -3733,7 +3759,7 @@ function showThinking() {
   div.className = 'message';
   div.innerHTML = `
     <div class="message-header">
-      <img src="/static/emblem.png" alt="N" class="message-avatar assistant" style="object-fit:cover;">
+      <img src="/static/emblem.png" alt="N" class="message-avatar assistant">
       <div class="message-sender">IDINO NOVA</div>
     </div>
     <div class="thinking">
@@ -3785,7 +3811,7 @@ function startStreamingMessage() {
 
   div.innerHTML = `
     <div class="message-header">
-      <img src="/static/emblem.png" alt="N" class="message-avatar assistant" style="object-fit:cover;">
+      <img src="/static/emblem.png" alt="N" class="message-avatar assistant">
       <div class="message-sender">IDINO NOVA</div>
     </div>
     <div class="activity-area" id="streamingActivity">
