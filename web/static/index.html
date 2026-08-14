@@ -3106,7 +3106,7 @@ function renderSessionList() {
     <button type="button" data-action="clear-selection">선택 해제</button>
   </div>`;
   // 미분류로 되돌리는 드롭 자리 — 드래그 중에만 나타난다.
-  html += '<div class="drop-zone-ungrouped" data-folder="">📂 미분류로 이동</div>';
+  html += '<div class="drop-zone-ungrouped" data-folder="">' + ICON_FOLDER + ' 미분류로 이동</div>';
   // 폴더 섹션(상단, 접이식).
   for (const fname of folderNames) {
     const collapsed = _folderCollapsed(fname);
@@ -4159,7 +4159,7 @@ function renderTodoUpdate(data) {
   for (const t of todos) {
     const status = t.status || 'pending';
     const cls = 'todo-item todo-' + status;
-    const mark = icon[status] || '○';
+    const mark = icon[status] || icon.pending;
     // 진행 중이면 active_form(있으면)을 꼬리표로 강조한다.
     let tail = '';
     if (status === 'in_progress') {
@@ -4199,7 +4199,7 @@ function renderDownloadButtons(msgEl, downloads) {
     const a = document.createElement('a');
     a.className = 'dl-link';
     a.href = d.url;
-    a.textContent = '⬇ ' + decodeURIComponent(d.filename);
+    a.innerHTML = ICON_DOWNLOAD + ' ' + escapeHtml(decodeURIComponent(d.filename));
     wrap.appendChild(a);
   }
   body.appendChild(wrap);
