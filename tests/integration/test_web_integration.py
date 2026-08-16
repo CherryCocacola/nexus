@@ -96,15 +96,20 @@ class TestWebAPIIntegration:
         assert "total" in data
 
     async def test_models_endpoint(self, client: AsyncClient) -> None:
-        """GET /v1/models가 모델 목록을 반환한다."""
+        """GET /v1/models가 모델 목록 형식을 지킨다.
+
+        이 테스트는 config 없이(부트스트랩 전) 앱을 띄운다. 그 경우 목록은 **비어야**
+        한다 — 종전에는 하드코딩된 기본 2종을 돌려줬는데, 바로 그것이 모델을 바꾼 뒤에도
+        옛 이름이 남는 경로였다(2026-08-16). 모르면 지어내지 않는다.
+        """
         resp = await client.get("/v1/models")
 
         assert resp.status_code == 200
         data = resp.json()
         assert "models" in data
         assert "total" in data
-        # 최소 2개 모델 (primary + auxiliary)
-        assert data["total"] >= 2
+        assert data["total"] == len(data["models"])
+        assert data["models"] == []  # config 미로드 → 알 수 없음
 
     async def test_metrics_endpoint(self, client: AsyncClient) -> None:
         """GET /metrics가 메트릭스 딕셔너리를 반환한다."""

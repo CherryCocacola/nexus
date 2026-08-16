@@ -863,6 +863,33 @@ class LocalModelProvider(ModelProvider):
 
     # ─── health_check() ───
 
+    async def list_upstream_models(self) -> list[dict[str, Any]] | None:
+        """vLLM 이 **실제로 서빙 중인** 모델 목록을 그대로 돌려준다 (2026-08-16).
+
+        왜 필요한가:
+          `GET /v1/models` 가 표시 이름을 코드에 박아 두고 있었다. 그래서 모델을
+          바꾼 뒤에도 옛 이름이 남아, 실제는 A.X-4.0 72B 인데 "Qwen 3.5 27B" 로
+          응답했다. 연동하는 쪽이 그 값을 믿으면 잘못된 전제를 세운다.
+          이름을 **서빙 주체에게 물어보면** 모델을 바꿔도 저절로 맞는다.
+
+        Returns:
+            vLLM `/v1/models` 의 `data` 배열(각 항목에 id·root·max_model_len 등).
+            **실패하면 None** — 정보성 엔드포인트가 추론 서버 상태 때문에 죽으면 안 된다.
+        """
+        try:
+            response = await self._client.get(
+                f"{self.base_url}/v1/models",
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                timeout=5.0,
+            )
+            if response.status_code != 200:
+                return None
+            data = response.json().get("data")
+            return data if isinstance(data, list) else None
+        except Exception as e:  # noqa: BLE001 — 조회 실패가 응답을 막지 않게 한다
+            logger.debug("[models] 상위 모델 목록 조회 실패: %s", e)
+            return None
+
     async def health_check(self) -> bool:
         """vLLM /health 엔드포인트로 가용성을 확인한다."""
         try:

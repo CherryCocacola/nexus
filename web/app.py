@@ -4459,42 +4459,46 @@ async def list_tools() -> dict[str, Any]:
 async def list_models() -> dict[str, Any]:
     """사용 가능한 모델 목록을 반환한다 (GET /v1/models).
 
-    config가 로드돼 있으면 실제 설정값(primary/auxiliary/embedding 모델 id)을 읽어
-    ModelInfo 목록으로 만든다. config가 아직 없으면(부트스트랩 전/실패) 하드코딩된
-    기본 2종을 폴백으로 돌려준다 — 목록 조회가 500으로 죽지 않게 하기 위함이다.
+    id 는 config 의 모델 식별자(= vLLM served-model-name)이고, name 은 **실제로
+    서빙 중인 모델**에게 물어본 값이다(vLLM `/v1/models` 의 `root`, 예 "skt/A.X-4.0").
+
+    ★왜 물어보나 (2026-08-16):
+      종전에는 name 을 코드에 박아 뒀다. 그래서 모델을 바꾼 뒤에도 옛 모델의 이름이
+      그대로 남아, 실제 72B 를 서빙하면서 응답에는 27B 시절 이름이 나가고 있었다.
+      연동하는 쪽이 그 값을 믿으면 파라미터 규모를 잘못 가정한다. 서빙 주체에게
+      물어보면 모델을 바꿔도 저절로 맞는다 — 프롬프트를 도구 레지스트리에서 유도한
+      것과 같은 원칙이다.
+
+      조회에 실패하거나(추론 서버 다운) 그 서버가 안 가진 모델(임베딩은 별도 서버)이면
+      name 을 id 로 둔다. **모르면 지어내지 않고 id 를 그대로 보여 준다.**
     """
     config = _app_state.get("config")
-    if config:
-        models = [
-            ModelInfo(
-                id=config.model.primary_model,
-                name="Qwen 3.5 27B",
-                role="primary",
-            ),
-            ModelInfo(
-                id=config.model.auxiliary_model,
-                name="ExaOne 7.8B",
-                role="auxiliary",
-            ),
-            ModelInfo(
-                id=config.model.embedding_model,
-                name="Multilingual E5 Large",
-                role="embedding",
-            ),
-        ]
-        return {
-            "models": [m.model_dump() for m in models],
-            "total": len(models),
-        }
+    if not config:
+        # 부트스트랩 전/실패 — 조회가 500으로 죽지 않게 빈 목록을 돌려준다.
+        # 종전에는 하드코딩된 기본 2종을 돌려줬는데, 그것이 바로 옛 이름이 남는 경로였다.
+        return {"models": [], "total": 0}
 
-    # 설정이 없으면 기본 모델 정보를 반환한다
-    return {
-        "models": [
-            {"id": "qwen3.5-27b", "name": "Qwen 3.5 27B", "role": "primary"},
-            {"id": "exaone-7.8b", "name": "ExaOne 7.8B", "role": "auxiliary"},
-        ],
-        "total": 2,
-    }
+    # 상위(vLLM)가 실제로 서빙 중인 목록 — id → root 로 만들어 둔다(fail-soft).
+    upstream: dict[str, str] = {}
+    provider = _app_state.get("model_provider")
+    lister = getattr(provider, "list_upstream_models", None)
+    if lister is not None:
+        try:
+            for item in await lister() or []:
+                if isinstance(item, dict) and item.get("id"):
+                    upstream[str(item["id"])] = str(item.get("root") or item["id"])
+        except Exception as e:  # noqa: BLE001 — 정보 조회 실패가 응답을 막지 않게 한다
+            logger.debug("[models] 상위 목록 병합 실패(무시): %s", e)
+
+    models = [
+        ModelInfo(id=mid, name=upstream.get(mid, mid), role=role)
+        for mid, role in (
+            (config.model.primary_model, "primary"),
+            (config.model.auxiliary_model, "auxiliary"),
+            (config.model.embedding_model, "embedding"),
+        )
+    ]
+    return {"models": [m.model_dump() for m in models], "total": len(models)}
 
 
 # ─────────────────────────────────────────────
