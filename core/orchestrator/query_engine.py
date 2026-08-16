@@ -237,6 +237,8 @@ class QueryEngine:
         structured_output: StructuredOutputSpec | None = None,
         max_tokens_override: int | None = None,
         append_user_message: bool = True,
+        forced_query_class: str | None = None,
+        request_id: str | None = None,
     ) -> AsyncGenerator[StreamEvent | Message, None]:
         """
         사용자 메시지를 제출하고 스트리밍 응답을 반환한다.
@@ -313,12 +315,15 @@ class QueryEngine:
 
         # ─── 라우팅 결정 (RoutingResolver) ─────────────────
         tenant = self._context.options.get("tenant") if self._context else None
-        decision = self._router.resolve(user_input, tenant)
+        # 호출자가 클래스를 지정했으면 분류기를 건너뛴다(요청 단위 고정).
+        decision = self._router.resolve(user_input, tenant, forced_class=forced_query_class)
         if decision.routing_enabled:
             logger.info(
-                "라우팅: class=%s, model=%s, temp=%.2f, top_p=%.2f, "
+                "라우팅: class=%s%s, model=%s, temp=%.2f, top_p=%.2f, "
                 "rep_pen=%.2f, max_tokens=%s, tenant=%s",
-                decision.query_class, decision.model_override,
+                decision.query_class,
+                "(고정)" if forced_query_class else "",
+                decision.model_override,
                 decision.temperature, decision.top_p,
                 decision.repetition_penalty, decision.max_tokens_cap,
                 decision.tenant_id,
@@ -386,6 +391,10 @@ class QueryEngine:
                 ),
                 messages=self._messages,
                 system_prompt=effective_system_prompt,
+                # 프롬프트 덤프 키 — 진단이 켜져 있을 때만 쓰인다.
+                # 요청 ID 가 없으면(웹 UI·CLI) 세션 ID 로 떨어진다.
+                request_id=request_id,
+                session_id=self._session_id,
                 on_turn_complete=_on_turn_complete,
                 model_override=decision.model_override,
                 temperature=decision.temperature,
@@ -412,6 +421,10 @@ class QueryEngine:
             stream = query_loop(
                 messages=self._messages,
                 system_prompt=effective_system_prompt,
+                # 프롬프트 덤프 키 — 진단이 켜져 있을 때만 쓰인다.
+                # 요청 ID 가 없으면(웹 UI·CLI) 세션 ID 로 떨어진다.
+                request_id=request_id,
+                session_id=self._session_id,
                 model_provider=active_provider,
                 tools=self._tools,
                 context=self._context,

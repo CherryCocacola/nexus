@@ -616,6 +616,49 @@ def _sanitize_client_id(raw: Any) -> str | None:
     return cleaned[:32] or None
 
 
+def _resolve_query_class(body_value: Any, header_value: Any) -> str | None:
+    """요청이 지정한 질의 클래스를 정규화한다 (2026-08-16).
+
+    왜 두 경로인가:
+      body 는 프록시를 지나도 안 유실되고 OpenAI SDK 의 extra_body 로 보낼 수 있다.
+      헤더는 body 를 못 건드리는 클라이언트용 폴백이다. 둘 다 오면 body 가 이긴다
+      (요청 본문이 그 요청의 의도를 더 직접적으로 담는다).
+
+    왜 잘못된 값을 무시하지 않고 400 을 내는가:
+      조용히 무시하면 호출자는 "왜 여전히 RAG 가 붙지"의 원인을 영영 못 찾는다.
+      이 리포는 같은 이유로 쓸 수 없는 도구를 받았을 때도 400 으로 거부한다.
+
+    Returns:
+        대문자 정규화된 클래스, 또는 지정이 없으면 None.
+
+    Raises:
+        HTTPException(400): 값이 유효 목록에 없을 때.
+    """
+    from core.orchestrator.routing import QUERY_CLASSES
+
+    # 문자열이 아니면 "미지정"으로 본다. 엔드포인트 함수를 직접 부르는 테스트에서는
+    # 헤더 인자에 FastAPI 의 Header 표식 객체가 들어오기 때문이다(실제 요청에서는
+    # 항상 str 또는 None). body 쪽은 Pydantic 이 이미 str|None 으로 강제한다.
+    body = body_value.strip() if isinstance(body_value, str) and body_value.strip() else None
+    header = (
+        header_value.strip() if isinstance(header_value, str) and header_value.strip() else None
+    )
+    raw = body or header
+    if raw is None:
+        return None
+
+    value = raw.upper()
+    if value not in QUERY_CLASSES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"알 수 없는 query_class: {raw!r}. "
+                f"허용값: {', '.join(QUERY_CLASSES)}"
+            ),
+        )
+    return value
+
+
 def _sanitize_request_id(raw: Any) -> str | None:
     """X-Request-ID 헤더를 로그에 안전한 형태로 정규화한다 (2026-08-13).
 
@@ -1308,6 +1351,15 @@ class OpenAIChatCompletionRequest(BaseModel):
     top_p: float | None = Field(default=None, description="nucleus 샘플링(엔진 관리 시 무시)")
     # 멀티테넌시 — body로도 테넌트 지정 가능(헤더/API 키와 동일 우선순위 체계).
     tenant_id: str | None = Field(default=None, description="테넌트 ID(선택)")
+    # 질의 클래스 고정(2026-08-16). 지정하면 서버의 휴리스틱 분류를 건너뛴다.
+    #   "TOOL"      — 지식 RAG 미주입 + 도구/코드 작업 프로필(코드 분석에 권장)
+    #   "KNOWLEDGE" — 지식 RAG 주입(테넌트 소스 필터는 그대로 적용)
+    #   "CHAT"      — 짧은 응답 프로필, RAG 미주입
+    # 왜 필요한가: 짧고 키워드 없는 코드 질문이 KNOWLEDGE 로 분류돼 사내 문서가
+    # 주입되는 일이 실측됐다. 호출자가 의도를 밝힐 수 있어야 한다.
+    query_class: str | None = Field(
+        default=None, description='질의 클래스 고정: "TOOL" | "KNOWLEDGE" | "CHAT"'
+    )
     # OpenAI 표준 response_format — 구조화 출력(guided decoding) 요청.
     #   {"type": "json_schema", "json_schema": {"name": ..., "schema": {...}, "strict": ...}}
     #   또는 {"type": "json_object"}(스키마 없는 JSON 강제).
@@ -2937,6 +2989,7 @@ async def chat_completions(
     authorization: str | None = Header(default=None),
     x_client_id: str | None = Header(default=None, alias="X-Client-Id"),
     x_request_id: str | None = Header(default=None, alias="X-Request-ID"),
+    x_query_class: str | None = Header(default=None, alias="X-Nexus-Query-Class"),
 ) -> Any:
     """OpenAI 호환 채팅 완성 엔드포인트.
 
@@ -2952,8 +3005,10 @@ async def chat_completions(
     # (실측: 2026-08-13 문의의 요청 ID 두 건 모두 로그 grep 0건이었다.)
     session_id = str(uuid.uuid4())
     _request_id = _sanitize_request_id(x_request_id)
+    # 잘못된 값이면 여기서 400 — StreamingResponse 가 시작된 뒤에는 못 낸다.
+    _forced_class = _resolve_query_class(request.query_class, x_query_class)
     logger.info(
-        "[요청추적] session=%s request_id=%s client=%s tenant=%s stream=%s",
+        "[요청추적] session=%s request_id=%s client=%s tenant=%s stream=%s class=%s",
         session_id,
         _request_id or "-",
         _sanitize_client_id(x_client_id) or "-",
@@ -2961,6 +3016,7 @@ async def chat_completions(
         # 필드명과 달라서, 틀리면 getattr 기본값 때문에 조용히 "-" 로만 찍힌다).
         getattr(tenant, "id", None) or "-",
         request.stream,
+        _forced_class or "auto",
     )
 
     # 요청 검증/분해는 StreamingResponse 생성 '이전'에 수행해야 400을 정상 반환한다
@@ -3036,6 +3092,8 @@ async def chat_completions(
                 client_tools=client_tools,
                 is_tool_continuation=is_tool_continuation,
                 tool_warnings=tool_warnings,
+                forced_query_class=_forced_class,
+                request_id=_request_id,
             ),
             media_type="text/event-stream",
             headers={
@@ -3085,6 +3143,9 @@ async def chat_completions(
         max_tokens_override=_max_tokens_req,
         # 도구 결과로 이어 도는 호출이면 새 user 발화를 만들지 않는다.
         append_user_message=not is_tool_continuation,
+        # 요청이 클래스를 지정했으면 서버 분류를 건너뛴다(지식 RAG 주입 여부가 갈린다).
+        forced_query_class=_forced_class,
+        request_id=_request_id,
     ):
         if not isinstance(event, StreamEvent):
             continue
@@ -3211,6 +3272,8 @@ async def _openai_stream_generate(
     client_tools: list[Any] | None = None,
     is_tool_continuation: bool = False,
     tool_warnings: list[str] | None = None,
+    forced_query_class: str | None = None,
+    request_id: str | None = None,
 ) -> AsyncGenerator[str, None]:
     """OpenAI `chat.completion.chunk` SSE 프레임을 생성한다.
 
@@ -3284,6 +3347,8 @@ async def _openai_stream_generate(
                 max_tokens_override=(max_tokens if (max_tokens or 0) > 0 else None),
                 # 도구 결과로 이어 도는 호출이면 새 user 발화를 만들지 않는다.
                 append_user_message=not is_tool_continuation,
+                forced_query_class=forced_query_class,
+                request_id=request_id,
             ):
                 await event_queue.put(("event", ev))
         except BaseException as e:  # noqa: BLE001 — 모든 예외를 에러 프레임/종료로 수렴

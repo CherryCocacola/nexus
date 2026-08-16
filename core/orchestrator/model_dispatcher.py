@@ -157,6 +157,9 @@ class ModelDispatcher:
         provider_override: Any | None = None,
         temperature: float = 0.7,
         max_tokens_cap: int | None = None,
+        # 프롬프트 덤프 키 — 진단이 켜져 있을 때만 쓰인다(query_loop 로 통과).
+        request_id: str | None = None,
+        session_id: str = "",
         enable_thinking: bool = False,
         top_p: float = 1.0,
         repetition_penalty: float = 1.0,
@@ -224,6 +227,8 @@ class ModelDispatcher:
             max_turns=self._max_turns,
             on_turn_complete=on_turn_complete,
             model_override=model_override,
+            request_id=request_id,
+            session_id=session_id,
             temperature=temperature,
             max_tokens_cap=max_tokens_cap,
             enable_thinking=enable_thinking,

@@ -271,6 +271,9 @@ class _FakeOpenAIEngine:
         structured_output: Any = None,
         max_tokens_override: Any = None,
         append_user_message: bool = True,
+        # 실제 QueryEngine 이 인자를 늘려도 더미가 깨지지 않게 받아 둔다
+        # (요청 클래스 고정·요청 ID 등). 검증은 각 전용 테스트가 한다.
+        **_kwargs,
     ):
         # max_tokens_override: OpenAI 요청의 max_tokens를 엔진까지 전달하는 통로
         # (2026-08-05 신설). 여기서는 받기만 하고 검증은 별도 테스트에서 한다.

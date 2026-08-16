@@ -72,6 +72,11 @@ _SC_FACTUAL_PATTERN = re.compile(
 # ─────────────────────────────────────────────
 # HeuristicClassifier는 기본 구현. 향후 LLM 분류기·학교별 커스터마이즈 등을
 # 플러그인할 수 있도록 ABC로 열어둔다.
+# 질의 클래스의 유일한 목록. 웹 계층의 요청 검증도 이 값을 본다 —
+# 두 곳에 따로 적으면 한쪽만 늘어나 조용히 어긋난다.
+QUERY_CLASSES: tuple[str, ...] = ("KNOWLEDGE", "TOOL", "CHAT")
+
+
 class QueryClassifier:
     """질의 → ("KNOWLEDGE" | "TOOL" | "CHAT") 분류기 인터페이스.
 
@@ -329,6 +334,7 @@ class RoutingResolver:
         self,
         user_input: str,
         tenant: TenantConfig | None = None,
+        forced_class: str | None = None,
     ) -> RoutingDecision:
         """
         사용자 입력 + (선택) 테넌트를 받아 최종 RoutingDecision을 반환한다.
@@ -363,7 +369,18 @@ class RoutingResolver:
 
         # 먼저 질의를 분류한다. 이 라벨이 아래의 모든 분기(프로필 선택, 테넌트
         # override 적용 여부, KB 필터 적용 여부)를 결정하는 기준이 된다.
-        query_class = self._classifier.classify(user_input)
+        # 호출자가 클래스를 지정했으면 분류기를 건너뛴다 (2026-08-16).
+        #   왜 필요한가: 짧고 키워드 없는 코드 질문이 KNOWLEDGE 로 분류돼 사내 문서
+        #   RAG 가 ~5,000자 주입됐다(실측). 코드 분석에는 방해이고, 지금은 "우연히
+        #   TOOL 로 분류되기를 기대하는" 상태였다. 호출자가 의도를 밝히면 그대로 따른다.
+        #
+        #   RAG 만 끄지 않고 클래스를 고정하는 이유: RAG 만 끄면 KNOWLEDGE 프로필
+        #   (temp 0.2 / max 4096)인데 근거는 없는 어정쩡한 상태가 된다. 클래스를
+        #   고정하면 샘플링 프로필까지 함께 결정돼 결과가 예측 가능하다.
+        #
+        #   권한 확대가 아니다 — KNOWLEDGE 로 고정해도 아래 테넌트 allowed_sources
+        #   필터는 그대로 적용된다.
+        query_class = forced_class or self._classifier.classify(user_input)
         # 분류 결과에 대응하는 RoutingProfile을 고른다. 각 프로필은 model 이름과
         # temperature/max_tokens/샘플링 파라미터 묶음을 담고 있다.
         # CHAT 프로필은 v0.14.6 신규 — 구버전 RoutingConfig 객체에 chat_mode가

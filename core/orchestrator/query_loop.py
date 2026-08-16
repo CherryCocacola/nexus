@@ -640,6 +640,8 @@ async def query_loop(
     model_override: str | None = None,
     temperature: float = 0.7,
     max_tokens_cap: int | None = None,
+    request_id: str | None = None,
+    session_id: str = "",
     enable_thinking: bool = False,
     top_p: float = 1.0,
     repetition_penalty: float = 1.0,
@@ -949,6 +951,7 @@ async def query_loop(
             # Tier 3 호출: model_provider.stream()
             # StreamWatchdog (Ch.7.2)로 감싸서 스트림 무응답을 감지한다.
             # idle 30초, total 300초 초과 시 StreamWatchdogTimeout 발생 → 재시도
+            from core.orchestrator import prompt_dump
             from core.orchestrator.stream_watchdog import (
                 DegenerationMonitor,
                 stream_with_watchdog,
@@ -971,6 +974,33 @@ async def query_loop(
             # v7.0 Part 2.5: 라우팅에서 결정된 model_override/temperature/
             # enable_thinking을 Tier 3로 전달한다. None/기본값인 경우 프로바이더의
             # 기본 설정(config.primary_model, temp=0.7, thinking=False)이 적용된다.
+            # ── 프롬프트 덤프 (기본 비활성) ─────────────────────────────
+            # 여기가 진짜 최종본이다 — 프롬프트 조립·컨텍스트 압축이 모두 끝난 뒤,
+            # 모델로 나가기 직전. 무상태 엔드포인트라 이 값은 어디에도 남지 않아,
+            # "모델이 무엇을 봤는가"를 나중에 확인할 방법이 없었다.
+            # 사내 문서 RAG 본문이 그대로 들어가므로 환경변수를 준 경우에만 켜진다.
+            if prompt_dump.is_enabled():
+                prompt_dump.dump_prompt(
+                    request_id=request_id,
+                    session_id=session_id,
+                    turn=state.turn_count,
+                    system_prompt=system_prompt,
+                    messages=api_messages,
+                    tool_names=[t.get("name", "?") for t in tool_schemas],
+                    routing={
+                        "model_override": model_override,
+                        "max_tokens": max_tokens,
+                        "structured_output": structured_output is not None,
+                    },
+                    sampling={
+                        "temperature": effective_temperature,
+                        "top_p": top_p,
+                        "repetition_penalty": repetition_penalty,
+                        "frequency_penalty": frequency_penalty,
+                        "presence_penalty": presence_penalty,
+                    },
+                )
+
             _raw_stream = model_provider.stream(
                 messages=api_messages,
                 system_prompt=system_prompt,

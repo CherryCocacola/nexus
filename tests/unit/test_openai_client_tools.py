@@ -222,6 +222,9 @@ class _ToolCallingEngine:
         structured_output=None,
         max_tokens_override=None,
         append_user_message: bool = True,
+        # 실제 QueryEngine 이 인자를 늘려도 더미가 깨지지 않게 받아 둔다
+        # (요청 클래스 고정·요청 ID 등). 검증은 각 전용 테스트가 한다.
+        **_kwargs,
     ):
         from core.message import StreamEvent, StreamEventType, ToolUseBlock
 
