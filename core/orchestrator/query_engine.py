@@ -379,9 +379,19 @@ class QueryEngine:
         # 코딩 질의로 판정됐고 코딩 프로바이더가 배선돼 있으면 그것을 쓴다.
         # 둘 중 하나라도 없으면 기본 프로바이더 — 즉 기본 동작은 변하지 않는다.
         active_provider = self._model_provider
+        # 페이로드에 실을 모델 이름. 기본은 라우팅 프로필이 정한 값이다.
+        active_model_override = decision.model_override
         if decision.use_coder and self._coder_provider is not None:
             active_provider = self._coder_provider
-            logger.info("라우팅: 코딩 전용 모델로 전환 (class=%s)", decision.query_class)
+            # ★프로필의 model 값(= 앵커 이름 "ax-4.0")을 그대로 실으면 코딩 서버가
+            #   404 를 낸다 — 그 서버는 자기 served-model-name 만 안다. 프로바이더를
+            #   갈아끼울 때는 그 프로바이더 자신의 model_id 를 쓴다(2026-08-20 실측).
+            active_model_override = None
+            logger.info(
+                "라우팅: 코딩 전용 모델로 전환 (class=%s, model=%s)",
+                decision.query_class,
+                getattr(active_provider, "model_id", "?"),
+            )
 
         if self._model_dispatcher is not None:
             stream = self._model_dispatcher.route(
@@ -399,7 +409,7 @@ class QueryEngine:
                 request_id=request_id,
                 session_id=self._session_id,
                 on_turn_complete=_on_turn_complete,
-                model_override=decision.model_override,
+                model_override=active_model_override,
                 temperature=decision.temperature,
                 # 호출 단위 override(OpenAI max_tokens)가 있으면 우선한다.
                 max_tokens_cap=max_tokens_override or decision.max_tokens_cap,
@@ -434,7 +444,7 @@ class QueryEngine:
                 context_manager=self._context_manager,
                 max_turns=self._max_turns,
                 on_turn_complete=_on_turn_complete,
-                model_override=decision.model_override,
+                model_override=active_model_override,
                 temperature=decision.temperature,
                 # 호출 단위 override(OpenAI max_tokens)가 있으면 우선한다.
                 max_tokens_cap=max_tokens_override or decision.max_tokens_cap,
