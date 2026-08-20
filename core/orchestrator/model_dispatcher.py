@@ -178,6 +178,10 @@ class ModelDispatcher:
         sc_min_agreement: int = 2,
         sc_short_answer_max_chars: int = 80,
         sc_similarity_threshold: float = 0.90,
+        # 컨텍스트 압축 관리자(2026-08-19). None이면 query_loop이 긴급 압축을
+        # **건너뛴다** — 웹/OpenAI 경로가 컨텍스트 초과에서 복구하지 못하던
+        # 원인이 이 인자가 빠져 있던 것이었다. 기본 None이라 미주입 호출부는 무회귀.
+        context_manager: Any | None = None,
     ) -> AsyncGenerator[StreamEvent | Message, None]:
         """
         Worker query_loop으로 직행하는 비동기 제너레이터 (passthrough).
@@ -224,6 +228,9 @@ class ModelDispatcher:
             model_provider=provider_override or self._worker_provider,
             tools=self._worker_tools,
             context=self._context,
+            # 압축 관리자를 그대로 넘긴다 — 이것이 있어야 query_loop이
+            # 컨텍스트 초과 시 emergency_compact 로 복구할 수 있다.
+            context_manager=context_manager,
             max_turns=self._max_turns,
             on_turn_complete=on_turn_complete,
             model_override=model_override,

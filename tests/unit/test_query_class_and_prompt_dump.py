@@ -286,22 +286,53 @@ def test_dispatcher_accepts_every_kwarg_the_engine_sends() -> None:
     assert not missing, f"route() 가 못 받는 인자를 엔진이 보낸다: {missing}"
 
 
-def test_dispatcher_path_has_no_context_manager() -> None:
-    """★기존 결함을 못 박아 둔다(2026-08-16 발견, 이번 작업 범위 밖).
+def test_dispatcher_path_passes_context_manager() -> None:
+    """★2026-08-19 수정 — 이 자리에 있던 '결함 고정' 테스트를 뒤집었다.
 
-    엔진은 query_loop 직접 호출에는 context_manager 를 넘기지만 dispatcher 경로에는
-    넘기지 않는다. query_loop 은 `context_manager is None` 이면 **긴급 압축을 건너뛴다**.
-    즉 웹/OpenAI 엔드포인트는 컨텍스트 초과 시 압축으로 복구하지 못한다
-    (예산 기반 truncate 는 별개로 동작한다).
+    이전에는 엔진이 query_loop 직접 호출에만 context_manager 를 넘기고 dispatcher
+    경로에는 넘기지 않았다. query_loop 은 `context_manager is None` 이면 **긴급 압축을
+    건너뛴다**. 그래서 웹/OpenAI 엔드포인트는 컨텍스트가 넘칠 때 압축으로 복구하지
+    못하고 그대로 실패했다(예산 기반 truncate 는 별개로 동작).
 
-    고치면 이 테스트가 실패한다 — 그때 의도적으로 지우면 된다.
+    이제 두 경로 모두 넘긴다. 한쪽만 넘기는 상태로 되돌아가면 여기서 잡힌다 —
+    실행 경로가 둘인데 한쪽만 고쳐 2,472개 테스트가 전부 통과하는 채로 운영이
+    500 을 냈던 2026-08-16 사고와 같은 종류를 막기 위함이다.
     """
     direct = _kwargs_passed_to("query_loop")
     via_dispatcher = _kwargs_passed_to("self._model_dispatcher.route")
 
-    assert "context_manager" in direct
-    assert "context_manager" not in via_dispatcher
+    assert "context_manager" in direct, "폴백(query_loop 직접) 경로에서 빠졌다"
+    assert "context_manager" in via_dispatcher, "dispatcher 경로에서 빠졌다"
 
+
+def test_dispatcher_route_accepts_context_manager() -> None:
+    """엔진이 보내는 것을 route() 가 실제로 받을 수 있어야 한다(시그니처 대조).
+
+    값이 아니라 **구조**를 본다. 엔진만 고치고 dispatcher 시그니처를 안 고치면
+    TypeError 로 실서버가 죽는데, 단위 테스트는 dispatcher 경로를 타지 않아
+    전부 통과해 버린다(2026-08-16 실제 사고).
+    """
+    import inspect
+
+    from core.orchestrator.model_dispatcher import ModelDispatcher
+
+    assert "context_manager" in inspect.signature(ModelDispatcher.route).parameters
+
+
+def test_dispatcher_forwards_context_manager_to_query_loop() -> None:
+    """route() 가 받은 값을 query_loop 으로 **실제로 흘려보내는지** 소스에서 확인한다.
+
+    시그니처에 인자만 추가하고 내부에서 안 쓰면 조용히 무시된다 — 그 상태도
+    시그니처 대조 테스트는 통과하므로 여기서 따로 막는다.
+    """
+    import inspect
+
+    from core.orchestrator import model_dispatcher
+
+    src = inspect.getsource(model_dispatcher.ModelDispatcher.route)
+    assert "context_manager=context_manager" in src, (
+        "route() 가 context_manager 를 query_loop 으로 넘기지 않는다"
+    )
 
 # ─────────────────────────────────────────────
 # ④ query_loop 통합 — 실제로 최종 프롬프트가 남는가

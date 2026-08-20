@@ -385,6 +385,9 @@ class QueryEngine:
 
         if self._model_dispatcher is not None:
             stream = self._model_dispatcher.route(
+                # 압축 관리자 전달(2026-08-19) — 빠져 있으면 이 경로에서만
+                # 긴급 압축이 죽어 웹/OpenAI 요청이 컨텍스트 초과에서 못 살아난다.
+                context_manager=self._context_manager,
                 # 코딩 턴에만 프로바이더를 갈아끼운다(None이면 dispatcher 기본 Worker).
                 provider_override=(
                     active_provider if active_provider is not self._model_provider else None
