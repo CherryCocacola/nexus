@@ -7654,3 +7654,225 @@ KNOWLEDGE 로 분류돼 사내 문서가 ~5,000자 주입된다(실측). 헤더
 2. **이식 작업은 함수만 세면 안 된다.** 디자인 이식에서 마크업 속성(`draggable`,
    `accept`)과 인라인 트리거(`onpaste`, 글로우)가 함께 사라졌다. 전부 "함수는 있는데
    부르는 곳이 없다" 형태라 함수 목록만 보면 안 보인다.
+
+---
+
+## 2026-08-17 — 연동 측 질의 3건 답변 + CORS 컨테이너 재생성
+
+### 1. 연동 측 질의 답변 (코드 기준, 추정 없음)
+
+**시스템 프롬프트 접두부 — 우리가 준 설명이 부정확했다.**
+`prompt_dump.py` 문서 주석의 목록("이전 턴 요약·계획 체크리스트·지식 RAG·도구 안내문")을
+그대로 전달했는데, 그것은 **조립기의 전체 스텝 목록**이지 API 경로에서 실제로 배선된
+것이 아니다. `_assemble_session_engine`(web/app.py:1177)은 QueryEngine 에
+`knowledge_retriever` **하나만** 넘긴다. `turn_state_store`·`todo_store`·`rag_retriever`
+는 넘기지 않아 셋 다 None → 해당 스텝이 전부 스킵된다.
+
+즉 `/v1/chat/completions` 에서:
+- 이전 턴 요약 — 안 붙음(미배선). query_class 와 무관하다.
+- 계획 체크리스트 — 안 붙음(미배선).
+- 프로젝트 파일 RAG — 안 붙음(미배선). ※ 우리 설명에서 아예 빠져 있던 항목이다.
+- 지식 RAG — KNOWLEDGE 일 때만. `query_class:"TOOL"` 이면 스킵.
+
+부수 발견: **`response_format` 을 쓰면 서버가 `tools` 를 통째로 비운다**
+(query_loop.py:790, vLLM 상호배타). 그런데 `_client_tools_instruction` 이 만든
+"도구 안내문"은 시스템 프롬프트에 남는다 → 프롬프트↔실제 도구 풀 불일치. 미수정.
+
+**JSON Schema** — 표준 OpenAI 형식 그대로 지원. `strict` 지원(생략 시 config 기본 true,
+inference.py:1074 로 전달). 스키마 누락/65536B 초과/미지원 type 은 400. **사후 검증·
+재시도는 없다** — 강제는 vLLM 디코딩 단계 문법 제약이고, 깨지는 경우는 사실상 토큰
+한도 절단뿐이다. 비스트림에 한해 서버가 `json.loads` 를 먼저 해 보고
+`RESPONSE_TRUNCATED` / `INVALID_STRUCTURED_OUTPUT` 을 `finish_detail` 로 싣는다
+(web/app.py:3207). 스트리밍에는 이 사전 파싱이 없다.
+
+### 2. 프롬프트 덤프 — 켜지 않기로 결정
+
+요청받았으나 **켜지 않았다.** 근거 세 가지.
+1. 덤프를 원한 이유(무엇이 붙는가)가 위 코드 조사로 이미 해소됐다.
+2. 요청 단위 선택이 불가능하다 — `query_loop.py:982` 가 `if is_enabled()` 한 줄이라
+   켜면 **모든 요청·턴·테넌트**의 프롬프트 전문(사내 문서 RAG 본문 포함)이 남는다.
+   진단 도구가 아니라 상시 평문 로깅에 가깝다.
+3. 보존 청소(`_cleanup`)가 덤프를 **쓸 때** 돌아서, 환경변수를 빼면 청소도 멈춘다.
+   끄는 것만으로 정리되지 않고 수동 삭제가 따라붙는다.
+
+→ 설명 안 되는 증상이 실제로 나오면 그때 짧게 켜고 파일까지 지우는 방식으로 한다.
+   과거 요청(11:47 건)은 소급 생성이 불가능해 전달 불가.
+
+### 3. CORS 컨테이너 재생성 — 완료
+
+**★재생성 직전에 발견한 함정 (중요).**
+`docker inspect` 의 `Config.Image` 는 `nexus-web:uploadspersist-20260808`(08-08)이었다.
+그런데 컨테이너 시작은 08-16 13:10, `nexus-web:latest` 커밋은 13:14 — 컨테이너가 뜬
+**뒤**다. 08-13~16 작업(요청ID 추적·토큰 세기·디자인 이식·/v1/models·질의클래스)이
+`docker cp` 로 실행 중 컨테이너에 들어간 뒤 나중에 commit 된 것이다.
+**`Config.Image` 값으로 그대로 `docker run` 했으면 8일치 작업이 조용히 사라졌다.**
+
+그래서 재생성 전 `/app` 트리를 전수 대조했다 — 실행 컨테이너 494개 파일 vs
+`nexus-web:latest` 494개 파일, **차이 0**. 그 확인 후에만 진행했다.
+
+실행 내용:
+- 기존 컨테이너는 `rm` 하지 않고 `nexus-web-prev-20260817` 로 rename 해 보존(롤백 수단)
+- `nexus-web:latest` 로 재생성, 기존 인자 전부 복원(network=host, restart=unless-stopped,
+  바인드 4개, Cmd, env) + `NEXUS_EXTRA_CORS_ORIGINS=http://192.168.10.215` 만 추가
+- 헬스체크 실패 시 스크립트가 자동 롤백하도록 작성(발동하지 않음)
+
+검증(health 200 만으로 판정하지 않는다 — 과거 사고 반영):
+- 부트스트랩 로그 정상 — Redis/PG/MemoryManager/권한파이프라인/KnowledgeStore(1,599,391)/
+  SymbolStore/ModelDispatcher/QueryEngine(CLI 26개·웹 12개)/임베딩 워밍업 성공
+- Traceback·ERROR·ImportError **0건**
+- `/health` 200 (gpu_server=healthy)
+- CORS 프리플라이트: `Origin: http://192.168.10.215` → `access-control-allow-origin` 반환
+- 대조군 `http://8.8.8.8` → 400, 허용 헤더 없음 (fail-closed 정상)
+- 인증 미들웨어 생존: 키 없는 `/v1/chat` → 401
+
+부수 효과: 이제 컨테이너가 **실제 이미지로부터** 떠 있어 `Config.Image` 와 내용이
+일치한다. 다음 재생성 때는 이 드리프트 함정이 없다.
+
+### 남은 것
+- 실제 생성 e2e(모델 응답)는 API 키가 필요해 미확인. 이미지 동일 + 부트스트랩 정상이라
+  위험은 낮지만, 웹 UI 클릭 한 번으로 확인하는 것이 정확하다.
+- `nexus-web-prev-20260817`(정지 상태) — 안정 확인 후 삭제
+- `response_format` + `tools` 동시 요청 시 도구 안내문만 남는 불일치 — 미수정
+- dispatcher 경로 `context_manager` 누락 — 미수정(수정 지점 4곳 특정 완료)
+
+---
+
+## 2026-08-18~19 — PC 원클릭 실행 · CLI 마크다운 · dispatcher 압축 · 구현요청 라우팅 · CLI 문서 도구
+
+세션이 PC 강제 종료로 끊겨 기록이 비어 있었다. 워킹트리 diff 를 근거로 복원해 적는다.
+아래는 전부 **미커밋 상태**다(브랜치 `feature/b200-bakeoff`, origin 대비 17커밋 앞섬).
+
+### 1. PC 원클릭 실행 (08-18)
+
+`nova.bat` 런처 + `deploy_pc/tunnel.ps1|.sh`, `deploy_pc/start_cli.ps1|.sh`.
+폴더를 끌어다 놓거나 인자로 주면 그 폴더를 작업 디렉토리로 잡는다(도구 샌드박스 기준).
+
+**한글 안내를 `nova-help-*.txt` 로 뺀 이유** — `chcp` 로 코드페이지를 바꾸면 cmd 파서의
+파일 오프셋이 어긋나 뒤따르는 멀티바이트 텍스트가 깨진다. 그래서 배치는 ASCII 만 담고
+한글은 전부 `TYPE` 으로 출력한다.
+
+### 2. CLI 마크다운 렌더 (08-18)
+
+`cli/markdown_stream.py` 신규. 모델이 쓰는 마크다운을 기호 그대로 흘리지 않고
+**완성된 블록 단위**로 그린다. `/markdown` 으로 끌 수 있다.
+
+- 스트림 종료 시 버퍼를 반드시 비운다 — 없으면 빈 줄로 끝나지 않는 답변의 **끝문단이
+  통째로 사라진다**.
+- 도구 결과 Panel·사용량 표시 앞에서도 먼저 본문을 비운다(출력 순서 역전 방지).
+- `ask` 는 **터미널일 때만** 렌더한다. 파이프·리다이렉트에는 원문을 그대로 흘린다 —
+  스크립트 진입점이라 렌더 산물이 섞이면 받는 쪽 파싱이 깨진다.
+- 콘솔 stdout 을 UTF-8 로 고정(`_ensure_utf8_stdout`). 파이프·테스트 더미 스트림은
+  건드리지 않고, 재설정 실패해도 기존 인코딩으로 계속 간다.
+
+### 3. dispatcher 경로 컨텍스트 압축 누락 수정 (08-19)
+
+**이전 핸드오프의 "다음 착수점 ②" 를 처리했다.** `ModelDispatcher.route()` 가
+`context_manager` 를 받아 `query_loop` 에 전달한다(`model_dispatcher.py:181,231`),
+`QueryEngine` 이 `route()` 호출 시 `self._context_manager` 를 넘긴다
+(`query_engine.py:388`). 이제 웹/OpenAI 경로도 컨텍스트 초과에서 긴급 압축으로
+복구한다. 기본값 `None` 이라 미주입 호출부는 무회귀.
+`tests/unit/test_dispatcher_compaction.py` 신규.
+
+### 4. 구현 요청이 KNOWLEDGE 로 새던 문제 (08-19)
+
+**증상** — "대화창 구현해줘" 가 KNOWLEDGE 로 분류됐다. `tool_keywords` 가 전부
+파일·프로젝트 명사(파일/폴더/디렉토리…)라, **파일을 명시하지 않은 구현 요청**이
+전부 지식 질의로 샜다. 그 결과 셋이 한꺼번에 나빠졌다.
+① 도구를 안 쓰고 코드를 화면에만 뿌린다(사용자가 복붙해야 함)
+② 사내 문서 RAG 가 불필요하게 주입된다
+③ `max_tokens` 가 4096 으로 묶인다(TOOL 은 8192) — 긴 코드가 잘린다
+
+**해결** — `routing.tool_regex_patterns` 3개 추가(설정 3본 동일).
+오탐 설계가 핵심이다. "구현" 단독으로는 안 걸리고 뒤에 `해|하|중|좀` 을 요구해
+"구현 원리를 설명해줘" 는 KNOWLEDGE 로 남는다. "만들/작성" 계열은 코딩 명사와 함께일
+때만 건다 — "김치는 어떻게 만들어?" 는 영향 없다.
+실측 **구현요청 12/12 포착, 지식질의 오탐 0/13**.
+`tests/unit/test_routing_implementation_requests.py` 신규.
+
+### 5. PathGuard 차단 사유 분리 (08-19)
+
+"진짜 상위 순회(`..`)" 와 "그냥 접근 범위 밖" 을 갈라 안내한다. 후자는 작업 디렉토리를
+함께 알려 준다(오타인지 범위 문제인지 사용자가 판단 가능). `test_path_guard_reason.py` 신규.
+
+### 6. CLI 문서 도구 2종 추가 (08-19, 이번 세션에서 마무리)
+
+**비대칭 해소** — 옛 TIER_S 구조에서 문서 파싱은 Scout 전담이었고, TIER_L 로 오며
+Read/Glob/Grep/LS 는 CLI 풀로 옮겨왔는데 `DocumentProcess` 만 따라오지 않았다.
+웹은 업로드 문서를 읽는데 **CLI 사용자는 자기 PC 의 xlsx 를 못 읽는** 상태였다.
+
+- `_create_tool_registry()` 에 `DocumentProcessTool` + `DocumentExportTool` 등록 → **28개**
+- ToolUseContext 에 `exports_dir = state.cwd`(미주입이면 tempdir 로 가서 사용자가 파일을
+  못 찾는다) 와 `download_ui = False` 주입
+- `DocumentExport` 결과 문구를 표면별로 분기 — 웹은 URL·파일명 재현 금지(긴 UUID 재현이
+  degeneration 의 방아쇠였다), CLI 는 붙여 줄 UI 가 없으니 **절대경로를 알려준다**.
+  메타데이터에 `path` 추가. 웹은 `download_ui` 를 주입하지 않아 기본 True → 무회귀.
+
+**이번 세션에서 채운 것**
+- `_DEFAULT_EXPANDED_TOOLS`(프롬프트 폴백 상수)가 26개인 채 뒤처져 있었다 → 28개로 동기화.
+  어긋나면 "있는 도구를 숨기거나 없는 도구를 안내"하는 조용한 버그가 된다(과거
+  `알 수 없는 도구: 'Agent'` 사고와 같은 형태).
+- `tests/unit/test_cli_document_tools.py` 신규 — 등록 확인 + **폴백 상수 == 실제 레지스트리
+  대조** + 프롬프트 도구 목록 노출. 값이 아니라 구조를 본다.
+- `test_document_export_tool.py` 에 표면별 문구 분기 테스트 2건 추가.
+- 흩어져 있던 낡은 도구 개수 주석(23개/26개) 6곳을 28개로 정리.
+- 실물 검증(mock 아님) — 실제 `.xlsx` 파싱 5,568자 3청크, `.docx` 36,668 bytes 생성,
+  CLI 컨텍스트에서 저장 경로 안내 정상.
+
+### 검증
+`ruff check` 통과. **unit+integration 2,549 passed / 1 skipped**(직전 2,501 → +48).
+실물 문서 파싱·생성은 위 6번에 적은 대로 실제 파일로 확인했다.
+
+### 남은 것
+- **미커밋** — 위 6건 전부. 논리 단위로 쪼개 커밋 필요
+- 잔여 파일 정리 — `*.bak` 7개, 리다이렉트 사고로 생긴 `cd` 파일
+- 실서버 반영 안 함 — dispatcher 압축·라우팅 수정은 112 컨테이너에 미배포
+- `response_format` + `tools` 동시 요청 시 도구 안내문만 남는 불일치 — 여전히 미수정
+
+---
+
+## 2026-08-20 — 코딩 슬롯 교체: Devstral → Qwen3-Coder 30B-A3B (A 경로 실행)
+
+배경은 위 08-18~19 섹션과 세션 논의 — "앵커는 72B 유지, 전문 턴은 에이전틱 훈련 소형"
+전략에 따라 코딩 슬롯(B200 8005)을 교체했다. A.X 운영은 전 과정 무접촉.
+
+### 실행 절차
+
+1. `Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8`(30GB) 다운로드 — B200 내부망 ~30초
+2. `run_coder.sh` 교체(원복 = `run_coder.sh.devstral`). watchdog/start_all 은
+   스크립트 이름을 유지해 무수정 — 세션 kill 만으로 새 모델로 재기동된다
+3. vLLM 인자: FP8 체크포인트(플래그 불필요), `--tool-call-parser qwen3_coder`
+   (XML 계열 자체 형식 — hermes 로는 파싱 안 됨), util 0.23, max-model-len 65536
+
+### 함정 2개 (둘 다 실측으로 발견)
+
+**① /tmp 가 noexec tmpfs** — torchinductor 가 컴파일한 MoE 커널(.so)을 /tmp 에서
+로드하다 "failed to map segment" 크래시. `TORCHINDUCTOR_CACHE_DIR` 를
+`/NHNHOME/nexus/torchinductor_cache` 로 옮겨 해소. dense 모델(A.X·Devstral)은
+이 컴파일 경로를 안 타서 여태 무증상이었다 — MoE 모델을 B200 에 올릴 때마다 걸릴 함정.
+
+**② 배포 웹에 코더 라우팅이 이미 살아 있었다** — 컨테이너 안 `query_engine.py:382`
+에 `decision.use_coder → coder_provider` 경로가 있고 부트스트랩이 코더 프로바이더를
+초기화한다(로그 확인). 이름만 바꾸면 웹 코딩 턴(VSCode 플러그인·AgentHub 경로)이
+전부 404. → **무중단 브리지**: 8005 의 served-model-name 을 두 개
+(`qwen3-coder-30b` + `devstral-small` 알리아스) 등록. 112 라이브 config 는
+`qwen3-coder-30b` 로 갱신해 다음 웹 재기동 때 정식 이름으로 넘어간다.
+
+### 검증 (전부 실서버)
+
+- `/v1/models` = [qwen3-coder-30b, devstral-small]
+- 한글 주석 코드 생성 정상(해요체 — 어투는 bakeoff 에서 평가)
+- **tool_calls 파싱 정상** — qwen3_coder 파서, JSON 인자 온전, finish=tool_calls
+- 112→터널 18005 프로드 실경로 200 (웹이 쓰는 옛 이름 호출 포함)
+- GPU0 여유 6.9GB (util 0.25 로는 3.2GB 라 0.23 으로 내림 — A.X 동거 안전 마진)
+
+### 실측 데이터
+
+- **한국어 토큰 배율**: A.X 0.384 tok/char vs Qwen3-Coder **0.671 tok/char (1.75배)**
+  — 같은 한국어 문장 /tokenize 대조. 코딩 턴 컨텍스트 예산 산정 시 반영할 것
+
+### 남은 것
+
+- **bakeoff**: 도구 루프 성공률 / 코드 정확도 / 한글 주석·설명 품질 / vs A.X 대조
+- 웹 컨테이너 다음 재기동 때 정식 이름 반영 확인 후 → 8005 알리아스 제거
+- config 3본 coder_model 갱신분 포함 **미커밋**(08-18~19 6건 + 이번 건)
+
