@@ -8066,3 +8066,57 @@ NOVA 가 코딩 전용 도구가 아니기 때문이다 — "만들어"를 키�
 - **VSCode 플러그인 경로 미검증** — `response_format` 구조화 출력 + Qwen 조합은 미측정.
 - 테스트 작성 범주 Qwen 재측정(TODO), Qwen 산출물 ruff W293 자동 정리 검토.
 
+---
+
+## 2026-08-20 (4) — 112 배포 완료
+
+권장안 5단계. 배포 대상은 08-18~20 커밋 전체 중 **web 이 쓰는 core 파일 9개**다.
+
+### 배포 전 확인 (이번에도 드리프트 신호가 있었다)
+
+`docker ps` 의 이미지 ID(`394b99b8a5d0`=queryclass-20260816)와 `Config.Image`
+(`nexus-web:latest`=`1e115a4fc2ac`)가 **달랐다**. 08-19 에 만든 스냅샷으로 태그만
+옮겨졌고 컨테이너는 옛 이미지에서 뜬 채였다.
+→ [[reference_container_image_drift]] 절차대로 **/app 파이썬 트리 전수 대조**를 먼저 했다.
+
+- 컨테이너 137개 vs 로컬 137개, **추가·삭제 0**
+- 내용이 다른 것 **9개 = 전부 이번 세션 커밋분**(그 외 파일은 완전 일치)
+→ 즉 컨테이너는 `fe9bee0` 상태였고, 9개만 넣으면 리포 HEAD 와 같아지는 깨끗한 델타였다.
+
+### 실행
+
+1. **롤백 수단 확보** — `docker commit` → `nexus-web:prebakeoff-20260820`,
+   라이브 config 는 `nexus_config.112.yaml.bak-20260820` 으로 백업
+2. `docker cp` 9개 + 라이브 config 갱신(`coder_regex_patterns` 추가)
+3. **해시 대조 — 9개 전부 로컬과 일치**(넣었다고 믿지 않는다)
+4. `docker restart` → 부트스트랩 정상: Redis/PG/권한/KnowledgeStore(1,599,391)/
+   SymbolStore(6,074)/ModelDispatcher/ContextManager/QueryEngine(CLI 28·웹 12)/임베딩 워밍업
+5. **배포 상태를 이미지로 굳힘** — `nexus-web:coderrouting-20260820`, `latest` 를 그 위로
+   이동. `docker run nexus-web:latest` 와 실행 컨테이너의 해시가 일치함을 확인했다
+   (다음 재생성 때 드리프트 없음)
+
+### 검증 — health 200 만으로 판정하지 않았다
+
+- 부트스트랩 로그 정상, **모델 신원 로그에 `코딩=qwen3-coder-30b`** 확인
+- Traceback 4건이 잡혔으나 **전부 재시작 시각(02:31:03.16) 것**이고 내용은
+  종료 중 `CancelledError` 다. 재시작 순간 in-flight 였던 실사용 요청 1건이 500 을 받았다
+  (무중단 배포가 아니므로 예상된 손실 — 다만 실제 사용자 영향이 있었다는 점은 기록해 둔다)
+- **재시작 이후 200 OK 110~231건, 신규 500 = 0**. 실사용 트래픽(`tenant=coding`,
+  192.168.20.144 = VSCode 플러그인)이 계속 성공하고 있다 — 이것이 곧 인증 e2e 증거다
+- 인증 미들웨어 생존(키 없는 요청 401), CORS 프리플라이트 200
+
+### ★서버는 코더 라우팅을 켜지 않았다 (의도)
+
+`.112.yaml` 에 `coder_enabled` 를 넣지 않았다(기본 false). 이유는 표면이 다르기 때문이다.
+- 웹 채팅은 파일 수정 도구가 없다(보안상 Bash 제거) → 코딩 모델로 보내도 "코드 텍스트"이고,
+  한국어 산문은 앵커가 낫다
+- VSCode 플러그인은 `response_format` 구조화 출력 경로다. **Qwen3-Coder 로 스키마 준수는
+  확인**했다(json_schema strict → 유효 JSON, finish=stop). 다만 실제 파일 내용을 주고
+  find/replace 정확도를 재는 검증은 아직이다 — 그건 켜기 전 마지막 관문이다
+- 켜는 것은 config 한 줄 + 재시작이라 언제든 가능하고, 되돌리기도 같다
+
+### 남은 것
+- 서버 `coder_enabled` 활성 여부 결정(위 관문 통과 후)
+- `nexus-web-prev-20260817`(정지) 정리 — 안정 확인됐으니 삭제 가능
+- push 미실행(origin 대비 32커밋)
+
