@@ -297,7 +297,31 @@ async def init_phase2(state: GlobalState) -> dict:
         #   - CommandFilter: block_package_install을 config에서 받아 개발(false)/
         #     배포(true) 정책을 코드 하드코딩 없이 분기한다(anti #4).
         cmd_cfg = config.command_filter
-        path_guard = PathGuard()
+        # 업로드 파일·생성물은 작업 디렉토리 밖에 산다. 웹은 세션별 샌드박스를
+        # cwd 로 쓰므로, 이 둘을 허용하지 않으면 경로 검사를 켜는 순간 문서 첨부
+        # 분석과 다운로드가 통째로 죽는다(2026-08-20 실측).
+        # 설정값이 아니라 **해석된 실제 경로**를 넣는다 — 빈 값이면 도구가
+        # tempdir 로 폴백하므로 설정값만 보면 허용 목록이 빗나간다.
+        # 보호 경로(.env/*.pem 등) 검사는 이 목록과 무관하게 그대로 적용된다.
+        from core.tools.implementations.analyze_image_tool import resolve_uploads_dir
+        from core.tools.implementations.document_export_tool import resolve_exports_dir
+
+        _allowed_dirs: list[str] = []
+        for _resolver, _configured in (
+            (
+                resolve_exports_dir,
+                getattr(getattr(config, "document_export", None), "exports_dir", ""),
+            ),
+            (
+                resolve_uploads_dir,
+                getattr(getattr(config, "upload", None), "uploads_dir", ""),
+            ),
+        ):
+            try:
+                _allowed_dirs.append(str(_resolver(_configured)))
+            except Exception as _e:  # noqa: BLE001 — 해석 실패가 기동을 막지 않는다
+                logger.warning("허용 디렉토리 해석 실패(무시): %s", _e)
+        path_guard = PathGuard(allowed_dirs=_allowed_dirs)
         command_filter = CommandFilter(
             block_package_install=cmd_cfg.block_package_install,
         )

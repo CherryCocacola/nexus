@@ -1074,6 +1074,12 @@ def _build_web_engine_parts(components: dict, state: Any) -> dict:
     # AgentTool·SymbolSearchTool이 해석할 의존성 일체 — tenant를 제외한 '공용' 옵션.
     # 세션별 assemble에서 {**base_options, "tenant": tenant}로 얕은 복제해 격리한다.
     base_options = {
+        # ★권한 파이프라인 — 이 키가 없으면 executor 가 Layer 2 경로 검사를
+        #   통째로 건너뛴다. 실제로 빠져 있어서 웹 표면에서 API 키 하나로
+        #   /app/config/tenants.yaml(전 테넌트 키)과 /etc/passwd 가 읽혔다
+        #   (2026-08-20 실증). 세션 샌드박스 cwd 전환은 이미 되어 있었으므로
+        #   '파이프라인이 도는 것'을 전제한 설계였는데 배선만 누락돼 있었다.
+        "permission_pipeline": components.get("permission_pipeline"),
         "memory_manager": components.get("memory_manager"),
         "task_manager": components.get("task_manager"),
         # 계획 체크리스트 저장소 — 웹 TodoWrite/TodoRead 도구와 todo_update 프레임이

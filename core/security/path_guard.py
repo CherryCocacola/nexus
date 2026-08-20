@@ -93,6 +93,7 @@ class PathGuard:
         self,
         protected_paths: list[str] | None = None,
         read_only_paths: list[str] | None = None,
+        allowed_dirs: list[str] | None = None,
     ) -> None:
         """
         PathGuard를 초기화한다.
@@ -106,6 +107,13 @@ class PathGuard:
         Args:
             protected_paths: 기본 보호 목록에 더할 추가 보호 경로 패턴
             read_only_paths: 기본 읽기 전용 목록에 더할 추가 패턴
+            allowed_dirs: 작업 디렉토리 밖이어도 접근을 허용할 절대경로 목록.
+                왜 필요한가(2026-08-20): 웹은 세션별 샌드박스를 cwd 로 쓰는데,
+                업로드 파일(data/uploads)과 생성물(data/exports)은 그 밖에 있다.
+                허용 목록이 없으면 보안을 켜는 순간 문서 첨부·다운로드가 죽는다.
+                **보호 경로 검사는 이 목록과 무관하게 그대로 적용된다** —
+                즉 여기에 넣어도 .env·*.pem 같은 비밀 파일은 계속 막힌다.
+                미지정(기본)이면 동작이 1비트도 바뀌지 않는다(무회귀).
         """
         # 기본 보호 목록을 복사(list())해서 인스턴스 전용 목록으로 만든다.
         self._protected = list(self.PROTECTED_PATHS)
@@ -116,6 +124,15 @@ class PathGuard:
         self._read_only = list(self.READ_ONLY_PATHS)
         if read_only_paths:
             self._read_only.extend(read_only_paths)
+
+        # 허용 디렉토리 — 절대경로로 정규화해 둔다(비교를 매번 하지 않기 위해).
+        # 해석할 수 없는 값은 조용히 버린다(잘못된 설정이 전체를 막지 않게).
+        self._allowed_dirs: list[Path] = []
+        for raw in allowed_dirs or []:
+            try:
+                self._allowed_dirs.append(Path(raw).resolve())
+            except (OSError, ValueError):
+                logger.warning("허용 디렉토리 해석 실패 — 무시: %s", raw)
 
     def is_path_safe(self, path: str, cwd: str) -> tuple[bool, str]:
         """
@@ -258,6 +275,16 @@ class PathGuard:
 
             # 최종 경로가 작업 디렉토리 하위(또는 자기 자신)인지 확인한다.
             # relative_to()는 하위가 아니면 ValueError를 던진다.
+            # 허용 디렉토리 하위면 cwd 밖이어도 통과시킨다(2026-08-20).
+            # 업로드 파일·생성물이 세션 샌드박스 밖에 있어 이 예외가 없으면
+            # 보안을 켜는 순간 문서 첨부·다운로드가 통째로 죽는다.
+            for allowed in self._allowed_dirs:
+                try:
+                    resolved.relative_to(allowed)
+                except ValueError:
+                    continue
+                return True
+
             try:
                 resolved.relative_to(cwd_path)
                 # 작업 디렉토리 안쪽 — 안전.
