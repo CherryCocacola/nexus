@@ -299,6 +299,9 @@ def list_transcript_sessions(
                 "title": meta.get("title"),
                 "pinned": bool(meta.get("pinned")),
                 "folder": meta.get("folder") or "",
+                # 소유 테넌트 — 목록에서 남의 세션을 걸러내는 데 쓴다(2026-08-20).
+                # 과거 세션에는 없다(None). 호출부가 기본 테넌트 소유로 해석한다.
+                "tenant": meta.get("tenant"),
             }
         )
 

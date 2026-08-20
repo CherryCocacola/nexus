@@ -745,6 +745,71 @@ def _record_client_meta(
         logger.debug("클라이언트 메타 기록 실패(무시): %s", e)
 
 
+def _session_owner(session_id: str) -> str:
+    """세션을 소유한 테넌트 id를 돌려준다.
+
+    소유자는 세션 meta.json 의 tenant 값이다(_record_client_meta 가 기록한다).
+    기록이 없는 과거 세션(2026-08-20 이전)은 **기본 테넌트 소유**로 본다 —
+    웹 UI 가 기본 테넌트로 써 온 기록이라, 숨기면 사용자가 자기 대화를 잃는다.
+    채널을 둘 다 보는 이유: 웹 세션과 api 세션(플러그인·AgentHub)이 다른 디렉토리에
+    쌓이는데, 조회 엔드포인트는 채널을 구분하지 않고 id 로만 접근하기 때문이다.
+    """
+    from core.memory.transcript import read_session_meta
+
+    cfg = _app_state.get("config")
+    sessions_dir = cfg.session.sessions_dir if cfg else ".nexus/sessions"
+    for channel in ("web", "api"):
+        try:
+            owner = (read_session_meta(sessions_dir, session_id, channel=channel) or {}).get(
+                "tenant"
+            )
+        except Exception as e:  # noqa: BLE001 — 메타 손상이 조회를 깨뜨리면 안 된다
+            logger.debug("세션 메타 읽기 실패(%s/%s): %s", channel, session_id, e)
+            owner = None
+        if owner:
+            return str(owner)
+    return _default_tenant_id()
+
+
+def _default_tenant_id() -> str:
+    """기본 테넌트 id(레지스트리 미배선이면 "default")."""
+    registry = _app_state.get("tenant_registry")
+    if registry is None:
+        return "default"
+    try:
+        return str(getattr(registry.resolve(None), "id", "") or "default")
+    except Exception:  # noqa: BLE001
+        return "default"
+
+
+def _require_session_owner(session_id: str, tenant: Any) -> None:
+    """호출자가 그 세션의 소유 테넌트가 아니면 404 를 던진다.
+
+    왜 403 이 아니라 404 인가: 403 은 "그 세션은 존재하지만 네 것이 아니다"를
+    알려 준다. 남의 세션 id 존재 여부를 확인하는 통로가 되므로 없는 것처럼 답한다.
+
+    테넌트 레지스트리가 없으면(단일 테넌트 개발 환경) 검사하지 않는다 — 무회귀.
+    """
+    from fastapi import HTTPException
+
+    caller = str(getattr(tenant, "id", "") or "")
+    if not caller:
+        return
+    if _session_owner(session_id) != caller:
+        logger.info(
+            "세션 접근 차단(테넌트 불일치): session=%s, caller=%s", session_id, caller
+        )
+        raise HTTPException(status_code=404, detail=f"session not found: {session_id}")
+
+
+def _owns_listed_session(entry: dict[str, Any], caller: str) -> bool:
+    """목록 항목이 호출자 소유인지 — tenant 미기록(과거 세션)은 기본 테넌트 것으로 본다."""
+    if not caller:
+        return True
+    owner = entry.get("tenant") or _default_tenant_id()
+    return str(owner) == caller
+
+
 def _map_finish_reason(stop_reason: Any) -> str:
     """내부 StopReason을 OpenAI finish_reason으로 변환한다 (2026-08-05).
 
@@ -3457,7 +3522,10 @@ async def _openai_stream_generate(
 # 세션 엔드포인트
 # ─────────────────────────────────────────────
 @app.get("/v1/sessions")
-async def list_sessions() -> dict[str, Any]:
+async def list_sessions(
+    x_tenant_id: str | None = Header(default=None, alias="X-Tenant-ID"),
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
     """
     저장된 세션 목록을 반환한다 (Ch 16).
 
@@ -3495,6 +3563,14 @@ async def list_sessions() -> dict[str, Any]:
             # Redis 조회 실패는 치명적이지 않음 — disk 결과만으로 응답
             logger.debug("list_sessions Redis 조회 실패 (무시): %s", e)
 
+    # 남의 테넌트 세션은 목록에서 제외한다(2026-08-20 격리 수정).
+    # redis_only 는 meta 가 없어 tenant 를 모르므로 소유자 판정 헬퍼로 확인한다.
+    caller = str(getattr(_resolve_tenant(None, x_tenant_id, authorization), "id", "") or "")
+    disk_sessions = [x for x in disk_sessions if _owns_listed_session(x, caller)]
+    redis_only = [
+        x for x in redis_only if not caller or _session_owner(x["session_id"]) == caller
+    ]
+
     return {
         "sessions": disk_sessions + redis_only,
         "total": len(disk_sessions) + len(redis_only),
@@ -3503,7 +3579,11 @@ async def list_sessions() -> dict[str, Any]:
 
 
 @app.get("/v1/sessions/search")
-async def search_sessions(q: str = "") -> dict[str, Any]:
+async def search_sessions(
+    q: str = "",
+    x_tenant_id: str | None = Header(default=None, alias="X-Tenant-ID"),
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
     """세션 대화를 질의어로 검색한다(사이드바 검색창).
 
     web 채널 트랜스크립트만 스캔(진입점 격리). 질의어가 2자 미만이면 빈 결과.
@@ -3514,6 +3594,13 @@ async def search_sessions(q: str = "") -> dict[str, Any]:
     cfg = _app_state.get("config")
     sessions_dir = cfg.session.sessions_dir if cfg else ".nexus/sessions"
     results = search_transcript_sessions(sessions_dir, q, channel="web")
+    # 검색도 목록과 같은 기준으로 남의 세션을 제외한다(2026-08-20 격리 수정).
+    # 검색 결과에는 tenant 필드가 없으므로 세션 id 로 소유자를 확인한다.
+    caller = str(getattr(_resolve_tenant(None, x_tenant_id, authorization), "id", "") or "")
+    if caller:
+        results = [
+            r for r in results if _session_owner(str(r.get("session_id", ""))) == caller
+        ]
     return {"query": q, "results": results, "total": len(results)}
 
 
@@ -3594,7 +3681,11 @@ def _render_session_export(
 
 
 @app.get("/v1/sessions/{session_id}/messages")
-async def get_session_messages(session_id: str) -> dict[str, Any]:
+async def get_session_messages(
+    session_id: str,
+    x_tenant_id: str | None = Header(default=None, alias="X-Tenant-ID"),
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
     """
     특정 세션의 대화 히스토리를 반환한다 (Ch 16 프론트 복원용).
 
@@ -3616,6 +3707,8 @@ async def get_session_messages(session_id: str) -> dict[str, Any]:
     경로 파라미터 검증: session_id에 경로 분리자(슬래시/백슬래시/..)가 들어오면
     거부 — 트랜스크립트 파일 시스템 접근 시 디렉토리 탈출을 막는다.
     """
+    # 남의 테넌트 세션이면 없는 것처럼 404 (2026-08-20 격리 수정).
+    _require_session_owner(session_id, _resolve_tenant(None, x_tenant_id, authorization))
     from fastapi import HTTPException
 
     # 입력 검증 — 경로 탈출 차단 (파일 시스템 폴백 경로에서만 의미가 있지만
@@ -3639,7 +3732,12 @@ async def get_session_messages(session_id: str) -> dict[str, Any]:
 
 
 @app.get("/v1/sessions/{session_id}/export")
-async def export_session(session_id: str, fmt: str = "md"):
+async def export_session(
+    session_id: str,
+    fmt: str = "md",
+    x_tenant_id: str | None = Header(default=None, alias="X-Tenant-ID"),
+    authorization: str | None = Header(default=None),
+):
     """세션 대화를 md 또는 txt 파일로 내보낸다(첨부 다운로드).
 
     사이드바의 "내보내기" 버튼이 호출. 메시지는 get_session_messages와 같은
@@ -3648,6 +3746,8 @@ async def export_session(session_id: str, fmt: str = "md"):
 
     쿼리: fmt=md|txt (기본 md). 응답은 Content-Disposition 첨부 + UTF-8 파일명.
     """
+    # 남의 테넌트 세션이면 없는 것처럼 404 (2026-08-20 격리 수정).
+    _require_session_owner(session_id, _resolve_tenant(None, x_tenant_id, authorization))
     from urllib.parse import quote
 
     from fastapi import HTTPException
@@ -3685,7 +3785,11 @@ async def export_session(session_id: str, fmt: str = "md"):
 
 
 @app.post("/v1/sessions/{session_id}/truncate")
-async def truncate_last_exchange(session_id: str) -> dict[str, Any]:
+async def truncate_last_exchange(
+    session_id: str,
+    x_tenant_id: str | None = Header(default=None, alias="X-Tenant-ID"),
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
     """마지막 (user, assistant) 교환을 히스토리에서 제거한다(재생성용).
 
     프론트 "재생성" 버튼이 호출한다. 마지막 assistant 응답과 그 직전 user 메시지를
@@ -3699,6 +3803,8 @@ async def truncate_last_exchange(session_id: str) -> dict[str, Any]:
 
     channel="web" 고정. 세션 락으로 진행 중 생성과 직렬화한다(레이스 방지).
     """
+    # 남의 테넌트 세션이면 없는 것처럼 404 (2026-08-20 격리 수정).
+    _require_session_owner(session_id, _resolve_tenant(None, x_tenant_id, authorization))
     from fastapi import HTTPException
 
     if not session_id or any(ch in session_id for ch in ("/", "\\", "..", "\x00")):
@@ -3771,7 +3877,12 @@ class ForkRequest(BaseModel):
 
 
 @app.post("/v1/sessions/{session_id}/fork")
-async def fork_session(session_id: str, body: ForkRequest) -> dict[str, Any]:
+async def fork_session(
+    session_id: str,
+    body: ForkRequest,
+    x_tenant_id: str | None = Header(default=None, alias="X-Tenant-ID"),
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
     """대화를 특정 지점까지 복사한 새 세션(분기)을 만든다(메시지 편집·분기용).
 
     at_index개의 앞 메시지를 새 session_id로 복사한다(chat_histories + Redis +
@@ -3779,6 +3890,8 @@ async def fork_session(session_id: str, body: ForkRequest) -> dict[str, Any]:
     충돌하지 않고 원본이 보존된다(Fable5 설계). 프론트는 새 세션으로 전환한 뒤 편집한
     메시지를 전송해 분기를 이어간다. channel="web" 고정.
     """
+    # 남의 테넌트 세션이면 없는 것처럼 404 (2026-08-20 격리 수정).
+    _require_session_owner(session_id, _resolve_tenant(None, x_tenant_id, authorization))
     from fastapi import HTTPException
 
     from core.message import Message
@@ -4410,7 +4523,11 @@ async def update_session_meta(session_id: str, body: SessionMetaUpdate) -> dict[
 
 
 @app.delete("/v1/sessions/{session_id}")
-async def delete_session(session_id: str) -> dict[str, Any]:
+async def delete_session(
+    session_id: str,
+    x_tenant_id: str | None = Header(default=None, alias="X-Tenant-ID"),
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
     """
     특정 세션을 Redis(단기) + 트랜스크립트(영구) 양쪽에서 삭제한다 (Ch 16).
 
@@ -4427,6 +4544,8 @@ async def delete_session(session_id: str) -> dict[str, Any]:
     둘 다 False여도 200 — 이미 없었을 뿐 에러는 아님. 다만 session_id 자체가
     부적합(슬래시/백슬래시/'..')하면 400.
     """
+    # 남의 테넌트 세션이면 없는 것처럼 404 (2026-08-20 격리 수정).
+    _require_session_owner(session_id, _resolve_tenant(None, x_tenant_id, authorization))
     from fastapi import HTTPException
 
     if not session_id or any(ch in session_id for ch in ("/", "\\", "..", "\x00")):
