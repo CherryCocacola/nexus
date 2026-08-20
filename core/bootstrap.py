@@ -1376,6 +1376,17 @@ _DEFAULT_EXPANDED_TOOLS = (
 
 # 티어와 무관하게 동일한 대화 규약 — 두 프롬프트 변형이 공유한다(중복 방지).
 _PROMPT_COMMON_SECTIONS = (
+    # 답변 언어 규칙(2026-08-20). 여태 언어 지시는 "잡담" 섹션 안에만 있어서
+    # 작업 턴에는 적용되지 않았다. A.X 는 한국어 모델이라 자연히 한국어로 답해
+    # 구멍이 드러나지 않았는데, 코딩 전용 모델(Qwen3-Coder)로 갈아끼우자 설명이
+    # 통째로 영어로 나왔다(실측: 한국어 비율 0%). 모델을 교체해도 표면이 바뀌지
+    # 않도록 규칙을 프롬프트에 명시한다.
+    "## Response language\n"
+    "Write your explanation in the user's language. If the user writes in "
+    "Korean, answer in Korean — including short progress notes between tool "
+    "calls and the final summary. Code, identifiers, file paths, and command "
+    "output stay in their original form; only the prose around them follows "
+    "the user's language.\n\n"
     "## Conversational style (greetings & small talk)\n"
     "For a short greeting or small talk (안녕, 좋은 아침, hi, thanks, 잘 자 등):\n"
     "- Reply briefly and warmly in the user's language — one or two short "
