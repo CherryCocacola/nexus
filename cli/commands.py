@@ -40,10 +40,30 @@ logger = logging.getLogger("nexus.cli.commands")
 # @click.group() 은 여러 하위 명령어를 담는 "최상위 명령 그룹"을 만든다.
 # 즉 `nexus` 자체는 아무 동작도 하지 않고, 그 아래 chat/ask/version/health 로
 # 분기시키는 허브 역할만 한다. 아래 각 함수에 붙은 @cli.command() 가 이 그룹에 등록된다.
+def _ensure_utf8_stdout() -> None:
+    """콘솔 출력 인코딩을 UTF-8 로 고정한다.
+
+    왜 필요한가(2026-08-18): 답변을 마크다운으로 렌더하면 Rich 가 목록에 불릿
+    문자(U+2022)를 쓴다. 한글 Windows 콘솔 기본 코드페이지(cp949)로는 이 글자를
+    인코딩할 수 없어 UnicodeEncodeError 로 출력이 통째로 죽는다(실측).
+    런처 스크립트가 PYTHONIOENCODING 을 넣어 주지만, 사용자가 python 을 직접
+    실행하면 그 보장이 사라진다. 그래서 프로그램이 스스로 보장한다.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue  # 파이프·테스트 더미 스트림 등 — 건드리지 않는다
+        try:
+            if (getattr(stream, "encoding", "") or "").lower() not in ("utf-8", "utf8"):
+                reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass  # 재설정 실패는 치명적이지 않다 — 기존 인코딩으로 계속 간다
+
 @click.group(invoke_without_command=True)
 @click.pass_context
 def cli(ctx):
     """IDINO NOVA — 에어갭 로컬 LLM 오케스트레이션 플랫폼."""
+    _ensure_utf8_stdout()
     # 서브커맨드 없이 그냥 `nexus`만 치면 대화형 chat을 기본으로 실행한다.
     # (기존 진입점이 인자 파싱 없는 repl:main이라 --resume·--log-level·sessions 등이
     #  콘솔 스크립트로 도달 불가했다. 진입점을 이 그룹으로 바꾸고, 인자 없는 호출은
@@ -320,10 +340,23 @@ def ask(query: str, log_level: str) -> None:
         #      - 사고(thinking) 텍스트는 포매터로 걸러 답변만 stdout에 흘린다.
         #      - 답변이 하나도 없이 끝나거나 에러가 있었으면 종료 코드 1로 나간다.
         from cli.formatters import OutputFormatter
+        from cli.markdown_stream import MarkdownStreamRenderer
         from core.message import StreamEvent, StreamEventType
 
         fmt = OutputFormatter(show_thinking=False)
         fmt.reset_stream_state()
+        # 마크다운 렌더는 "사람이 보는 터미널"일 때만 켠다.
+        #   왜 조건부인가: ask 는 파이프·스크립트용 진입점이다. 리다이렉트된 출력에
+        #   목록 기호·들여쓰기 같은 렌더 산물이 섞이면 받는 쪽 파싱이 깨진다.
+        #   터미널이면 읽기 좋게, 파이프면 원문 그대로 — 양쪽 다 만족시킨다.
+        md = MarkdownStreamRenderer(enabled=console.is_terminal)
+
+        def _emit(block) -> None:
+            """렌더 ON이면 블록 단위로 줄을 바꿔 출력, OFF면 원문을 이어붙인다."""
+            if md.enabled:
+                console.print(block)
+            else:
+                console.print(block, end="")
         saw_text = False   # 답변 텍스트(TEXT_DELTA)를 한 조각이라도 받았는가
         had_error = False  # 스트림 도중 ERROR 이벤트가 있었는가
 
@@ -348,8 +381,15 @@ def ask(query: str, log_level: str) -> None:
                 answer_parts.append(event.text)
                 out = fmt.format_text_delta(event.text)
                 if out:
-                    # end="" 로 조각을 이어붙여 스트리밍이 자연스럽게 흐르도록 한다.
-                    console.print(out, end="")
+                    # 렌더 ON이면 완성된 블록만, OFF면 조각 그대로 이어붙인다.
+                    piece = out.plain if hasattr(out, "plain") else str(out)
+                    for block in md.feed(piece):
+                        _emit(block)
+
+        # 스트림이 끝났으니 버퍼에 남은 마지막 블록을 반드시 마저 낸다
+        # (빈 줄로 끝나지 않는 답변의 끝문단이 통째로 사라지는 것을 막는다).
+        for block in md.flush():
+            _emit(block)
 
         if saw_text:
             console.print()  # 마지막 개행 — 파이프·터미널 모두에서 줄이 끊기지 않게

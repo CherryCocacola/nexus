@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 from typing import Any
 
 from prompt_toolkit import PromptSession
@@ -52,6 +53,7 @@ from rich.table import Table
 from rich.text import Text
 
 from cli.formatters import OutputFormatter, format_change_preview
+from cli.markdown_stream import MarkdownStreamRenderer
 from core.message import StreamEvent, StreamEventType
 
 # 모듈 전용 로거. 프로젝트 규칙상 "nexus.{모듈경로}" 네임스페이스를 사용한다.
@@ -248,7 +250,12 @@ class NexusREPL:
             "/copy": self._cmd_copy,
             "/compact": self._cmd_compact,
             "/resume": self._cmd_resume,
+            "/markdown": self._cmd_markdown,
         }
+
+        # 답변 본문 마크다운 렌더러(2026-08-18). 모델이 쓰는 마크다운을 기호
+        # 그대로 흘리지 않고 완성된 블록 단위로 그린다. `/markdown` 으로 끌 수 있다.
+        self._md = MarkdownStreamRenderer(enabled=True)
 
         # ── 부트스트랩 후에 채워지는 상태 변수 ──
         # 지금은 None이고, _bootstrap()이 성공하면 실제 객체가 들어간다.
@@ -713,6 +720,9 @@ class NexusREPL:
             # 어떤 경로로 끝나든(정상/취소/예외) 스피너가 남아있지 않도록 최종 안전 장치.
             # 예: TEXT_DELTA가 한 번도 안 와서 스피너가 계속 떠 있는 상태로 끝난 경우.
             self._suspend_spinner()
+            # 마크다운 버퍼에 덜 그린 마지막 블록을 마저 출력한다. 이게 없으면
+            # 답변 끝문단이 빈 줄로 끝나지 않았을 때 통째로 사라진다(2026-08-18).
+            self._flush_markdown()
 
         # ── 사후 검증 ──
         # 이미 흘려보낸 본문은 고치지 않고, 확인이 필요한 것만 뒤에 덧붙인다.
@@ -819,19 +829,32 @@ class NexusREPL:
         if result is None:
             return
 
-        # 텍스트 델타는 토큰이 이어져 한 문단을 이루므로 end=""로 줄바꿈 없이 붙인다.
+        # 텍스트 델타 — 마크다운 렌더러에 넣고, 확정된 블록만 화면에 그린다.
         if event.type == StreamEventType.TEXT_DELTA:
-            # 화면에는 렌더된 값을, /copy용으로는 원문 텍스트를 따로 모은다.
+            # /copy 용 원문은 렌더와 무관하게 항상 원본 그대로 모은다.
             if event.text:
                 self._last_response += event.text
-            self.console.print(result, end="")
-        # 사용량(토큰 수 등) 정보는 스트리밍 텍스트 뒤에 오므로 먼저 줄을 바꿔 마감한다.
+            # format_text_delta 가 thinking 을 걸러 준 뒤의 '보여줄 텍스트'를 쓴다.
+            # Text.plain 을 꺼내는 이유: 마크다운 원문이 필요하기 때문이다. (thinking
+            # 요약 한 줄이 섞이는 드문 경우엔 그 줄도 본문처럼 렌더된다 — 흐린 이탤릭만
+            # 잃을 뿐 내용은 그대로라 허용한다.)
+            piece = result.plain if isinstance(result, Text) else str(result)
+            for block in self._md.feed(piece):
+                self.console.print(block)
+        # 사용량(토큰 수 등) 정보는 스트리밍 텍스트 뒤에 오므로 먼저 본문을 마감한다.
         elif event.type == StreamEventType.USAGE_UPDATE:
-            self.console.print()  # 앞선 텍스트 스트림을 한 줄로 끝맺음
+            self._flush_markdown()
             self.console.print(result)
-        # 나머지(도구 결과 Panel, 에러 등)는 완결된 블록이라 그대로 한 번에 출력.
+        # 나머지(도구 결과 Panel, 에러 등)는 완결된 블록이다. 다만 버퍼에 덜 그린
+        # 본문이 남아 있으면 순서가 뒤집히므로, 먼저 본문을 비우고 나서 출력한다.
         else:
+            self._flush_markdown()
             self.console.print(result)
+
+    def _flush_markdown(self) -> None:
+        """버퍼에 남은 답변 본문을 마저 그린다(순서 보장 + 스트림 종료 처리)."""
+        for block in self._md.flush():
+            self.console.print(block)
 
     # ─── 권한 프롬프트 ───
 
@@ -1248,6 +1271,7 @@ class NexusREPL:
             ("/session", "세션 정보를 표시한다"),
             ("/thinking", "thinking 표시를 토글한다"),
             ("/verbose", "도구 표시를 축약↔전문으로 토글한다"),
+            ("/markdown", "답변을 마크다운 렌더↔원문으로 토글한다"),
             ("/cost", "세션 누적 토큰 사용량을 보여준다"),
             ("/save", "대화를 Markdown 파일로 저장한다"),
             ("/diff", "작업 트리의 git 변경사항을 보여준다"),
@@ -1738,6 +1762,18 @@ class NexusREPL:
         status = "켜짐" if self._formatter.show_thinking else "꺼짐"
         self.console.print(f"[green]Thinking 표시: {status}[/green]")
 
+    async def _cmd_markdown(self, args: list[str]) -> None:
+        """/markdown — 답변 본문을 마크다운으로 렌더할지, 원문 그대로 볼지 토글한다.
+
+        평소에는 렌더가 훨씬 읽기 좋다(제목·목록·표·코드블록이 실제 서식으로 보인다).
+        모델이 정확히 무슨 문자를 냈는지 봐야 하는 디버깅 때만 끄면 된다.
+        """
+        # 토글 전에 버퍼를 비운다 — 렌더 방식이 바뀌는 경계에서 내용이 섞이지 않게.
+        self._flush_markdown()
+        self._md.enabled = not self._md.enabled
+        state = "켜짐(마크다운 렌더)" if self._md.enabled else "꺼짐(원문 그대로)"
+        self.console.print(f"[green]마크다운 렌더: {state}[/green]")
+
     async def _cmd_verbose(self, args: list[str]) -> None:
         """/verbose — 도구 호출·결과를 한 줄 축약으로 볼지, 전문으로 볼지 토글한다 (D8).
 
@@ -1771,7 +1807,27 @@ class NexusREPL:
         self.console.print("[dim]Goodbye![/dim]")
 
 
+def _ensure_utf8_stdout() -> None:
+    """콘솔 출력 인코딩을 UTF-8 로 고정한다.
+
+    왜 필요한가(2026-08-18): 답변을 마크다운으로 렌더하면 Rich 가 목록에 불릿
+    문자(U+2022)를 쓴다. 한글 Windows 콘솔 기본 코드페이지(cp949)로는 이 글자를
+    인코딩할 수 없어 UnicodeEncodeError 로 출력이 통째로 죽는다(실측).
+    런처 스크립트가 PYTHONIOENCODING 을 넣어 주지만, 사용자가 python 을 직접
+    실행하면 그 보장이 사라진다. 그래서 프로그램이 스스로 보장한다.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue  # 파이프·테스트 더미 스트림 등 — 건드리지 않는다
+        try:
+            if (getattr(stream, "encoding", "") or "").lower() not in ("utf-8", "utf8"):
+                reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass  # 재설정 실패는 치명적이지 않다 — 기존 인코딩으로 계속 간다
+
 def main():
+    _ensure_utf8_stdout()
     """CLI 진입점 — 콘솔에서 `nexus`를 치면 실행되는 함수.
 
     pyproject.toml의 [project.scripts]에 nexus = "cli.repl:main"으로 등록되어 있다.
