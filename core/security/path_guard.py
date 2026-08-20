@@ -154,7 +154,7 @@ class PathGuard:
         #    _check_traversal은 "안전하면 True"를 주므로, not 으로 뒤집어
         #    "순회가 감지되면(=False면)" 차단한다.
         if not self._check_traversal(path, cwd):
-            return False, "경로 순회 공격이 감지되었습니다 (작업 디렉토리 밖으로 이동)"
+            return False, self._traversal_reason(path, cwd)
 
         # 4. 보호 경로 검사.
         #    .env, .ssh 등 민감 파일 패턴에 걸리면 차단한다.
@@ -192,6 +192,43 @@ class PathGuard:
 
         # 안전하고 읽기 전용도 아님 — 쓰기 허용.
         return True, ""
+
+    def _traversal_reason(self, path: str, cwd: str) -> str:
+        """차단 사유 문구를 만든다 — '진짜 순회'와 '단순히 밖'을 갈라 준다.
+
+        왜 나누는가 (2026-08-19, 실측):
+            둘을 같은 문구로 뭉뚱그리면 두 가지가 망가진다.
+
+            ① 모델이 스스로 못 고친다. A.X-4.0 은 긴 절대경로를 재현하다 글자를
+               틀리는데(실측: `nexus-b200` → `nexus-b2200`), 돌아오는 말이
+               "경로 순회 공격이 감지되었습니다" 뿐이라 **경로가 틀렸다는 정보를
+               받지 못한다.** 그래서 사과만 하고 같은 경로를 그대로 반복했다.
+               작업 디렉토리를 알려 주면 스스로 교정할 재료가 생긴다.
+            ② 감사 로그가 오염된다. 오타 수백 건과 진짜 침입 시도가 같은 문구로
+               쌓이면, 나중에 진짜를 찾을 때 묻힌다.
+
+        자동 교정(퍼지 매칭)은 일부러 넣지 않는다. `b2200` 을 `b200` 으로 알아서
+        고쳐 읽으면 요청한 것과 **다른 파일**을 조용히 읽게 된다. 지금처럼 막고
+        이유를 정확히 말해 주는 편이 낫다(fail-closed 유지).
+        """
+        # 경로 성분에 실제로 '..' 이 들어 있으면 상위로 빠져나가려는 시도다.
+        # (문자열 검사만으로 충분하지 않은 우회는 _check_traversal 이 이미 걸렀다.)
+        raw = str(path).replace("\\", "/")
+        has_dotdot = ".." in raw.split("/")
+        if has_dotdot:
+            return "경로 순회 공격이 감지되었습니다 (작업 디렉토리 밖으로 이동)"
+
+        # 순회 성분이 없는데 밖으로 나갔다 = 그냥 다른 위치를 가리킨 것.
+        # 오타이거나, 애초에 접근 범위 밖이거나. 작업 디렉토리를 함께 알려 준다.
+        try:
+            shown_cwd = str(Path(cwd).resolve())
+        except (OSError, ValueError):
+            shown_cwd = cwd
+        return (
+            f"작업 디렉토리 밖의 경로입니다. 현재 작업 디렉토리는 '{shown_cwd}' 이며 "
+            "그 하위 경로만 접근할 수 있습니다. 경로에 오타가 없는지 확인하거나, "
+            "작업 디렉토리 기준 상대경로를 사용하십시오."
+        )
 
     def _check_traversal(self, path: str, cwd: str) -> bool:
         """
