@@ -1317,15 +1317,32 @@ async def query_loop(
                 await streaming_executor.cancel_all()
                 continue
             else:
-                # 재시도 모두 실패 — 사용자에게 에러 메시지 전달 후 종료
-                yield StreamEvent(
-                    type=StreamEventType.ERROR,
-                    error_code="CONTEXT_OVERFLOW",
-                    message=(
-                        "입력 내용이 너무 길어 분석할 수 없습니다. "
-                        "더 짧은 내용으로 다시 시도해 주세요."
-                    ),
-                )
+                # 재시도 모두 실패 — 사용자에게 에러 메시지 전달 후 종료.
+                # ★사유를 뭉뚱그리지 않는다(2026-08-20). 예전에는 어떤 모델 오류든
+                #   "입력이 너무 길다"로 보고해, 실제 원인이 HTTP 404(모델 이름
+                #   불일치)인데도 사용자가 입력만 줄이게 만들었다. 실측으로 확인된
+                #   오진이라, 컨텍스트 초과로 단정할 수 있을 때만 그렇게 말한다.
+                detail = (model_error or "").strip()
+                is_context = "context" in detail.lower() or "너무 길" in detail
+                if is_context:
+                    yield StreamEvent(
+                        type=StreamEventType.ERROR,
+                        error_code="CONTEXT_OVERFLOW",
+                        message=(
+                            "입력 내용이 너무 길어 분석할 수 없습니다. "
+                            "더 짧은 내용으로 다시 시도해 주세요."
+                        ),
+                    )
+                else:
+                    yield StreamEvent(
+                        type=StreamEventType.ERROR,
+                        error_code="MODEL_ERROR",
+                        message=(
+                            "모델 응답을 처리하지 못했습니다"
+                            f"({MAX_TOOL_PARSE_RETRY}회 재시도 실패). "
+                            f"원인: {detail[:300] or '알 수 없음'}"
+                        ),
+                    )
                 return
 
         # ─── 자기일관성(SC) 합의 + 승자 의사-스트림 (Point 4.3, §3·§6.2) ───
