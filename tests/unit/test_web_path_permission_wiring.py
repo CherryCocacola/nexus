@@ -107,14 +107,30 @@ def test_broken_allowed_dir_does_not_break_guard():
 # ─────────────────────────────────────────────
 # 배선 — 값이 아니라 경로가 연결됐는가
 # ─────────────────────────────────────────────
-def test_web_base_options_carries_permission_pipeline():
-    """이 키가 빠지면 executor 가 경로 검사를 건너뛴다 — 실제로 그래서 유출됐다."""
+def test_web_base_options_carries_all_permission_keys():
+    """executor 게이트는 **세 키가 모두** 있어야 돈다.
+
+    실측 교훈: 1차 수정에서 `permission_pipeline` 만 넣었더니 게이트 조건
+    (`_pe.get("enabled") and _pipeline is not None`)의 앞쪽이 False 라
+    검사가 여전히 안 돌았고 tenants.yaml 이 계속 읽혔다. 한 키만 보는
+    테스트였다면 그 상태를 통과시켰을 것이다.
+    """
     from web import app as web_app
 
     src = inspect.getsource(web_app)
     i = src.index("base_options = {")
-    block = src[i : i + 4000]
-    assert '"permission_pipeline"' in block, "웹 base_options 에 권한 파이프라인이 없다"
+    block = src[i : i + 6000]
+    for key in ("permission_pipeline", "permission_enforcement", "audit_logger"):
+        assert f'"{key}"' in block, f"웹 base_options 에 {key} 가 없다"
+
+
+def test_executor_gate_requires_both_keys():
+    """게이트 조건 자체를 고정한다 — 조건이 바뀌면 배선 테스트도 같이 바뀌어야 한다."""
+    from core.tools import executor as executor_mod
+
+    src = inspect.getsource(executor_mod)
+    assert 'context.options.get("permission_pipeline")' in src
+    assert 'context.options.get("permission_enforcement")' in src
 
 
 def test_bootstrap_injects_allowed_dirs():
