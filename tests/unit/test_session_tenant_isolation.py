@@ -150,3 +150,53 @@ def test_list_endpoints_filter_by_tenant(func: str):
     assert ("_owns_listed_session(" in src) or ("_session_owner(" in src), (
         f"{func} 에 소유자 필터가 없다"
     )
+
+# ─────────────────────────────────────────────
+# 소유자 기록 — 격리의 전제 데이터
+# ─────────────────────────────────────────────
+def test_owner_is_recorded_for_new_session(app_state, tmp_path):
+    """소유자를 기록해야 격리가 성립한다.
+
+    실측 배경: 기존 `_record_client_meta` 는 X-Client-Id 가 있고 채널이 web 이 아닐
+    때만 돌아, **tenant 가 기록된 세션이 하나도 없었다**(meta.json 13개 중 0개).
+    그 상태에서는 모든 세션이 기본 테넌트 소유로 보여 격리가 무의미하다.
+    """
+    web_app._record_session_owner("s-new", "web", _Tenant("coding"))
+    assert web_app._session_owner("s-new") == "coding"
+
+
+def test_owner_record_is_idempotent(app_state, tmp_path):
+    """같은 값이면 다시 쓰지 않는다(매 턴 파일 I/O 방지)."""
+    from core.memory.transcript import read_session_meta
+
+    web_app._record_session_owner("s-idem", "web", _Tenant("coding"))
+    before = read_session_meta(str(tmp_path), "s-idem", channel="web")
+    web_app._record_session_owner("s-idem", "web", _Tenant("coding"))
+    after = read_session_meta(str(tmp_path), "s-idem", channel="web")
+    assert before == after
+
+
+def test_owner_record_keeps_other_meta(app_state, tmp_path):
+    """제목·핀 같은 기존 메타를 지우지 않는다(병합 저장)."""
+    from core.memory.transcript import read_session_meta
+
+    _write_meta(tmp_path, "s-merge", {"title": "내 대화", "pinned": True})
+    web_app._record_session_owner("s-merge", "web", _Tenant("default"))
+    meta = read_session_meta(str(tmp_path), "s-merge", channel="web")
+    assert meta.get("title") == "내 대화" and meta.get("pinned") is True
+    assert meta.get("tenant") == "default"
+
+
+def test_owner_record_without_tenant_is_noop(app_state, tmp_path):
+    """테넌트를 모르면 아무것도 쓰지 않는다(단일 테넌트 개발 환경)."""
+    web_app._record_session_owner("s-none", "web", None)
+    assert web_app._session_owner("s-none") == "default"
+
+
+@pytest.mark.parametrize("handler", ["chat", "chat_stream", "chat_completions"])
+def test_every_chat_handler_records_owner(handler: str):
+    """세 진입점 모두 기록해야 한다 — 한 곳만 빠져도 그 경로 세션이 무주공산이 된다."""
+    import inspect
+
+    src = inspect.getsource(getattr(web_app, handler))
+    assert "_record_session_owner(" in src, f"{handler} 이 소유자를 기록하지 않는다"

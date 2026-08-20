@@ -745,6 +745,35 @@ def _record_client_meta(
         logger.debug("클라이언트 메타 기록 실패(무시): %s", e)
 
 
+def _record_session_owner(session_id: str, channel: str, tenant: Any) -> None:
+    """세션의 소유 테넌트를 meta.json 에 남긴다 (fail-soft).
+
+    왜 별도 함수인가:
+      _record_client_meta 는 "어느 클라이언트가 만들었나"를 남기는 함수라
+      **X-Client-Id 가 있고 채널이 web 이 아닐 때만** 호출된다. 그래서 실제로는
+      tenant 가 기록된 세션이 하나도 없었다(실측: meta.json 13개 중 0개).
+      소유권은 그 조건과 무관하게 항상 필요하므로 여기서 따로 남긴다.
+
+    매 턴 쓰지 않는다 — 이미 같은 값이면 파일을 건드리지 않는다.
+    """
+    tid = str(getattr(tenant, "id", "") or "")
+    if not tid:
+        return
+    try:
+        from core.memory.transcript import read_session_meta, write_session_meta
+
+        cfg = _app_state.get("config")
+        sessions_dir = cfg.session.sessions_dir if cfg else ".nexus/sessions"
+        current = (read_session_meta(sessions_dir, session_id, channel=channel) or {}).get(
+            "tenant"
+        )
+        if current == tid:
+            return
+        write_session_meta(sessions_dir, session_id, {"tenant": tid}, channel=channel)
+    except Exception as e:  # noqa: BLE001 — 메타 기록이 대화를 막아서는 안 된다
+        logger.warning("세션 소유자 기록 실패(session=%s): %s", session_id, e)
+
+
 def _session_owner(session_id: str) -> str:
     """세션을 소유한 테넌트 id를 돌려준다.
 
@@ -2003,6 +2032,9 @@ async def chat(
     _client_id = _sanitize_client_id(x_client_id)
     if _client_id and channel != "web":
         _record_client_meta(session_id, channel, _client_id, tenant)
+    # 소유 테넌트는 클라이언트 선언·채널과 무관하게 항상 남긴다 —
+    # 이 값이 없으면 세션 격리가 성립하지 않는다(2026-08-20).
+    _record_session_owner(session_id, channel, tenant)
 
     # 동시성 수정(#5): 요청/세션별 격리 엔진을 얻는다(프로덕션). parts가 없으면
     # 기존 싱글톤/placeholder 경로로 폴백(무회귀).
@@ -2210,6 +2242,9 @@ async def chat_stream(
     _client_id = _sanitize_client_id(x_client_id)
     if _client_id and channel != "web":
         _record_client_meta(session_id, channel, _client_id, tenant)
+    # 소유 테넌트는 클라이언트 선언·채널과 무관하게 항상 남긴다 —
+    # 이 값이 없으면 세션 격리가 성립하지 않는다(2026-08-20).
+    _record_session_owner(session_id, channel, tenant)
 
     async def _locked_generate() -> AsyncGenerator[str, None]:
         """세션별 격리 엔진 획득 + 세션 락으로 감싼 뒤 실제 스트림을 위임한다.
@@ -3139,6 +3174,9 @@ async def chat_completions(
     _client_id = _sanitize_client_id(x_client_id)
     if _client_id:
         _record_client_meta(session_id, "api", _client_id, tenant)
+    # 무상태 요청이라도 트랜스크립트는 남는다 — 소유 테넌트도 함께 남겨야
+    # 나중에 그 기록이 남의 것으로 취급되지 않는다(2026-08-20).
+    _record_session_owner(session_id, "api", tenant)
     # 응답에 반향할 모델명(요청값 우선, 없으면 기본값).
     model_name = request.model or "ax-4.0"
 
