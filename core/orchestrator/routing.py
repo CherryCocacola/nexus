@@ -329,6 +329,22 @@ class RoutingResolver:
         self._routing = routing
         # classifier를 명시 주입하지 않으면 config.classifier_type에 따라 자동 생성
         self._classifier = classifier or build_classifier(routing)
+        # 코딩 질의 정규식은 생성 시 1회만 컴파일한다(요청마다 컴파일하면 낭비).
+        # 잘못된 패턴 하나가 라우팅 전체를 죽이지 않도록 개별적으로 건너뛴다.
+        self._coder_regexes: list[re.Pattern[str]] = []
+        for pattern in getattr(routing, "coder_regex_patterns", None) or []:
+            try:
+                self._coder_regexes.append(re.compile(pattern))
+            except re.error:
+                logger.warning("coder_regex_patterns 컴파일 실패 — 건너뜀: %s", pattern)
+        self._coder_exclude_regexes: list[re.Pattern[str]] = []
+        for pattern in getattr(routing, "coder_exclude_patterns", None) or []:
+            try:
+                self._coder_exclude_regexes.append(re.compile(pattern))
+            except re.error:
+                logger.warning(
+                    "coder_exclude_patterns 컴파일 실패 — 건너뜀: %s", pattern
+                )
 
     def resolve(
         self,
@@ -381,6 +397,20 @@ class RoutingResolver:
         #   권한 확대가 아니다 — KNOWLEDGE 로 고정해도 아래 테넌트 allowed_sources
         #   필터는 그대로 적용된다.
         query_class = forced_class or self._classifier.classify(user_input)
+
+        # 코딩 질의로 판정됐는데 클래스가 KNOWLEDGE 면 클래스를 TOOL 로 맞춘다
+        # (2026-08-20 실측). 예: "이 버그를 고쳐줘" 는 coder 로 가면서 KNOWLEDGE 로
+        # 분류돼, 코딩 모델에 **사내 문서 RAG 가 주입**되고 출력이 4096 으로 묶였다.
+        # 코딩 모델에게 무관한 문서를 밀어 넣는 셈이라 방해만 된다. 호출자가 클래스를
+        # 명시(forced_class)했으면 그 의도를 존중해 건드리지 않는다.
+        if (
+            forced_class is None
+            and query_class == "KNOWLEDGE"
+            and self._detect_coder_query(user_input)
+        ):
+            logger.info("라우팅: 코딩 질의라 KNOWLEDGE → TOOL 로 보정")
+            query_class = "TOOL"
+
         # 분류 결과에 대응하는 RoutingProfile을 고른다. 각 프로필은 model 이름과
         # temperature/max_tokens/샘플링 파라미터 묶음을 담고 있다.
         # CHAT 프로필은 v0.14.6 신규 — 구버전 RoutingConfig 객체에 chat_mode가
@@ -488,7 +518,18 @@ class RoutingResolver:
             return False
         keywords = getattr(self._routing, "coder_keywords", None) or []
         lowered = (user_input or "").lower()
-        return any(kw.lower() in lowered for kw in keywords)
+        if any(kw.lower() in lowered for kw in keywords):
+            return True
+        text = user_input or ""
+        # 순수 테스트 작성 요청은 앵커가 받는다(08-07 실측 계약). 위 명시 키워드
+        # (디버깅·리팩터링 등 동률 확인 범주)보다 뒤에서 보는 이유는
+        # "테스트 코드 디버깅해줘"까지 앵커로 보내지 않기 위해서다.
+        if any(rx.search(text) for rx in self._coder_exclude_regexes):
+            return False
+        # 키워드로 안 걸리는 "구현/추가" 형태는 정규식으로 본다(2026-08-20).
+        # 부분 문자열로 넓히면 "보고서 만들어줘" 같은 비코딩 요청까지 삼키므로
+        # 동사 단독이 아니라 코딩 명사와 함께일 때만 건다.
+        return any(rx.search(text) for rx in self._coder_regexes)
 
     def _resolve_sc_gate(
         self, user_input: str, query_class: str
