@@ -53,8 +53,8 @@ gpu_server:
   image_url: "http://127.0.0.1:18003"      # SD 3.5 Large 이미지 서버(터널 18003→B200:8003)
   vision_url: "http://127.0.0.1:18004"     # 비전 VLM(터널 18004→B200:8004)
   vision_model: "gemma-3-27b"              # 요청 body의 served-model-name — 실제 서빙명과 일치해야 400이 안 난다
-  coder_url: "http://127.0.0.1:18005"      # Devstral 코딩 서브모델(터널 로컬포트, 2026-08-05)
-  coder_model: "devstral-small"           # served-model-name과 일치
+  coder_url: "http://127.0.0.1:18005"      # Qwen3-Coder 코딩 서브모델(터널 로컬포트) — Devstral에서 교체(2026-08-20)
+  coder_model: "qwen3-coder-30b"          # served-model-name과 일치
   timeout_seconds: 120.0     # 단일 요청 타임아웃 — 장문 생성 여유까지 고려한 값
   max_retries: 10            # with_retry(Tier 4) 최대 재시도 횟수 (콜드/일시장애 흡수)
   retry_base_delay: 0.5      # 지수 백오프 기준 지연(초) — 0.5→1→2…로 증가
