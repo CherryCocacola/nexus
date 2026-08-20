@@ -13,7 +13,7 @@ Phase 1 (init 함수): "환경 비의존" 초기화 — 외부 서비스가 없�
   - 플랫폼(OS/셸) 감지
 
 Phase 2 (init_phase2 함수): "환경 의존" 초기화 — 외부 서비스에 실제로 붙는 단계
-  - ToolRegistry (도구 등록 — 티어에 따라 7개/23개)
+  - ToolRegistry (도구 등록 — 티어에 따라 7개/28개)
   - MemoryManager (Redis 단기 + PostgreSQL 장기, 실패 시 인메모리 폴백)
   - RAG/지식/심볼 인덱서, MCP 연결, 권한 파이프라인
   - QueryEngine (Tier 1 세션 오케스트레이터) 최종 조립
@@ -195,7 +195,7 @@ async def init_phase2(state: GlobalState) -> dict:
     # ①-c 모델 서버 신원 확인(2026-08-07) — 주소만 맞는지가 아니라 무엇을 서빙하는지 본다.
     await _verify_model_endpoints(config)
 
-    # ② ToolRegistry — 23개 도구 등록 (실측: _create_tool_registry 등록 개수)
+    # ② ToolRegistry — 28개 도구 등록 (실측: _create_tool_registry 등록 개수)
     registry = _create_tool_registry()
     components["tool_registry"] = registry
     logger.info("[Phase 2] ToolRegistry 초기화: %d개 도구", registry.tool_count)
@@ -343,6 +343,12 @@ async def init_phase2(state: GlobalState) -> dict:
             "todo_store": todo_store,
             "agent_registry": agent_registry,
             "model_provider": provider,
+            # 문서 생성물 저장 위치 — CLI 는 "지금 작업 중인 폴더"에 떨군다.
+            # 미주입이면 tempdir 로 가서 사용자가 파일을 찾지 못한다(2026-08-19).
+            "exports_dir": state.cwd or os.getcwd(),
+            # 다운로드 UI 유무. 웹은 링크를 화면에 자동 첨부하지만 CLI 는 없다.
+            # 도구가 이 값을 보고 경로를 알려줄지 말지를 가른다.
+            "download_ui": False,
             # 문서 청크 크기 — 하드코딩 외부화(2026-07-03). DocumentProcess 도구가
             # 이 값을 읽어 청크를 나눈다. 미주입 시 도구가 CHUNK_SIZE(2500)로 폴백.
             "document_chunk_size": config.context_budgets.document_chunk_size,
@@ -420,11 +426,11 @@ async def init_phase2(state: GlobalState) -> dict:
 
     # ⑧ 티어별 도구 레지스트리 자동 선택 (실측 개수)
     # TIER_S: 7개 도구 (_create_cli_tool_registry) — 컨텍스트 절약
-    # TIER_M/L: 23개 도구 전체 (_create_tool_registry) — 컨텍스트 충분
+    # TIER_M/L: 28개 도구 전체 (_create_tool_registry) — 컨텍스트 충분
     if tier == HardwareTier.TIER_S:
         cli_registry = _create_cli_tool_registry()
     else:
-        cli_registry = _create_tool_registry()  # 23개 전체
+        cli_registry = _create_tool_registry()  # 28개 전체
     cli_tools = cli_registry.get_all_tools()
 
     # ⑧-b Scout 전용 읽기 전용 도구 세트 (TIER_S만 사용)
@@ -1085,7 +1091,7 @@ async def _create_pg_pool(config: Any) -> Any:
 
 
 def _create_tool_registry():  # noqa: ANN202 — ToolRegistry는 함수 내부에서 import
-    """26개 도구를 모두 등록한 "풀세트" ToolRegistry를 생성한다(실측 등록 개수).
+    """28개 도구를 모두 등록한 "풀세트" ToolRegistry를 생성한다(실측 등록 개수).
 
     2026-08-04 확장: RenderPreview(헤드리스 렌더 스크린샷) + AnalyzeImage(VLM
     스크린샷 검토)를 추가해 "만들고 → 찍고 → 고치는" 웹 자가 검증 루프를
@@ -1101,6 +1107,8 @@ def _create_tool_registry():  # noqa: ANN202 — ToolRegistry는 함수 내부�
     from core.tools.implementations.analyze_image_tool import AnalyzeImageTool
     from core.tools.implementations.bash_tool import BashTool
     from core.tools.implementations.docker_tools import DockerBuildTool, DockerRunTool
+    from core.tools.implementations.document_export_tool import DocumentExportTool
+    from core.tools.implementations.document_tool import DocumentProcessTool
     from core.tools.implementations.edit_tool import EditTool
     from core.tools.implementations.git_tools import (
         GitBranchTool,
@@ -1155,6 +1163,13 @@ def _create_tool_registry():  # noqa: ANN202 — ToolRegistry는 함수 내부�
             # 메모리 (2개)
             MemoryReadTool(),
             MemoryWriteTool(),
+            # 문서 (2개) — 2026-08-19 추가.
+            #   왜 이제야: 옛 TIER_S 구조에서 문서 파싱은 Scout 전담이었고,
+            #   TIER_L 로 오며 Read/Glob/Grep/LS 는 CLI 풀로 옮겨왔는데
+            #   DocumentProcess 만 따라오지 않았다(누락). 웹은 업로드 문서를
+            #   읽는데 CLI 사용자는 자기 PC 의 xlsx 를 못 읽는 비대칭이었다.
+            DocumentProcessTool(),  # .pdf/.docx/.xlsx/.pptx/.hwpx/.hwp 파싱(read-only)
+            DocumentExportTool(),   # .docx/.pptx/.hwpx/.md/.txt 생성
             # Docker (2개)
             DockerBuildTool(),
             DockerRunTool(),
@@ -1347,10 +1362,13 @@ def _create_web_tool_registry(tier: Any = None):  # noqa: ANN202
     return registry
 
 
-# tool_names 미전달 시 가정하는 TIER_M/L 표준 풀(= _create_tool_registry의 26개).
+# tool_names 미전달 시 가정하는 TIER_M/L 표준 풀(= _create_tool_registry의 28개).
 # 실제 운영 경로는 항상 레지스트리에서 이름을 받아오므로 이 값은 테스트·하위호환용 폴백이다.
+# 레지스트리와 어긋나면 프롬프트가 없는 도구를 안내하거나 있는 도구를 숨긴다 —
+# test_expanded_tools_fallback_matches_registry 가 이 드리프트를 막는다(2026-08-19).
 _DEFAULT_EXPANDED_TOOLS = (
-    "AnalyzeImage", "Bash", "DockerBuild", "DockerRun", "Edit", "GitBranch",
+    "AnalyzeImage", "Bash", "DockerBuild", "DockerRun", "DocumentExport",
+    "DocumentProcess", "Edit", "GitBranch",
     "GitCheckout", "GitCommit", "GitDiff", "GitLog", "GitStatus", "Glob", "Grep",
     "LS", "MemoryRead", "MemoryWrite", "MultiEdit", "NotebookEdit", "NotebookRead",
     "Read", "RenderPreview", "ScaffoldWeb", "Task", "TodoRead", "TodoWrite", "Write",
@@ -1412,7 +1430,7 @@ def _build_expanded_system_prompt(tool_names: set[str] | None = None) -> str:
     None이면(테스트·하위호환) TIER_M/L 표준 풀을 가정한다.
 
     왜 별도 변형이 필요한가 (progress.md 기존 버그 해소):
-      TIER_M/L의 CLI는 `_create_tool_registry()`(23개)를 쓴다. 이 풀에는
+      TIER_M/L의 CLI는 `_create_tool_registry()`(28개)를 쓴다. 이 풀에는
       Read/Glob/Grep/LS가 **있고** Agent는 **없다**. 그런데 기존 프롬프트는
       TIER_S 서사("Read/Glob 없음, scout에 위임하라")를 티어와 무관하게
       내보내고 있었다. 모델이 지시를 그대로 따르면 존재하지 않는 Agent를
@@ -1659,7 +1677,7 @@ def _build_default_system_prompt(
       - 파일 탐색·읽기·검색은 모두 Scout에 위임
       - Worker는 Scout JSON 결과를 해석해 최종 답변 생성
 
-    TIER_M/L은 도구 풀이 완전히 다르므로(23개, Agent 없음) 위 서사를 쓰면
+    TIER_M/L은 도구 풀이 완전히 다르므로(28개, Agent 없음) 위 서사를 쓰면
     프롬프트↔도구 불일치가 된다. 그 경우 `_build_expanded_system_prompt()`로
     분기한다(⑧ 티어별 도구 레지스트리 선택과 짝을 이룬다).
 

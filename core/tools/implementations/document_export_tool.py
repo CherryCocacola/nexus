@@ -281,19 +281,35 @@ class DocumentExportTool(BaseTool):
         download_url = f"/v1/download/{filename}"
         logger.info("DocumentExport %s (%d bytes) → %s", filename, size, out_path)
 
-        # 결과 본문에는 URL을 "한 번만" 넣는다(서버가 _DOWNLOAD_URL_RE로 추출 → UI에 자동 첨부).
-        # 모델에게는 URL/파일명을 재현하지 말라고 지시한다 — 긴 UUID 문자열을 FP8 모델이
-        # 반복 재현하다 degeneration(반복 붕괴)에 빠지는 것을 막기 위함이다(ImageGenerate와 동일 규약).
+        # 결과 문구는 표면에 따라 다르다 (2026-08-19).
+        #   웹  — 서버가 tool_result 에서 URL 을 추출해 화면에 다운로드 버튼을 붙인다.
+        #        그래서 모델에게 파일명·URL 재현을 금지한다(긴 UUID 재현이
+        #        degeneration 의 방아쇠였다 — ImageGenerate 와 같은 규약).
+        #   CLI — 붙여 줄 UI 가 없다. 여기서 경로를 숨기면 사용자는 파일이 어디
+        #        생겼는지 영영 알 수 없다. 그래서 절대경로를 알려주게 한다.
+        if context.options.get("download_ui", True):
+            message = (
+                f"문서 생성 완료: {filename} ({size:,} bytes).\n"
+                f"[시스템] 다운로드 링크는 서버가 사용자 화면에 자동으로 첨부합니다. "
+                f"답변에는 파일명·URL·마크다운 링크를 다시 쓰지 말고, "
+                f"'요청하신 문서를 생성했습니다.' 같은 짧은 한 줄만 작성하세요.\n"
+                f"(서버 링크 추출용, 사용자에게 노출 금지: {download_url})"
+            )
+        else:
+            message = (
+                f"문서 생성 완료: {filename} ({size:,} bytes)\n"
+                f"저장 위치: {out_path}\n"
+                f"[시스템] 이 표면에는 다운로드 UI 가 없습니다. 사용자에게 "
+                f"저장 위치(위 경로)를 한 줄로 알려주세요. URL 은 쓰지 마세요."
+            )
+
         return ToolResult.success(
-            f"문서 생성 완료: {filename} ({size:,} bytes).\n"
-            f"[시스템] 다운로드 링크는 서버가 사용자 화면에 자동으로 첨부합니다. "
-            f"답변에는 파일명·URL·마크다운 링크를 다시 쓰지 말고, "
-            f"'요청하신 문서를 생성했습니다.' 같은 짧은 한 줄만 작성하세요.\n"
-            f"(서버 링크 추출용, 사용자에게 노출 금지: {download_url})",
+            message,
             download_url=download_url,
             filename=filename,
             format=fmt,
             bytes=size,
+            path=str(out_path),
         )
 
     # ═══ 7. UI Hints(진행 표시용 힌트) ═══

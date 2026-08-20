@@ -214,9 +214,9 @@ class TestGetTierConfig:
         assert cfg["max_worker_tools"] == 7
 
     def test_tier_m_max_worker_tools_full(self):
-        """TIER_M max_worker_tools는 풀세트 실측 26개(정보용 필드)."""
+        """TIER_M max_worker_tools는 풀세트 실측 28개(정보용 필드)."""
         cfg = get_tier_config(HardwareTier.TIER_M)
-        assert cfg["max_worker_tools"] == 26
+        assert cfg["max_worker_tools"] == 28
 
     def test_tier_s_turn_state_enabled(self):
         """TIER_S는 turn_state_enabled=True이다."""

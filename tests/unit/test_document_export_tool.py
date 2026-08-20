@@ -124,3 +124,42 @@ def test_parse_blocks_structure():
     # 글머리표 묶음에 2개 항목
     bullet = next(b for b in blocks if b[0] == "bullet")
     assert len(bullet[1]) == 2
+
+
+# ─────────────────────────────────────────────
+# 표면별 결과 문구 (2026-08-19)
+#   웹은 서버가 다운로드 버튼을 붙여 주므로 URL·파일명 재현을 금지하고(긴 UUID 재현이
+#   degeneration 의 방아쇠였다), CLI 는 붙여 줄 UI 가 없으므로 저장 경로를 알려야 한다.
+# ─────────────────────────────────────────────
+async def test_export_message_hides_url_when_download_ui(tmp_path: Path):
+    """download_ui 미지정(=웹 기본)이면 URL 재현 금지 문구가 붙고 경로는 노출하지 않는다."""
+    tool = DocumentExportTool()
+    result = await tool.call(
+        {"content": SAMPLE, "format": "md", "filename": "요약"},
+        _ctx(tmp_path),  # download_ui 미주입 → 기본 True
+    )
+    assert not result.is_error, result.error_message
+    body = result.data
+    assert "노출 금지" in body
+    assert "저장 위치" not in body
+    assert str(tmp_path) not in body
+
+
+async def test_export_message_shows_path_without_download_ui(tmp_path: Path):
+    """download_ui=False(=CLI)면 절대경로를 알려주고 URL 은 문구에 넣지 않는다."""
+    tool = DocumentExportTool()
+    ctx = ToolUseContext(
+        cwd=str(tmp_path),
+        options={"exports_dir": str(tmp_path), "download_ui": False},
+    )
+    result = await tool.call(
+        {"content": SAMPLE, "format": "md", "filename": "요약"}, ctx
+    )
+    assert not result.is_error, result.error_message
+    body = result.data
+    assert "저장 위치" in body
+    assert str(tmp_path) in body
+    assert "/v1/download/" not in body  # CLI 에는 그 링크가 무의미하다
+    # 메타데이터에는 표면과 무관하게 둘 다 남는다(웹 추출·CLI 안내 양쪽 계약).
+    assert result.metadata["download_url"].startswith("/v1/download/")
+    assert result.metadata["path"].endswith(result.metadata["filename"])
