@@ -83,23 +83,61 @@ def _config_js(api_base: str, api_key: str) -> str:
     )
 
 
-def _web_config() -> str:
-    """IIS 정적 호스팅용 web.config.
+def _web_config(proxy_target: str = "") -> str:
+    """IIS 호스팅용 web.config 를 만든다.
 
-    - 기본 문서를 index.html 로
-    - 폰트/JSON MIME 등록(서버마다 빠져 있어 아이콘이 깨진다)
-    - index.html·config.js 는 캐시 금지(배포 후 즉시 반영되게)
-    - vendor 자산은 장기 캐시(해시가 아니라 경로 고정이므로 1일로 둔다)
+    두 가지 모드가 있다.
+
+      proxy_target 없음 — 정적 전용.
+          브라우저가 API 를 다른 오리진으로 직접 호출한다(CORS 필요).
+      proxy_target 있음 — 리버스 프록시(권장).
+          `/v1/*`·`/health` 를 IIS 가 API 서버로 넘긴다. 브라우저가 보기에는
+          전부 같은 오리진이라 **CORS 도 혼합 콘텐츠 차단도 발생하지 않는다.**
+          프런트를 HTTPS(443)로 서비스할 때는 사실상 이 방법뿐이다 — HTTPS 페이지가
+          http:// API 를 부르면 브라우저가 요청 자체를 막기 때문이다(CORS 로 못 푼다).
+
+    ★2026-08-18 수정 — `<location>` 을 `<system.webServer>` 안에 넣고 있었다.
+      IIS 스키마상 `<location>` 은 `<configuration>` 직속이어야 하며, 잘못 두면
+      `Unrecognized element 'location'` 으로 **사이트 전체가 500.19** 가 된다.
     """
     mime = "\n".join(
         f'        <remove fileExtension="{ext}" />\n'
         f'        <mimeMap fileExtension="{ext}" mimeType="{mt}" />'
         for ext, mt in MIME_MAP.items()
     )
+
+    if proxy_target:
+        head_note = (
+            "     이 사이트는 정적 파일 + API 리버스 프록시를 함께 담당한다.\n"
+            f"     `/v1/*` 와 `/health` 는 IIS 가 {proxy_target} 로 넘긴다"
+            "(같은 오리진 = CORS 불필요).\n"
+            "     ※ 서버에 URL Rewrite + ARR 이 설치돼 있어야 하고, ARR 서버 프록시가\n"
+            "       켜져 있어야 한다. SSE(/v1/chat/stream) 때문에 응답 버퍼 임계값을 0 으로\n"
+            "       둬야 한다. 자세한 절차는 README-배포.md 참고."
+        )
+        rewrite = (
+            "\n    <!-- API 리버스 프록시 — 브라우저는 같은 오리진만 부른다.\n"
+            "         {R:1} 은 match 의 첫 괄호 그룹(v1/... 또는 health)이다. -->\n"
+            "    <rewrite>\n"
+            "      <rules>\n"
+            '        <rule name="NOVA API proxy" stopProcessing="true">\n'
+            '          <match url="^(v1/.*|health)$" />\n'
+            f'          <action type="Rewrite" url="{proxy_target}/{{R:1}}"'
+            ' logRewrittenUrl="true" />\n'
+            "        </rule>\n"
+            "      </rules>\n"
+            "    </rewrite>\n"
+        )
+    else:
+        head_note = (
+            "     이 사이트는 정적 파일만 서빙한다. API 호출은 브라우저가 직접 다른 오리진\n"
+            "     (config.js 의 apiBase)으로 보내므로 IIS 에 프록시(ARR) 설정이 필요 없다."
+        )
+        rewrite = ""
+
     return f"""<?xml version="1.0" encoding="utf-8"?>
-<!-- NOVA 프런트 정적 호스팅용 IIS 설정 — build_frontend.py 가 생성했다.
-     이 사이트는 정적 파일만 서빙한다. API 호출은 브라우저가 직접 다른 오리진
-     (config.js 의 apiBase)으로 보내므로 IIS 에 프록시(ARR) 설정이 필요 없다. -->
+<!-- NOVA 프런트 IIS 설정 — build_frontend.py 가 생성했다.
+{head_note} -->
 <configuration>
   <system.webServer>
     <defaultDocument>
@@ -114,23 +152,7 @@ def _web_config() -> str:
       <!-- 기본 캐시: 자산은 1일. index.html·config.js 는 아래에서 따로 끈다. -->
       <clientCache cacheControlMode="UseMaxAge" cacheControlMaxAge="1.00:00:00" />
     </staticContent>
-
-    <!-- 배포 직후 옛 화면이 뜨는 것을 막는다 — 실제로 겪은 문제다. -->
-    <location path="index.html">
-      <system.webServer>
-        <staticContent>
-          <clientCache cacheControlMode="DisableCache" />
-        </staticContent>
-      </system.webServer>
-    </location>
-    <location path="static/config.js">
-      <system.webServer>
-        <staticContent>
-          <clientCache cacheControlMode="DisableCache" />
-        </staticContent>
-      </system.webServer>
-    </location>
-
+{rewrite}
     <httpProtocol>
       <customHeaders>
         <add name="X-Content-Type-Options" value="nosniff" />
@@ -138,19 +160,100 @@ def _web_config() -> str:
         <add name="Referrer-Policy" value="same-origin" />
       </customHeaders>
     </httpProtocol>
+
+    <security>
+      <requestFiltering>
+        <!-- 업로드 상한 30MB — API 는 20MB 에서 413 을 내므로 그보다 넉넉히 둔다.
+             IIS 가 먼저 잘라 버리면 사용자는 API 의 정확한 사유를 못 본다. -->
+        <requestLimits maxAllowedContentLength="31457280" />
+      </requestFiltering>
+    </security>
   </system.webServer>
+
+  <!-- ★배포 직후 옛 화면이 뜨는 것을 막는다 — 실제로 겪은 문제다.
+       location 은 configuration 직속이어야 한다(안쪽에 두면 500.19). -->
+  <location path="index.html">
+    <system.webServer>
+      <staticContent>
+        <clientCache cacheControlMode="DisableCache" />
+      </staticContent>
+    </system.webServer>
+  </location>
+  <location path="static/config.js">
+    <system.webServer>
+      <staticContent>
+        <clientCache cacheControlMode="DisableCache" />
+      </staticContent>
+    </system.webServer>
+  </location>
 </configuration>
+"""
+def _readme(api_base: str, proxy_target: str = "") -> str:
+    """배포 담당자가 폴더만 받아도 끝까지 갈 수 있게, 산출물에 함께 넣는 안내문."""
+    proxy_note = f"""
+## 2. ★API 리버스 프록시 (이 단계를 빼면 화면만 뜨고 아무것도 안 됩니다)
+
+이 빌드는 **같은 오리진 방식**입니다. 브라우저는 `/v1/...` 을 이 IIS 로만 부르고,
+IIS 가 뒤에서 `{proxy_target}` 로 넘깁니다. 그래서 CORS 설정이 필요 없고,
+HTTPS(443)로 서비스해도 혼합 콘텐츠 차단이 발생하지 않습니다.
+
+### 2-1. 모듈 설치 (서버에 한 번만)
+
+1. **URL Rewrite** 설치
+2. **ARR(Application Request Routing)** 설치
+   - 둘 다 Microsoft 웹 플랫폼 설치 관리자 또는 개별 MSI 로 설치합니다.
+   - 폐쇄망이면 MSI 를 미리 받아 반입해야 합니다.
+
+### 2-2. ARR 프록시 켜기 (필수 — 이걸 안 하면 리라이트 규칙이 무시됩니다)
+
+IIS 관리자 → **서버 노드** 선택 → `Application Request Routing Cache` →
+우측 `Server Proxy Settings`
+
+| 항목 | 값 | 이유 |
+|---|---|---|
+| Enable proxy | **체크** | 이게 꺼져 있으면 규칙이 동작하지 않습니다 |
+| Response buffer threshold | **0** | ★스트리밍 응답(`/v1/chat/stream`)이 끝까지 안 나옵니다 |
+| Time-out (seconds) | **600** 이상 | 긴 답변 생성이 30초 기본값에서 끊깁니다 |
+
+`Response buffer threshold` 를 0 으로 두지 않으면 **답변이 다 끝난 뒤에야 한꺼번에**
+나타납니다. 타자기처럼 흐르지 않으면 이 값을 먼저 의심하십시오.
+
+### 2-3. 확인
+
+    curl -k https://<이 서버 주소>/health
+
+`{{"status":"ok"...}}` 가 나오면 프록시가 동작하는 것입니다. 404 면 리라이트 규칙이
+안 걸린 것이고, 502 면 IIS 가 API 서버에 못 닿는 것입니다.
+"""
+    cors_note = """
+## 2. ★API 서버에 CORS 허용 (이 단계를 빼면 화면만 뜨고 아무것도 안 됩니다)
+
+프런트와 API 가 서로 다른 주소이므로, API 서버가 이 프런트 주소를 허용해야 합니다.
+API 서버(nexus-web 컨테이너)에 환경변수를 주입하고 재시작합니다.
+
+    NEXUS_EXTRA_CORS_ORIGINS=http://<이 프런트의 주소>
+
+예: `NEXUS_EXTRA_CORS_ORIGINS=http://192.168.10.215`
+쉼표로 여러 개를 넣을 수 있습니다. **사설망(LAN) 주소만 허용되고 공인 주소는 무시됩니다.**
+
 """
 
 
-def _readme(api_base: str) -> str:
-    """배포 담당자가 폴더만 받아도 끝까지 갈 수 있게, 산출물에 함께 넣는 안내문."""
+    # f-string 안의 긴 조건식은 줄 길이 규칙을 지킬 수 없어 변수로 뺀다(출력 동일).
+    api_note = (
+        'API 는 이 서버가 대신 중계합니다(리버스 프록시).'
+        if proxy_target else 'API 는 브라우저가 직접 아래 주소로 호출합니다.'
+    )
+    trouble_note = (
+        '- 화면은 뜨는데 응답이 없음 → ARR 프록시 미설정(2번) 또는 Enable proxy 꺼짐'
+        if proxy_target else '- `Access-Control-Allow-Origin` 관련 오류 → 2번 CORS 미설정'
+    )
     return f"""# IDINO NOVA 프런트 — IIS 배포 안내
 
 이 폴더는 **정적 파일만** 들어 있습니다. 서버 런타임(.NET/Node)이 필요 없습니다.
-API 는 브라우저가 직접 아래 주소로 호출합니다.
+{api_note}
 
-    API 주소: {api_base}
+    API 주소: {proxy_target or api_base}
 
 ## 1. IIS 설정
 
@@ -162,21 +265,12 @@ API 는 브라우저가 직접 아래 주소로 호출합니다.
 
 > 하위 경로(`/nova/`)에 올려도 동작합니다 — 자산 경로가 전부 상대경로입니다.
 
-## 2. ★API 서버에 CORS 허용 (이 단계를 빼면 화면만 뜨고 아무것도 안 됩니다)
-
-프런트와 API 가 서로 다른 주소이므로, API 서버가 이 프런트 주소를 허용해야 합니다.
-API 서버(nexus-web 컨테이너)에 환경변수를 주입하고 재시작합니다.
-
-    NEXUS_EXTRA_CORS_ORIGINS=http://<이 프런트의 주소>
-
-예: `NEXUS_EXTRA_CORS_ORIGINS=http://192.168.10.215`
-쉼표로 여러 개를 넣을 수 있습니다. **사설망(LAN) 주소만 허용되고 공인 주소는 무시됩니다.**
-
+{proxy_note if proxy_target else cors_note}
 ## 3. 확인
 
 브라우저로 열고 `F12 → Console` 에 다음이 없으면 정상입니다.
 
-- `Access-Control-Allow-Origin` 관련 오류 → 2번 CORS 미설정
+{trouble_note}
 - `net::ERR_CONNECTION` → 프런트 서버에서 API 주소로 통신이 안 됨(방화벽/라우팅)
 - 폰트/아이콘 404 → `web.config` 의 MIME 설정이 적용되지 않음
 
@@ -210,7 +304,7 @@ def _to_relative_paths(html: str) -> str:
     return re.sub(r"([\"'`])/static/", r"\1static/", html)
 
 
-def build(api_base: str, api_key: str, out_dir: Path) -> dict:
+def build(api_base: str, api_key: str, out_dir: Path, proxy_target: str = "") -> dict:
     if out_dir.exists():
         shutil.rmtree(out_dir)
     out_static = out_dir / "static"
@@ -247,10 +341,14 @@ def build(api_base: str, api_key: str, out_dir: Path) -> dict:
 
     # ③ 설정·IIS 파일 생성
     (out_static / "config.js").write_text(
-        _config_js(api_base, api_key), encoding="utf-8", newline="\n"
+        # 프록시 모드에서는 apiBase 를 비운다. 그래야 fetch 래퍼가 상대경로를
+        # 그대로 두어 브라우저가 같은 오리진(IIS)만 부르고, IIS 가 뒤에서 넘긴다.
+        _config_js("" if proxy_target else api_base, api_key), encoding="utf-8", newline="\n"
     )
-    (out_dir / "web.config").write_text(_web_config(), encoding="utf-8", newline="\n")
-    (out_dir / "README-배포.md").write_text(_readme(api_base), encoding="utf-8", newline="\n")
+    (out_dir / "web.config").write_text(_web_config(proxy_target), encoding="utf-8", newline="\n")
+    (out_dir / "README-배포.md").write_text(
+        _readme(api_base, proxy_target), encoding="utf-8", newline="\n"
+    )
 
     # 남은 절대경로가 있으면 배포 후에야 404 로 드러난다 — 여기서 잡는다.
     leftovers = sorted(set(re.findall(r'["\']/(?:static)/[\w./-]+', html)))
@@ -279,6 +377,15 @@ def main() -> int:
         help="테넌트 API 키. ★브라우저로 내려가는 값이다.",
     )
     ap.add_argument("--out", default=str(DEFAULT_OUT), help="출력 폴더")
+    ap.add_argument(
+        "--proxy-to",
+        default="",
+        help=(
+            "IIS 리버스 프록시 대상(예: http://192.168.21.112:8600). 주면 web.config 에 "
+            "/v1/*·/health 리라이트 규칙이 들어가고 apiBase 는 빈 값(같은 오리진)이 된다. "
+            "HTTPS 로 서비스할 때는 이 방식을 써야 한다 — 혼합 콘텐츠 차단을 피할 수 없다."
+        ),
+    )
     args = ap.parse_args()
 
     api_base = args.api_base.rstrip("/")
@@ -286,7 +393,8 @@ def main() -> int:
         print("[오류] --api-base 는 http:// 또는 https:// 로 시작해야 합니다.")
         return 1
 
-    r = build(api_base, args.api_key, Path(args.out))
+    proxy_target = args.proxy_to.rstrip('/')
+    r = build(api_base, args.api_key, Path(args.out), proxy_target)
 
     print("=" * 66)
     print("NOVA 프런트 분리 배포 빌드 완료")
@@ -306,9 +414,14 @@ def main() -> int:
     print("\n다음 단계")
     print("  1) 폴더를 IIS 서버로 복사하고 사이트/앱의 실제 경로로 지정")
     print("  2) 응용 프로그램 풀: '관리되는 코드 없음'(정적 전용)")
-    print("  3) ★API 서버(112)에 CORS 오리진 주입 후 재시작:")
-    print("        NEXUS_EXTRA_CORS_ORIGINS=http://<IIS 주소>")
-    print("  4) 브라우저에서 열고 F12 콘솔에 CORS 오류가 없는지 확인")
+    if proxy_target:
+        print("  3) ★IIS 서버에 URL Rewrite + ARR 설치 후 서버 프록시 켜기")
+        print("     (Response buffer threshold=0, Time-out=600 — README 2-2 참고)")
+    else:
+        print("  3) ★API 서버(112)에 CORS 오리진 주입 후 재시작:")
+        print("        NEXUS_EXTRA_CORS_ORIGINS=http://<IIS 주소>")
+    print("  4) 브라우저에서 열고 F12 콘솔 확인 — "
+          + ("응답이 없으면 ARR 프록시 설정" if proxy_target else "CORS 오류 유무"))
     print("\n주의 — config.js 의 apiKey 는 브라우저로 내려갑니다"
           "(페이지를 여는 사람은 모두 볼 수 있음).")
     return 0
