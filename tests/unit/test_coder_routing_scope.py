@@ -120,12 +120,19 @@ def test_every_config_ships_the_patterns(path: str) -> None:
     assert len(raw.get("coder_regex_patterns") or []) == 3, f"{path}: 패턴 누락"
 
 
-def test_server_config_keeps_coder_off() -> None:
-    """112(서버)는 아직 켜지 않는다 — 배포된 컨테이너에 404 수정이 안 올라갔다."""
-    raw = yaml.safe_load(open("config/nexus_config.112.yaml", encoding="utf-8"))["routing"]
-    assert raw.get("coder_enabled", False) is False, (
-        "서버 설정을 켜기 전에 nexus-web 컨테이너에 코더 모델명 수정을 배포해야 한다"
-    )
+@pytest.mark.parametrize("path", CONFIGS)
+def test_every_surface_has_coder_enabled(path: str) -> None:
+    """세 표면 모두 코딩 라우팅이 켜져 있다(2026-08-21 서버까지 활성).
+
+    ★계약 변경 기록: 08-20 에는 "112 는 꺼져 있어야 한다"였다. 배포된 컨테이너에
+    코더 모델명 수정(404)이 없었기 때문이다. 배포·검증을 마치고 켰다 —
+    VSCode 플러그인 find/replace 실측에서 앵커 75~83% / 코딩 모델 100%,
+    속도 4~23초 → 2초. 켠 상태로 표면 e2e 34/34 통과.
+
+    되돌리려면 이 테스트부터 바꿔야 한다 — 조용히 꺼지는 것을 막기 위함이다.
+    """
+    raw = yaml.safe_load(open(path, encoding="utf-8"))["routing"]
+    assert raw.get("coder_enabled", False) is True, f"{path}: 코딩 라우팅이 꺼져 있다"
 
 
 def test_broken_regex_does_not_break_routing() -> None:
