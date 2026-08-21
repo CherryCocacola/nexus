@@ -1151,6 +1151,12 @@ def _build_web_engine_parts(components: dict, state: Any) -> dict:
     return {
         "tier": components["hardware_tier"],
         "worker_provider": components["model_provider"],
+        # 코딩 전용 프로바이더 — 라우팅이 coder 로 판정해도 이 값이 없으면
+        # QueryEngine 이 전환할 대상이 없어 **항상 앵커로 간다**(2026-08-20 실측:
+        # 판정은 coder=True 인데 전환 로그 0회). bootstrap 이 만들어 두는 것을
+        # 그대로 넘긴다. gpu_server.coder_url 이 비어 있으면 None(무회귀).
+        "coder_provider": components.get("coder_provider"),
+
         "scout_provider": components.get("scout_provider"),
         "web_tools": web_tools,
         "scout_tools": scout_tools,
@@ -1296,6 +1302,9 @@ def _assemble_session_engine(
         system_prompt=parts["system_prompt"],
         max_turns=200,
         routing_config=parts["routing_config"],
+        # 신규 키라 .get() 으로 읽는다 — parts 를 직접 만들어 넘기는 기존
+        # 호출부(통합 테스트 등)를 깨뜨리지 않기 위해서다(무회귀).
+        coder_provider=parts.get("coder_provider"),
         # 컨텍스트 예산(하드코딩 외부화, 2026-07-03) — RAG 주입 예산 + 출력
         # 토큰 에스컬레이션. 실 config는 항상 존재, 없으면 None → 현행 상수 폴백.
         context_budgets=parts["budgets"],

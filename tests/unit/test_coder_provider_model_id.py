@@ -24,7 +24,6 @@ from core.config import RoutingConfig
 from core.message import StreamEvent, StreamEventType
 from core.orchestrator.query_engine import QueryEngine
 from core.tools.base import ToolUseContext
-
 from tests.conftest import EnhancedMockModelProvider, MockResponse
 
 # 코딩 질의로 분류되게 하는 키워드(설정 기본값에 포함된 단어).
@@ -111,3 +110,26 @@ def test_both_paths_use_the_same_override_variable() -> None:
     source = Path("core/orchestrator/query_engine.py").read_text(encoding="utf-8")
     assert source.count("model_override=active_model_override,") == 2
     assert "model_override=decision.model_override," not in source
+
+def test_web_wires_coder_provider_into_engine() -> None:
+    """웹도 코딩 프로바이더를 엔진에 넘겨야 한다.
+
+    실측 배경(2026-08-20): 라우팅 판정은 `coder=True` 로 정상이었는데 전환 로그가
+    0회였다. 웹이 QueryEngine 을 자체 조립하면서 `coder_provider` 를 빼먹어
+    전환할 대상이 없었기 때문이다(`decision.use_coder and self._coder_provider is
+    not None` 의 뒤쪽이 항상 False). 판정만 보는 테스트로는 이 상태를 못 잡는다.
+
+    같은 유형(웹 자체 조립 시 키 누락)이 하루에 세 번 나왔다 —
+    권한 파이프라인·세션 소유자·코딩 프로바이더. 그래서 배선을 직접 고정한다.
+    """
+    import inspect
+
+    from web import app as web_app
+
+    src = inspect.getsource(web_app)
+    assert '"coder_provider": components.get("coder_provider")' in src, (
+        "웹 parts 에 코딩 프로바이더가 없다"
+    )
+    assert 'coder_provider=parts.get("coder_provider")' in src, (
+        "QueryEngine 생성에 코딩 프로바이더를 넘기지 않는다"
+    )
