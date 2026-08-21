@@ -57,6 +57,13 @@ CODING = [
     "이 코드 리팩터링해줘",
     "에러 디버깅 해줘",
     "이 버그를 고쳐줘",
+    # 2026-08-21 보강으로 새로 포착되는 표현들. 이전 패턴은 20종 중 6종만 잡았다.
+    "korean_ratio 함수의 시그니처에 타입 힌트를 붙여줘",
+    "변수명을 더 명확하게 바꿔줘",
+    "이 함수에 주석을 달아줘",
+    "import 문 정리해줘",
+    "app.py 의 라우터 부분을 개선해줘",
+    "이 부분 성능 개선해줘",
 ]
 
 # 앵커가 받아야 하는 요청 — 코딩 모델로 새면 품질이 떨어진다.
@@ -71,6 +78,12 @@ NOT_CODING = [
     # 08-07 실측 계약 — 순수 테스트 작성은 앵커가 받는다.
     "이 함수 테스트 코드 짜줘",
     "write a unit test for this",
+    # 2026-08-21 보강 시 가장 위험했던 표현들(동사를 넓히면 여기가 먼저 샌다).
+    "발표 자료 제목을 바꿔줘",
+    "회의 일정 추가해줘",
+    "이메일 초안 작성해줘",
+    "제안서.docx 요약해줘",
+    "매출 데이터 분석해줘",
 ]
 
 
@@ -115,9 +128,16 @@ def test_disabled_switch_blocks_everything() -> None:
 
 @pytest.mark.parametrize("path", CONFIGS)
 def test_every_config_ships_the_patterns(path: str) -> None:
-    """설정 3본이 같은 패턴을 갖는다 — 한 본만 고치는 드리프트를 막는다."""
+    """설정 3본이 **같은** 패턴을 갖는다 — 한 본만 고치는 드리프트를 막는다.
+
+    개수를 박아 두지 않는다(2026-08-21 3개→5개로 보강했다). 대신 세 본이
+    서로 같은지를 본다 — 실제 사고는 "한 본만 고쳤다"에서 났다.
+    """
     raw = yaml.safe_load(open(path, encoding="utf-8"))["routing"]
-    assert len(raw.get("coder_regex_patterns") or []) == 3, f"{path}: 패턴 누락"
+    patterns = raw.get("coder_regex_patterns") or []
+    assert patterns, f"{path}: 패턴이 비었다"
+    reference = yaml.safe_load(open(CONFIGS[0], encoding="utf-8"))["routing"]
+    assert patterns == reference["coder_regex_patterns"], f"{path}: 다른 본과 어긋난다"
 
 
 @pytest.mark.parametrize("path", CONFIGS)
