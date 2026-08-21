@@ -79,6 +79,10 @@ config/ssl/
 nova.bat
 nova-resume.ps1
 nova-resume.bat
+# 런처가 TYPE 으로 출력하는 한글 안내문 — 런처와 짝이라 같이 제외한다.
+#   (배치에서 chcp 로 코드페이지를 바꾸면 cmd 파서가 깨져 한글을 직접 못 넣는다.
+#    그래서 별도 txt 로 뺀 것이고, 런처가 커밋 대상이 아니므로 이것도 아니다.)
+nova-help-*.txt
 
 # SSH 개인키 — 절대 커밋 금지(유출 방지)
 user_mig/nova_key
