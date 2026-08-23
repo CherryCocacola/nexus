@@ -233,3 +233,50 @@ def test_verify_rule_absent_without_state_changing_tools():
     """읽기 전용 풀이면 행동 후 검증 규칙이 불필요하다."""
     p = _build_default_system_prompt(tier=HardwareTier.TIER_L, tool_names={"Read", "LS"})
     assert "verify the outcome before claiming success" not in p
+
+
+class TestWorkflowSections:
+    """작업 진행 방식 지침(2026-08-23) — Claude Code 의 일하는 리듬을 이식한 부분.
+
+    도구를 쥐어 주는 것과 "도구를 쓰는 방식"을 정해 주는 것은 다르다. 아래 세 절이
+    각각 실측된 증상 하나씩에 대응하므로, 조용히 빠지면 그 증상이 그대로 돌아온다.
+    """
+
+    def _prompt(self) -> str:
+        # TIER_M/L 경로(= 현행 배포). tier 를 넘겨야 확장 프롬프트로 분기한다.
+        return _build_default_system_prompt(
+            tier=HardwareTier.TIER_L,
+            tool_names={"Read", "Write", "Edit", "Bash", "Glob", "Grep", "TodoWrite"},
+        )
+
+    def test_narrate_before_acting_is_instructed(self) -> None:
+        """연속 도구 호출 중 침묵하면 사용자가 '멈췄다'고 판단해 취소한다(실측)."""
+        prompt = self._prompt()
+        assert "## Narrate before you act" in prompt
+        # 한 문장으로 제한하는 부분이 핵심 — 없으면 계획 문단을 늘어놓는다.
+        assert "ONE short sentence" in prompt
+
+    def test_batching_independent_calls_is_instructed(self) -> None:
+        """서로 무관한 파일 3개를 읽는 데 턴 3번을 쓰면 체감 지연이 3배가 된다."""
+        prompt = self._prompt()
+        assert "## Batch independent tool calls" in prompt
+        assert "TOGETHER in one turn" in prompt
+
+    def test_answer_shape_forbids_restating_the_work(self) -> None:
+        """코드를 고친 뒤 방금 쓴 코드를 다시 설명하면 답변만 길어진다."""
+        prompt = self._prompt()
+        assert "## Answer shape" in prompt
+        assert "re-explain the code you just wrote" in prompt
+
+    def test_file_line_citation_format_is_taught(self) -> None:
+        """`path:line` 형식이라야 사용자가 바로 그 자리로 갈 수 있다."""
+        assert "path/to/file.py:123" in self._prompt()
+
+    def test_tier_s_prompt_does_not_get_workflow_sections(self) -> None:
+        """TIER_S 는 도구 풀·서사가 완전히 달라 같은 지침을 쓰면 어긋난다.
+
+        (TIER_S 는 현행 배포에서 비활성이지만, 프롬프트↔도구 풀 불일치를 만드는
+        변경을 막기 위해 경계를 고정해 둔다.)
+        """
+        prompt = _build_default_system_prompt(tier=HardwareTier.TIER_S)
+        assert "## Batch independent tool calls" not in prompt

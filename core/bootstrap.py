@@ -1455,6 +1455,42 @@ _PROMPT_COMMON_SECTIONS = (
 )
 
 
+# ─────────────────────────────────────────────
+# 작업 진행 방식 (2026-08-23) — Claude Code 의 일하는 방식을 CLI 에 이식
+# ─────────────────────────────────────────────
+# 왜 필요한가:
+#   도구를 쥐어 주는 것과 "도구를 쓰는 방식"을 정해 주는 것은 다르다. 기존 프롬프트는
+#   무엇을 할 수 있는지(도구 목록)와 무엇을 하면 안 되는지(hard rules)는 촘촘한데,
+#   **어떤 리듬으로 일하는지**가 비어 있었다. 그 공백에서 실측된 증상 세 가지:
+#     ① 도구를 여러 번 연속 호출하는 동안 화면에 아무 글자도 안 나와 사용자가
+#        멈춘 줄 알고 Ctrl+C 를 눌렀다.
+#     ② 서로 무관한 파일 3개를 읽는데 턴을 3번 썼다(= 왕복 3회, 체감 지연 3배).
+#     ③ 코드를 고친 뒤 방금 쓴 코드를 다시 처음부터 설명해 답변이 길어졌다.
+#   아래 세 절이 각각에 대응한다. 규칙을 늘리면 다른 지시가 묽어지므로, 이 등급
+#   모델이 실제로 지킬 수 있는 만큼만 짧게 쓴다.
+_PROMPT_WORKFLOW_SECTIONS = (
+    "## Narrate before you act\n"
+    "Before a tool call — or a batch of them — write ONE short sentence saying what "
+    "you are about to do. Then call the tool. The user is watching a terminal: a "
+    "long run of silent tool calls is indistinguishable from a hang.\n"
+    'Keep it to one sentence ("설정 파일부터 확인합니다."). Do NOT write a plan '
+    "paragraph, and do NOT narrate at all when you are answering with no tools.\n\n"
+    "## Batch independent tool calls\n"
+    "When several tool calls do NOT depend on each other's results, issue them "
+    "TOGETHER in one turn instead of one per turn. Reading three unrelated files, or "
+    "grepping two different patterns, is ONE batch. Only go one-at-a-time when a "
+    "call genuinely needs the previous result.\n\n"
+    "## Answer shape\n"
+    "- Lead with the answer. Do not restate the question, and do not close with a "
+    '"결론적으로…" paragraph that repeats what you just said.\n'
+    "- After changing code, state what changed and where — then stop. Do NOT "
+    "re-explain the code you just wrote unless the user asks.\n"
+    "- Point at code as `path/to/file.py:123` so the user can jump straight to it.\n"
+    "- Keep the closing summary shorter than the work. Three files changed → about "
+    "three lines.\n\n"
+)
+
+
 def _build_expanded_system_prompt(tool_names: set[str] | None = None) -> str:
     """CLI Worker용 TIER_M/L 시스템 프롬프트 — 직접 탐색(Scout 위임 없음).
 
@@ -1682,6 +1718,7 @@ def _build_expanded_system_prompt(tool_names: set[str] | None = None) -> str:
         + tool_list
         + "\n"
         + delegation_note
+        + _PROMPT_WORKFLOW_SECTIONS
         + explore_note
         + compute_note
         + plan_note
