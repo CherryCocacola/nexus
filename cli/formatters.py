@@ -5,7 +5,7 @@
 Nexus는 모델의 응답을 한 번에 완성해서 주는 게 아니라, 4-Tier AsyncGenerator
 체인을 통해 잘게 쪼갠 조각(StreamEvent)을 실시간으로 흘려보낸다.
 이 파일은 그 체인의 "가장 바깥(최종 출력) 단계"에서 StreamEvent 하나하나를 받아,
-사람이 터미널에서 보기 좋은 형태(Rich의 Panel / Markdown / Text / 색이 입혀진 문자열)로
+사람이 터미널에서 보기 좋은 형태(Rich의 Panel / Text / 색이 입혀진 문자열)로
 바꿔주는 번역기 역할을 한다. 즉, "내부 데이터 → 화면에 보일 모양"을 담당한다.
 
 [주요 구성]
@@ -13,14 +13,14 @@ Nexus는 모델의 응답을 한 번에 완성해서 주는 게 아니라, 4-Tie
   - format_text_delta : 모델이 흘려보내는 텍스트 조각 처리(+ Qwen thinking 필터링)
   - format_tool_use   : 도구 호출(이름 + 입력 인자)을 JSON 패널로 표시
   - format_tool_result: 도구 실행 결과를 성공/에러 색상 패널로 표시
-  - format_thinking   : 모델의 사고(thinking) 과정을 패널로 표시(디버그용)
+  - format_thinking   : 모델의 사고(thinking) 과정을 흐린 인라인 블록으로 표시(디버그용)
   - format_error      : 시스템/네트워크/권한 에러 메시지를 패널로 표시
   - format_usage      : 토큰 사용량을 REPL 하단용 한 줄 문자열로 표시
   - format_event      : StreamEvent 타입을 보고 위 메서드 중 알맞은 것으로 라우팅하는 진입점
 
 [의존성 방향] cli/ → core/ (단방향). 이 파일은 core.message의 StreamEvent 등
 데이터 타입을 "읽기만" 하며, core 쪽이 cli를 거꾸로 import 하지 않는다.
-화면 렌더링은 외부 라이브러리 Rich(rich.panel/markdown/syntax/text)에 의존한다.
+화면 렌더링은 외부 라이브러리 Rich(rich.panel/syntax/text)에 의존한다.
 
 [호출 관계] CLI REPL(예: cli/repl.py)이 query_loop에서 yield된 StreamEvent를
 받아 이 OutputFormatter.format_event()에 넘기고, 반환된 Rich 객체를 콘솔에 출력한다.
@@ -33,7 +33,6 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.text import Text
@@ -50,7 +49,7 @@ class OutputFormatter:
     StreamEvent(스트리밍 이벤트)를 Rich 렌더러블 객체로 변환하는 포매터.
 
     [역할] query_loop 등 4-Tier 체인에서 yield된 StreamEvent를 하나씩 받아서,
-    터미널에 그대로 출력할 수 있는 Rich 객체(Panel, Markdown, Text)나
+    터미널에 그대로 출력할 수 있는 Rich 객체(Panel, Text)나
     색상 마크업이 포함된 문자열로 바꿔준다.
 
     [왜 필요한가] "무슨 데이터인가(core 계층의 StreamEvent)"와
@@ -243,10 +242,18 @@ class OutputFormatter:
                 expand=False,
             )
 
-        # 축약 모드(C1): 결과를 `⎿ 요약` 한 줄로 접는다. 첫 비어있지 않은 줄과
+        # 축약 모드(C1): 결과를 `⎿  요약` 한 줄로 접는다. 첫 비어있지 않은 줄과
         # 전체 줄 수만 보여 주고, 전문이 필요하면 `/verbose`로 켠다.
+        #
+        # 정렬(2026-08-23): `⏺ Tool(...)` 아래에 `  ⎿  결과` 가 오도록 앞 2칸 +
+        # 마커 뒤 2칸으로 고정한다. Claude Code 와 같은 들여쓰기라, 도구 호출 한 건이
+        # 시각적으로 하나의 덩어리로 묶여 보인다.
+        #
+        # 색(2026-08-23): 성공 결과를 초록에서 중립 dim 으로 낮췄다. 성공은 기본값이라
+        # 색으로 강조할 이유가 없고, 도구를 많이 쓰는 턴에서 초록 줄이 답변보다 눈에
+        # 띄는 역전이 일어났다. 에러(빨강)만 색으로 튀게 남긴다.
         if not self._verbose:
-            return Text(f"  ⎿ {summarize_tool_output(content)}", style="dim green")
+            return Text(f"  ⎿  {summarize_tool_output(content)}", style="dim")
 
         # 정상 결과: 결과가 길면 잘라서 보여준다(터미널이 도배되는 것을 방지).
         # 화면에 남길 최대 줄 수. 이보다 길면 뒷부분을 잘라내고 생략 안내를 붙인다.
@@ -315,26 +322,32 @@ class OutputFormatter:
 
     # ─── 사고(Thinking) ───
 
-    def format_thinking(self, text: str) -> Panel:
+    def format_thinking(self, text: str) -> Text:
         """
-        모델의 사고(thinking) 과정을 Rich Panel로 만들어 반환한다.
+        모델의 사고(thinking) 과정을 흐린 이탤릭 인라인 블록으로 만든다.
 
-        [주의] show_thinking이 False일 때는 이 메서드가 빈 Panel을 만들어 반환하는 게
-        아니라, 애초에 이 메서드를 "호출하지 않는" 것이 규칙이다. 즉 표시 여부 판단은
+        [2026-08-23 변경] 예전에는 노란 테두리 Panel 이었다. 사고 블록은 본문보다
+        **덜** 중요한데 테두리 박스가 화면에서 가장 강한 요소라 시선을 뺏었고, 사고가
+        길면 박스가 화면을 가득 채워 정작 답변이 밀렸다. Claude Code 처럼 `✻` 마크 +
+        흐린 이탤릭으로 낮춰, "곁다리 정보"라는 위계가 눈에 바로 보이게 한다.
+
+        [주의] show_thinking이 False일 때는 이 메서드가 빈 값을 반환하는 게 아니라,
+        애초에 이 메서드를 "호출하지 않는" 것이 규칙이다. 즉 표시 여부 판단은
         호출자(아래 format_event) 책임이며, 이 메서드는 표시가 확정된 경우에만 불린다.
 
         Args:
-            text: 모델의 사고 과정 텍스트(Markdown으로 렌더링됨).
+            text: 모델의 사고 과정 텍스트.
 
         Returns:
-            노란색 테두리의 Rich Panel.
+            `✻ Thinking…` 머리말이 붙은 흐린 이탤릭 Text.
         """
-        return Panel(
-            Markdown(text),
-            title="[bold yellow]Thinking[/bold yellow]",
-            border_style="yellow",
-            expand=False,
-        )
+        block = Text()
+        block.append("✻ Thinking… ", style="magenta")
+        # 사고 본문은 마크다운으로 렌더하지 않는다 — 조각(delta)으로 들어와서
+        # 블록 문법이 잘린 채 도착하는 경우가 많고, 그때 Markdown 렌더는 깨진
+        # 표·코드펜스를 만든다. 원문 그대로 흐리게 흘리는 편이 정확하다.
+        block.append(text.strip(), style="dim italic")
+        return block
 
     # ─── 에러 ───
 

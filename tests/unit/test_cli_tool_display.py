@@ -16,7 +16,7 @@ import io
 from rich.console import Console
 
 from cli.formatters import OutputFormatter, summarize_tool_input, summarize_tool_output
-from cli.repl import SlashCommandCompleter
+from cli.repl import NovaCompleter
 
 
 def _render(renderable) -> str:
@@ -110,7 +110,7 @@ class TestSlashCompleter:
     def _complete(self, text: str, commands: list[str]) -> list[str]:
         from prompt_toolkit.document import Document
 
-        completer = SlashCommandCompleter(lambda: commands)
+        completer = NovaCompleter(lambda: commands)
         return [c.text for c in completer.get_completions(Document(text, len(text)), None)]
 
     def test_suggests_matching_commands(self) -> None:
@@ -129,7 +129,7 @@ class TestSlashCompleter:
     def test_command_list_is_dynamic(self) -> None:
         """명령 목록을 콜러블로 받아, 나중에 추가된 명령도 자동으로 제안된다."""
         commands = ["/help"]
-        completer = SlashCommandCompleter(lambda: commands)
+        completer = NovaCompleter(lambda: commands)
         commands.append("/verbose")
         from prompt_toolkit.document import Document
 

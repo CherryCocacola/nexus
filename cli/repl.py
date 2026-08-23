@@ -19,7 +19,6 @@ StreamEvent를 사람이 보기 좋게 터미널에 그려주는 표현(presenta
                              spinner(진행 표시)와 함께 스트리밍 출력
       · display_stream_event() : StreamEvent 한 개를 실제로 화면에 그림
       · _cmd_* 핸들러들    : /help, /model 등 슬래시 명령어 처리
-  - _IDINO_MARK          : 배너 좌측에 그려지는 IDINO 픽셀 로고 문자열
   - main()               : pyproject.toml의 `nexus` 콘솔 스크립트 진입점
 
 ── 의존성 방향 ──
@@ -39,7 +38,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
+import time
 from typing import Any
 
 from prompt_toolkit import PromptSession
@@ -62,12 +63,51 @@ from core.message import StreamEvent, StreamEventType
 logger = logging.getLogger("nexus.cli.repl")
 
 
-class SlashCommandCompleter(Completer):
-    """`/`로 시작하는 입력에 슬래시 명령을 제안하는 자동완성기 (D9).
+# ─── 슬래시 명령 설명표 (자동완성·/help 공용 출처) ───
+# 왜 모듈 상수인가: 예전에는 이 목록이 _cmd_help() 안에만 있었고 자동완성기는
+# 명령 "이름"만 알았다. 그 결과 목록이 두 벌이 되거나(드리프트) 자동완성이 무슨
+# 명령인지 설명하지 못했다. 한 곳에서 정의해 양쪽이 같은 값을 쓰게 한다.
+_COMMAND_HELP: dict[str, str] = {
+    "/help": "이 도움말을 표시한다",
+    "/clear": "화면을 지운다",
+    "/exit": "세션을 종료한다",
+    "/model": "현재 라우팅 모델을 표시한다",
+    "/mode": "권한 모드 확인·변경 (Shift+Tab으로 순환)",
+    "/config": "현재 설정을 표시한다",
+    "/session": "세션 정보를 표시한다",
+    "/thinking": "thinking 표시를 토글한다",
+    "/verbose": "도구 표시를 축약↔전문으로 토글한다",
+    "/markdown": "답변을 마크다운 렌더↔원문으로 토글한다",
+    "/cost": "세션 누적 토큰 사용량을 보여준다",
+    "/save": "대화를 Markdown 파일로 저장한다",
+    "/diff": "작업 트리의 git 변경사항을 보여준다",
+    "/copy": "마지막 응답을 클립보드로 복사한다",
+    "/compact": "대화 맥락을 강제로 압축한다",
+    "/resume": "이전 세션 목록을 보고 이어받는다",
+}
 
-    명령 목록을 인자로 "고정"하지 않고 콜러블로 받는 이유: REPL이 명령을
-    추가·제거해도 완성 목록이 자동으로 따라오게 하기 위함이다(손으로 두 벌
-    관리하면 반드시 어긋난다).
+# `@` 파일 경로 자동완성 한 번에 보여 줄 최대 항목 수.
+# 노드 수천 개짜리 디렉터리에서 목록이 폭주해 화면을 덮는 것을 막는다.
+_PATH_COMPLETION_LIMIT = 40
+
+
+class NovaCompleter(Completer):
+    """입력줄 자동완성기 — `/` 슬래시 명령과 `@` 파일 경로를 함께 제안한다.
+
+    ── 왜 두 가지를 한 클래스에 두는가 ──
+    prompt_toolkit 은 세션당 completer 하나만 받는다. 접두 문자로 분기하는 편이
+    merge_completers 로 두 개를 합치는 것보다 규칙이 한눈에 보인다.
+
+    ── `@` 경로 완성이 필요한 이유 ──
+    이 시스템의 주모델(A.X-4.0)은 **긴 리터럴 재현이 약해 파일 경로를 자주 틀린다**
+    (실측). 사용자가 프롬프트에 경로를 직접 적어 줄 때 오타가 나면 모델은 그 오타를
+    그대로 물고 Read 를 실패시킨다. 경로를 손으로 치지 않게 하는 것만으로 그 경로가
+    사라진다. 즉 이건 편의 기능이 아니라 정확도 장치다.
+    주의: `@경로` 는 파일 내용을 자동으로 끼워 넣지 않는다. 정확한 경로 문자열을
+    입력해 줄 뿐이고, 실제 읽기는 모델이 Read 도구로 한다.
+
+    명령 목록을 콜러블로 받는 이유: REPL 이 명령을 추가·제거해도 완성 목록이
+    자동으로 따라오게 하기 위함이다(손으로 두 벌 관리하면 반드시 어긋난다).
     """
 
     def __init__(self, list_commands: Any) -> None:
@@ -75,35 +115,191 @@ class SlashCommandCompleter(Completer):
 
     def get_completions(self, document: Any, complete_event: Any) -> Any:
         text = document.text_before_cursor
-        # 첫 토큰이 슬래시로 시작할 때만 제안한다(일반 대화 입력을 방해하지 않도록).
-        if not text.startswith("/") or " " in text:
+
+        # ① 슬래시 명령 — 첫 토큰이 `/` 로 시작하고 아직 인자를 치기 전일 때만.
+        #    (인자 입력 중에 명령 목록이 튀어나오면 방해가 된다)
+        if text.startswith("/") and " " not in text:
+            for command in self._list_commands():
+                if command.startswith(text):
+                    yield Completion(
+                        command,
+                        start_position=-len(text),
+                        display=command,
+                        # display_meta = 목록 오른쪽에 흐리게 붙는 설명.
+                        display_meta=_COMMAND_HELP.get(command, ""),
+                    )
             return
-        for command in self._list_commands():
-            if command.startswith(text):
-                yield Completion(command, start_position=-len(text))
+
+        # ② 파일 경로 — 커서 직전 토큰이 `@` 로 시작할 때.
+        token = text.rsplit(" ", 1)[-1]
+        if token.startswith("@"):
+            yield from self._file_completions(token)
+
+    @staticmethod
+    def _file_completions(token: str) -> Any:
+        """`@접두어` 토큰에 맞는 파일·디렉터리 후보를 만든다.
+
+        Args:
+            token: `@` 로 시작하는 현재 토큰 (예: "@core/too").
+
+        Yields:
+            Completion. 디렉터리는 뒤에 `/` 를 붙여 이어서 파고들 수 있게 한다.
+        """
+        prefix = token[1:]  # `@` 를 뗀 실제 경로 조각
+        # 마지막 `/` 를 기준으로 "이미 확정된 디렉터리"와 "지금 치는 조각"을 나눈다.
+        directory, _, partial = prefix.rpartition("/")
+        base = directory or "."
+
+        try:
+            entries = sorted(os.listdir(base))
+        except OSError:
+            # 없는 디렉터리를 치는 중이면 후보가 없는 게 맞다(예외를 올리지 않는다).
+            return
+
+        shown = 0
+        for name in entries:
+            # 숨김 항목은 사용자가 `.` 을 직접 칠 때만 보여 준다(.git 등으로 도배 방지).
+            if name.startswith(".") and not partial.startswith("."):
+                continue
+            # 윈도우 사용자를 고려해 대소문자를 구분하지 않고 매칭한다.
+            if not name.lower().startswith(partial.lower()):
+                continue
+
+            is_dir = os.path.isdir(os.path.join(base, name))
+            full = f"{directory}/{name}" if directory else name
+            suffix = "/" if is_dir else ""
+            yield Completion(
+                full + suffix,
+                start_position=-len(prefix),
+                display=name + suffix,
+                display_meta="디렉터리" if is_dir else "파일",
+            )
+            shown += 1
+            if shown >= _PATH_COMPLETION_LIMIT:
+                return
 
 # ─── 버전 정보 ───
 # 배너와 세션 요약 등에 노출되는 REPL 버전 문자열. 릴리스 시 갱신한다.
 __version__ = "0.1.0"
 
-# ─── IDINO 회사 마크 (블록 ASCII 아트) ───
-# 배너 좌측에 배치되는 IDINO 로고. 사용자 제공 원본 디자인을 정확히 유지한다.
-# 블록(████)은 4칸씩, 블록 사이 공백도 4칸 — 가로 폭 20칸의 정사각 비율.
-# 이 비율을 어기면 'i'/'d' 글자 형태가 깨지므로 변형 금지.
-# (파이썬 여러 줄 문자열이라 줄 끝의 백슬래시 "\"는 불필요한 개행을 제거하기 위한
-#  것 — 문자열 시작/끝에 빈 줄이 들어가지 않도록 맞춰 둔 것이다.)
-_IDINO_MARK = """\
-████    ████
-████    ████
-        ████
-        ████
-████████████████████
-████████████████████
-████    ████    ████
-████    ████    ████
-████████████    ████
-████████████    ████\
-"""
+# ─── 진행 스피너 동사 (2026-08-23) ───
+# 대기 단계에서 8초마다 순환시키는 동사 목록.
+# 왜 여러 개인가: 고정 문구 하나면 "화면이 멈춘 것"과 "오래 걸리는 것"이 구분되지
+# 않는다. 문구가 바뀌면 사람은 즉시 살아있다고 인지한다(Claude Code 와 같은 장치).
+# 순우리말 위주로 골라 브랜드 톤을 맞췄다. 길이는 6자 이내로 통일해 폭이 흔들리지
+# 않게 한다.
+_SPINNER_VERBS: tuple[str, ...] = (
+    "궁리하는 중",
+    "톺아보는 중",
+    "짚어보는 중",
+    "헤아리는 중",
+    "벼리는 중",
+    "매만지는 중",
+    "갈무리하는 중",
+    "여미는 중",
+    "곱씹는 중",
+    "가늠하는 중",
+)
+
+# 대기 단계 동사를 몇 초마다 바꿀지.
+_SPINNER_VERB_PERIOD_SEC = 8
+
+# 턴 종료 요약을 붙이기 시작하는 최소 소요시간(초).
+# 이보다 빨리 끝난 턴은 통계가 정보가 아니라 잡음이다.
+_TURN_FOOTER_MIN_SEC = 2.0
+
+
+def compact_count(n: int) -> str:
+    """큰 수를 스피너 한 줄에 들어가게 줄인다 (1234 → "1.2k", 12345 → "12k").
+
+    왜 필요한가: 스피너 문구는 한 줄이라 폭이 곧 정보량이다. "1,234,567 토큰"은
+    일곱 자리를 먹는데 사람이 그 자리에서 필요한 정보는 "백만 단위"뿐이다.
+
+    Args:
+        n: 표시할 정수(토큰 수 등). 음수는 0으로 취급한다.
+
+    Returns:
+        1000 미만은 그대로, 그 이상은 k/M 접미사를 붙인 짧은 문자열.
+    """
+    n = max(0, int(n))
+    if n < 1000:
+        return str(n)
+    if n < 10_000:
+        # 1.2k — 천 단위에서만 소수 첫째 자리를 남긴다(그 위는 자릿수가 길어진다).
+        return f"{n / 1000:.1f}k"
+    if n < 1_000_000:
+        return f"{n // 1000}k"
+    return f"{n / 1_000_000:.1f}M"
+
+
+def build_spinner_suffix(elapsed_sec: float, produced_tokens: int) -> str:
+    """스피너 뒤에 붙는 꼬리표를 만든다 — `  (12s · ↓1.2k 토큰 · esc 중단)`.
+
+    왜 이 세 가지인가:
+      · 경과초 — "멈춘 것"과 "오래 걸리는 것"을 구분하는 유일한 근거다.
+      · 생성 토큰 — 모델이 실제로 뭔가 뱉고 있음을 보여 준다. 이번 턴 증가분만
+        센다(누적을 보여 주면 매 턴 큰 수가 찍혀 변화가 안 보인다).
+      · 중단 키 — 길어질 때 사용자가 가장 먼저 찾는 정보다.
+
+    Args:
+        elapsed_sec: 턴 시작 후 지난 초.
+        produced_tokens: 이번 턴에 생성된 출력 토큰 수(증가분).
+
+    Returns:
+        Rich 마크업이 포함된 꼬리표 문자열(앞에 공백 두 칸).
+    """
+    parts = [f"{int(elapsed_sec)}s"]
+    # 아직 한 토큰도 안 나왔으면 "0 토큰"을 굳이 보여 주지 않는다(잡음).
+    if produced_tokens > 0:
+        parts.append(f"↓{compact_count(produced_tokens)} 토큰")
+    parts.append("esc 중단")
+    return "  [dim](" + " · ".join(parts) + ")[/dim]"
+
+
+def build_spinner_text(
+    base: str | None,
+    elapsed_sec: float,
+    produced_tokens: int,
+    turn_index: int,
+) -> str:
+    """화면에 그릴 스피너 문구 전체(기준 문구 + 꼬리표)를 만든다.
+
+    기준 문구가 없으면 = 아직 단계 이벤트가 안 온 대기 상태다. 이때는
+    _SPINNER_VERBS 를 시간에 따라 순환시킨다. 시작 동사는 턴 번호로 골라
+    턴마다 다른 동사에서 출발하게 한다(같은 화면 반복 인상을 줄이기 위함).
+
+    Args:
+        base: 현재 단계 라벨(Rich 마크업). None 이면 대기 상태.
+        elapsed_sec: 턴 시작 후 지난 초.
+        produced_tokens: 이번 턴에 생성된 출력 토큰 수.
+        turn_index: 이번이 몇 번째 턴인가(시작 동사 선택용).
+
+    Returns:
+        Rich 마크업 문자열.
+    """
+    if base is None:
+        tick = int(elapsed_sec // _SPINNER_VERB_PERIOD_SEC)
+        base = f"[cyan]{_SPINNER_VERBS[(turn_index + tick) % len(_SPINNER_VERBS)]}[/cyan]"
+    return base + build_spinner_suffix(elapsed_sec, produced_tokens)
+
+
+def build_turn_footer(elapsed_sec: float, produced_tokens: int) -> str | None:
+    """턴 종료 한 줄 요약을 만든다. 찍지 말아야 하면 None 을 돌려준다.
+
+    2초 미만으로 끝난 턴에는 붙이지 않는다 — 짧은 잡담마다 통계가 달리면
+    대화가 지저분해진다. 통계는 "오래 걸린 작업"에서만 정보 가치가 있다.
+
+    Args:
+        elapsed_sec: 턴에 걸린 초.
+        produced_tokens: 이번 턴에 생성된 출력 토큰 수.
+
+    Returns:
+        Rich 마크업 한 줄, 또는 표시하지 않음을 뜻하는 None.
+    """
+    if elapsed_sec < _TURN_FOOTER_MIN_SEC:
+        return None
+    tail = f" · ↓{compact_count(produced_tokens)} 토큰" if produced_tokens > 0 else ""
+    return f"[dim]  {elapsed_sec:.1f}s{tail}[/dim]"
 
 
 class NexusREPL:
@@ -193,6 +389,22 @@ class NexusREPL:
         self._status_ctx: Any = None
         self._status_active: bool = False
 
+        # ── 스피너 라이브 상태 (2026-08-23, Claude Code식 진행 표시) ──
+        # 이전에는 "요청 분석 중..." 고정 문구 하나였다. cold start 로 60초가 걸리면
+        # 화면이 얼어붙은 것과 구분이 안 됐다. 경과시간·생성 토큰을 1초마다 갱신해
+        # "얼마나 기다렸고 얼마나 나왔는지"를 항상 보이게 한다.
+        #   _spinner_base       : 지금 단계 라벨(예: "[yellow]Read 실행 중[/yellow]").
+        #                         None 이면 대기 단계라 동사를 순환시킨다.
+        #   _turn_started_at    : 이번 턴 시작 시각(monotonic — 시스템 시계 변경에 안전).
+        #   _turn_out_base      : 턴 시작 시점의 누적 출력 토큰. 이번 턴 증가분만 보이려는 것.
+        #   _turn_index         : 몇 번째 턴인가. 시작 동사를 턴마다 다르게 고르는 데 쓴다.
+        #   _interrupt_requested: Esc 가 눌렸는가(A4). 스트림 루프가 이 값을 보고 빠져나온다.
+        self._spinner_base: str | None = None
+        self._turn_started_at: float = 0.0
+        self._turn_out_base: int = 0
+        self._turn_index: int = 0
+        self._interrupt_requested: bool = False
+
         # prompt-toolkit 세션 — 방향키로 이전 입력 재호출(히스토리)과
         # 멀티라인 편집을 지원한다. InMemoryHistory라 프로세스 종료 시 사라진다.
         # Shift+Tab으로 권한 모드를 순환한다(A2). 키 콜백이 상태를 직접 바꾸지 않고
@@ -223,7 +435,7 @@ class NexusREPL:
             # Live는 타자기처럼 흘리는 본문 출력과 화면 갱신이 서로 간섭한다.
             bottom_toolbar=self._bottom_toolbar,
             # `/`로 시작하면 슬래시 명령을 제안한다(D9).
-            completer=SlashCommandCompleter(lambda: sorted(self._session_commands)),
+            completer=NovaCompleter(lambda: sorted(self._session_commands)),
             complete_while_typing=True,
             # 위/아래 화살표가 "입력한 접두어로 시작하는 과거 입력"을 찾게 한다.
             # (Ctrl+R 역방향 검색은 prompt_toolkit 기본 emacs 바인딩으로 동작한다.)
@@ -299,7 +511,7 @@ class NexusREPL:
                 # 별도 스레드에서 입력을 기다리게 하고 그 완료를 await한다.
                 user_input = await asyncio.get_event_loop().run_in_executor(
                     None,
-                    lambda: self._prompt_session.prompt("nova> "),
+                    lambda: self._prompt_session.prompt("> "),
                 )
 
                 # 공백만 입력한 경우는 아무 것도 하지 않고 다음 입력을 기다린다.
@@ -485,138 +697,99 @@ class NexusREPL:
     # ─── 배너 표시 ───
 
     def _display_banner(self) -> None:
-        """시작 배너 + 도움말 힌트를 화면에 출력한다 (v0.14.10 IDINO 코퍼레이트).
+        """시작 배너를 출력한다 (Claude Code 스타일 미니멀 박스 + IDINO 브랜드).
 
-        레이아웃:
-          하나의 둥근 패널(Panel) 안에 2열 grid를 넣는다.
-            · 좌측 열: IDINO 픽셀 로고(_IDINO_MARK)
-            · 우측 열: 회사 카드 + 모델 라우팅/인프라/세션 정보
-          패널 아래에 슬래시 커맨드와 단축키 힌트 두 줄을 덧붙인다.
+        레이아웃 (2026-08-23 개편):
+          둥근 패널 한 장에 왼쪽 정렬로 세 덩어리만 담는다.
+            ① 인사줄     — 패널 타이틀 "✻ Welcome to IDINO NOVA"
+            ② 힌트줄     — 가장 자주 쓰는 슬래시 명령 세 개
+            ③ 컨텍스트   — cwd / model / mode 를 라벨-값 2열로
+          그 아래 단축키 한 줄.
 
-        모델 표시 규칙:
-          config.routing.enabled가 True면 CHAT/KNOWLEDGE/TOOL 세 분기 각각에
-          "실제 served-model-name"(예: qwen3.5-27b)을 보여준다. 별칭("primary")만
-          보이면 어떤 모델이 도는지 헷갈리므로, 실모델명을 노출해 모호성을 없앤다.
-          라우팅이 꺼져 있으면 대신 primary/auxiliary 모델을 표시한다.
+        왜 바꿨나:
+          이전 배너는 IDINO 픽셀 로고(20줄)와 모델·인프라·세션 3개 섹션을 2열
+          grid로 펼쳐 세로 20줄을 넘겼다. 터미널을 열자마자 첫 화면이 배너로
+          가득 차 정작 첫 질문이 스크롤 위로 밀렸다. Claude Code 가 시작 화면을
+          5줄 안쪽으로 유지하는 이유가 이것이라, 같은 원칙으로 압축했다.
+          브랜드(이름·코퍼레이트 컬러 rgb(0,71,157)·✻ 마크)는 그대로 유지한다.
 
-        구현 메모:
-          self._state가 None(부트스트랩 실패)일 수 있으므로, 아래 정보 조회는
-          전부 getattr(..., 기본값) 패턴으로 방어적으로 접근한다. 즉 값이 없어도
-          "?"나 "-" 같은 자리표시자로 대체되어 배너가 깨지지 않는다.
+        방어적 접근:
+          self._state 는 부트스트랩 실패 시 None 일 수 있다. 아래 조회는 전부
+          중첩 getattr(..., 기본값) 패턴이라 값이 없어도 배너가 깨지지 않는다.
         """
-        # ───── 좌측: IDINO 픽셀 마크 ─────
-        # IDINO 코퍼레이트 컬러 rgb(0,71,157) — 배지/홈페이지/이미지와 색을 맞춘다.
-        mark = Text(_IDINO_MARK, style="bold rgb(0,71,157)")
+        # ───── ② 힌트줄 + ③ 컨텍스트를 담을 본문 ─────
+        body = Text()
 
-        # ───── 우측: 회사 카드 + 시스템 정보 ─────
-        # Rich의 Text 객체에 append로 조각조각 스타일을 입혀 한 덩어리로 쌓는다.
-        info = Text()
-        info.append("IDINO NOVA", style="bold rgb(0,71,157)")
-        info.append(f"  v{__version__}\n", style="dim white")
-        info.append("에어갭 로컬 LLM 오케스트레이션 플랫폼\n", style="white")
-        info.append("Powered by ", style="dim white")
-        info.append("IDINO Corp.", style="bold rgb(0,71,157)")
-        info.append("  ·  Air-gapped AI for Enterprise\n", style="dim white")
+        # 자주 쓰는 명령 세 개만 노출한다. 전체 목록은 /help 가 표로 보여 준다.
+        body.append("/help", style="cyan")
+        body.append(" 도움말   ", style="dim")
+        body.append("/model", style="cyan")
+        body.append(" 모델 전환   ", style="dim")
+        body.append("/mode", style="cyan")
+        body.append(" 권한 모드\n\n", style="dim")
 
-        # 회사 카드와 시스템 정보 사이를 나누는 가로 구분선.
-        info.append("─" * 44 + "\n", style="dim rgb(0,71,157)")
+        # ── cwd ──
+        # 작업 디렉터리는 "지금 어느 리포에서 도는가"라 가장 먼저 확인해야 한다.
+        # 경로가 길면 앞을 잘라 뒤(=실제 프로젝트 폴더명)를 남긴다.
+        cwd = os.getcwd()
+        if len(cwd) > 52:
+            cwd = "…" + cwd[-51:]
+        body.append("cwd    ", style="dim")
+        body.append(f"{cwd}\n", style="white")
 
-        # 라우팅 설정을 안전하게 꺼낸다: state.config.routing 경로 중 하나라도
-        # 없으면 None이 된다(중첩 getattr 방어 패턴).
+        # ── model ──
+        # 라우팅이 켜져 있으면 CHAT 모델을 대표로 쓰고 TOOL 모델을 괄호로 덧붙인다.
+        #   왜 두 개만: 사용자가 체감하는 분기가 "대화"와 "도구/코딩" 두 갈래다.
+        #   KNOWLEDGE 까지 넣으면 다시 3줄이 되어 압축 목적이 사라진다(/config 로 전체 조회).
         routing = getattr(getattr(self._state, "config", None), "routing", None)
-        # 라우팅이 존재하고 켜져 있으면 → 질의 유형별(CHAT/KNOWLEDGE/TOOL) 실모델명 표시.
+        model_cfg = getattr(getattr(self._state, "config", None), "model", None)
         if routing is not None and getattr(routing, "enabled", False):
-            chat_model = getattr(
-                getattr(routing, "chat_mode", None), "model", "?"
-            )
-            know_model = getattr(
-                getattr(routing, "knowledge_mode", None), "model", "?"
-            )
-            tool_model = getattr(
-                getattr(routing, "tool_mode", None), "model", "?"
-            )
-            info.append("모델 라우팅 (질의별 자동 분기)\n", style="bold white")
-            info.append(f"  CHAT       {chat_model}\n", style="cyan")
-            info.append(f"  KNOWLEDGE  {know_model}\n", style="green")
-            info.append(f"  TOOL       {tool_model}\n", style="yellow")
+            chat_model = getattr(getattr(routing, "chat_mode", None), "model", "?")
+            tool_model = getattr(getattr(routing, "tool_mode", None), "model", "?")
+            model_line = f"{chat_model}"
+            # 도구 모델이 대화 모델과 다를 때만 괄호를 붙인다(같으면 잡음).
+            if tool_model and tool_model != chat_model:
+                model_line += f"  (TOOL: {tool_model})"
         else:
-            # 라우팅 비활성 — 단순히 primary/auxiliary 두 모델만 표시한다.
-            model_cfg = getattr(
-                getattr(self._state, "config", None), "model", None
-            )
-            primary = getattr(model_cfg, "primary_model", self._model)
-            aux = getattr(model_cfg, "auxiliary_model", "-")
-            info.append("모델\n", style="bold white")
-            info.append(f"  Primary    {primary}\n", style="cyan")
-            info.append(f"  Auxiliary  {aux}\n", style="dim")
+            model_line = str(getattr(model_cfg, "primary_model", self._model))
+        body.append("model  ", style="dim")
+        body.append(f"{model_line}\n", style="cyan")
 
-        # 인프라 정보(Worker=GPU 추론 서버, Scout=경량 라우팅/사전판단 서버) 표시.
-        # 두 URL 모두 없을 수 있으므로 기본값("(?)", "-")으로 방어한다.
-        gpu_url = getattr(
-            getattr(self._state, "config", None), "gpu_server_url", "(?)"
-        )
-        scout_cfg = getattr(
-            getattr(self._state, "config", None), "scout", None
-        )
-        scout_url = getattr(scout_cfg, "base_url", "-") if scout_cfg else "-"
-        info.append("인프라\n", style="bold white")
-        info.append(f"  Worker     {gpu_url}\n", style="dim")
-        info.append(f"  Scout      {scout_url}\n", style="dim")
-
-        # 세션 컨텍스트 — 현재 권한 모드와, 새 세션인지/이어받은 세션인지 표시.
-        info.append("세션\n", style="bold white")
+        # ── mode ──
+        # 권한 모드는 "도구가 물어보고 실행하는가"를 결정하므로 한 줄로 풀어 쓴다.
         _ask_note = (
-            "자동 허용"
+            "도구 자동 허용"
             if self._permission_mode in {"auto", "bypass", "trust"}
-            else "실행 전 확인"
+            else "도구 실행 전 확인"
         )
-        info.append(
-            f"  권한 모드   {self._permission_mode} (도구 ASK: {_ask_note})\n",
-            style="dim",
-        )
+        body.append("mode   ", style="dim")
+        body.append(f"{self._permission_mode}", style="yellow")
+        body.append(f" · {_ask_note}", style="dim")
+
+        # 이어받은 세션이 있을 때만 한 줄 더. 신규 세션은 굳이 알릴 필요가 없다.
         if self._resume_session_id:
-            info.append(f"  복원 세션   {self._resume_session_id}\n", style="dim")
-        else:
-            info.append("  복원 세션   (신규)\n", style="dim")
+            body.append("\nresume ", style="dim")
+            body.append(f"{self._resume_session_id}", style="dim white")
 
-        # ───── 좌·우 열을 하나의 grid로 합쳐 나란히 배치 ─────
-        # Table.grid는 테두리 없는 표. padding=(0,4)로 두 열 사이 좌우 간격을 준다.
-        layout = Table.grid(padding=(0, 4))
-        layout.add_column(justify="left", vertical="top")
-        layout.add_column(justify="left", vertical="top")
-        layout.add_row(mark, info)  # 왼쪽=로고, 오른쪽=정보
-
-        # Claude Code 스타일 패널 — 둥근 모서리(ROUNDED) + 좌측 정렬 타이틀로 감싼다.
+        # ───── 패널 ─────
+        # ROUNDED + 좌측 정렬 타이틀 = Claude Code 시작 박스와 같은 형태.
+        # expand=False 로 내용 폭에 맞춰 붙인다(터미널 전체 폭으로 늘어나지 않게).
         self.console.print(
             Panel(
-                layout,
-                title="[bold]✻ Welcome to IDINO NOVA[/bold]",
+                body,
+                title="[bold rgb(0,71,157)]✻ Welcome to IDINO NOVA[/bold rgb(0,71,157)]",
                 title_align="left",
-                subtitle="[dim]IDINO Corp. · 2026[/dim]",
-                subtitle_align="right",
                 border_style="rgb(0,71,157)",
                 box=ROUNDED,
                 padding=(1, 2),
                 expand=False,
             )
         )
-        # 패널 아래 첫 번째 힌트 줄 — 사용 가능한 슬래시 커맨드 목록.
+        # 단축키 한 줄 — Esc 중단(A4)을 포함한다. Ctrl+C 도 계속 동작한다.
+        # 네 개만 남긴 이유: 좁은 터미널(80칸)에서 줄바꿈되면 오히려 읽기 나빠진다.
+        # 나머지(Alt+Enter 줄바꿈·Ctrl+R 히스토리)는 /help 가 표로 안내한다.
         self.console.print(
-            "[dim]✻ 슬래시 커맨드: [/dim]"
-            "[cyan]/help[/cyan][dim] · [/dim]"
-            "[cyan]/model[/cyan][dim] · [/dim]"
-            "[cyan]/config[/cyan][dim] · [/dim]"
-            "[cyan]/session[/cyan][dim] · [/dim]"
-            "[cyan]/thinking[/cyan][dim] · [/dim]"
-            "[cyan]/clear[/cyan][dim] · [/dim]"
-            "[cyan]/exit[/cyan]"
-        )
-        # 두 번째 힌트 줄 — 키보드 단축키 안내(Enter/Ctrl+C/Ctrl+D).
-        self.console.print(
-            "[dim]   단축키:    [/dim]"
-            "[white]Enter[/white][dim] 전송 · [/dim]"
-            "[white]Ctrl+C[/white][dim] 요청 취소 · [/dim]"
-            "[white]Ctrl+D[/white][dim] 종료[/dim]\n"
+            "[dim]  Enter 전송 · Esc 중단 · Shift+Tab 권한 모드 · Ctrl+D 종료[/dim]\n"
         )
 
     # ─── 메시지 처리 ───
@@ -627,11 +800,13 @@ class NexusREPL:
 
         이 메서드가 REPL과 core를 잇는 핵심 다리다. 흐름은 다음과 같다:
           1) QueryEngine이 준비됐는지 확인(없으면 안내만 하고 종료).
-          2) "요청 분석 중..." 스피너를 띄운다(cold start 동안 사용자를 안심시킴).
+          2) 진행 스피너를 띄우고, 1초마다 경과시간·토큰을 갱신하는 배경 태스크와
+             Esc 감시 리스너를 함께 연다.
           3) submit_message()가 yield하는 이벤트마다:
              - _stage_label_for()로 스피너를 켤지/끌지/문구를 바꿀지 판단,
              - display_stream_event()로 실제 화면 출력.
-          4) 취소(Ctrl+C)·예외·정상 종료 어느 경우든 스피너를 반드시 닫는다.
+          4) 중단(Esc/Ctrl+C)·예외·정상 종료 어느 경우든 스피너·티커·리스너를
+             반드시 정리하고, 마지막에 턴 요약 한 줄을 남긴다.
 
         Args:
             user_input: 사용자가 입력한 순수 텍스트(슬래시 명령어가 아닌 일반 대화).
@@ -661,10 +836,12 @@ class NexusREPL:
         # QueryEngine.submit_message()는 AsyncGenerator로 이벤트를 하나씩 흘려준다.
         # v0.14.8부터 Console.status() 스피너로 "지금 무슨 단계인지"를 시각화한다.
         # 아이디어:
-        #   · 처음엔 "요청 분석 중..." 스피너를 띄운다.
+        #   · 처음엔 대기 동사 스피너(_SPINNER_VERBS 순환)를 띄운다.
         #   · 첫 본문 토큰(TEXT_DELTA)이 오면 스피너를 닫고 본문을 print로 흘린다.
-        #   · 도구 호출이 시작되면 다시 스피너로 전환해 "X 실행 중..."을 보여준다.
-        # 이렇게 하면 cold start로 60초가 걸려도 사용자는 "멈춘 게 아니라 분석 중"으로 인지한다.
+        #   · 도구 호출이 시작되면 다시 스피너로 전환해 "X 실행 중"을 보여준다.
+        # 문구에는 항상 경과초·생성 토큰·중단 키가 붙고 1초마다 갱신된다(_spinner_ticker).
+        # 이렇게 하면 cold start로 60초가 걸려도 사용자는 "멈춘 게 아니라 진행 중"으로
+        # 인지하고, 얼마나 더 기다려야 할지도 가늠할 수 있다.
         #
         # status_ctx는 컨텍스트 매니저지만, `async for` 도중 동적으로 열고 닫아야 해서
         # with 문 대신 __enter__/__exit__를 직접 호출하며 status_active 플래그로
@@ -673,13 +850,32 @@ class NexusREPL:
         # 권한 확인(prompt_permission)이 executor 깊은 곳에서 호출되는데, 그때 입력
         # 프롬프트가 스피너와 겹치면 화면이 깨진다. 핸들러가 _suspend_spinner()로
         # 스피너를 닫으려면 이 상태에 접근할 수 있어야 하므로 self._status_* 로 공유한다.
-        self._status_ctx = self.console.status(
-            "[cyan]요청 분석 중...[/cyan] [dim](Ctrl+C로 중단)[/dim]", spinner="dots"
-        )
+        # ── 이번 턴의 스피너 기준점 ──
+        # 경과시간·토큰 증가분을 계산하려면 "턴이 시작된 순간"을 먼저 못 박아야 한다.
+        self._turn_index += 1
+        self._turn_started_at = time.monotonic()
+        self._turn_out_base = self._session_tokens()[1]
+        self._spinner_base = None  # 아직 단계 라벨이 없다 → 대기 동사를 순환
+        self._interrupt_requested = False
+
+        self._status_ctx = self.console.status(self._spinner_text(), spinner="dots")
         self._status_ctx.__enter__()
         self._status_active = True
+
+        # 1초마다 스피너 문구를 다시 그리는 배경 태스크. 이게 없으면 경과시간이
+        # 멈춰 보여 "얼어붙었나"를 판단할 근거가 사라진다.
+        ticker = asyncio.create_task(self._spinner_ticker())
+        # Esc 감시(A4). 붙이지 못하면 None — 중단은 Ctrl+C 로만 가능하다(fail-soft).
+        detach_interrupt = self._attach_interrupt_listener()
+
         try:
             async for event in self._query_engine.submit_message(user_input):
+                # Esc 가 눌렸으면 더 소비하지 않고 빠져나온다. `async for` 를 break 하면
+                # 제너레이터가 닫히며(aclose) 하위 Tier 까지 정리된다 — 4-Tier 체인을
+                # 우회하지 않는 정상 종료 경로다.
+                if self._interrupt_requested:
+                    break
+
                 # 이 이벤트를 근거로 스피너를 어떻게 할지 결정한다.
                 # 반환 규약은 _stage_label_for()의 docstring 참고.
                 next_label = self._stage_label_for(event)
@@ -694,15 +890,17 @@ class NexusREPL:
                     self._suspend_spinner()
                 elif next_label is not None:
                     # 스피너 문구를 갱신해야 하는 단계 이벤트(TURN_START/TOOL_USE_START 등).
+                    # 라벨은 "기준 문구"로만 저장하고, 실제 표시 문자열은 항상
+                    # _spinner_text()가 만든다 — 경과시간·토큰 꼬리표가 단계 전환
+                    # 때마다 사라지지 않게 하려는 것이다.
+                    self._spinner_base = next_label
                     if self._status_active:
                         # 이미 스피너가 떠 있으면 문구만 바꾼다.
-                        self._status_ctx.update(next_label)
+                        self._status_ctx.update(self._spinner_text())
                     else:
                         # 스피너가 닫혀 있었다면(예: 본문 출력·권한 프롬프트 뒤 도구 호출
                         # 시작) 새로 연다.
-                        self._status_ctx = self.console.status(
-                            next_label, spinner="dots"
-                        )
+                        self._status_ctx = self.console.status(self._spinner_text(), spinner="dots")
                         self._status_ctx.__enter__()
                         self._status_active = True
 
@@ -719,11 +917,27 @@ class NexusREPL:
         finally:
             # 어떤 경로로 끝나든(정상/취소/예외) 스피너가 남아있지 않도록 최종 안전 장치.
             # 예: TEXT_DELTA가 한 번도 안 와서 스피너가 계속 떠 있는 상태로 끝난 경우.
+            ticker.cancel()
+            if detach_interrupt is not None:
+                # 터미널을 raw 모드로 두고 나가면 다음 프롬프트 입력이 깨진다.
+                # 어떤 경로로 끝나도 반드시 원복한다.
+                try:
+                    detach_interrupt()
+                except Exception:  # noqa: BLE001 — 원복 실패가 대화를 끊지 않게
+                    logger.debug("Esc 리스너 원복 실패", exc_info=True)
             self._suspend_spinner()
             # 마크다운 버퍼에 덜 그린 마지막 블록을 마저 출력한다. 이게 없으면
             # 답변 끝문단이 빈 줄로 끝나지 않았을 때 통째로 사라진다(2026-08-18).
             self._flush_markdown()
 
+        # Esc 로 끊었으면 그 사실을 알린다. 모델이 답을 다 못 냈다는 뜻이므로
+        # 조용히 넘어가면 "짧게 답했다"로 오해된다.
+        if self._interrupt_requested:
+            self.console.print("[yellow]⏹ 중단됨 (esc)[/yellow]")
+
+        # ── 턴 종료 한 줄 요약 (A9) ──
+        # 얼마나 걸렸고 얼마나 썼는지를 매 턴 남긴다. /cost 를 따로 치지 않아도
+        # 비용 감각이 쌓이게 하려는 것 — Claude Code 가 턴마다 같은 정보를 준다.
         # ── 사후 검증 ──
         # 이미 흘려보낸 본문은 고치지 않고, 확인이 필요한 것만 뒤에 덧붙인다.
         #   왜 CLI 에도 필요한가: 숫자 자릿수 오류와 "실행하지 않고 통과했다고 단정"이
@@ -739,6 +953,146 @@ class NexusREPL:
             )
             if warning:
                 self.console.print(warning)
+
+        # ── 턴 종료 한 줄 요약 (A9) ──
+        # 본문·경고를 모두 낸 뒤 맨 마지막에 둔다. 얼마나 걸렸고 얼마나 썼는지를
+        # 매 턴 남겨, /cost 를 따로 치지 않아도 비용 감각이 쌓이게 한다.
+        self._print_turn_footer()
+
+    # ─── 진행 스피너 (Claude Code식 라이브 표시) ───
+
+    def _session_tokens(self) -> tuple[int, int]:
+        """현재 세션의 누적 (입력, 출력) 토큰을 안전하게 읽는다.
+
+        상태가 아직 없거나(부트스트랩 전) 요약 조회가 실패해도 예외를 내지 않는다 —
+        이 값은 장식용이라, 못 읽었다고 대화를 막아서는 안 된다.
+
+        Returns:
+            (입력 토큰, 출력 토큰). 못 읽으면 (0, 0).
+        """
+        try:
+            summary = self._state.get_session_summary()
+            return (
+                int(summary.get("total_input_tokens", 0) or 0),
+                int(summary.get("total_output_tokens", 0) or 0),
+            )
+        except Exception:  # noqa: BLE001 — 장식용 수치라 실패해도 흐름 유지
+            return (0, 0)
+
+    def _turn_progress(self) -> tuple[float, int]:
+        """이번 턴의 (경과초, 생성 토큰)을 계산한다 — 스피너·턴 요약의 공통 입력."""
+        elapsed = time.monotonic() - self._turn_started_at
+        produced = max(0, self._session_tokens()[1] - self._turn_out_base)
+        return elapsed, produced
+
+    def _spinner_text(self) -> str:
+        """지금 화면에 그려야 할 스피너 문구 전체를 만든다.
+
+        실제 문자열 조립은 모듈 함수 build_spinner_text()가 한다. 이 메서드는
+        "지금 상태를 읽어 넘겨 주는" 얇은 껍데기다 — 조립 규칙을 인스턴스 상태에서
+        떼어 놓아야 터미널 없이도 규칙을 검증할 수 있기 때문이다.
+
+        Returns:
+            Rich 마크업 문자열.
+        """
+        elapsed, produced = self._turn_progress()
+        return build_spinner_text(self._spinner_base, elapsed, produced, self._turn_index)
+
+    async def _spinner_ticker(self) -> None:
+        """1초마다 스피너 문구를 다시 그리는 배경 태스크.
+
+        Rich 의 Status 는 스피너 애니메이션만 자동으로 돌고 **문구는 update() 를
+        불러야 바뀐다**. 그래서 경과시간·토큰이 살아 움직이게 하려면 이렇게 주기적으로
+        직접 갱신해 줘야 한다.
+
+        스피너가 닫혀 있는 구간(본문 출력 중·권한 프롬프트 중)에는 아무것도 하지
+        않는다 — 닫힌 Status 를 건드리면 화면이 깨진다.
+        """
+        try:
+            while True:
+                await asyncio.sleep(1.0)
+                if not self._status_active or self._status_ctx is None:
+                    continue
+                try:
+                    self._status_ctx.update(self._spinner_text())
+                except Exception:  # noqa: BLE001 — 갱신 실패 시 조용히 멈춘다
+                    logger.debug("스피너 갱신 실패", exc_info=True)
+                    return
+        except asyncio.CancelledError:
+            # 턴이 끝나면 호출부가 cancel() 한다. 정상 종료 경로다.
+            return
+
+    def _attach_interrupt_listener(self) -> Any:
+        """스트리밍 중 Esc 키를 감시하는 리스너를 붙인다 (A4).
+
+        Claude Code 와 같은 중단 키를 제공하는 것이 목적이다. Ctrl+C 는 그대로
+        동작하므로 이건 **추가** 수단이다.
+
+        fail-soft 설계:
+          비 TTY(파이프 입력·테스트·CI), 터미널이 raw 모드를 지원하지 않는 경우,
+          prompt_toolkit 이 예외를 내는 경우 모두 조용히 None 을 돌려준다. 입력
+          감시를 못 붙였다고 대화 자체가 막히면 안 되기 때문이다.
+          환경변수 `NEXUS_NO_ESC_INTERRUPT=1` 로 강제로 끌 수 있다(비상 스위치).
+
+        Returns:
+            리스너를 떼어내는 함수. 붙이지 못했으면 None.
+        """
+        if os.environ.get("NEXUS_NO_ESC_INTERRUPT") == "1":
+            return None
+        try:
+            if not sys.stdin.isatty():
+                return None
+        except Exception:  # noqa: BLE001 — isatty 조차 실패하는 환경이 있다
+            return None
+
+        try:
+            from prompt_toolkit.input import create_input
+            from prompt_toolkit.keys import Keys
+
+            inp = create_input()
+
+            def _on_keys() -> None:
+                # 눌린 키를 모두 비워야 다음 콜백이 정상 동작한다.
+                # Esc 외의 키는 스트리밍 중 의미가 없으므로 버린다(입력 큐잉은 미지원).
+                for key_press in inp.read_keys():
+                    if key_press.key == Keys.Escape:
+                        self._interrupt_requested = True
+
+            raw_ctx = inp.raw_mode()
+            raw_ctx.__enter__()
+            try:
+                attach_ctx = inp.attach(_on_keys)
+                attach_ctx.__enter__()
+            except Exception:
+                # attach 만 실패한 경우에도 raw 모드는 반드시 원복한다.
+                raw_ctx.__exit__(None, None, None)
+                raise
+
+            def _detach() -> None:
+                try:
+                    attach_ctx.__exit__(None, None, None)
+                finally:
+                    raw_ctx.__exit__(None, None, None)
+
+            return _detach
+        except Exception:  # noqa: BLE001 — 감시 실패로 대화를 막지 않는다
+            logger.debug("Esc 인터럽트 리스너를 붙이지 못했습니다", exc_info=True)
+            return None
+
+    def _print_turn_footer(self) -> None:
+        """턴이 끝난 뒤 소요시간·토큰을 한 줄로 남긴다 (A9).
+
+        무엇을 찍을지는 build_turn_footer()가 정하고(None 이면 안 찍는다), 이
+        메서드는 찍기만 한다. 실패해도 조용히 넘어간다 — 장식용 한 줄 때문에
+        대화가 끊기면 안 된다.
+        """
+        try:
+            elapsed, produced = self._turn_progress()
+            line = build_turn_footer(elapsed, produced)
+            if line:
+                self.console.print(line)
+        except Exception:  # noqa: BLE001 — 요약 실패로 대화를 끊지 않는다
+            logger.debug("턴 요약 출력 실패", exc_info=True)
 
     def _suspend_spinner(self) -> None:
         """진행 스피너가 떠 있으면 닫는다(멱등). 없으면 아무것도 하지 않는다.
@@ -781,18 +1135,18 @@ class NexusREPL:
             return "_TEXT_"
         if et == StreamEventType.STREAM_REQUEST_START:
             # GPU(Worker) 서버에 추론 요청을 막 보낸 시점. 지식 검색(KB) 직후 단계.
-            return "[cyan]모델 추론 중...[/cyan]"
+            return "[cyan]모델 추론 중[/cyan]"
         if et == StreamEventType.MESSAGE_START:
             # 모델이 응답 메시지를 만들기 시작한 단계.
-            return "[cyan]응답 생성 중...[/cyan]"
+            return "[cyan]응답 생성 중[/cyan]"
         if et == StreamEventType.THINKING_START:
             # 모델이 내부 사고(thinking)를 시작한 단계 — 색을 달리해 구분.
-            return "[magenta]생각 정리 중...[/magenta]"
+            return "[magenta]생각 정리 중[/magenta]"
         if et == StreamEventType.TOOL_USE_START:
-            # 도구 호출 시작 — 어떤 도구인지 이름을 넣어 "Read 실행 중..." 식으로 보여준다.
+            # 도구 호출 시작 — 어떤 도구인지 이름을 넣어 "Read 실행 중" 식으로 보여준다.
             # tool_name 속성이 없거나 비어 있으면 일반명 "도구"로 폴백.
             tool_name = getattr(event, "tool_name", None) or "도구"
-            return f"[yellow]{tool_name} 실행 중...[/yellow]"
+            return f"[yellow]{tool_name} 실행 중[/yellow]"
         if et == StreamEventType.TOOL_USE_STOP:
             # 도구 실행 종료 신호.
             return "_TOOL_DONE_"
@@ -1261,36 +1615,22 @@ class NexusREPL:
         table.add_column("명령어", style="cyan", no_wrap=True)
         table.add_column("설명", style="white")
 
-        commands = [
-            ("/help", "이 도움말을 표시한다"),
-            ("/clear", "화면을 지운다"),
-            ("/exit", "세션을 종료한다"),
-            ("/model", "현재 라우팅 모델을 표시한다"),
-            ("/mode", "권한 모드 확인·변경 (Shift+Tab으로 순환)"),
-            ("/config", "현재 설정을 표시한다"),
-            ("/session", "세션 정보를 표시한다"),
-            ("/thinking", "thinking 표시를 토글한다"),
-            ("/verbose", "도구 표시를 축약↔전문으로 토글한다"),
-            ("/markdown", "답변을 마크다운 렌더↔원문으로 토글한다"),
-            ("/cost", "세션 누적 토큰 사용량을 보여준다"),
-            ("/save", "대화를 Markdown 파일로 저장한다"),
-            ("/diff", "작업 트리의 git 변경사항을 보여준다"),
-            ("/copy", "마지막 응답을 클립보드로 복사한다"),
-            ("/compact", "대화 맥락을 강제로 압축한다"),
-            ("/resume", "이전 세션 목록을 보고 이어받는다"),
-            ("!<명령>", "셸 명령을 실행한다(표시 전용 — 대화 맥락에 미포함)"),
-        ]
-        for cmd, desc in commands:
-            table.add_row(cmd, desc)
-        # 키 단축키 안내(D9/D10) — 명령 표만 보면 알 수 없는 조작을 함께 알린다.
-        self.console.print(table)
-        self.console.print(
-            "[dim]단축키: Shift+Tab 권한 모드 순환 · Alt+Enter 줄바꿈 · "
-            "Ctrl+R 히스토리 검색 · `/` 입력 시 명령 자동완성 · Ctrl+C 요청 취소[/dim]"
-        )
-        return
+        # 설명 문구는 _COMMAND_HELP(모듈 상수) 한 곳에서만 관리한다 — 자동완성기와
+        # 같은 출처를 써야 둘이 어긋나지 않는다.
+        # 실제 등록된 명령만 보여 준다. 표에는 있는데 못 부르는 명령이 생기지 않도록,
+        # 등록 맵(_session_commands)을 기준으로 교차 확인한다.
+        for cmd in sorted(self._session_commands):
+            table.add_row(cmd, _COMMAND_HELP.get(cmd, ""))
+        # 슬래시 명령이 아니라 접두 문법이라 등록 맵에는 없다. 따로 덧붙인다.
+        table.add_row("!<명령>", "셸 명령을 실행한다(표시 전용 — 대화 맥락에 미포함)")
+        table.add_row("@<경로>", "파일 경로를 자동완성한다(오타 방지 — 내용 삽입은 아님)")
 
         self.console.print(table)
+        # 키 단축키 안내(D9/D10) — 명령 표만 보면 알 수 없는 조작을 함께 알린다.
+        self.console.print(
+            "[dim]단축키: Shift+Tab 권한 모드 순환 · Alt+Enter 줄바꿈 · "
+            "Ctrl+R 히스토리 검색 · Esc 요청 중단 · Ctrl+C 요청 취소[/dim]"
+        )
 
     async def _cmd_clear(self, args: list[str]) -> None:
         """/clear — 터미널 화면을 지운다(대화 히스토리 자체는 유지)."""
