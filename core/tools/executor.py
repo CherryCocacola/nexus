@@ -358,12 +358,35 @@ async def run_tool_use(
                     ):
                         yield _ev
                     return
+            elif not context.options.get("ask_auto_approve"):
+                # ★핸들러도 없고 자동 승인도 명시되지 않았다 → 거부(2026-08-24).
+                #   예전에는 이 자리에서 **그냥 통과**시켰다. 그 결과 `nexus ask`
+                #   한 줄로 Write·Edit·Bash 가 아무 확인 없이 실행됐다(실측).
+                #   fail-closed 원칙(P6)과 정면으로 어긋나고, 웹에서 Bash 를 보안
+                #   사유로 제거한 결정과도 결이 맞지 않는다.
+                #
+                #   자동 승인이 필요한 표면(웹·CI)은 options 에 ask_auto_approve=True
+                #   를 **명시**해야 한다. 실수로 빠뜨리면 조용히 열리는 게 아니라
+                #   막히므로, 배선 누락이 즉시 드러난다.
+                logger.warning(
+                    "[permission ask] 도구=%s 확인 핸들러 없음 + 자동 승인 미지정 — 거부",
+                    tool.name,
+                )
+                async for _ev in _emit_tool_result(
+                    tool_use_id,
+                    "<tool_use_error>이 도구는 사용자 확인이 필요합니다. "
+                    "확인 프롬프트가 없는 비대화형 실행에서는 자동 승인을 명시해야 "
+                    "합니다(`nexus ask --yes`).</tool_use_error>",
+                    is_error=True,
+                ):
+                    yield _ev
+                return
             elif tool.name not in _ASK_PASSTHROUGH_WARNED:
-                # 핸들러 부재 — 통과시키되, 배선 누락을 도구별 1회만 경고로 남긴다.
+                # 자동 승인이 명시된 표면 — 통과시키되 도구별 1회만 기록을 남긴다.
+                # (매 호출마다 경고하면 웹 로그가 도배된다.)
                 _ASK_PASSTHROUGH_WARNED.add(tool.name)
                 logger.warning(
-                    "[permission ask] 도구=%s ASK 확인 핸들러 미배선 — 통과"
-                    "(웹/비대화형). CLI 확인 프롬프트 없음.",
+                    "[permission ask] 도구=%s ASK 자동 승인(비대화형) — 확인 프롬프트 없음.",
                     tool.name,
                 )
     except Exception as e:

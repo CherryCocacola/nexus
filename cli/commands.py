@@ -274,7 +274,18 @@ def sessions(limit: int, plain: bool) -> None:
         "섞이면 파이프·스크립트에서 파싱이 깨지므로 기본값을 조용하게 둔다."
     ),
 )
-def ask(query: str, log_level: str) -> None:
+@click.option(
+    "--yes",
+    "-y",
+    is_flag=True,
+    default=False,
+    help=(
+        "확인이 필요한 도구(Write/Edit/Bash 등)를 자동 승인한다. 비대화형이라 "
+        "확인 프롬프트를 띄울 수 없으므로, 이 플래그가 없으면 해당 도구는 "
+        "거부된다(fail-closed). 자동화·CI 에서만 붙일 것."
+    ),
+)
+def ask(query: str, log_level: str, yes: bool) -> None:
     """
     단일 질문을 보낸다 — 비대화형 1회성 모드 (`nexus ask "<질문>"`).
 
@@ -314,6 +325,14 @@ def ask(query: str, log_level: str) -> None:
             state = await init()
             components = await init_phase2(state)
             engine = components.get("query_engine")
+            # ASK 자동 승인 여부를 도구 실행 컨텍스트에 명시한다(2026-08-24).
+            #   비대화형이라 확인 프롬프트를 띄울 수 없다. 예전에는 핸들러가 없으면
+            #   executor 가 그냥 통과시켜, `nexus ask` 한 줄로 Write·Edit·Bash 가
+            #   무확인 실행됐다. 이제는 이 플래그가 있어야만 실행된다.
+            #   options 는 참조 공유라 서브에이전트 컨텍스트까지 그대로 전파된다.
+            _ctx = components.get("tool_use_context")
+            if _ctx is not None:
+                _ctx.options["ask_auto_approve"] = yes
         except Exception as e:
             # 부트스트랩 도중 예외 → 사용자에게 알리고 실패 종료.
             console.print(f"[red]부트스트랩 실패: {e}[/red]")

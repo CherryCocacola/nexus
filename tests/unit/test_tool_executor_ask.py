@@ -110,14 +110,31 @@ async def test_executor_ask_handler_deny_blocks():
 
 
 @pytest.mark.asyncio
-async def test_executor_ask_no_handler_passthrough():
-    """확인 핸들러가 없으면(웹·비대화형) 종전대로 통과시켜 도구를 실행한다(무회귀)."""
+async def test_executor_ask_no_handler_denies():
+    """확인 핸들러도 자동 승인도 없으면 **거부**한다 (2026-08-24 계약 변경).
+
+    이전에는 이 경우 그냥 통과시켰다. 그 결과 `nexus ask` 한 줄로 Write·Edit·Bash 가
+    아무 확인 없이 실행됐다(실측). fail-closed 원칙(P6)과 어긋나 뒤집었다.
+    자동 승인이 필요한 표면은 options["ask_auto_approve"]=True 를 **명시**해야 한다 —
+    실수로 빠뜨리면 조용히 열리는 대신 조용히 막혀 배선 누락이 즉시 드러난다.
+    """
     tool = _FakeAskTool()
-    ctx = ToolUseContext(cwd=".")  # options 비어 있음 — ask_handler 없음
+    ctx = ToolUseContext(cwd=".")  # 핸들러도 자동 승인 키도 없음
 
     await _drain(tool, ctx)
 
-    assert tool.called is True  # 통과 → 실행됨
+    assert tool.called is False  # 거부 → 실행되지 않음
+
+
+@pytest.mark.asyncio
+async def test_executor_ask_explicit_auto_approve_runs():
+    """웹·CI 처럼 확인 화면이 없는 표면은 명시 키로 통과한다."""
+    tool = _FakeAskTool()
+    ctx = ToolUseContext(cwd=".", options={"ask_auto_approve": True})
+
+    await _drain(tool, ctx)
+
+    assert tool.called is True
 
 
 @pytest.mark.asyncio

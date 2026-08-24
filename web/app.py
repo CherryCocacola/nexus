@@ -1091,6 +1091,14 @@ def _build_web_engine_parts(components: dict, state: Any) -> dict:
             "enabled": getattr(_perm_cfg, "enabled", False),
             "mode": getattr(_perm_cfg, "mode", "shadow"),
         },
+        # ★ASK 자동 승인(2026-08-24). 웹에는 확인 프롬프트를 띄울 화면이 없으므로
+        #   ASK 판정 도구는 자동 승인해야 동작한다 — 종전과 같은 동작이다.
+        #   달라진 것은 그것을 **명시**한다는 점이다. executor 가 이 키 없이는
+        #   거부하도록 바뀌었기 때문에(fail-closed), 이 줄이 빠지면 웹 도구가
+        #   전부 막힌다. 조용히 열리는 대신 조용히 막히는 쪽으로 뒤집은 것이다.
+        #   ※웹의 실제 방어선은 이것이 아니라 Bash 제거 + PathGuard +
+        #     permission_pipeline(위 세 키)이다.
+        "ask_auto_approve": True,
         "memory_manager": components.get("memory_manager"),
         "task_manager": components.get("task_manager"),
         # 계획 체크리스트 저장소 — 웹 TodoWrite/TodoRead 도구와 todo_update 프레임이
