@@ -36,6 +36,7 @@ from __future__ import annotations
 # 표준 라이브러리
 import json  # SSE 청크(JSON 문자열) 파싱 및 tool_calls arguments 직렬화에 사용
 import logging
+import re  # tool_call arguments 의 잘못된 이스케이프 복구에 사용
 import time  # latency 측정용 단조 시계(time.monotonic)
 from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator
@@ -120,6 +121,130 @@ class StructuredOutputSpec(BaseModel):
 # /tokenize 호출 제한 시간(초). 토크나이즈는 추론이 아니라 빠르므로 짧게 둔다
 # (실측: 20만 자 0.267초). 초과하면 폴백 추정으로 넘어간다.
 _TOKENIZE_TIMEOUT_SECONDS = 15.0
+
+# ─────────────────────────────────────────────
+# tool_call arguments 파싱 (3단 폴백)
+# ─────────────────────────────────────────────
+
+# JSON 명세가 인정하는 이스케이프 문자. 이 집합 밖의 `\X` 는 문법 위반이다.
+_JSON_VALID_ESCAPES = frozenset('"\\/bfnrtu')
+
+# 유효 집합 밖의 이스케이프. `\\` 를 먼저 통째로 소비해 이미 올바르게
+# 이스케이프된 백슬래시를 건드리지 않는다(안 그러면 `\\n` 을 망가뜨린다).
+_BAD_ESCAPE_RE = re.compile(r'\\\\|\\(.)', re.DOTALL)
+
+# `\u` 는 유효 집합에 있지만 **뒤에 hex 4자리**가 와야 한다. 아니면 역시 위반이다.
+_BAD_UNICODE_ESCAPE_RE = re.compile(r'\\\\|\\u(?![0-9a-fA-F]{4})')
+
+
+def _repair_json_escapes(raw: str) -> str:
+    """JSON 문법에 없는 이스케이프를 리터럴 백슬래시로 되돌린다.
+
+    왜 필요한가 (2026-08-23 실측):
+      모델이 **마크다운 이스케이프**(`\\_` `\\.` `\\*`)를 JSON 문자열 값 안에 그대로
+      쓴다. JSON 은 그런 이스케이프를 모르므로 `Invalid \\escape` 로 파싱이 거부된다.
+      문서를 만드는 도구(Write·DocumentExport)에서 특히 잦다 — 파일명·경로에 밑줄과
+      점이 많기 때문이다(실제 실패 tail: `no\\_line\\_products\\.csv`).
+      길이가 원인이 아니라, 길수록 이런 문자가 나올 확률이 높은 것뿐이다.
+
+    의미 보존:
+      `\\_` → `\\\\_` 로 고치면 파싱 결과 문자열은 모델이 쓴 바이트 그대로(`no\\_line`)다.
+      마크다운 파일에서는 그게 올바른 이스케이프로 렌더되므로 내용 왜곡이 없다.
+
+    건드리지 않는 것:
+      이미 올바른 `\\\\` 는 정규식이 먼저 통째로 소비해 보존한다. 문자열 경계가
+      깨진 경우(따옴표 미이스케이프로 인한 조기 종료 등)는 **여기서 다루지 않는다** —
+      경계를 추측해 고치면 조용히 다른 내용을 쓰게 되어 빈 dict 폴백보다 나쁘다.
+
+    Args:
+        raw: 모델이 보낸 arguments 원문.
+
+    Returns:
+        복구된 문자열. 고칠 것이 없으면 입력과 동일한 문자열을 돌려준다.
+    """
+
+    def _fix_escape(m: re.Match[str]) -> str:
+        if m.group(0) == "\\\\":  # 올바른 백슬래시 이스케이프 — 그대로 둔다
+            return m.group(0)
+        ch = m.group(1)
+        return m.group(0) if ch in _JSON_VALID_ESCAPES else "\\\\" + ch
+
+    def _fix_unicode(m: re.Match[str]) -> str:
+        if m.group(0) == "\\\\":
+            return m.group(0)
+        return "\\\\u"  # hex 4자리가 안 오는 `\u` 는 리터럴로 되돌린다
+
+    return _BAD_UNICODE_ESCAPE_RE.sub(_fix_unicode, _BAD_ESCAPE_RE.sub(_fix_escape, raw))
+
+
+def parse_tool_arguments(raw_args: str, tool_name: str) -> tuple[dict, bool]:
+    """모델이 낸 tool_call arguments 를 3단 폴백으로 파싱한다.
+
+    단계와 각 단계의 실측 근거:
+      1) strict 파싱 — 정상 경로.
+      2) strict=False — A.X-4.0 가 긴 content 값 안에 실제 개행/탭을 이스케이프
+         없이 넣어 "Invalid control character" 가 나는 경우를 복구한다.
+      3) 이스케이프 복구 후 strict=False — 마크다운 이스케이프 혼입(위 함수 참조).
+         두 결함이 한 인자에 함께 있을 수 있어 strict=False 로 파싱한다.
+
+    셋 다 실패하면 빈 dict + parse_error=True 를 돌려준다. 여기서 더 추측하지
+    않는 것이 중요하다 — 문자열 경계를 짐작해 고치면 **조용히 다른 내용**을 파일에
+    쓰게 된다. 빈 dict 는 도구 스키마 검증에서 거부되어 guided 재시도로 이어지는
+    fail-closed 경로다.
+
+    Args:
+        raw_args: arguments 원문 문자열.
+        tool_name: 로그용 도구 이름.
+
+    Returns:
+        (파싱된 인자 dict, 파싱 실패 여부).
+    """
+    try:
+        return json.loads(raw_args), False
+    except json.JSONDecodeError as e:
+        # `except ... as e` 는 블록을 나가며 이름을 지운다. 아래에서 로그에 쓰려면
+        # 별도 변수에 옮겨 둬야 한다(파이썬 스코프 규칙).
+        first_error = e
+
+    try:
+        args = json.loads(raw_args, strict=False)
+    except json.JSONDecodeError as e:
+        lenient_error = e
+    else:
+        logger.warning(
+            "tool_call arguments 1차 파싱 실패 → strict=False 복구 성공 "
+            "(tool=%s, err=%s, len=%d)",
+            tool_name,
+            first_error,
+            len(raw_args),
+        )
+        return args, False
+
+    repaired = _repair_json_escapes(raw_args)
+    if repaired != raw_args:
+        try:
+            args = json.loads(repaired, strict=False)
+        except json.JSONDecodeError:
+            pass
+        else:
+            logger.warning(
+                "tool_call arguments 이스케이프 복구 성공 (tool=%s, err=%s, len=%d)",
+                tool_name,
+                lenient_error,
+                len(raw_args),
+            )
+            return args, False
+
+    # 절단·구조 파손·문자열 미종료 — 복구 대상이 아니다. 말미를 남겨 원인을 추적한다.
+    logger.warning(
+        "tool_call arguments JSON 파싱 실패 — 빈 dict 폴백 "
+        "(tool=%s, err=%s, len=%d, tail=%.200r)",
+        tool_name,
+        lenient_error,
+        len(raw_args),
+        raw_args[-200:],
+    )
+    return {}, True
 
 
 class ModelProvider(ABC):
@@ -1193,43 +1318,11 @@ class LocalModelProvider(ModelProvider):
                 # 명시적 guided 강제를 검토). {} 폴백은 유지 — 도구 스키마 검증이
                 # 거부하면 tool_use_error가 되어 모델이 자기교정(재호출)한다.
                 raw_args = tc["function"].get("arguments", "{}")
-                # 파싱 실패 신호 — strict=False로도 복구 못 하면 True. 상위(query_loop)가
+                # 파싱 실패 신호 — 3단 폴백으로도 복구 못 하면 True. 상위(query_loop)가
                 # 이 신호를 보고 tool_choice를 해당 도구로 강제한 guided 재시도를 건다.
-                parse_failed = False
-                try:
-                    args = json.loads(raw_args)
-                except json.JSONDecodeError as e:
-                    # 1차 실패의 실측 원인: A.X-4.0가 DocumentExport 등 긴 content
-                    # 문자열 값 안에 실제 개행/탭(제어문자)을 이스케이프(\\n) 없이
-                    # 그대로 넣어, json 기본(strict=True)이 "Invalid control
-                    # character"로 거부한다. (해당 턴은 output_tokens가 max에 못
-                    # 미치고 stop_reason=tool_use로 정상 종료 → 절단이 아님이 실측됨.)
-                    # strict=False로 재파싱하면 문자열 내부의 실제 제어문자를 허용해
-                    # 대부분 복구된다 → content가 살아 DocumentExport가 파일을 만든다.
-                    try:
-                        args = json.loads(raw_args, strict=False)
-                        logger.warning(
-                            "tool_call arguments 1차 파싱 실패 → strict=False 복구 성공 "
-                            "(tool=%s, err=%s, len=%d)",
-                            tc["function"]["name"],
-                            e,
-                            len(raw_args),
-                        )
-                    except json.JSONDecodeError as e2:
-                        # strict=False로도 실패 = 다른 malformation(절단/구조 파손).
-                        # 말미(tail)를 남겨 원인(절단이면 문자열 미종료)을 추적하고,
-                        # {}로 폴백해 도구 스키마 검증이 거부 → tool_use_error로 모델이
-                        # 스스로 재호출(자기교정)하도록 넘긴다.
-                        logger.warning(
-                            "tool_call arguments JSON 파싱 실패 — 빈 dict 폴백 "
-                            "(tool=%s, err=%s, len=%d, tail=%.200r)",
-                            tc["function"]["name"],
-                            e2,
-                            len(raw_args),
-                            raw_args[-200:],
-                        )
-                        args = {}
-                        parse_failed = True
+                args, parse_failed = parse_tool_arguments(
+                    raw_args, tc["function"]["name"]
+                )
                 events.append(
                     StreamEvent(
                         type=StreamEventType.TOOL_USE_STOP,
