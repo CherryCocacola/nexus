@@ -58,6 +58,12 @@ from core.tools.executor import run_tool_use
 
 logger = logging.getLogger("nexus.orchestrator.stream_handler")
 
+# 취소한 도구 Task 가 정리를 끝낼 때까지 기다려 주는 상한(초).
+#   왜 상한이 필요한가: cancel_all()은 에러 복구 경로에서 불린다. 취소에 반응하지
+#   않는 도구가 하나 있다고 해서 재시도 전체가 멈추면 안 된다. 정리를 기다리되
+#   복구를 볼모로 잡지 않는 타협점이다.
+_CANCEL_DRAIN_TIMEOUT = 5.0
+
 
 class StreamingToolExecutor:
     """
@@ -257,11 +263,26 @@ class StreamingToolExecutor:
           이때 선행 실행해 둔 도구 결과는 더 이상 쓸모가 없으므로 함께 폐기한다.
         """
         # 아직 안 끝난 백그라운드 Task 에 취소 신호를 보낸다.
-        # (cancel()은 신호만 보내며 즉시 멈추는 것을 보장하지는 않지만,
-        #  아래에서 참조를 모두 비우므로 결과는 어차피 수거되지 않는다.)
-        for task in self._running_tasks:
-            if not task.done():
-                task.cancel()
+        pending = [t for t in self._running_tasks if not t.done()]
+        for task in pending:
+            task.cancel()
+
+        # ★취소가 실제로 끝날 때까지 기다린다(2026-08-24).
+        #   예전에는 신호만 보내고 곧바로 참조를 비웠다. 그러면 아직 정리 중인
+        #   도구 코루틴(과 그 안의 async generator)이 그대로 GC 로 넘어간다.
+        #   그 상태에서 파이썬의 asyncgen finalizer 가 닫으려 들면
+        #   `aclose(): asynchronous generator is already running` 이 날 수 있고,
+        #   취소된 Task 를 아무도 회수하지 않아 "Task exception was never retrieved"
+        #   경고도 남는다. 기다렸다 버리면 둘 다 사라진다.
+        #
+        #   ※상한을 두는 이유: 이 함수는 **에러 복구 경로**에서 불린다. 취소에
+        #     반응하지 않는 도구(예: 블로킹 서브프로세스)가 하나라도 있으면
+        #     재시도가 통째로 멈춘다. 정리를 기다리되 복구를 볼모로 잡지는 않는다.
+        if pending:
+            try:
+                await asyncio.wait(pending, timeout=_CANCEL_DRAIN_TIMEOUT)
+            except Exception:  # noqa: BLE001 — 정리 실패가 복구를 막으면 안 된다
+                logger.debug("도구 취소 대기 중 예외(무시)", exc_info=True)
         # 세 버퍼를 모두 비워 이 실행기를 초기 상태로 되돌린다.
         self._running_tasks.clear()
         self._deferred_calls.clear()
