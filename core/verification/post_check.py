@@ -62,6 +62,11 @@ def build_answer_warnings(answer: str, messages: list) -> str:
             build_execution_warning,
             find_execution_claims,
         )
+        from core.verification.file_claim import (
+            build_file_claim_warning,
+            collect_successful_write_tools,
+            find_file_claims,
+        )
         from core.verification.literal_citation import (
             build_literal_warning,
             find_misquoted_literals,
@@ -78,6 +83,14 @@ def build_answer_warnings(answer: str, messages: list) -> str:
         # (2026-08-13, `OMEGA77` → `오메가77` 실측).
         warning += build_literal_warning(find_misquoted_literals(answer, sources))
         warning += build_execution_warning(find_execution_claims(answer), len(sources))
+        # 파일 작성 주장 대조(2026-08-23 추가) — 위 실행 주장 검증과 **별개**다.
+        #   실행 주장은 도구 결과 '개수'만 보므로, Read 만 하고 "파일에 작성했습니다"
+        #   라고 답한 실측 사고를 못 잡았다(개수가 0 이 아니라 억제됨).
+        #   이쪽은 **성공한 쓰기 도구**만 세어 그 구멍을 막는다. 기존 검증기의
+        #   시그니처·동작은 건드리지 않는다(무회귀).
+        warning += build_file_claim_warning(
+            find_file_claims(answer), collect_successful_write_tools(messages)
+        )
         return warning
     except Exception as e:  # noqa: BLE001 — 검증 실패가 응답을 막지 않게 한다
         logger.warning("사후 검증 실패(무시): %s", e)
