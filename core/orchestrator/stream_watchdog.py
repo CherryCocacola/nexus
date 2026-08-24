@@ -57,6 +57,53 @@ def _is_emoji(ch: str) -> bool:
     return any(lo <= o <= hi for lo, hi in _EMOJI_RANGES)
 
 
+# 표 구분선 행을 이루는 문자들. 이 집합과 공백만으로 된 줄이 구분선 후보다.
+_TABLE_RULE_CHARS = frozenset("|:-=")
+
+
+def _is_table_rule(line: str) -> bool:
+    """마크다운 표의 구분선 행인지 판정한다 (4-gram 검사에서 제외할 대상).
+
+    왜 필요한가 (2026-08-23 실측):
+      넓은 표를 만들면 구분선 행이 `|--------|--------|…` 처럼 길어진다. 4-gram
+      검사는 공백을 제거하고 세므로 이 줄이 `----` 를 수백 개 만들어 낸다.
+      실제로 8열 테스트케이스 표 1800자에서 최빈 4-gram 이 `'----'` 457회,
+      비율 **0.609** 로 임계(0.45)를 넘겨 **정상 문서 생성이 두 번 잘렸다**.
+      붕괴가 아니라 멀쩡한 표였다.
+
+    왜 정규식 앵커(`^\\s*\\|[\\s|:-]*\\|\\s*$`)가 아닌가:
+      `_tail` 은 델타 조각을 이어붙인 window 라 줄이 반토막 난 상태로 검사된다.
+      특히 구분선을 **생성하는 도중**에는 마지막 줄이 항상 `|-----|--` 형태로
+      미완성이라 끝 앵커에 걸리지 않는다. 실측으로 tail 미완성 0.862,
+      head 반토막 0.608 로 둘 다 여전히 오탐했다. 앵커를 버리고 "구성 문자"로
+      판정하면 반토막에도 강건하다(각각 0.029, 0.016 으로 떨어진다).
+
+    왜 "연속 동일 문자 축약"이 아닌가:
+      순수 대시 폭주(`------…`)는 개행이 없어 A(동일라인)가, 문장부호가 없어
+      D(전역반복)가 못 본다. B 가 유일한 신호인데 run 축약은 그 신호 자체를
+      지운다. 그래서 줄 단위 제외를 택했다 — 폭주는 `|` 가 없어 계속 잡힌다.
+
+    알려진 사각:
+      `|-|-|-|-…` 형태의 폭주는 이 술어에 걸려 제외되므로 B 로 못 잡는다.
+      관측 사례가 없고 A/D 가 부분적으로 커버하므로 수용한다.
+
+    Args:
+        line: 검사할 한 줄(개행 없음).
+
+    Returns:
+        구분선 행이면 True — 즉 4-gram 풀에서 빼야 한다.
+    """
+    stripped = line.strip()
+    if not stripped:
+        return False
+    # 구성 문자가 전부 표 구조 문자(또는 공백)여야 한다.
+    if not all(ch in _TABLE_RULE_CHARS or ch.isspace() for ch in stripped):
+        return False
+    # `|` 와 `-` 를 **둘 다** 가진 줄만 구분선으로 본다. 이 조건이 순수 대시
+    # 폭주(`|` 없음)를 제외 대상에서 지켜 준다 — 그래야 탐지가 살아 있다.
+    return "|" in stripped and "-" in stripped
+
+
 class DegenerationMonitor:
     """스트리밍 생성 텍스트를 누적하며 '생성 중 붕괴(degeneration)'를 감지한다.
 
@@ -172,7 +219,10 @@ class DegenerationMonitor:
                 return True
 
         # B) 문자 4-gram 최빈 비율 — 문자 샐러드/대시·기호 폭주.
-        compact = re.sub(r"\s+", "", w)
+        #   ★표 구분선 행은 세지 않는다(2026-08-23 오탐 수정). 근거는 _is_table_rule 참조.
+        compact = re.sub(r"\s+", "", "\n".join(
+            ln for ln in w.splitlines() if not _is_table_rule(ln)
+        ))
         grams = [compact[i : i + 4] for i in range(len(compact) - 3)]
         if grams:
             top_gram = Counter(grams).most_common(1)[0][1] / len(grams)
