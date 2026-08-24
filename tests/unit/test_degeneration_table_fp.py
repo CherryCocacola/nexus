@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from core.orchestrator.stream_watchdog import DegenerationMonitor, _is_table_rule
 
 
@@ -146,3 +148,47 @@ class TestTruePositivesPreserved:
             for i in range(30)
         )
         assert feed_streaming(DegenerationMonitor(), text) is True
+
+
+class TestTimeoutClosesUpstream:
+    """타임아웃으로 스트림을 끊을 때 원본 제너레이터를 남기지 않는다.
+
+    `async for` 는 예외로 빠져나갈 때 이터레이터를 닫아 주지 않는다. 붕괴 절단
+    경로는 예전부터 aclose 를 불렀는데 타임아웃 경로만 빠져 있었다 —
+    버려진 스트림 정리와 GPU 꼬리 생성 차단이라는 같은 이유가 적용되는 자리다.
+
+    (실서버에서 타임아웃 재시도 직후 asyncio 의 `aclose(): asynchronous generator
+    is already running` 경고가 관측돼 이 누락을 의심했으나 단위 재현에는 실패했다.
+    이 테스트는 "원본을 닫는다"는 계약만 고정하며, 그 경고의 원인 규명은 별건이다.)
+    """
+
+    @pytest.mark.asyncio
+    async def test_upstream_is_closed_on_timeout(self) -> None:
+        import asyncio
+
+        from core.message import StreamEvent, StreamEventType
+        from core.orchestrator.stream_watchdog import (
+            StreamWatchdogTimeout,
+            stream_with_watchdog,
+        )
+
+        closed = {"value": False}
+
+        async def slow_stream():
+            try:
+                yield StreamEvent(type=StreamEventType.TEXT_DELTA, text="첫 조각")
+                await asyncio.sleep(2)  # idle 한계를 넘겨 무응답 상태로 만든다
+                # ★비-ping 이벤트를 보낸다. TEXT_DELTA 같은 토큰성 이벤트는
+                #   check() 앞에서 ping() 이 idle 타이머를 리셋해 버려 idle 판정이
+                #   나지 않는다(프로덕션에서도 비-ping 이벤트에서 걸렸다).
+                yield StreamEvent(type=StreamEventType.MESSAGE_STOP)
+            except GeneratorExit:
+                closed["value"] = True
+                raise
+
+        raw = slow_stream()
+        with pytest.raises(StreamWatchdogTimeout):
+            async for _ in stream_with_watchdog(raw, idle_timeout=0.3, total_timeout=30.0):
+                pass
+
+        assert closed["value"] is True, "타임아웃 시 원본 스트림이 닫히지 않았다"

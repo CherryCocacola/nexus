@@ -549,6 +549,22 @@ async def stream_with_watchdog(
             # 실제 타임아웃이면 예외 객체를 받아 raise 해 스트림을 중단시킨다.
             timeout = watchdog.check()
             if timeout:
+                # raise 하기 전에 원본 스트림을 닫는다(2026-08-24).
+                #   `async for` 는 예외로 빠져나갈 때 이터레이터를 닫아 주지 않는다.
+                #   위 붕괴 절단 경로는 이미 aclose 를 부르는데 타임아웃 경로만
+                #   빠져 있었다 — 같은 이유(버려진 스트림 정리 + GPU 가 꼬리를 계속
+                #   생성하는 것 차단)가 여기에도 그대로 적용되므로 맞춘다.
+                #
+                #   ※ 실서버에서 타임아웃 재시도 직후
+                #     `RuntimeError: aclose(): asynchronous generator is already running`
+                #     이 관측됐고 이 누락을 의심했으나, **단위 재현에는 실패했다.**
+                #     따라서 이 수정이 그 경고를 없앤다고 단정하지 않는다. 버려지는
+                #     제너레이터를 명시적으로 닫는 것 자체가 옳아서 넣은 것이고,
+                #     경고의 원인은 여전히 미규명이다.
+                try:
+                    await stream.aclose()
+                except Exception:  # noqa: BLE001, S110 — 이미 끊는 중이라 실패는 무시
+                    pass
                 raise timeout
 
             # 여기까지 통과하면 정상 이벤트 — 원본을 그대로 상위로 전달.
