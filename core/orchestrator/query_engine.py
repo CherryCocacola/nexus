@@ -423,6 +423,8 @@ class QueryEngine:
                 output_token_escalation=self._output_token_escalation,
                 # 구조화 출력 스펙(호출 단위 인자). None이면 일반 경로.
                 structured_output=structured_output,
+                # 종료 시점 검증 훅 — None이면 query_loop이 건너뛴다(무회귀).
+                hook_manager=self._hook_manager,
                 # 자기일관성(SC) 파라미터 — 게이트 미통과 시 sc_n=1(비활성, 무회귀).
                 sc_n=decision.sc_n,
                 sc_min_agreement=decision.sc_min_agreement,
@@ -458,6 +460,8 @@ class QueryEngine:
                 output_token_escalation=self._output_token_escalation,
                 # 구조화 출력 스펙(호출 단위 인자). None이면 일반 경로.
                 structured_output=structured_output,
+                # 종료 시점 검증 훅 — None이면 query_loop이 건너뛴다(무회귀).
+                hook_manager=self._hook_manager,
                 # 자기일관성(SC) 파라미터 — 게이트 미통과 시 sc_n=1(비활성, 무회귀).
                 sc_n=decision.sc_n,
                 sc_min_agreement=decision.sc_min_agreement,

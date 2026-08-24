@@ -55,6 +55,8 @@ from enum import Enum
 from typing import Any
 
 from core.message import (
+    STREAM_DISCARD_RETRY,
+    STREAM_TRUNCATED,
     Message,
     Role,
     StopReason,
@@ -130,6 +132,18 @@ class LoopState:
     # 에러 복구 카운터
     tool_parse_retry_count: int = 0
     model_error_count: int = 0
+    # ★도구별 파싱 실패 **누적** 횟수 (2026-08-23). 위 tool_parse_retry_count 와
+    #   달리 정상 턴에도 리셋하지 않는다.
+    #   왜 따로 필요한가(실측): [파싱 실패 턴 → 성공 턴 → 파싱 실패 턴 …] 교대
+    #   패턴에서, Transition 7(정상 턴)이 tool_parse_retry_count 를 0 으로 되돌려
+    #   카운터가 1↔0 을 오가며 한도에 영영 도달하지 못했다. 그 결과 같은 문서를
+    #   11회 다시 쓰며 30턴·10분을 공전했다. 누적 카운터가 그 사각을 메운다.
+    tool_parse_fail_total: dict[str, int] = field(default_factory=dict)
+    # STOP 훅이 이 세션에서 종료를 막은 횟수. 상한 없이 두면 모델이 계속 같은
+    # 주장을 반복할 때 무한 루프가 된다(builtin_hooks.MAX_FILE_CLAIM_BLOCKS 참조).
+    stop_hook_block_count: int = 0
+    # 도구별 넛지를 이미 보냈는가(도구당 1회만 — 매 턴 잔소리하면 컨텍스트만 먹는다).
+    parse_nudge_sent: set[str] = field(default_factory=set)
     # guided 재시도용 — 도구 인자 JSON 파싱이 실패한 도구 이름. 다음 턴 stream()에
     # tool_choice로 강제 전달돼 vLLM guided decoding으로 유효 JSON을 받게 한다.
     # 한 턴만 유효(one-shot): stream() 호출 직후 None으로 리셋한다.
@@ -162,6 +176,10 @@ class LoopState:
 MAX_TURNS = 200  # 최대 턴 수 (무한 루프 방지)
 MAX_OUTPUT_RECOVERY = 3  # max_output 복구 최대 시도 횟수
 MAX_TOOL_PARSE_RETRY = 2  # 도구 JSON 파싱 재시도 횟수
+# 도구별 파싱 실패 **누적** 임계 (2026-08-23). 연속이 아니라 누적으로 세는 이유는
+# LoopState.tool_parse_fail_total 주석 참조 — 교대 패턴이 연속 카운터를 빠져나간다.
+PARSE_FAIL_NUDGE_AT = 3   # 이 횟수에 도달하면 행동 지시를 한 번 주입한다
+PARSE_FAIL_ABORT_AT = 6   # 이 횟수에 도달하면 정직한 에러로 종료한다(무한 공전 차단)
 MAX_MODEL_ERROR_RETRY = 3  # 모델 에러 재시도 횟수
 MAX_COMPACT_RETRY = 2  # prompt-too-long 압축 재시도 횟수
 # 생성 중 degeneration(동일라인 반복·문자샐러드·이모지 폭주) 감지 시 스트림 조기 절단.
@@ -209,6 +227,40 @@ def _tool_call_signature(name: str, tool_input: Any) -> str:
     except (TypeError, ValueError):
         norm = str(tool_input)
     return f"{name}::{norm}"
+
+
+def _successful_write_tools_since_user(messages: list[Any]) -> list[str]:
+    """마지막 사용자 메시지 이후 **성공한** 쓰기 도구 이름을 모은다 (STOP 훅 판정용).
+
+    왜 "마지막 사용자 메시지 이후"인가: 모델이 세 턴 전에 파일을 쓰고 지금은 그
+    작업을 요약하는 중일 수 있다. 턴 하나만 보면 그런 정상 케이스를 오탐한다.
+    한 요청 단위로 봐야 "이번 요청에서 파일을 만들었나"에 답할 수 있다.
+
+    왜 "성공"인가: 권한 거부나 에러로 실패한 Write 를 실행으로 치면, 정작 잡아야 할
+    케이스(호출은 했는데 실패했고 그런데도 "작성했습니다"라고 하는 경우)가 빠진다.
+
+    Args:
+        messages: 대화 메시지 전체(state.messages).
+
+    Returns:
+        성공한 쓰기 도구 이름 목록. 없으면 빈 목록.
+    """
+    # 마지막 user 메시지 위치를 찾는다. 없으면 전체를 본다.
+    start = 0
+    for idx in range(len(messages) - 1, -1, -1):
+        role = messages[idx].role
+        role_value = role if isinstance(role, str) else getattr(role, "value", "")
+        if role_value == "user":
+            start = idx
+            break
+
+    try:
+        from core.verification.file_claim import collect_successful_write_tools
+
+        return sorted(collect_successful_write_tools(messages[start:]))
+    except Exception:  # noqa: BLE001 — 판정 실패로 루프를 막지 않는다(fail-open)
+        logger.debug("쓰기 도구 수집 실패", exc_info=True)
+        return []
 
 
 def _update_tool_failure_streak(
@@ -1168,6 +1220,9 @@ async def query_loop(
                     )
                     yield StreamEvent(
                         type=StreamEventType.SYSTEM_WARNING,
+                        # 소비자가 텍스트가 아니라 코드로 판별하게 한다 — 파이프
+                        # 모드는 이 신호를 받으면 여태 모은 버퍼를 버려야 한다.
+                        error_code=STREAM_DISCARD_RETRY,
                         message=(
                             "[생성 붕괴 감지] 앞의 출력은 버리고 다시 생성합니다 "
                             f"({state.degen_retry_count}/{DEGEN_MAX_RETRY})"
@@ -1181,6 +1236,19 @@ async def query_loop(
                 logger.warning(
                     "degeneration 재생성 예산 소진 — 절단본을 그대로 사용한다(%d자)",
                     degen_monitor.length,
+                )
+                # ★2026-08-23: 여기가 유일하게 신호가 없던 자리였다. 절단본을 그대로
+                #   내보내면서 아무에게도 알리지 않아, 비대화형 `nexus ask` 가
+                #   **잘린 답변을 exit 0 으로** 내보냈다(실측). 소비자가 성공으로
+                #   오인하는 것을 막으려면 이 사실이 스트림에 실려야 한다.
+                yield StreamEvent(
+                    type=StreamEventType.SYSTEM_WARNING,
+                    error_code=STREAM_TRUNCATED,
+                    message=(
+                        f"[생성 붕괴] 재생성 {DEGEN_MAX_RETRY}회로도 복구하지 못해 "
+                        f"잘린 출력을 그대로 사용합니다({degen_monitor.length}자). "
+                        "답변이 불완전할 수 있습니다."
+                    ),
                 )
             elif state.degen_retry_count:
                 # 붕괴 없이 끝났다 → 예산을 되돌려 다음 붕괴도 1회 재생성을 받는다.
@@ -1207,6 +1275,9 @@ async def query_loop(
                     )
                     yield StreamEvent(
                         type=StreamEventType.SYSTEM_WARNING,
+                        # 붕괴 재생성과 같은 구조다 — 이미 흘린 부분 출력은 버려지고
+                        # 처음부터 다시 생성된다. 소비자도 같게 처리해야 한다.
+                        error_code=STREAM_DISCARD_RETRY,
                         message=(
                             f"[스트림 {e.timeout_type} 타임아웃] "
                             f"재시도 {state.model_error_count}/{MAX_MODEL_ERROR_RETRY}"
@@ -1267,6 +1338,63 @@ async def query_loop(
         # 'named'로 강제해 다시 요청하면, vLLM이 그 도구의 parameters 스키마로 guided
         # decoding을 적용해 유효 JSON을 보장한다(B200 실서버 확증). 정상 파싱된 도구가
         # 하나라도 있으면(tool_use_blocks 비어있지 않음) 그걸로 진행하므로 건너뛴다.
+        # ── 도구별 파싱 실패 누적 가드 (2026-08-23) ──
+        # 아래 `if parse_failed_tools and not tool_use_blocks:` 분기와 별개다.
+        # 그 분기는 **이번 턴에 건진 도구가 하나도 없을 때만** 돌고, 재시도 카운터도
+        # 정상 턴마다 리셋된다. 그래서 [실패 → 성공 → 실패 …] 교대 패턴이 통째로
+        # 빠져나갔다(실측: 같은 문서를 11회 다시 쓰며 30턴 공전).
+        # 여기서는 성공 여부와 무관하게 **누적**으로 세어 그 사각을 막는다.
+        for _failed_name in dict.fromkeys(parse_failed_tools):
+            state.tool_parse_fail_total[_failed_name] = (
+                state.tool_parse_fail_total.get(_failed_name, 0) + 1
+            )
+            _total = state.tool_parse_fail_total[_failed_name]
+
+            if _total >= PARSE_FAIL_ABORT_AT:
+                logger.warning(
+                    "도구 인자 파싱 실패 누적 %d회(%s) — 턴 루프 강제 종료",
+                    _total,
+                    _failed_name,
+                )
+                yield StreamEvent(
+                    type=StreamEventType.ERROR,
+                    error_code="TOOL_ARGS_REPEATEDLY_UNPARSEABLE",
+                    message=(
+                        f"{_failed_name} 도구의 인자를 {_total}회 연속으로 생성하지 "
+                        "못했습니다. 요청 범위를 나눠(예: 섹션별로) 다시 시도해 주세요."
+                    ),
+                )
+                await streaming_executor.cancel_all()
+                return
+
+            # 넛지는 도구당 1회만. 매 턴 잔소리하면 컨텍스트만 먹고 효과는 없다.
+            if _total >= PARSE_FAIL_NUDGE_AT and _failed_name not in state.parse_nudge_sent:
+                state.parse_nudge_sent.add(_failed_name)
+                logger.warning(
+                    "도구 인자 파싱 실패 누적 %d회(%s) — 분할 작성 넛지 주입",
+                    _total,
+                    _failed_name,
+                )
+                yield StreamEvent(
+                    type=StreamEventType.SYSTEM_WARNING,
+                    message=(
+                        f"[인자 생성 반복 실패] {_failed_name} {_total}회 — "
+                        "요청을 나눠 진행하도록 안내합니다"
+                    ),
+                )
+                # user 역할로 넣어야 모델이 다음 턴에 확실히 읽는다(위 반복 실패
+                # 경고와 같은 방식). 내용은 **행동 지시**여야 한다 — "실패했다"만
+                # 알리면 모델이 같은 크기로 또 시도한다.
+                state.messages.append(
+                    Message.user(
+                        f"[시스템] {_failed_name} 도구의 인자 JSON 이 {_total}회 "
+                        "연속으로 깨졌습니다. 한 번에 넘기는 내용이 너무 깁니다. "
+                        "같은 크기로 다시 시도하지 마세요. 문서를 여러 조각으로 "
+                        "나눠 짧게 여러 번 쓰거나, 이미 쓴 파일이 있으면 그대로 두고 "
+                        "다음 단계로 넘어가세요."
+                    )
+                )
+
         if parse_failed_tools and not tool_use_blocks:
             # 중복 제거하며 순서 보존
             unique_failed = list(dict.fromkeys(parse_failed_tools))
@@ -1532,15 +1660,42 @@ async def query_loop(
                         metadata={
                             "stop_reason": str(stop_reason) if stop_reason else None,
                             "turn_count": state.turn_count,
-                            "assistant_text": assistant_text[:200],
+                            # ★전문을 넘긴다(2026-08-23). 200자로 자르면 주장이 대개
+                            #   답변 끝에 오기 때문에 판정에 필요한 문장이 잘려 나간다.
+                            "assistant_text": assistant_text,
+                            # 마지막 사용자 메시지 이후 **성공한** 쓰기 도구들.
+                            #   훅이 "썼다는데 안 썼다"를 판정할 유일한 근거다.
+                            "write_tools": _successful_write_tools_since_user(
+                                state.messages
+                            ),
+                            "block_count": state.stop_hook_block_count,
                         },
                     )
                     hook_result = await hook_manager.run(HookEvent.STOP, hook_input)
                     if hook_result.decision == HookDecision.BLOCK:
                         # Hook이 종료를 차단 → 강제 다음 턴
+                        state.stop_hook_block_count += 1
                         state.continue_reason = ContinueReason.STOP_HOOK_BLOCKING
                         logger.info(
-                            "Hook이 종료를 차단: %s", hook_result.block_reason
+                            "Hook이 종료를 차단(%d회): %s",
+                            state.stop_hook_block_count,
+                            hook_result.block_reason,
+                        )
+                        # ★차단 사유를 대화에 넣어야 모델이 무엇을 해야 하는지 안다.
+                        #   이게 없으면 모델은 왜 턴이 이어지는지 모른 채 같은 답을
+                        #   반복한다(차단이 루프로 바뀌는 지점).
+                        if hook_result.block_reason:
+                            state.messages.append(
+                                Message.user(
+                                    f"[시스템] {hook_result.block_reason} "
+                                    "말로 끝내지 말고 지금 실제로 도구를 호출해 "
+                                    "파일을 만드세요. 이미 만들었다면 Read 나 LS 로 "
+                                    "존재를 확인한 뒤 그 결과를 근거로 답하세요."
+                                )
+                            )
+                        yield StreamEvent(
+                            type=StreamEventType.SYSTEM_WARNING,
+                            message=f"[종료 차단] {hook_result.block_reason}",
                         )
                         await streaming_executor.cancel_all()
                         continue

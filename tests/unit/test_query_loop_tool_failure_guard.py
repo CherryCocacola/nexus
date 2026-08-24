@@ -121,3 +121,86 @@ def test_streak_missing_result_treated_as_non_error():
 def test_thresholds_warn_below_abort():
     """경고 임계는 강제 종료 임계보다 낮아야(먼저 발동해야) 한다."""
     assert REPEATED_TOOL_FAILURE_WARN < REPEATED_TOOL_FAILURE_ABORT
+
+
+# ─────────────────────────────────────────────
+# 도구 인자 파싱 실패 **누적** 가드 (2026-08-23)
+# ─────────────────────────────────────────────
+# 위 streak 가드가 못 잡는 사각을 메운다.
+#
+# 실측 사고: [파싱 실패 턴 → 성공 턴 → 파싱 실패 턴 …] 교대 패턴에서
+#   ① 파싱 실패 도구는 tool_use_blocks 에 아예 안 들어가 streak 에 집계조차 안 되고,
+#   ② Transition 7(정상 턴)이 tool_parse_retry_count 를 0 으로 되돌린다.
+# 그래서 카운터가 1↔0 을 오가며 한도에 영영 도달하지 못했고, 같은 문서를 11회
+# 다시 쓰며 30턴·10분을 공전했다. 누적 카운터는 정상 턴에도 리셋되지 않는다.
+
+
+def _simulate_alternating(state, tool_name: str, rounds: int) -> None:
+    """[파싱 실패 → 정상 턴] 교대를 흉내낸다.
+
+    정상 턴은 query_loop 의 Transition 7 이 하는 일(턴 단위 카운터 리셋)만
+    재현한다 — 누적 카운터가 그 리셋을 견디는지가 이 테스트의 핵심이다.
+    """
+    for _ in range(rounds):
+        state.tool_parse_fail_total[tool_name] = (
+            state.tool_parse_fail_total.get(tool_name, 0) + 1
+        )
+        # 정상 턴 — Transition 7 의 리셋
+        state.tool_parse_retry_count = 0
+
+
+def test_cumulative_counter_survives_normal_turn_reset():
+    """★핵심 — 정상 턴이 끼어들어도 누적 카운터는 줄지 않는다."""
+    from core.orchestrator.query_loop import LoopState
+
+    state = LoopState(messages=[])
+    _simulate_alternating(state, "Write", 5)
+
+    assert state.tool_parse_retry_count == 0  # 턴 단위 카운터는 리셋됨(기존 동작)
+    assert state.tool_parse_fail_total["Write"] == 5  # 누적 카운터는 살아 있음
+
+
+def test_cumulative_counter_reaches_nudge_threshold():
+    """교대 패턴에서도 넛지 임계에 도달한다 — 기존 카운터로는 불가능했다."""
+    from core.orchestrator.query_loop import PARSE_FAIL_NUDGE_AT, LoopState
+
+    state = LoopState(messages=[])
+    _simulate_alternating(state, "Write", PARSE_FAIL_NUDGE_AT)
+    assert state.tool_parse_fail_total["Write"] >= PARSE_FAIL_NUDGE_AT
+
+
+def test_cumulative_counter_reaches_abort_threshold():
+    """계속 실패하면 결국 중단 임계에 도달해 공전이 끊긴다."""
+    from core.orchestrator.query_loop import PARSE_FAIL_ABORT_AT, LoopState
+
+    state = LoopState(messages=[])
+    _simulate_alternating(state, "Write", PARSE_FAIL_ABORT_AT)
+    assert state.tool_parse_fail_total["Write"] >= PARSE_FAIL_ABORT_AT
+
+
+def test_thresholds_leave_room_between_nudge_and_abort():
+    """넛지 뒤 모델이 행동을 고칠 여지가 있어야 한다 — 둘이 붙어 있으면 의미가 없다."""
+    from core.orchestrator.query_loop import PARSE_FAIL_ABORT_AT, PARSE_FAIL_NUDGE_AT
+
+    assert PARSE_FAIL_NUDGE_AT < PARSE_FAIL_ABORT_AT
+    assert PARSE_FAIL_ABORT_AT - PARSE_FAIL_NUDGE_AT >= 2
+
+
+def test_counters_are_per_tool():
+    """도구가 다르면 카운터도 따로 센다(한 도구의 실패가 다른 도구를 끊으면 안 된다)."""
+    from core.orchestrator.query_loop import LoopState
+
+    state = LoopState(messages=[])
+    _simulate_alternating(state, "Write", 4)
+    _simulate_alternating(state, "Edit", 1)
+    assert state.tool_parse_fail_total == {"Write": 4, "Edit": 1}
+
+
+def test_nudge_is_sent_once_per_tool():
+    """도구당 1회만 주입한다 — 매 턴 잔소리하면 컨텍스트만 먹는다."""
+    from core.orchestrator.query_loop import LoopState
+
+    state = LoopState(messages=[])
+    state.parse_nudge_sent.add("Write")
+    assert "Write" in state.parse_nudge_sent
+    assert "Edit" not in state.parse_nudge_sent

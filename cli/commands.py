@@ -341,7 +341,12 @@ def ask(query: str, log_level: str) -> None:
         #      - 답변이 하나도 없이 끝나거나 에러가 있었으면 종료 코드 1로 나간다.
         from cli.formatters import OutputFormatter
         from cli.markdown_stream import MarkdownStreamRenderer
-        from core.message import StreamEvent, StreamEventType
+        from core.message import (
+            STREAM_DISCARD_RETRY,
+            STREAM_TRUNCATED,
+            StreamEvent,
+            StreamEventType,
+        )
 
         fmt = OutputFormatter(show_thinking=False)
         fmt.reset_stream_state()
@@ -359,6 +364,7 @@ def ask(query: str, log_level: str) -> None:
                 console.print(block, end="")
         saw_text = False   # 답변 텍스트(TEXT_DELTA)를 한 조각이라도 받았는가
         had_error = False  # 스트림 도중 ERROR 이벤트가 있었는가
+        truncated = False  # 붕괴 복구 실패로 잘린 출력을 받았는가 (2026-08-23)
 
         # 사후 검증용 — 흘려보낸 답변을 모아 두고, 이번 턴 구간의 시작을 기억한다.
         #   왜 CLI 에도 필요한가: 숫자 자릿수 오류와 "실행하지 않고 통과했다고 단정"이
@@ -366,6 +372,35 @@ def ask(query: str, log_level: str) -> None:
         #   무방비다.
         answer_parts: list[str] = []
         turn_start = len(getattr(engine, "_messages", []))
+
+        # ── 파이프 모드 버퍼링 (2026-08-23) ──
+        # 왜 필요한가: 생성 붕괴가 감지되면 엔진이 앞의 출력을 버리고 재생성한다.
+        # 그런데 조각을 즉시 출력해 버리면 **폐기된 절단본과 재생성본이 구분자 없이
+        # 이어붙은 채** stdout 으로 나간다(실측). 받는 쪽은 그게 한 답변인 줄 안다.
+        #   · 비 TTY(파이프·CI): 어차피 점진 출력이 필요 없고 정합성이 전부다.
+        #     끝까지 모았다가 한 번에 낸다. 폐기 신호가 오면 버퍼를 비운다.
+        #   · TTY(사람): 이미 화면에 찍힌 글자는 되돌릴 수 없다. 스트리밍을 유지하되
+        #     경계를 한 줄로 알려 주는 것이 상한이다.
+        pipe_mode = not console.is_terminal
+        pending: list = []  # 파이프 모드에서 출하 대기 중인 블록들
+
+        def _collect(block) -> None:
+            """블록을 즉시 출력하거나(TTY) 버퍼에 쌓는다(파이프)."""
+            if pipe_mode:
+                pending.append(block)
+            else:
+                _emit(block)
+
+        def _discard_pending() -> None:
+            """폐기 신호 수신 — 여태 모은 본문을 전부 버리고 상태를 초기화한다."""
+            nonlocal saw_text, md
+            pending.clear()
+            answer_parts.clear()
+            saw_text = False
+            # 마크다운 렌더러도 새로 만든다 — 절단본의 미완성 블록이 남아 있으면
+            # 재생성본 첫 문단과 뒤섞인다.
+            md = MarkdownStreamRenderer(enabled=console.is_terminal)
+            fmt.reset_stream_state()
 
         async for event in engine.submit_message(query):
             if not isinstance(event, StreamEvent):
@@ -376,6 +411,20 @@ def ask(query: str, log_level: str) -> None:
                     or "스트림 오류"
                 click.echo(f"[에러] {msg}", err=True)  # stderr로 — stdout(답변)과 분리
                 continue
+            # ── 스트림 정합성 신호 ──
+            # 문구가 아니라 error_code 로 판별한다(문구는 바뀌어도 코드는 안 바뀐다).
+            if event.type == StreamEventType.SYSTEM_WARNING:
+                code = getattr(event, "error_code", None)
+                if code == STREAM_DISCARD_RETRY:
+                    # 재시도는 **정상 복구 경로**다 — 실패로 치지 않는다(종료 코드 불변).
+                    _discard_pending()
+                    click.echo(f"[알림] {event.message}", err=True)
+                elif code == STREAM_TRUNCATED:
+                    # 복구 실패 — 불완전한 답변이 나간다. 자동화는 이걸 성공으로
+                    # 오인하면 안 된다.
+                    truncated = True
+                    click.echo(f"[경고] {event.message}", err=True)
+                continue
             if event.type == StreamEventType.TEXT_DELTA and event.text:
                 saw_text = True
                 answer_parts.append(event.text)
@@ -384,12 +433,18 @@ def ask(query: str, log_level: str) -> None:
                     # 렌더 ON이면 완성된 블록만, OFF면 조각 그대로 이어붙인다.
                     piece = out.plain if hasattr(out, "plain") else str(out)
                     for block in md.feed(piece):
-                        _emit(block)
+                        _collect(block)
 
         # 스트림이 끝났으니 버퍼에 남은 마지막 블록을 반드시 마저 낸다
         # (빈 줄로 끝나지 않는 답변의 끝문단이 통째로 사라지는 것을 막는다).
         for block in md.flush():
-            _emit(block)
+            _collect(block)
+
+        # 파이프 모드는 여기서 한 번에 출하한다 — 여기까지 왔다는 건 폐기 신호가
+        # 더 오지 않는다는 뜻이라, 이 시점의 버퍼가 최종본이다.
+        if pipe_mode:
+            for block in pending:
+                _emit(block)
 
         if saw_text:
             console.print()  # 마지막 개행 — 파이프·터미널 모두에서 줄이 끊기지 않게
@@ -407,7 +462,10 @@ def ask(query: str, log_level: str) -> None:
                 console.print(warning)
 
         # 실패(연결·컨텍스트 초과 등)나 빈 응답을 성공(exit 0)으로 오인하면 CI가 무너진다.
-        if had_error or not saw_text:
+        #   truncated: 붕괴 복구 실패로 **잘린 답변**이 나간 경우(2026-08-23 추가).
+        #   재시도(STREAM_DISCARD_RETRY)는 정상 복구라 여기 들어가지 않는다 —
+        #   그걸 실패로 치면 복구가 성공한 정상 실행이 CI 실패로 둔갑한다.
+        if had_error or truncated or not saw_text:
             sys.exit(1)
 
     # 위 코루틴을 이벤트 루프에서 실행한다.

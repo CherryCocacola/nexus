@@ -746,8 +746,26 @@ async def init_phase2(state: GlobalState) -> dict:
     )
     components["transcript"] = cli_transcript
 
+    # ── STOP 훅 매니저 (2026-08-23) ──
+    # 왜 별도 키인가: components["hook_manager"] 는 **권한 파이프라인 Layer 4** 가
+    # 쓰는 자리다(위 :338). 거기에 매니저를 꽂으면 PRE_TOOL_USE 훅이 활성화돼
+    # shadow 모드의 "관측 전용" 보장이 깨진다(그 자리 주석의 경고 그대로).
+    # 여기서 하려는 것은 종료 시점 검증 하나뿐이라, 권한 경로를 건드리지 않도록
+    # STOP 전용 매니저를 따로 만든다. Layer 4 배선은 별개 결정 사항이다.
+    #
+    # 무엇을 막나: 모델이 파일을 만들었다고 말만 하고 실제로는 안 쓴 채 끝내는
+    # 턴을 잡아 한 번 더 기회를 준다(실측 8회 중 2회 발생). 사후 검증기는 경고만
+    # 붙일 수 있고, 경고는 사람이 무시하거나 자동화가 못 본다.
+    from core.hooks.builtin_hooks import file_claim_stop_hook
+    from core.hooks.hook_manager import HookEvent, HookManager
+
+    stop_hook_manager = HookManager()
+    stop_hook_manager.register(HookEvent.STOP, file_claim_stop_hook)
+    components["stop_hook_manager"] = stop_hook_manager
+
     engine = QueryEngine(
         model_provider=provider,
+        hook_manager=stop_hook_manager,
         # 코딩 전용 프로바이더(없으면 None) — 라우팅이 코딩 질의로 판정한 턴에만 쓴다.
         coder_provider=coder_provider,
         tools=cli_tools,

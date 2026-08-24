@@ -349,6 +349,26 @@ class OutputFormatter:
         block.append(text.strip(), style="dim italic")
         return block
 
+    # ─── 시스템 경고 ───
+
+    def format_system_warning(self, message: str) -> Text:
+        """스트림 정합성 경고를 눈에 띄되 답변을 가리지 않는 한 줄로 만든다.
+
+        박스를 쓰지 않는 이유: 이 경고는 답변 **도중**에 끼어든다. 패널을 그리면
+        본문 흐름이 두 동강 나고, 재생성으로 이어질 경우 화면이 박스로 도배된다.
+        에러(빨간 패널)보다 낮고 일반 본문보다 높은 위계로 한 줄만 남긴다.
+
+        Args:
+            message: 엔진이 실어 보낸 사람 읽을 문구.
+
+        Returns:
+            노란 마커가 붙은 한 줄 Text.
+        """
+        line = Text()
+        line.append("⚠ ", style="yellow")
+        line.append(message.strip(), style="yellow")
+        return line
+
     # ─── 에러 ───
 
     def format_error(self, message: str) -> Panel:
@@ -467,6 +487,14 @@ class OutputFormatter:
         # 에러 — 에러 메시지를 빨간 패널로 표시한다.
         if event_type == StreamEventType.ERROR and event.message:
             return self.format_error(event.message)
+
+        # 시스템 경고 — 스트림 정합성 신호(재생성/절단 등)를 사람에게 알린다.
+        #   [2026-08-23 추가] 이전에는 이 타입이 여기서 None 으로 떨어져 **화면에
+        #   아무것도 안 나왔다.** 그래서 생성 붕괴로 앞의 출력이 통째로 폐기되고
+        #   다시 생성돼도 사용자는 그 사실을 알 수 없었고, 화면에는 절단본과
+        #   재생성본이 그냥 이어져 보였다.
+        if event_type == StreamEventType.SYSTEM_WARNING and event.message:
+            return self.format_system_warning(event.message)
 
         # 사용량 업데이트 — 토큰 사용량을 한 줄로 표시한다.
         if event_type == StreamEventType.USAGE_UPDATE and event.usage:

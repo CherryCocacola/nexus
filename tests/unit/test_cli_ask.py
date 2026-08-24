@@ -94,3 +94,97 @@ def test_ask_model_option_removed():
     result = CliRunner().invoke(cli, ["ask", "--model", "primary", "질문"])
     assert result.exit_code == 2  # click usage 에러
     assert "no such option" in result.output.lower()
+
+
+# ─────────────────────────────────────────────
+# 스트림 정합성 신호 (2026-08-23)
+# ─────────────────────────────────────────────
+# 배경(실측 사고): 생성 붕괴가 감지되면 엔진이 앞의 출력을 버리고 재생성한다.
+# 재생성으로도 복구하지 못하면 **잘린 출력을 그대로** 내보내는데, 그 사실을 알리는
+# 신호가 없어 `nexus ask` 가 잘린 답변을 exit 0 으로 내보냈다. 파이프·CI 는 성공으로
+# 오인한다. 아래 테스트가 그 계약을 고정한다.
+#
+# ★가장 중요한 것은 "재시도는 실패가 아니다"이다. STREAM_DISCARD_RETRY 를 실패로
+#   오배선하면 정상 복구가 CI 실패로 둔갑한다.
+
+
+def _discard_retry(msg: str = "[생성 붕괴 감지] 다시 생성합니다") -> StreamEvent:
+    from core.message import STREAM_DISCARD_RETRY
+
+    return StreamEvent(
+        type=StreamEventType.SYSTEM_WARNING,
+        error_code=STREAM_DISCARD_RETRY,
+        message=msg,
+    )
+
+
+def _truncated(msg: str = "[생성 붕괴] 잘린 출력을 그대로 사용합니다") -> StreamEvent:
+    from core.message import STREAM_TRUNCATED
+
+    return StreamEvent(
+        type=StreamEventType.SYSTEM_WARNING,
+        error_code=STREAM_TRUNCATED,
+        message=msg,
+    )
+
+
+def test_truncated_signal_exits_one():
+    """복구 실패로 잘린 답변이 나가면 실패로 처리한다 — 이게 없어서 exit 0 이었다."""
+    result = _invoke_ask([_text("표를 만들다 잘린 본문"), _truncated()])
+    assert result.exit_code == 1
+
+
+def test_truncated_signal_reports_to_stderr():
+    """경고는 stderr 로 — stdout(답변)을 오염시키면 파이프 소비자가 깨진다."""
+    result = _invoke_ask([_text("본문"), _truncated()])
+    assert "잘린 출력" in result.stderr
+    assert "잘린 출력" not in result.stdout
+
+
+def test_discard_retry_alone_still_exits_zero():
+    """★재시도는 정상 복구 경로다. 실패로 치면 정상 실행이 CI 실패로 둔갑한다."""
+    result = _invoke_ask([_text("버려질 본문"), _discard_retry(), _text("최종 답변입니다.")])
+    assert result.exit_code == 0
+
+
+def test_discard_retry_drops_earlier_output_from_stdout():
+    """폐기된 절단본이 stdout 에 남으면 재생성본과 이어붙어 한 답변처럼 보인다."""
+    result = _invoke_ask(
+        [_text("버려질 절단본입니다."), _discard_retry(), _text("최종 답변입니다.")]
+    )
+    assert "최종 답변입니다." in result.stdout
+    assert "버려질 절단본" not in result.stdout
+
+
+def test_timeout_retry_success_exits_zero():
+    """★오배선 방지 핵심 — 타임아웃 재시도 후 성공한 실행은 성공이어야 한다."""
+    result = _invoke_ask(
+        [
+            _text("여기까지 쓰다 타임아웃"),
+            _discard_retry("[스트림 idle 타임아웃] 재시도 1/3"),
+            _text("재시도 후 완성된 답변."),
+        ]
+    )
+    assert result.exit_code == 0
+    assert "재시도 후 완성된 답변." in result.stdout
+    assert "여기까지 쓰다 타임아웃" not in result.stdout
+
+
+def test_retry_then_truncated_exits_one():
+    """재시도했으나 끝내 복구 못 한 경우 — step5 에서 실제로 일어난 시퀀스다."""
+    result = _invoke_ask(
+        [_text("1차 절단본"), _discard_retry(), _text("2차도 잘림"), _truncated()]
+    )
+    assert result.exit_code == 1
+    assert "1차 절단본" not in result.stdout
+
+
+def test_plain_system_warning_without_code_is_ignored():
+    """코드가 없는 일반 경고는 종료 코드에 영향을 주지 않는다(무회귀)."""
+    result = _invoke_ask(
+        [
+            StreamEvent(type=StreamEventType.SYSTEM_WARNING, message="참고 사항"),
+            _text("정상 답변입니다."),
+        ]
+    )
+    assert result.exit_code == 0

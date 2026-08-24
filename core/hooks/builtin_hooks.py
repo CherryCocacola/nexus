@@ -255,3 +255,76 @@ async def sensitive_path_hook(hook_input: HookInput) -> HookResult:
 
     # 어떤 후보 경로도 민감 패턴에 걸리지 않았다 — 안전하다고 보고 통과시킨다.
     return HookResult(decision=HookDecision.CONTINUE)
+
+
+# ─────────────────────────────────────────────
+# 3. file_claim_stop_hook — "썼다"고 했는데 안 쓴 턴의 종료를 막는다
+# ─────────────────────────────────────────────
+# 왜 필요한가 (2026-08-23 실측, 재현 3회):
+#   모델이 문서를 파일에 쓰지 않고 **채팅에 출력한 뒤** 이렇게 답하고 종료했다.
+#     "docs/TABLE_DESIGN.md 파일에 내용을 작성했습니다. 파일 존재를 확인했습니다."
+#   Write 0회, 검증 0회. 시스템 프롬프트에 "열지 않은 것을 읽었다고 말하지 마라"가
+#   있는데도 뚫렸고, 8회 중 2회 발생하는 확률적 실패다.
+#
+#   사후 검증기(core/verification/file_claim.py)는 이 상황에 **경고만** 붙인다.
+#   경고는 사람이 무시할 수 있고 자동화는 아예 못 본다. 종료 자체를 막아 모델에게
+#   한 번 더 기회를 주는 것이 이 훅의 역할이다 — 탐지에서 예방으로 한 칸 올린다.
+#
+# 왜 STOP 시점인가:
+#   PRE_TOOL_USE 로는 못 잡는다. 문제는 "도구를 부른 것"이 아니라 **안 부른 것**이라,
+#   도구 호출이 없는 종료 시점에만 관측된다.
+
+# 한 세션에서 이 훅이 종료를 막을 수 있는 최대 횟수.
+#   왜 상한이 필요한가: 모델이 계속 파일을 안 쓰고 같은 주장을 반복하면 무한 루프가
+#   된다. 두 번 기회를 주고도 안 되면 사람이 볼 수 있게 그냥 끝내는 편이 낫다
+#   (사후 검증 경고가 답변 뒤에 붙으므로 사실이 사라지지는 않는다).
+MAX_FILE_CLAIM_BLOCKS = 2
+
+
+async def file_claim_stop_hook(hook_input: HookInput) -> HookResult:
+    """파일을 만들었다는 주장과 실제 쓰기 도구 실행을 대조해 종료를 차단한다.
+
+    판정 근거는 전부 호출부(query_loop)가 metadata 에 실어 준다.
+      - assistant_text : 이번 턴 모델 답변 전문(주장을 찾을 대상)
+      - write_tools    : 마지막 사용자 메시지 이후 **성공한** 쓰기 도구 이름들
+      - block_count    : 이 세션에서 이미 차단한 횟수
+
+    차단 조건은 셋을 모두 만족할 때다.
+      ① 답변에 파일 작성 완료형 주장이 있다(파일 표지 포함 — 채팅 전용 산출 제외).
+      ② 성공한 쓰기 도구 실행이 0건이다(시도가 아니라 성공. 권한 거부로 실패한
+         Write 를 성공으로 치면 정작 잡아야 할 케이스가 빠진다).
+      ③ 차단 상한에 아직 도달하지 않았다.
+
+    Args:
+        hook_input: STOP 이벤트 입력. metadata 에 위 세 값이 담겨 온다.
+
+    Returns:
+        BLOCK(차단 사유 포함) 또는 CONTINUE.
+    """
+    if hook_input.event != HookEvent.STOP:
+        return HookResult(decision=HookDecision.CONTINUE)
+
+    meta = hook_input.metadata or {}
+    if meta.get("block_count", 0) >= MAX_FILE_CLAIM_BLOCKS:
+        # 상한 도달 — 더 붙잡지 않는다. 사후 검증 경고가 사실을 남긴다.
+        return HookResult(decision=HookDecision.CONTINUE)
+
+    # 성공한 쓰기가 하나라도 있으면 주장이 사실일 수 있다 — 통과시킨다.
+    if meta.get("write_tools"):
+        return HookResult(decision=HookDecision.CONTINUE)
+
+    # 주장 탐지는 사후 검증기와 같은 규칙을 재사용한다(두 벌 관리하면 반드시 어긋난다).
+    from core.verification.file_claim import find_file_claims
+
+    claims = find_file_claims(meta.get("assistant_text") or "")
+    if not claims:
+        return HookResult(decision=HookDecision.CONTINUE)
+
+    logger.warning("STOP 차단 — 파일 작성 주장 %d건, 성공한 쓰기 0건", len(claims))
+    return HookResult(
+        decision=HookDecision.BLOCK,
+        block_reason=(
+            "파일을 만들었다고 했지만 이번 대화에서 파일을 쓰는 도구가 성공적으로 "
+            f"실행된 기록이 없습니다. 주장: {claims[0][:120]}"
+        ),
+    )

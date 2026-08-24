@@ -174,6 +174,9 @@ class ModelDispatcher:
         # 자기일관성(Self-Consistency) 파라미터(Point 4.3). sc_n=1(기본)이면 SC 비활성
         # 이라 query_loop이 기존 단일 경로로 동작한다(무회귀). QueryEngine이 라우팅
         # 결정(RoutingDecision.sc_*)을 넘겨주며, route()는 판단 없이 통과만 시킨다.
+        # 종료 시점 검증 훅(2026-08-23). None이면 query_loop이 STOP 훅 블록을
+        # 통째로 건너뛰어 종전과 비트 동일하게 동작한다(무회귀).
+        hook_manager: Any | None = None,
         sc_n: int = 1,
         sc_min_agreement: int = 2,
         sc_short_answer_max_chars: int = 80,
@@ -249,6 +252,8 @@ class ModelDispatcher:
             output_token_escalation=output_token_escalation,
             # 구조화 출력 스펙 passthrough (None이면 일반 경로).
             structured_output=structured_output,
+            # STOP 훅 passthrough — None이면 query_loop이 해당 블록을 건너뛴다.
+            hook_manager=hook_manager,
             # SC 파라미터 passthrough — sc_n=1이면 query_loop이 SC를 우회한다(무회귀).
             sc_n=sc_n,
             sc_min_agreement=sc_min_agreement,
