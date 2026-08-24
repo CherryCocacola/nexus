@@ -29,15 +29,45 @@ GPU 행(hang), vLLM 데드락, 네트워크 끊김처럼 "응답이 멈춘" 상�
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import time
 from collections import Counter
 from collections.abc import AsyncGenerator
+from typing import Any
 
 from core.message import StreamEvent, StreamEventType
 
 logger = logging.getLogger("nexus.orchestrator.stream_watchdog")
+
+
+# 이터레이터가 끝났음을 나타내는 센티널.
+#   왜 예외가 아니라 값인가: 아래 _next_or_stop 은 asyncio.wait_for 로 감싸 Task 안에서
+#   돈다. StopAsyncIteration 을 Task 밖으로 던지면 asyncio 가 이를 특수 처리해 흐름이
+#   꼬인다. 정상 종료는 값으로 돌려주는 편이 안전하다.
+_STREAM_END = object()
+
+
+async def _next_or_stop(iterator: Any) -> Any:
+    """이터레이터에서 다음 이벤트를 하나 받는다. 끝났으면 _STREAM_END 를 돌려준다."""
+    try:
+        return await iterator.__anext__()
+    except StopAsyncIteration:
+        return _STREAM_END
+
+
+async def _close_quietly(stream: Any) -> None:
+    """스트림을 닫되 실패는 무시한다(이미 끊어지는 중이라 의미가 없다).
+
+    `async for` 는 예외로 빠져나갈 때 이터레이터를 닫아 주지 않는다. 우리가 버리는
+    스트림은 우리가 닫아야 GPU 가 꼬리를 계속 생성하지 않고, 살아 있는 제너레이터가
+    GC 로 넘어가지도 않는다.
+    """
+    try:
+        await stream.aclose()
+    except Exception:  # noqa: BLE001, S110 — 이미 끊는 중이라 실패는 의미가 없다
+        pass
 
 
 # 이모지·기호 스팸 감지용 유니코드 범위(대략). degeneration 시 모델이 확률질량을
@@ -337,6 +367,62 @@ class StreamWatchdog:
         self._last_activity = time.monotonic()  # idle 기준 시각 갱신.
         self._token_count += 1  # 통계/디버깅용 토큰 수 누적.
 
+    def next_wait_budget(self) -> float:
+        """다음 이벤트를 **얼마나 기다려도 되는지**(초) 돌려준다.
+
+        왜 필요한가 (2026-08-24):
+          예전 워치독은 이벤트가 **도착했을 때만** 판정했다. 그런데 토큰성
+          이벤트는 판정 직전에 ping() 이 idle 타이머를 리셋해 버려, 실질적으로
+          **idle 타임아웃이 발동할 수 없었다.** 실제로 176초를 멈춰 있다가 토큰이
+          와도 그 공백은 지워진 뒤 검사됐다. 프로덕션에서 idle 이 잡힌 것은 뒤이어
+          온 이벤트가 비-ping 종류였던 우연 덕분이다.
+
+          진짜 필요한 것은 "조용한 동안" 감지하는 것이다. 그래서 호출부가 이
+          예산만큼만 다음 이벤트를 기다리고, 넘기면 타임아웃으로 처리한다.
+
+        첫 토큰 전에는 idle 을 적용하지 않는다:
+          cold start 로 첫 토큰까지 60초가 걸리는 것이 이 시스템의 정상 동작이다.
+          idle 은 "토큰 사이의 공백"이라 스트리밍이 시작된 뒤에만 의미가 있다.
+          그 구간은 total_timeout 이 감싼다.
+
+        Returns:
+            대기 허용 초. 이미 total 을 넘겼으면 0.0.
+        """
+        if not self._started:
+            return self._total_timeout
+
+        remaining_total = self._total_timeout - (time.monotonic() - self._start_time)
+        if remaining_total <= 0:
+            return 0.0
+        if self._token_count == 0:
+            # 첫 토큰 전 — cold start 를 idle 로 오인하지 않는다.
+            return remaining_total
+        return min(self._idle_timeout, remaining_total)
+
+    def expired_timeout(self) -> StreamWatchdogTimeout:
+        """대기 예산이 만료됐을 때 그 사유를 담은 예외 객체를 만든다.
+
+        next_wait_budget() 만큼 기다렸는데 아무것도 안 온 상황에서만 부른다.
+        어느 한계에 걸렸는지는 실제 경과 시간으로 판정한다.
+
+        Returns:
+            timeout_type 이 "idle" 또는 "total" 인 StreamWatchdogTimeout.
+        """
+        now = time.monotonic()
+        total_elapsed = now - self._start_time
+        # 첫 토큰조차 못 받았으면 idle 이 아니라 total 이다(위 주석 참조).
+        if self._token_count == 0 or total_elapsed >= self._total_timeout:
+            return StreamWatchdogTimeout(
+                timeout_type="total",
+                elapsed=total_elapsed,
+                threshold=self._total_timeout,
+            )
+        return StreamWatchdogTimeout(
+            timeout_type="idle",
+            elapsed=now - self._last_activity,
+            threshold=self._idle_timeout,
+        )
+
     def check(self) -> StreamWatchdogTimeout | None:
         """
         지금 시점에 타임아웃에 걸렸는지 검사한다.
@@ -508,8 +594,31 @@ async def stream_with_watchdog(
     if detect_degeneration:
         monitor = degen_monitor or DegenerationMonitor()
 
+    # 원본 이터레이터를 직접 잡는다 — `async for` 대신 한 건씩 **시간 제한을 걸어**
+    # 받기 위해서다. 그래야 스트림이 조용한 **동안** idle 을 감지할 수 있다
+    # (next_wait_budget 의 주석 참조).
+    iterator = stream.__aiter__()
     try:
-        async for event in stream:
+        while True:
+            budget = watchdog.next_wait_budget()
+            try:
+                event = await asyncio.wait_for(_next_or_stop(iterator), timeout=budget)
+            except TimeoutError:
+                # 기다리는 동안 아무것도 오지 않았다 = 진짜 멈춤.
+                timeout = watchdog.expired_timeout()
+                logger.warning(
+                    "스트림 %s 타임아웃 — %.1f초 무응답(한계 %.1f초)",
+                    timeout.timeout_type,
+                    timeout.elapsed,
+                    timeout.threshold,
+                )
+                await _close_quietly(stream)
+                # from None — 대기 만료(TimeoutError)는 구현 수단이지 원인이 아니다.
+                # 상위는 "스트림이 멈췄다"만 알면 되므로 내부 예외를 노출하지 않는다.
+                raise timeout from None
+            if event is _STREAM_END:
+                break
+
             # 이벤트 타입은 str일 수도, Enum일 수도 있어 .value로 정규화한다.
             # (제공자마다 문자열/Enum 표현이 다를 수 있어 방어적으로 처리)
             event_type = event.type if isinstance(event.type, str) else event.type.value
@@ -535,10 +644,7 @@ async def stream_with_watchdog(
                     logger.warning(
                         "degeneration 감지 — 스트림 조기 절단(%d자 생성 후)", monitor.length
                     )
-                    try:
-                        await stream.aclose()
-                    except Exception:  # noqa: BLE001, S110 — 종료 실패는 무시(이미 끊는 중)
-                        pass
+                    await _close_quietly(stream)
                     return
 
             # 타임아웃 직전이라면 경고 문자열을 받아 로그로 남긴다(비차단).
@@ -546,7 +652,9 @@ async def stream_with_watchdog(
             if warning:
                 logger.warning(warning)
 
-            # 실제 타임아웃이면 예외 객체를 받아 raise 해 스트림을 중단시킨다.
+            # 이벤트가 **도착한** 시점의 검사 — 이제는 total 한계에 대한 안전망이다.
+            #   idle 은 위 대기 예산(next_wait_budget)이 담당한다. 여기서 idle 을
+            #   기대하면 안 된다 — 토큰이 방금 왔으므로 ping() 이 타이머를 리셋했다.
             timeout = watchdog.check()
             if timeout:
                 # raise 하기 전에 원본 스트림을 닫는다(2026-08-24).
