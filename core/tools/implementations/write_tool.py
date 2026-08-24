@@ -190,6 +190,25 @@ class WriteTool(BaseTool):
         except OSError as e:
             return ToolResult.error(f"디렉토리를 생성할 수 없습니다: {e}")
 
+        # 1.5단계: 무변화 감지 (2026-08-23)
+        # 왜 필요한가(실측): 모델이 **똑같은 내용을 11회 다시 쓰며** 30턴을 공전한
+        # 사고가 있었다. 매번 "파일을 작성했습니다"가 성공으로 돌아오니 모델 입장에서
+        # 진전이 없다는 단서가 어디에도 없었다. 결과 문구로 그 사실을 알려 주면
+        # 모델이 다음 턴에 다른 행동을 고를 수 있다(in-band 신호).
+        #
+        # 오케스트레이터에 상태를 더하지 않는 것이 핵심이다 — pytest 반복 실행처럼
+        # 같은 호출이 정상인 워크플로와 충돌하지 않는다. 여기서는 사실만 보고한다.
+        #
+        # 쓰기를 막지는 않는다. 내용이 같으면 결과도 같으므로 해가 없고, 파일이
+        # 실제로 존재하게 만드는 것이 이 도구의 계약이기 때문이다.
+        unchanged = False
+        if path.exists():
+            try:
+                unchanged = path.read_text(encoding="utf-8") == content
+            except (OSError, UnicodeDecodeError):
+                # 읽기 실패는 무시한다 — 이 비교는 안내용이라 쓰기를 막으면 안 된다.
+                unchanged = False
+
         # 2단계: 임시 파일에 먼저 쓰기 (원자적 쓰기 보장)
         # tmp_fd(파일 디스크립터), tmp_path(임시 파일 경로)를 미리 None으로 두어,
         # finally 정리 블록에서 "아직 안 만들어졌는지 / 이미 정리됐는지"를 판별한다.
@@ -242,11 +261,18 @@ class WriteTool(BaseTool):
 
         # 성공 결과 반환. 사람이 읽을 요약 문자열과 함께, 후속 처리에 쓸 수 있도록
         # file_path/lines/bytes를 메타데이터로 함께 담아 준다.
+        # 무변화면 그 사실을 문구에 실어 준다. 모델이 "썼다"만 보고 진전이 있다고
+        # 오인한 채 같은 내용을 반복하는 것을 막기 위한 유일한 단서다.
+        summary = f"파일을 작성했습니다: {file_path} ({line_count}줄, {byte_count}바이트)"
+        if unchanged:
+            summary += " — 기존 내용과 동일합니다(변경 없음). 같은 내용을 다시 쓰지 마세요."
+
         return ToolResult.success(
-            f"파일을 작성했습니다: {file_path} ({line_count}줄, {byte_count}바이트)",
+            summary,
             file_path=file_path,
             lines=line_count,
             bytes=byte_count,
+            unchanged=unchanged,
         )
 
     # ═══ 7. UI Hints ═══
