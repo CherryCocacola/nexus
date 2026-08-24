@@ -223,7 +223,27 @@ class EditTool(BaseTool):
             span = find_whitespace_fuzzy_span(content, old_string)
             if span is not None:
                 start, end = span
-                new_content = content[:start] + new_string + content[end:]
+                # ★교체 전에 들여쓰기를 파일 기준으로 맞춘다(2026-08-23).
+                #   fuzzy 는 "모델이 공백을 틀렸을 때만" 발동하므로, 같은 모델이 쓴
+                #   new_string 의 공백도 믿을 수 없다. realign_fuzzy_replacement 참조.
+                aligned, mismatch = realign_fuzzy_replacement(
+                    content[start:end], old_string, new_string
+                )
+                if aligned is None:
+                    # 모델이 바꾸지 않은 줄의 들여쓰기가 파일과 어긋난다 —
+                    # 파이썬이면 블록이 바뀌는 무음 손상이다. 거부하고 원문을 보여
+                    # 준다(그래야 다음 시도에서 정확한 old_string 을 만들 수 있다).
+                    logger.warning(
+                        "Edit 거부(들여쓰기 불일치) %s: %r", file_path, mismatch
+                    )
+                    return ToolResult.error(
+                        "편집을 적용하지 않았습니다 — 바꾸지 않은 줄의 들여쓰기가 "
+                        "파일과 다릅니다. 그대로 적용하면 코드 블록이 바뀝니다.\n"
+                        f"파일 원문: {mismatch!r}\n"
+                        "해당 파일을 Read 로 다시 읽어 old_string/new_string 의 "
+                        "들여쓰기를 원문 그대로 맞춘 뒤 재시도하세요."
+                    )
+                new_content = content[:start] + aligned + content[end:]
                 # 쓰기 전 구문 검사 — Write 와 같은 이유다(syntax_validator 참조).
                 #   Edit 는 조각 치환이라 손상 위험이 낮지만, Write 가 거부되면
                 #   모델을 이쪽으로 유도하므로 여기도 막아 두지 않으면 구멍이 남는다.
@@ -363,6 +383,121 @@ def find_whitespace_fuzzy_span(content: str, old_string: str) -> tuple[int, int]
     start = offsets[start_line]
     end = offsets[end_line] + len(lines[end_line])  # 마지막 줄 개행 직전까지
     return (start, end)
+
+
+def _leading_ws(line: str) -> str:
+    """줄 앞의 공백(들여쓰기)만 잘라 낸다."""
+    return line[: len(line) - len(line.lstrip())]
+
+
+def _norm_body(line: str) -> str:
+    """공백을 무시한 줄 내용(대응 관계 판정용)."""
+    return " ".join(line.split())
+
+
+def realign_fuzzy_replacement(
+    file_segment: str, old_string: str, new_string: str
+) -> tuple[str | None, str | None]:
+    """공백 정규화 매칭으로 교체할 new_string 의 들여쓰기를 파일 기준으로 맞춘다.
+
+    ── 왜 필요한가 (2026-08-23 실측) ──
+    fuzzy 폴백은 **모델이 공백을 이미 틀렸을 때만** 발동한다. 그런데 교체는 같은
+    모델이 쓴 new_string 의 들여쓰기를 100% 신뢰해 그대로 써 넣었다. 즉 "못 믿을
+    공백"인 모집단을 골라내서 그 공백을 믿는 구조였다. 파이썬에서 들여쓰기는
+    의미이므로, `return` 한 줄이 `except` 블록 안으로 밀려들어가면 정상 경로가
+    None 을 반환하게 된다 — 문법은 유효해서 구문 검사도 통과한다.
+
+    ── 무엇을 하는가 ──
+    1) old ↔ new 에서 **모델이 바꾸지 않은 줄**을 찾는다(내용이 같은 줄).
+    2) 그 줄들이 각각 요구하는 이동량(파일 들여쓰기 − new 들여쓰기)을 모은다.
+       · 전부 같으면 그 값이 delta 다 — 블록이 통째로 밀린 것이라 교정 가능하다.
+       · 서로 다르면 **블록 내부 상대 들여쓰기가 틀린 것**이므로 거부한다.
+         step6 형 무음 손상(`return` 이 `except` 안으로 이동)이 정확히 여기서 잡힌다.
+    3) 새로 추가·수정된 줄은 대응이 없으므로 delta 만 적용해 통과시킨다.
+       그래서 old/new 의 줄 수가 달라도 문제가 되지 않는다.
+
+    ── 왜 delta 를 old_string 기준으로 잡지 않는가 ──
+    모델이 old_string 의 들여쓰기는 틀리면서 new_string 에는 파일과 같은 올바른
+    들여쓰기를 쓰는 경우가 흔하다(실측). old 기준으로 delta 를 잡으면 그 멀쩡한
+    편집을 통째로 밀어 버린다. 기준은 **파일과 유지된 줄**이어야 한다.
+
+    ── 왜 "무조건 파일 들여쓰기 강제"가 아닌가 ──
+    모델이 **의도적으로** 들여쓰기를 바꾸는 편집(try 로 감싸기 등)을 조용히
+    되돌리게 되어, 새로운 무음 손상을 만든다. 거부하고 exact 경로로 유도하는 편이
+    옳다 — 그 정도로 섬세한 편집이면 파일을 정확히 재현하라고 요구할 만하다.
+
+    Args:
+        file_segment: 파일에서 교체될 구간의 원문(fuzzy 매칭이 찾은 범위).
+        old_string: 모델이 보낸 찾을 문자열(공백이 파일과 다를 수 있다).
+        new_string: 모델이 보낸 바꿀 문자열.
+
+    Returns:
+        (조정된 new_string, None) — 통과. 또는 (None, 문제가 된 파일 원본 줄) — 거부.
+    """
+    file_lines = file_segment.splitlines()
+    old_lines = old_string.splitlines()
+    new_lines = new_string.splitlines()
+    if not file_lines or not old_lines or not new_lines:
+        return new_string, None
+
+    # ── 1) 유지된 줄의 대응 관계를 구한다 ──
+    # old ↔ new 에서 내용이 같은 줄 = 모델이 손대지 않은 줄. old_lines 의 인덱스는
+    # 곧 file_lines 의 인덱스이기도 하다(fuzzy 매칭이 줄 단위 1:1 로 찾았으므로).
+    matcher = difflib.SequenceMatcher(
+        None, [_norm_body(ln) for ln in old_lines], [_norm_body(ln) for ln in new_lines]
+    )
+    kept: list[tuple[int, int]] = []  # (파일 줄 번호, new_string 줄 번호)
+    for tag, i1, i2, j1, _j2 in matcher.get_opcodes():
+        if tag != "equal":
+            continue
+        for offset in range(i2 - i1):
+            file_idx, new_idx = i1 + offset, j1 + offset
+            if file_idx >= len(file_lines) or new_idx >= len(new_lines):
+                continue
+            if _norm_body(file_lines[file_idx]):  # 빈 줄은 제외
+                kept.append((file_idx, new_idx))
+
+    # ── 2) delta 를 "유지된 줄이 파일과 맞아떨어지는 값"으로 유도한다 ──
+    #   왜 old_string 기준이 아닌가: 모델이 old_string 의 들여쓰기는 틀리면서
+    #   new_string 에는 파일과 같은 올바른 들여쓰기를 쓰는 경우가 흔하다(실측).
+    #   그때 old 기준 delta 를 적용하면 멀쩡한 편집을 밀어 버린다.
+    #   유지된 줄이 요구하는 이동량이 서로 다르면 = 블록 내부 상대 들여쓰기가
+    #   틀린 것이므로 거부한다(이게 step6 형 무음 손상이다).
+    shifts = {
+        len(_leading_ws(file_lines[f])) - len(_leading_ws(new_lines[n]))
+        for f, n in kept
+    }
+    if len(shifts) > 1:
+        # 어느 줄이 어긋났는지 하나 집어 보여 준다(첫 번째 불일치).
+        base = len(_leading_ws(file_lines[kept[0][0]])) - len(
+            _leading_ws(new_lines[kept[0][1]])
+        )
+        bad = next(
+            file_lines[f]
+            for f, n in kept
+            if len(_leading_ws(file_lines[f])) - len(_leading_ws(new_lines[n])) != base
+        )
+        return None, bad
+    if shifts:
+        delta = shifts.pop()
+    else:
+        # 유지된 줄이 하나도 없다(전면 교체). 첫 줄 기준으로 맞추는 수밖에 없다.
+        delta = len(_leading_ws(file_lines[0])) - len(_leading_ws(old_lines[0]))
+
+    def _shift(line: str) -> str:
+        ws = _leading_ws(line)
+        body = line[len(ws) :]
+        if not body:
+            return line  # 빈 줄은 건드리지 않는다(들여쓰기 개념이 없다)
+        return " " * max(0, len(ws) + delta) + body
+
+    adjusted = [_shift(ln) for ln in new_lines]
+
+    rebuilt = "\n".join(adjusted)
+    # splitlines()는 끝 개행을 삼키므로 원문 형태를 복원한다(교체 위치의 개행 구조 보존).
+    if new_string.endswith("\n"):
+        rebuilt += "\n"
+    return rebuilt, None
 
 
 def closest_match_hint(
