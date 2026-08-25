@@ -635,6 +635,15 @@ class LocalModelProvider(ModelProvider):
             sc_candidate_texts: dict[int, list[str]] = {}
             sc_tool_seen = False
 
+            # ── payload 덤프 (기본 비활성) ─────────────────────────────
+            # 여기가 진짜 마지막이다 — 이 dict 가 그대로 vLLM 으로 나간다. Tier 2 의
+            # prompt_dump 는 system_prompt·messages 만 찍어서, prompt_tokens 를 좌우하는
+            # tools·tool_choice·response_format·chat_template_kwargs 가 보이지 않았다.
+            from core.orchestrator import prompt_dump as _pd
+
+            if _pd.is_enabled():
+                _pd.dump_payload(payload, base_url=self.base_url)
+
             try:
                 async with self._client.stream(
                     "POST",
@@ -744,6 +753,13 @@ class LocalModelProvider(ModelProvider):
                                 input_tokens=u.get("prompt_tokens", 0),
                                 output_tokens=u.get("completion_tokens", 0),
                             )
+                            # 같은 키로 usage 를 남긴다 — 덤프를 여러 개 회수했을 때
+                            # 어느 것이 문제의 요청인지 이것 없이는 구분할 수 없다.
+                            if _pd.is_enabled():
+                                _pd.dump_usage(
+                                    u.get("prompt_tokens", 0),
+                                    u.get("completion_tokens", 0),
+                                )
 
                         # usage 전용 청크는 choices가 비어 있을 수 있으므로 건너뛴다
                         if not data.get("choices"):

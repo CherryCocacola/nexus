@@ -33,6 +33,7 @@ import logging
 import os
 import re
 import time
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
@@ -78,6 +79,89 @@ def _cleanup(directory: Path) -> None:
             continue  # 지우기 실패는 다음 회차에 다시 시도한다
 
 
+# ─────────────────────────────────────────────
+# 요청 키 전달 (2026-08-25)
+# ─────────────────────────────────────────────
+# 왜 ContextVar 인가:
+#   실제로 나가는 payload 는 Tier 3(`inference.stream()`)에서 만들어지는데, 그 함수는
+#   request_id/session_id 를 받지 않는다(시그니처에 없다). 인자를 추가하려면 프로바이더
+#   구현 전부와 호출부를 함께 고쳐야 해 무회귀 위험이 크다.
+#   모듈 전역 변수로 두면 동시 요청끼리 키가 섞인다 — 이 서버는 요청마다 세션 전용
+#   엔진을 만들어 병렬로 돈다. ContextVar 는 asyncio 태스크별로 격리되므로 그 오염이
+#   구조적으로 불가능하다.
+_ctx: ContextVar[tuple[str | None, str, int]] = ContextVar(
+    "nexus_prompt_dump_ctx", default=(None, "", 0)
+)
+
+
+def set_context(request_id: str | None, session_id: str, turn: int) -> None:
+    """이번 턴의 덤프 키를 현재 태스크에 건다(Tier 2가 stream 호출 직전에 부른다)."""
+    _ctx.set((request_id, session_id, turn))
+
+
+def _key_and_turn() -> tuple[str, int]:
+    request_id, session_id, turn = _ctx.get()
+    return _SAFE.sub("_", (request_id or session_id or "unknown"))[:64], turn
+
+
+def _write(path: Path, obj: Any) -> Path | None:
+    """덤프 한 건을 쓴다. 실패는 삼킨다 — 진단이 본 요청을 막으면 본말전도다."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+        return path
+    except Exception as e:  # noqa: BLE001
+        logger.debug("[prompt_dump] 저장 실패(무시): %s", e)
+        return None
+
+
+def dump_payload(payload: dict[str, Any], base_url: str = "") -> Path | None:
+    """vLLM 으로 **실제로 나가는 payload 전문**을 남긴다.
+
+    [왜 dump_prompt 로 부족한가 — 2026-08-25]
+      `dump_prompt` 는 `model_provider.stream()` **직전**의 값(system_prompt·messages)만
+      찍는다. 그런데 prompt_tokens 를 좌우하는 것은 그 뒤 Tier 3 가 조립하는 payload 다 —
+      `tools`, `tool_choice`, `response_format`, `chat_template_kwargs`, `stop`, `n`.
+      실측 사건(08-24 +138 토큰)에서 system_prompt·messages 가 바이트 동일한데도
+      prompt_tokens 가 달랐고, 그 차이가 어디서 왔는지 **덤프로는 볼 수 없었다.**
+      여기서 payload 전문을 남기면 그 사각지대가 사라진다.
+    """
+    if dump_dir() is None:
+        return None
+    directory = dump_dir()
+    assert directory is not None
+    key, turn = _key_and_turn()
+    body = dict(payload)
+    body["_meta"] = {
+        "base_url": base_url,
+        "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "turn": turn,
+    }
+    return _write(directory / f"{key}_turn{turn}_payload.json", body)
+
+
+def dump_usage(prompt_tokens: int, completion_tokens: int) -> Path | None:
+    """모델이 보고한 usage 를 같은 키로 남긴다.
+
+    이게 없으면 덤프를 여러 개 회수해도 **어느 것이 문제의 요청인지 구분할 수 없다**
+    (08-24 조사에서 실제로 막힌 지점이다).
+    """
+    if dump_dir() is None:
+        return None
+    directory = dump_dir()
+    assert directory is not None
+    key, turn = _key_and_turn()
+    return _write(
+        directory / f"{key}_turn{turn}_usage.json",
+        {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "turn": turn,
+        },
+    )
+
+
 def dump_prompt(
     *,
     request_id: str | None,
@@ -99,6 +183,13 @@ def dump_prompt(
     directory = dump_dir()
     if directory is None:
         return None
+
+    # Tier 3/4 가 payload·usage 를 **같은 키로** 남길 수 있도록 현재 태스크에 키를 건다.
+    # 여기서 거는 이유: 호출부(query_loop)를 고치지 않기 위해서다. 배포된 컨테이너의
+    # query_loop.py 는 리포 브랜치보다 수백 줄 뒤처져 있어, 브랜치본을 복사하면 구버전
+    # core/message.py 에 없는 심볼을 import 해 부트스트랩이 깨진다(2026-08-25 실측 사고).
+    # 이 모듈은 다른 core 모듈을 import 하지 않아 단독 교체가 안전하다.
+    set_context(request_id, session_id, turn)
 
     key = _SAFE.sub("_", (request_id or session_id or "unknown"))[:64]
     path = directory / f"{key}_turn{turn}.json"
