@@ -3327,6 +3327,16 @@ async def chat_completions(
     )
 
     content = "".join(response_text_parts)
+    # 적용 주장 대조(2026-08-25) — 본문이 아니라 `warnings` 배열로 나간다.
+    # 이 표면은 클라이언트가 도구를 실행하므로, 모델이 read_file 의 ok:true 를 쓰기
+    # 성공으로 오독해 "적용되었습니다"라고 답하는 사고가 실측됐다(1,760 중 43건).
+    # 호출자의 리스트를 제자리 변경하지 않는다 — 공유 가변 객체는 조용히 번진다.
+    from core.verification.post_check import build_structured_warnings
+
+    response_warnings = list(tool_warnings or [])
+    response_warnings += build_structured_warnings(
+        content, engine._messages[dl_start_idx:]
+    )
     # 숫자 인용 검증 — 문서에서 옮긴 금액·수량의 자릿수가 원문과 다르면 경고를 덧붙인다.
     content += _answer_warnings_for(content, engine._messages[dl_start_idx:])
     # 표준 클라이언트도 링크를 볼 수 있게 content 끝에 마크다운으로 덧붙인다.
@@ -3398,7 +3408,7 @@ async def chat_completions(
         ],
         usage=usage,
         downloads=downloads,
-        warnings=tool_warnings,
+        warnings=response_warnings,
         finish_detail=finish_detail,
     )
 

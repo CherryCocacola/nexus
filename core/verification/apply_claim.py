@@ -1,0 +1,203 @@
+# "변경을 적용했다"는 주장을, 클라이언트가 실행한 도구 결과와 대조하는 검증기.
+"""
+2026-08-25 실측: VSCode 플러그인 회귀 측정에서 모델이 이렇게 답했다.
+
+    "변경이 성공적으로 적용되었습니다.
+     - backend/services/x.py 파일의 A 함수 위에 한 줄 주석이 추가되었습니다."
+
+그런데 파일은 **한 줄도 바뀌지 않았다**(주석 행 13개 → 13개). 그 턴에 모델이 받은
+도구 결과는 `read_file` 과 `search_text` 뿐이었고, 둘 다 `ok: true` 였다.
+**모델이 읽기 성공을 쓰기 성공으로 오독한 것이다.**
+
+오늘 회차에서만 1,760 세션 중 43건(2.4%)이 이 패턴이었고, 43건 전부가 코딩 전용
+모델로 라우팅된 세션이었다.
+
+■ 기존 file_claim.py 가 왜 못 잡았나 — 구멍이 둘이다
+
+  ① 주장 패턴에 "적용·반영·추가"가 없다. `작성|생성|저장|기록|만들|썼` 만 본다.
+     실측 문장은 "적용되었습니다"·"추가되었습니다" 라 통과했다.
+
+  ② 이 표면은 **클라이언트가 도구를 실행한다.** 그래서 서버가 보는 메시지에
+     `role="tool_result"` 가 아예 없다. 도구 결과는 user 메시지 본문에 JSON 으로
+     실려 온다. `collect_successful_write_tools()` 는 tool_result 역할만 훑으므로
+     이 표면에서는 언제나 빈 집합을 돌려준다.
+
+■ 그래서 이 모듈이 하는 일
+  (a) 적용·반영·추가 계열 완료 주장을 따로 잡고,
+  (b) user 메시지에 실려 온 **클라이언트 도구 결과**를 파싱해 이름과 성공 여부를 얻고,
+  (c) 성공한 도구가 **읽기 전용뿐이면** 주장의 근거가 없다고 본다.
+
+읽기 전용만으로 판정하는 것이 핵심이다. 도구 결과가 "있다"는 것만 세면 이번 사고가
+그대로 빠져나간다 — read_file 이 2건 있었으니까.
+
+■ 차단이 아니라 경고다
+  판단은 사람이 한다. 그리고 이 경고는 답변 본문에 덧붙이지 않고 응답의 `warnings`
+  배열로 내보낸다. 클라이언트가 게이트로 쓸 수 있고, 정상 흐름의 사용자 화면을
+  더럽히지 않는다.
+
+작성자: 이현수 / 작성일: 2026-08-25
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+from typing import Any
+
+logger = logging.getLogger("nexus.verification.apply_claim")
+
+# 변경을 **가했다고 단정**하는 완료형 표현. 계획형("적용하겠습니다", "추가하면")은
+# 제외한다 — 아직 안 했다고 말하는 것은 거짓 주장이 아니다.
+_CLAIM_PATTERNS = (
+    r"(?:적용|반영|추가|삽입|수정|변경|삭제|제거)(?:이|가|을|를)?\s*"
+    r"(?:성공적으로\s*)?(?:됐|되었|했|하였|완료)\w*",
+    r"(?:성공적으로\s*)?(?:적용|반영)(?:됐|되었)\w*",
+)
+_CLAIM_RE = re.compile("|".join(_CLAIM_PATTERNS))
+
+# 파일 표지가 문장 안에 있어야 발화한다. file_claim.py 와 같은 이유 —
+# "설명을 추가했습니다" 같은 대화형 완료까지 잡으면 전부 오탐이 된다.
+_FILE_MARKER_RE = re.compile(
+    r"파일|디렉[터토]리|폴더|함수|클래스|주석"
+    r"|[\w./\-]+\.(?:md|txt|py|js|jsx|ts|tsx|json|yaml|yml|sql|html|css|java|go|rs)"
+    r"|[\w-]+/[\w./-]+"
+)
+
+# 코드 블록 안의 문자열은 주장이 아니다(file_claim.py 와 동일한 실측 근거).
+_FENCED_BLOCK = re.compile(r"```.*?```", re.DOTALL)
+_INLINE_CODE = re.compile(r"`[^`\n]+`")
+
+# 클라이언트 도구 이름은 플러그인마다 다르므로 **어휘가 아니라 어간**으로 판정한다.
+# 이름을 열거하면 플러그인이 도구를 하나 추가할 때마다 조용히 빠져나간다.
+_WRITE_HINTS = ("write", "edit", "apply", "create", "delete", "remove", "rename",
+                "patch", "insert", "replace", "save", "modify", "run_command")
+_READ_HINTS = ("read", "search", "list", "get", "find", "symbol", "grep", "stat", "open")
+
+_MAX_QUOTES = 3
+_QUOTE_CHARS = 90
+
+
+def find_apply_claims(answer: str) -> list[str]:
+    """답변에서 "변경을 적용했다"는 완료형 주장 문장을 찾는다.
+
+    Args:
+        answer: 모델이 낸 최종 답변 텍스트.
+
+    Returns:
+        주장 문장들(원문, 중복 제거). 없으면 빈 목록.
+    """
+    if not answer:
+        return []
+
+    prose = _INLINE_CODE.sub(" ", _FENCED_BLOCK.sub("\n", answer))
+
+    found: list[str] = []
+    seen: set[str] = set()
+    for raw in re.split(r"(?<=[.!?。])\s+|\n+", prose):
+        sentence = raw.strip()
+        if not sentence or sentence in seen:
+            continue
+        if _CLAIM_RE.search(sentence) and _FILE_MARKER_RE.search(sentence):
+            seen.add(sentence)
+            found.append(sentence)
+    return found
+
+
+def collect_client_tool_results(messages: list[Any]) -> list[tuple[str, bool]]:
+    """user 메시지에 실려 온 **클라이언트 실행 도구 결과**를 (이름, 성공) 으로 모은다.
+
+    이 표면에서는 도구를 클라이언트가 실행하므로 서버 메시지에 `tool_result` 역할이
+    없다. 결과는 user 본문에 아래 형태의 JSON 으로 온다.
+
+        {"iteration": 1, "results": [{"id": "call_1", "name": "read_file", "ok": true, ...}]}
+
+    본문에는 그 앞뒤로 안내문이 섞여 있으므로 JSON 만 잘라 파싱한다. 파싱 실패는
+    조용히 넘긴다 — 형식이 바뀌어도 응답을 막으면 안 된다.
+
+    Returns:
+        [(도구이름, 성공여부)] 목록. 하나도 못 찾으면 빈 목록.
+    """
+    out: list[tuple[str, bool]] = []
+    for msg in messages:
+        role = msg.role if isinstance(msg.role, str) else getattr(msg.role, "value", "")
+        if role != "user":
+            continue
+        text = getattr(msg, "text_content", None) or getattr(msg, "content", "")
+        if not isinstance(text, str) or '"results"' not in text:
+            continue
+        # `{`부터 균형 잡힌 위치까지 잘라내 하나씩 시도한다. 정규식으로 중첩 JSON 을
+        # 뜯으려 하면 반드시 어긋난다.
+        for start in (m.start() for m in re.finditer(r"\{", text)):
+            depth = 0
+            for i in range(start, len(text)):
+                if text[i] == "{":
+                    depth += 1
+                elif text[i] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            obj = json.loads(text[start : i + 1])
+                        except ValueError:
+                            break
+                        results = obj.get("results") if isinstance(obj, dict) else None
+                        if isinstance(results, list):
+                            for r in results:
+                                if isinstance(r, dict) and r.get("name"):
+                                    out.append((str(r["name"]), bool(r.get("ok"))))
+                        break
+            if out:
+                break
+    return out
+
+
+def has_write_evidence(tool_results: list[tuple[str, bool]]) -> bool:
+    """성공한 도구 중 **쓰기 성격**의 것이 하나라도 있는지.
+
+    읽기 전용만 성공했다면 "적용했다"의 근거가 못 된다 — 이번 사고가 정확히 그
+    형태였다(read_file·search_text 가 ok:true, 쓰기 0건).
+
+    이름을 열거하지 않고 어간으로 판정한다. 읽기 어간에 걸리면 쓰기 어간이 있어도
+    읽기로 본다(`read_file_and_apply` 같은 이름에 속지 않기 위함).
+    """
+    for name, ok in tool_results:
+        if not ok:
+            continue
+        low = name.lower()
+        if any(h in low for h in _READ_HINTS):
+            continue
+        if any(h in low for h in _WRITE_HINTS):
+            return True
+    return False
+
+
+def build_apply_claim_warning(
+    claims: list[str], tool_results: list[tuple[str, bool]]
+) -> str:
+    """경고 문구를 만든다. 붙일 것이 없으면 빈 문자열.
+
+    Args:
+        claims: find_apply_claims 의 결과.
+        tool_results: collect_client_tool_results 의 결과.
+
+    Returns:
+        `warnings` 배열에 실을 한 줄. 경고할 것이 없으면 "".
+    """
+    if not claims or has_write_evidence(tool_results):
+        return ""
+
+    succeeded = sorted({n for n, ok in tool_results if ok})
+    if succeeded:
+        basis = "이번 대화에서 성공한 도구는 " + ", ".join(succeeded[:5]) + " 뿐입니다"
+    else:
+        basis = "이번 대화에 성공한 도구 실행 기록이 없습니다"
+
+    quote = claims[0][:_QUOTE_CHARS]
+    if len(claims[0]) > _QUOTE_CHARS:
+        quote += "…"
+    more = f" (외 {len(claims) - 1}건)" if len(claims) > 1 else ""
+
+    return (
+        f"APPLY_CLAIM_UNVERIFIED: 변경을 적용했다고 답했으나 근거가 없습니다. "
+        f"{basis}. 주장: \"{quote}\"{more}"
+    )

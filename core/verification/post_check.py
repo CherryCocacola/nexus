@@ -95,3 +95,44 @@ def build_answer_warnings(answer: str, messages: list) -> str:
     except Exception as e:  # noqa: BLE001 — 검증 실패가 응답을 막지 않게 한다
         logger.warning("사후 검증 실패(무시): %s", e)
         return ""
+
+
+def build_structured_warnings(answer: str, messages: list) -> list[str]:
+    """응답의 `warnings` 배열에 실을 검증 결과를 만든다(답변 본문은 건드리지 않는다).
+
+    ■ 왜 본문이 아니라 배열인가 (2026-08-25)
+      위 `build_answer_warnings` 는 경고를 답변 **본문 뒤에 덧붙인다.** 사람이 읽는
+      화면에는 그게 맞지만, 클라이언트가 프로그램으로 판정해야 하는 신호에는 맞지
+      않는다. 본문에 섞이면 클라이언트는 문자열을 뒤져야 하고, 사용자 화면도
+      더러워진다.
+
+      플러그인 팀이 요청한 것도 정확히 이것이다 — "HTTP 200, finish_reason=stop,
+      warnings 빈 배열이라 정상 응답과 구분할 수 없다. warnings 에 한 줄만 실어
+      주셔도 충분하다."
+
+    ■ 지금 싣는 것
+      적용 주장 대조 하나뿐이다. 클라이언트가 도구를 실행하는 표면에서 모델이
+      읽기 도구의 성공을 쓰기 성공으로 오독해 "적용되었습니다"라고 답하는 실측
+      사고를 잡는다(2026-08-25, 1,760 세션 중 43건).
+
+    Args:
+        answer:   모델이 낸 최종 답변 텍스트.
+        messages: 이번 요청 구간의 메시지들.
+
+    Returns:
+        경고 문자열 목록. 없으면 빈 목록. 검증 실패도 빈 목록(fail-soft).
+    """
+    try:
+        from core.verification.apply_claim import (
+            build_apply_claim_warning,
+            collect_client_tool_results,
+            find_apply_claims,
+        )
+
+        warning = build_apply_claim_warning(
+            find_apply_claims(answer), collect_client_tool_results(messages)
+        )
+        return [warning] if warning else []
+    except Exception as e:  # noqa: BLE001 — 진단이 응답을 막지 않게 한다
+        logger.warning("구조화 경고 생성 실패(무시): %s", e)
+        return []
