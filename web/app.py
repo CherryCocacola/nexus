@@ -1304,7 +1304,13 @@ def _assemble_session_engine(
         tools=session_tools,
         context=context,
         model_dispatcher=dispatcher,
-        context_manager=parts["context_manager"],
+        # ★세션별 인스턴스★ — 공유하면 압축 상태가 요청 간에 샌다.
+        # 공유 인스턴스에 _compact_boundary 가 남아 이후 모든 요청의 메시지가
+        # 잘려나간 장애가 있었다(2026-08-25, 입력 유실 / 08-24, +138 고정).
+        # 설정은 bootstrap 이 만든 원본 하나에서만 온다(for_session 이 복제한다).
+        context_manager=(
+            parts["context_manager"].for_session() if parts["context_manager"] else None
+        ),
         memory_manager=parts["memory_manager"],
         knowledge_retriever=parts["knowledge_retriever"],
         system_prompt=parts["system_prompt"],

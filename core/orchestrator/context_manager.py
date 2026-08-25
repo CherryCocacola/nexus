@@ -165,6 +165,43 @@ class ContextManager:
         # 판단한다. no-op 통과에서는 계속 None이라 매 턴 표시가 뜨지 않는다.
         self._last_compaction: str | None = None
 
+    def for_session(self) -> ContextManager:
+        """설정은 그대로 두고 **압축 상태만 새로 만든** 인스턴스를 돌려준다.
+
+        ■ 왜 필요한가 (2026-08-25 장애)
+          웹은 요청마다 세션 전용 엔진을 조립하면서 ContextManager 는 기동 시 만든
+          **하나를 공유**하고 있었다(`web/app.py`의 `parts["context_manager"]`).
+          그런데 이 객체에는 `_compact_boundary`·`_compact_summary` 라는 대화별
+          상태가 있다.
+
+          그래서 어떤 요청 하나가 auto-compact 를 유발하면 그 경계가 인스턴스에
+          남고, **이후 모든 요청**이 `messages[_compact_boundary:]` 로 잘렸다.
+          플러그인 요청은 메시지가 1~2개뿐이라 통째로 사라졌고, 모델에는 시스템
+          프롬프트만 남아 prompt_tokens 가 입력 크기와 무관한 고정값이 됐다.
+
+            08-24 03:07 압축 → 이후 모든 요청 +138 토큰 고정(요약만 남은 경우)
+            08-25 08:24 압축 → 이후 모든 요청 5,504·4,688 고정(입력 유실)
+
+          재기동하면 인스턴스가 새로 생겨 증상이 사라지므로 원인을 찾기 어려웠다.
+
+        ■ 왜 설정을 다시 읽지 않고 복제하는가
+          호출부(web)가 생성 인자를 다시 조립하면 bootstrap 과 두 벌이 되어 언젠가
+          어긋난다. 설정의 단일 출처는 bootstrap 이 만든 이 객체 하나로 둔다.
+
+        CLI 는 프로세스당 세션이 하나라 공유가 곧 격리이므로 이 메서드를 쓰지
+        않아도 된다(무회귀).
+        """
+        return ContextManager(
+            model_provider=self.model_provider,
+            max_context_tokens=self.max_tokens,
+            tool_result_budget=self.tool_result_budget,
+            snip_threshold=self.snip_threshold,
+            auto_compact_threshold=self.auto_compact_threshold,
+            preserve_recent_turns=self.preserve_recent_turns,
+            preserve_recent_tool_results=self.preserve_recent_tool_results,
+            tier=self._tier,
+        )
+
     # ═══════════════════════════════════════════
     # Public API
     # ═══════════════════════════════════════════
@@ -262,19 +299,40 @@ class ContextManager:
             # 최근 preserve_recent_turns개 턴은 요약하지 않고 원본으로 지킨다.
             recent = self._extract_recent_turns(messages, self.preserve_recent_turns)
 
-            # 경계를 "최근 턴 시작 지점"으로 옮기고, 그 앞은 요약으로 대체한다.
-            self._compact_boundary = len(messages) - len(recent)
-            self._compact_summary = summary
-            self._total_compactions += 1
-
             # 최종 형태: [요약 시스템 메시지] + [보존한 최근 턴들].
             result = [
                 Message.system(f"[대화 요약]\n{summary}\n[요약 끝 — 여기서부터 계속]"),
                 *recent,
             ]
+            new_count = self._estimate_tokens(result)
+
+            # ── 결과 검증 후에만 상태를 커밋한다 (2026-08-25) ──
+            # 예전에는 검증 **전에** _compact_boundary/_compact_summary 를 썼다.
+            # 그래서 요약이 원본보다 큰 경우에도 경계가 남았다. 실측 로그:
+            #   08-24 03:07  60,953 → 61,215 (절약 -262)
+            #   08-25 08:22  60,976 → 61,309 (절약 -333)
+            # 줄지 않은 압축은 이득이 없으면서 상태만 남긴다. 남은 경계는 이후
+            # 모든 요청의 메시지를 잘라내므로(_prepare 의 messages[boundary:]),
+            # 이득 없는 압축이 **입력 유실**로 이어졌다.
+            # force=True 는 제외한다. 그 경로는 query_loop 의 에러 복구(컨텍스트
+            # 초과)에서 "무슨 수를 써서라도 줄여라"로 부르는 자리다. 여기서 원본을
+            # 돌려주면 호출자가 같은 초과로 다시 실패한다. 실측 사고 2건은 모두
+            # force=False(임계치 자동 압축)였다.
+            if not force and new_count >= token_count:
+                logger.warning(
+                    "Auto-compact 무효 — 결과가 더 크거나 같다: %d → %d 토큰. "
+                    "원본을 유지하고 압축 상태를 남기지 않는다.",
+                    token_count,
+                    new_count,
+                )
+                return messages
+
+            # 경계를 "최근 턴 시작 지점"으로 옮기고, 그 앞은 요약으로 대체한다.
+            self._compact_boundary = len(messages) - len(recent)
+            self._compact_summary = summary
+            self._total_compactions += 1
 
             # 얼마나 줄었는지 로깅해 두면 나중에 압축 효과를 추적하기 쉽다.
-            new_count = self._estimate_tokens(result)
             logger.info(
                 f"Auto-compact 완료: {token_count} → {new_count} 토큰 "
                 f"(절약: {token_count - new_count})"
