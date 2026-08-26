@@ -92,3 +92,7 @@ user_mig/nexus_key
 # OMC 운영 상태 아티팩트
 .omc/
 **/.omc/
+
+# Claude Code 머신 로컬 설정 — 승인한 명령 목록이 세션마다 자동으로 늘어난다.
+# 프로젝트 규칙(.claude/rules, .claude/agents)은 팀 공유 대상이므로 추적을 유지한다.
+.claude/settings.local.json
