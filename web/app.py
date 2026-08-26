@@ -175,6 +175,24 @@ def _collect_downloads(messages: list) -> list[dict[str, str]]:
     return out
 
 
+def _is_discard_retry(event: Any) -> bool:
+    """"앞의 출력은 버리고 다시 생성한다"는 신호인지 판별한다.
+
+    query_loop 이 생성 붕괴(degeneration)를 감지하면 재생성하면서 이 신호를 낸다.
+    그 시점까지 흘려보낸 TEXT_DELTA 는 **버려진 출력**이므로 소비자가 모아 둔 것을
+    비워야 한다. CLI 는 이미 이 신호를 듣고 있었는데(`cli/commands.py`) 웹은 듣지
+    않아, 절단본이 정상 응답 앞에 그대로 붙어 나갔다(2026-08-26 실측 2건).
+
+    텍스트가 아니라 error_code 로 판별한다 — 문구는 바뀔 수 있다.
+    """
+    from core.message import STREAM_DISCARD_RETRY, StreamEventType
+
+    return (
+        getattr(event, "type", None) == StreamEventType.SYSTEM_WARNING
+        and getattr(event, "error_code", None) == STREAM_DISCARD_RETRY
+    )
+
+
 def _answer_warnings_for(answer: str, messages: list) -> str:
     """답변에 덧붙일 사후 검증 경고를 만든다(숫자 인용 + 리터럴 표기 + 실행 주장).
 
@@ -1867,6 +1885,44 @@ app.add_middleware(
     get_tenant_registry=_get_tenant_registry,
 )
 
+@app.exception_handler(Exception)
+async def _handle_unexpected_error(request: Request, exc: Exception) -> JSONResponse:
+    """미처리 예외(500)에 **요청 ID 와 오류 코드를 실어 돌려준다** (2026-08-26).
+
+    왜 필요한가:
+      기본 동작은 본문에 `Internal Server Error` 문자열만 담는다. 실제로 플러그인
+      팀이 3,011회 중 1건의 500 을 관측했는데 **요청 ID 도 오류 코드도 없어 서버
+      로그와 대조할 방법이 없었다.** 500 은 드물게 나므로 재현으로 좁히기가 특히
+      어렵고, 그때 유일한 단서가 요청 ID 다.
+
+      스택 트레이스는 응답에 싣지 않는다 — 내부 경로와 코드가 노출된다. 서버 로그에
+      전문을 남기고, 클라이언트에는 대조에 필요한 최소한만 준다.
+
+    RequestValidationError(422)와 HTTPException(4xx)은 각자의 핸들러가 먼저 잡으므로
+    여기는 **정말 예상 못 한 것**만 온다.
+    """
+    rid = _sanitize_request_id(request.headers.get("X-Request-ID"))
+    logger.exception(
+        "[미처리예외] 500 %s %s request_id=%s type=%s",
+        request.method,
+        request.url.path,
+        rid or "-",
+        type(exc).__name__,
+    )
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": {
+                "code": "INTERNAL_ERROR",
+                "message": "서버 내부 오류가 발생했습니다. request_id 로 문의해 주세요.",
+                "type": type(exc).__name__,
+                "request_id": rid,
+            }
+        },
+        headers={"X-Request-ID": rid} if rid else None,
+    )
+
+
 @app.exception_handler(RequestValidationError)
 async def _handle_validation_error(
     request: Request, exc: RequestValidationError
@@ -2166,6 +2222,10 @@ async def chat(
 
             if event.type == StreamEventType.TEXT_DELTA and event.text:
                 response_text_parts.append(event.text)
+
+            elif _is_discard_retry(event):
+                # 생성 붕괴 재생성 — 여태 모은 것은 버려진 출력이다(2026-08-26).
+                response_text_parts.clear()
 
             elif event.type == StreamEventType.USAGE_UPDATE and event.usage:
                 usage = UsageInfo(
@@ -3294,6 +3354,14 @@ async def chat_completions(
             continue
         if event.type == StreamEventType.TEXT_DELTA and event.text:
             response_text_parts.append(event.text)
+        elif _is_discard_retry(event):
+            # 생성 붕괴로 재생성한다 — 여태 모은 것은 버려진 출력이다 (2026-08-26).
+            # query_loop 이 이 신호를 내면서 "파이프 모드는 여태 모은 버퍼를 버려야
+            # 한다"고 명시했는데, 웹은 그 신호를 듣지 않고 있었다. 그래서 절단본이
+            # 정상 응답 앞에 그대로 붙어 나갔다. 실측(2026-08-26):
+            #   06:51:14 조기 절단 6,625자 → 재생성 255자 → 최종 6,877자
+            #   구조화 출력이면 그 순간 JSON 계약이 깨진다.
+            response_text_parts.clear()
         elif (
             event.type == StreamEventType.TOOL_USE_STOP
             and event.tool_use
@@ -3555,6 +3623,12 @@ async def _openai_stream_generate(
                     # 스트림이 끝난 뒤 숫자 인용 검증에 쓰려고 본문을 함께 모아 둔다.
                     answer_parts.append(event.text)
                     yield _chunk({"content": event.text})
+                elif _is_discard_retry(event):
+                    # 생성 붕괴 재생성 — 사후 검증에 쓰는 누적 본문을 비운다.
+                    # 이미 흘려보낸 delta 는 되돌릴 수 없으므로(스트림의 한계) 신호를
+                    # 그대로 전달해 클라이언트도 버릴 수 있게 한다.
+                    answer_parts.clear()
+                    yield _chunk({}, warnings=[f"STREAM_DISCARD_RETRY: {event.message}"])
                 elif (
                     event.type == StreamEventType.TOOL_USE_STOP
                     and event.tool_use
