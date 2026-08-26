@@ -597,6 +597,9 @@ async def _try_recover_from_model_error(
             )
             if context_manager is not None:
                 state.messages = await context_manager.emergency_compact(state.messages)
+                # 결과를 채택했으므로 경계를 되돌린다 — 남겨 두면 다음 턴에
+                # 짧아진 리스트에 옛 인덱스가 다시 적용돼 한 번 더 잘린다.
+                context_manager.mark_result_adopted()
                 # 긴급 압축이 실제로 줄였으면 CONTEXT_COMPACT를 UI에 흘려보낸다.
                 _compact_ev = _compaction_event(context_manager)
                 if _compact_ev is not None:
@@ -618,6 +621,8 @@ async def _try_recover_from_model_error(
                 state.messages = await context_manager.auto_compact_if_needed(
                     state.messages, force=True
                 )
+                # 위 emergency_compact 와 같은 이유로 경계를 되돌린다.
+                context_manager.mark_result_adopted()
                 # 반응적 압축이 실제로 줄였으면 CONTEXT_COMPACT를 UI에 흘려보낸다.
                 _compact_ev = _compaction_event(context_manager)
                 if _compact_ev is not None:

@@ -202,6 +202,31 @@ class ContextManager:
             tier=self._tier,
         )
 
+    def mark_result_adopted(self) -> None:
+        """압축 **결과로 메시지 리스트를 교체한** 호출부가 부른다.
+
+        ■ 왜 필요한가 (2026-08-26)
+          `_compact_boundary` 는 **교체 전** 리스트의 인덱스다. 그런데 아래 세 곳은
+          압축 결과를 그대로 채택해 리스트를 바꾼다.
+
+            query_loop.py  emergency_compact  → state.messages = 결과
+            query_loop.py  force=True 재압축   → state.messages = 결과
+            cli/repl.py    /compact           → messages[:] = 결과
+
+          채택 뒤에도 경계가 남아 있으면 다음 턴 `apply_all` 이 **짧아진** 리스트에
+          옛 인덱스를 다시 적용해 한 번 더 잘라낸다. 게다가 `_compact_summary` 도
+          남아 있어 요약이 **두 번** 앞에 붙는다 — 반환 리스트 0번에 이미 들어 있는데
+          apply_all 이 또 붙이기 때문이다.
+
+          반대로 `query_loop.py:821` 은 `api_messages` 라는 **임시** 리스트에만
+          결과를 담고 `state.messages` 는 원본을 유지한다. 거기서는 경계가 유효하다.
+          그래서 "리스트를 교체했는가"를 아는 호출부가 직접 알려 주는 형태로 둔다.
+
+        요약은 버리지 않는다 — 채택된 리스트의 첫 원소로 이미 들어가 있다.
+        """
+        self._compact_boundary = 0
+        self._compact_summary = None
+
     # ═══════════════════════════════════════════
     # Public API
     # ═══════════════════════════════════════════
@@ -744,8 +769,23 @@ class ContextManager:
                     start_idx = i
                     break
 
-        # 주의: user 메시지가 n개 미만이면 break 없이 끝나 start_idx가 그대로
-        # len(messages)로 남고, 결과가 빈 리스트가 된다(호출 측이 이를 감안).
+        # ── user 메시지가 n개 미만인 경우 (2026-08-26 수정) ──
+        # 예전에는 break 없이 끝나 start_idx 가 len(messages) 로 남아 **빈 리스트**를
+        # 돌려줬다. 주석에는 "호출 측이 이를 감안"이라 적혀 있었지만 감안하는 호출부가
+        # 하나도 없었다(이 파일 안 4곳 전부).
+        #
+        # 그래서 auto_compact 가 이렇게 동작했다.
+        #   recent = []  →  result = [요약] 하나뿐  →  boundary = len(messages)
+        #   = **사용자의 현재 질문까지 통째로 버리고 요약만 모델에 보낸다.**
+        # 그 요약도 최근 20개 메시지를 각 200자로 잘라 만든 것이라, 8만 자 입력의
+        # 요약은 사실상 앞부분 몇 천 자의 요약이다. 실측 로그에서 6~8만 토큰이
+        # 234~1,061 토큰으로 떨어진 항목들이 이 경로다.
+        #
+        # "최근 n턴을 남긴다"는 요청에 턴이 n개보다 적다면 답은 0개가 아니라
+        # **있는 것 전부**다. user 를 하나도 못 찾은 경우도 마찬가지 — 턴 경계를
+        # 모를 뿐이지 버리라는 뜻이 아니다.
+        if user_count < n:
+            return list(messages)
         return messages[start_idx:]
 
     def _split_into_turns(self, messages: list[Message]) -> list[list[Message]]:

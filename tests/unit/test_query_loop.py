@@ -169,6 +169,8 @@ class SpyContextManager:
         # auto_compact_if_needed에 전달된 force 값들을 순서대로 기록
         self.auto_compact_forces: list[bool] = []
         self.emergency_compact_calls = 0
+        # 결과를 채택한 호출부가 경계를 되돌렸는지 기록한다(2026-08-26).
+        self.adopted_calls = 0
 
     def apply_all(self, messages: list[Message]) -> list[Message]:
         self.apply_all_calls += 1
@@ -183,6 +185,15 @@ class SpyContextManager:
     async def emergency_compact(self, messages: list[Message]) -> list[Message]:
         self.emergency_compact_calls += 1
         return messages
+
+    def mark_result_adopted(self) -> None:
+        """압축 결과로 리스트를 교체한 호출부가 부른다.
+
+        실물과 같은 시그니처를 갖춰야 한다 — 이 더블에 메서드가 없으면 복구 경로가
+        AttributeError 로 죽는데, 그건 코드 결함이 아니라 더블이 뒤처진 것이다.
+        호출 여부 자체가 검증 대상이므로 횟수를 센다.
+        """
+        self.adopted_calls += 1
 
 
 # ─────────────────────────────────────────────

@@ -1870,6 +1870,9 @@ class NexusREPL:
         # 엔진의 실제 히스토리를 압축 결과로 교체한다(같은 리스트 객체를 유지해
         # 다른 곳이 들고 있는 참조가 어긋나지 않게 in-place로 바꾼다).
         messages[:] = compacted
+        # 결과를 채택했으므로 경계를 되돌린다(요약은 compacted[0] 에 이미 들어 있다).
+        # 남겨 두면 다음 턴에 짧아진 리스트가 옛 인덱스로 또 잘리고 요약이 두 번 붙는다.
+        cm.mark_result_adopted()
         after_tokens = cm._estimate_tokens(messages)
         saved = max(0, before_tokens - after_tokens)
         table = Table(title="컨텍스트 압축", border_style="blue", box=ROUNDED)

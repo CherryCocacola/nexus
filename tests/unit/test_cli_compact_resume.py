@@ -25,6 +25,7 @@ class _FakeCM:
 
     def __init__(self) -> None:
         self.forced: list[bool] = []
+        self.adopted_calls = 0
 
     def _estimate_tokens(self, messages) -> int:
         return sum(len(str(getattr(m, "content", ""))) for m in messages)
@@ -32,6 +33,14 @@ class _FakeCM:
     async def auto_compact_if_needed(self, messages, force: bool = False):
         self.forced.append(force)
         return [Message.user("요약본")]
+
+    def mark_result_adopted(self) -> None:
+        """/compact 는 결과로 리스트를 교체하므로 경계를 되돌려야 한다(2026-08-26).
+
+        되돌리지 않으면 다음 턴에 짧아진 리스트가 옛 인덱스로 또 잘리고 요약이
+        두 번 붙는다. 실물과 시그니처를 맞춰 둔다.
+        """
+        self.adopted_calls += 1
 
 
 class _FakeEngine:

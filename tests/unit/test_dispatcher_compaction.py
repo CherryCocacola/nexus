@@ -25,6 +25,11 @@ class _RecordingContextManager:
         self.emergency_calls = 0
         self.auto_calls = 0
         self.max_tokens = 10000
+        self.adopted_calls = 0
+
+    def mark_result_adopted(self) -> None:
+        """실물과 시그니처를 맞춘다 — 없으면 복구 경로가 AttributeError 로 죽는다."""
+        self.adopted_calls += 1
 
     async def emergency_compact(self, messages):
         self.emergency_calls += 1
