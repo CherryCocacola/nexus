@@ -71,11 +71,49 @@ _INLINE_CODE = re.compile(r"`[^`\n]+`")
 # 클라이언트 도구 이름은 플러그인마다 다르므로 **어휘가 아니라 어간**으로 판정한다.
 # 이름을 열거하면 플러그인이 도구를 하나 추가할 때마다 조용히 빠져나간다.
 _WRITE_HINTS = ("write", "edit", "apply", "create", "delete", "remove", "rename",
-                "patch", "insert", "replace", "save", "modify", "run_command")
+                "patch", "insert", "replace", "save", "modify",
+                # 셸 실행 계열 — 리다이렉션·스크립트로 파일을 만드는 것이 정상이라
+                # 쓰기로 본다(file_claim.py 가 Bash 를 포함한 것과 같은 근거).
+                "command", "terminal", "shell", "bash", "exec")
+# 읽기 어간이 하나라도 걸리면 읽기로 본다(안전 방향). 다만 어간을 **토큰 경계**로
+# 본다 — 부분 문자열로 보면 `search_replace`·`replace_symbol_body` 처럼 실제로
+# 쓰기인 도구가 읽기로 뒤집힌다(2026-08-26 리뷰 지적).
 _READ_HINTS = ("read", "search", "list", "get", "find", "symbol", "grep", "stat", "open")
 
 _MAX_QUOTES = 3
 _QUOTE_CHARS = 90
+
+
+def should_check_apply_claim(answer: str) -> bool:
+    """이 답변을 적용 주장 검사 대상으로 볼지 판별한다.
+
+    ■ deny-list 가 아니라 allow-list 다 (2026-08-26)
+      처음에는 `final_proposal` 만 제외했다. 그런데 액션은 셋이고
+      `tool_request` 에도 같은 오탐이 남았다. 프로토콜 문서 4.1절의 `VERIFYING`
+      상태가 **쓰기 직후 검증 도구를 다시 요청하는 정상 경로**이고, 그 턴의
+      rationale 은 자연히 "적용했으니 확인한다"가 된다.
+
+        {"type":"tool_request","rationale":"src/main.py 를 수정했으니 확인합니다",…}
+        → 이전 구현에서 APPLY_CLAIM_UNVERIFIED 발화(오탐)
+
+      실측 정탐 68건은 **전부 chat_response** 였다. 그래서 chat_response 일 때만
+      검사한다 — 정탐 손실 0으로 오탐군 하나를 통째로 없앤다.
+
+      액션 이름을 열거해 빼는 방식은 플러그인이 액션을 추가하면 또 같은 사고를
+      낸다. 도구 이름을 열거하지 않은 것과 같은 이유다.
+
+    구조화 출력이 아닌 평문 답변(웹 UI 표면)은 판별할 수 없으므로 **검사 대상으로
+    둔다** — 그쪽은 액션 스키마 자체가 없어 기존 동작이 맞다(무회귀).
+    """
+    if not answer:
+        return False
+    try:
+        obj = json.loads(answer)
+    except (ValueError, TypeError):
+        return True  # 평문 — 기존대로 검사한다
+    if not isinstance(obj, dict) or "type" not in obj:
+        return True
+    return obj.get("type") == "chat_response"
 
 
 def is_change_proposal(answer: str) -> bool:
@@ -144,6 +182,8 @@ def collect_client_tool_results(messages: list[Any]) -> list[tuple[str, bool]]:
         [(도구이름, 성공여부)] 목록. 하나도 못 찾으면 빈 목록.
     """
     out: list[tuple[str, bool]] = []
+    decoder = json.JSONDecoder()
+
     for msg in messages:
         role = msg.role if isinstance(msg.role, str) else getattr(msg.role, "value", "")
         if role != "user":
@@ -151,28 +191,37 @@ def collect_client_tool_results(messages: list[Any]) -> list[tuple[str, bool]]:
         text = getattr(msg, "text_content", None) or getattr(msg, "content", "")
         if not isinstance(text, str) or '"results"' not in text:
             continue
-        # `{`부터 균형 잡힌 위치까지 잘라내 하나씩 시도한다. 정규식으로 중첩 JSON 을
-        # 뜯으려 하면 반드시 어긋난다.
-        for start in (m.start() for m in re.finditer(r"\{", text)):
-            depth = 0
-            for i in range(start, len(text)):
-                if text[i] == "{":
-                    depth += 1
-                elif text[i] == "}":
-                    depth -= 1
-                    if depth == 0:
-                        try:
-                            obj = json.loads(text[start : i + 1])
-                        except ValueError:
-                            break
-                        results = obj.get("results") if isinstance(obj, dict) else None
-                        if isinstance(results, list):
-                            for r in results:
-                                if isinstance(r, dict) and r.get("name"):
-                                    out.append((str(r["name"]), bool(r.get("ok"))))
-                        break
-            if out:
+
+        # ── 왜 raw_decode 인가 (2026-08-26 수정) ──
+        # 예전에는 `{`/`}` 를 문자 단위로 세어 균형점을 찾았다. 그 방식은 **JSON
+        # 문자열 리터럴 안의 중괄호를 구분하지 못한다.** 그런데 이 표면의 도구
+        # 결과는 본질적으로 코드다 — `log.info("start {")` 같은 줄이 흔하다.
+        #
+        # 실측: 그런 줄이 든 파일을 read_file 로 읽으면
+        #   27,710자 → 642ms 소요, 같은 봉투의 apply_patch 증거는 **통째로 소실**
+        # 즉 (a) async 핸들러에서 await 없이 도는 코드가 서버 루프를 수백 ms 멈추고
+        #     (b) 정상적으로 적용에 성공한 턴에 "근거 없음" 오탐이 붙었다.
+        #
+        # raw_decode 는 문자열 인식이 공짜로 따라오고, 실패 시 첫 구조 오류에서
+        # 즉시 멈춘다. 성공하면 끝 위치를 알려 주므로 그 뒤부터 이어서 훑는다.
+        pos = 0
+        while True:
+            start = text.find("{", pos)
+            if start < 0:
                 break
+            try:
+                obj, end = decoder.raw_decode(text, start)
+            except ValueError:
+                pos = start + 1  # 이 위치는 객체 시작이 아니다
+                continue
+            results = obj.get("results") if isinstance(obj, dict) else None
+            if isinstance(results, list):
+                for r in results:
+                    if isinstance(r, dict) and r.get("name"):
+                        out.append((str(r["name"]), bool(r.get("ok"))))
+            # 파싱에 성공한 만큼 건너뛴다. 이전 구현은 결과를 하나라도 얻으면
+            # **메시지 순회 자체를** 끊어서, 뒤 메시지의 쓰기 증거를 놓쳤다.
+            pos = end
     return out
 
 
@@ -188,10 +237,19 @@ def has_write_evidence(tool_results: list[tuple[str, bool]]) -> bool:
     for name, ok in tool_results:
         if not ok:
             continue
-        low = name.lower()
-        if any(h in low for h in _READ_HINTS):
-            continue
-        if any(h in low for h in _WRITE_HINTS):
+        # 토큰 경계로 쪼갠다. 부분 문자열 매칭이면 이름 중간에 우연히 든 어간에
+        # 걸린다.
+        parts = set(re.split(r"[^a-z0-9]+", name.lower())) - {""}
+        # ── 둘 다 걸리면 쓰기가 이긴다 (2026-08-26 수정) ──
+        # 예전에는 읽기가 이겼다. `read_file_and_apply` 처럼 읽기인데 쓰기 어간이
+        # 섞인 이름을 막으려던 것이다. 그런데 그 이름은 **가상**이고, 반대로
+        # 아래는 전부 실재하며 전부 쓰기다.
+        #     search_replace · find_and_replace · replace_symbol_body
+        #     insert_after_symbol · edit_symbol
+        # 읽기 우선 규칙에서는 이것들이 전부 읽기로 뒤집혀, 정상적으로 적용에
+        # 성공한 턴에 "근거 없음" 오탐이 붙었다. 복합어에서 조작을 결정하는 것은
+        # 쓰기 동사 쪽이다("검색해서 치환한다"는 치환이다).
+        if parts & set(_WRITE_HINTS):
             return True
     return False
 

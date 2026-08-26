@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import json
 
-from core.verification.apply_claim import is_change_proposal
+from core.verification.apply_claim import should_check_apply_claim
 from core.verification.post_check import build_answer_warnings, build_structured_warnings
 
 
@@ -94,22 +94,49 @@ def test_warning_text_survives_as_one_line():
 # ── 결함 2: 변경안 제출 오탐 ─────────────────────────────────
 
 
-def test_final_proposal_is_a_change_proposal():
-    """final_proposal 은 완료 선언이 아니라 제안이다."""
-    answer = json.dumps(
+def test_only_chat_response_is_checked():
+    """★allow-list★ 구조화 출력에서는 chat_response 만 검사한다.
+
+    처음에는 `final_proposal` 만 뺐는데(deny-list), `tool_request` 에 같은 오탐이
+    남았다. 프로토콜의 VERIFYING 상태가 **쓰기 직후 검증 도구를 다시 요청하는
+    정상 경로**이고 그 턴의 rationale 은 자연히 "적용했으니 확인한다"가 된다.
+    실측 정탐은 전부 chat_response 였으므로 allow-list 로 뒤집어도 정탐 손실이 없다.
+    """
+    proposal = json.dumps(
         {"type": "final_proposal", "operations": [{"path": "a.py"}]}, ensure_ascii=False
     )
-    assert is_change_proposal(answer) is True
+    tool_req = json.dumps(
+        {
+            "type": "tool_request",
+            "rationale": "src/main.py 를 수정했으니 결과를 확인합니다.",
+            "tools": [{"name": "read_file"}],
+        },
+        ensure_ascii=False,
+    )
+
+    assert should_check_apply_claim(proposal) is False
+    assert should_check_apply_claim(tool_req) is False
+    assert should_check_apply_claim(_REAL_MODEL_OUTPUT) is True
 
 
-def test_chat_response_is_not_a_change_proposal():
-    """chat_response 로 "적용했다"고 말하는 것은 여전히 검사 대상이다."""
-    assert is_change_proposal(_REAL_MODEL_OUTPUT) is False
+def test_plain_text_answer_is_still_checked():
+    """평문 답변(웹 UI 표면)은 액션 스키마가 없으므로 기존대로 검사한다(무회귀)."""
+    assert should_check_apply_claim("변경을 적용했습니다. app.py 파일을 수정했습니다.") is True
 
 
-def test_plain_text_answer_is_not_treated_as_proposal():
-    """평문 답변은 판별 불가 → 기존 검사를 그대로 받는다(무회귀)."""
-    assert is_change_proposal("변경을 적용했습니다. app.py 파일을 수정했습니다.") is False
+def test_tool_request_suppresses_apply_claim_warning():
+    """★실측 오탐군★ 검증 요청 턴에 경고가 붙으면 안 된다."""
+    tool_req = json.dumps(
+        {
+            "type": "tool_request",
+            "rationale": "backend/x.py 파일에 주석을 추가했습니다. 검증하겠습니다.",
+            "tools": [{"name": "run_tests"}],
+        },
+        ensure_ascii=False,
+    )
+    msgs = [_Msg("user", '[AGENT_TOOL_RESULTS]{"results":[{"name":"read_file","ok":true}]}')]
+
+    assert build_structured_warnings(tool_req, msgs) == []
 
 
 def test_final_proposal_suppresses_apply_claim_warning():

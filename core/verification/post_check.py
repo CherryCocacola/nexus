@@ -127,13 +127,15 @@ def build_structured_warnings(answer: str, messages: list) -> list[str]:
             build_apply_claim_warning,
             collect_client_tool_results,
             find_apply_claims,
-            is_change_proposal,
+            should_check_apply_claim,
         )
 
-        # 변경안 제출(final_proposal)은 완료 선언이 아니다. 클라이언트가 사용자
-        # 승인 뒤 로컬에서 적용하므로 정상 흐름에서도 서버는 쓰기 성공을 못 본다.
-        # 이 분기가 없으면 정상 제안이 전부 오탐이 된다(실측 222건 중 153건).
-        if is_change_proposal(answer):
+        # 구조화 출력에서는 `chat_response` 만 검사한다(allow-list).
+        #   final_proposal — 클라이언트가 승인 뒤 로컬에서 적용하므로 정상 흐름에서도
+        #                    서버는 쓰기 성공을 못 본다. 제안은 완료 선언이 아니다.
+        #   tool_request   — 쓰기 직후 검증 도구를 다시 요청하는 정상 경로다.
+        # 실측 정탐은 전부 chat_response 였으므로 정탐 손실 없이 오탐만 사라진다.
+        if not should_check_apply_claim(answer):
             return []
 
         warning = build_apply_claim_warning(

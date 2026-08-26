@@ -3587,22 +3587,41 @@ async def _openai_stream_generate(
                 type(stream_abort_error).__name__,
             )
 
-    # 숫자 인용 검증 — 이미 흘려보낸 본문은 고치지 않고 경고만 마지막 청크로 덧붙인다.
-    _num_warning = _answer_warnings_for(
-        "".join(answer_parts), engine._messages[dl_start_idx:]
-    )
-    if _num_warning:
-        yield _chunk({"content": _num_warning})
+    # ── 사후 검증 (2026-08-26: 비스트림과 동작을 맞춘다) ──────────────
+    # 구조화 출력에서는 본문에 아무것도 덧붙이지 않는다. 이어 붙인 delta.content 가
+    # JSON 계약이라, 마크다운을 흘려보내면 클라이언트가 이은 결과가 깨진다.
+    # 비스트림보다 오히려 나쁘다 — 스트림은 되돌릴 수 없어 서버가 자기 실수를
+    # 발견할 기회조차 없다(비스트림은 최소한 다시 파싱해 INVALID_STRUCTURED_OUTPUT
+    # 을 남겼다). 신호는 종료 프레임의 `warnings` 로 옮긴다.
+    from core.verification.post_check import build_structured_warnings
 
-    # 이 턴에 생성된 문서 다운로드 링크를 마지막 content 청크로 덧붙인다.
+    _answer_text = "".join(answer_parts)
+    _stream_warnings = list(tool_warnings or [])
+    _num_warning = _answer_warnings_for(_answer_text, engine._messages[dl_start_idx:])
+
+    # 이 턴에 생성된 문서 다운로드 링크.
     downloads = _collect_downloads(engine._messages[dl_start_idx:])
     # 생성물 메타데이터를 tb_artifacts에 fail-soft 기록(pg 없으면 조용히 스킵).
     await _record_artifacts(
         downloads, tenant, session_id, turn=getattr(engine, "total_turns", None)
     )
     dl_md = _downloads_markdown(downloads)
-    if dl_md:
-        yield _chunk({"content": dl_md})
+
+    if structured_output is not None:
+        # 적용 주장 검증은 비스트림에만 배선돼 있었다. 같은 신호를 여기에도 싣는다.
+        _stream_warnings += build_structured_warnings(
+            _answer_text, engine._messages[dl_start_idx:]
+        )
+        if _num_warning.strip():
+            _stream_warnings.append(
+                "ANSWER_WARNING: " + " ".join(_num_warning.split())[:400]
+            )
+        # 다운로드는 본문 대신 구조화 필드로만 나간다(비스트림과 동일).
+    else:
+        if _num_warning:
+            yield _chunk({"content": _num_warning})
+        if dl_md:
+            yield _chunk({"content": dl_md})
 
     # 클라이언트가 실행할 도구가 있으면 종료 직전에 실어 보낸다.
     # OpenAI 규격은 tool_call 을 여러 delta 로 쪼개 보내는 것도, 한 delta 에 통째로
@@ -3619,7 +3638,8 @@ async def _openai_stream_generate(
     # 종료 프레임 → OpenAI 관례상 빈 delta + finish_reason, 이어서 [DONE].
     # 토큰 한도로 잘렸으면 "length"를 실어 클라이언트가 미완결을 알 수 있게 한다.
     _finish = "tool_calls" if pending_tool_uses else _map_finish_reason(stream_stop_reason)
-    yield _chunk({}, finish=_finish)
+    # 구조화 출력에서는 본문에 못 실은 경고를 종료 프레임의 `warnings` 로 내보낸다.
+    yield _chunk({}, finish=_finish, warnings=_stream_warnings or None)
     yield "data: [DONE]\n\n"
 
 
