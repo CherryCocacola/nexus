@@ -78,6 +78,31 @@ _MAX_QUOTES = 3
 _QUOTE_CHARS = 90
 
 
+def is_change_proposal(answer: str) -> bool:
+    """이 답변이 "변경안 제출"인지 판별한다(적용 완료 주장이 아니다).
+
+    ■ 왜 필요한가 (2026-08-26, 플러그인 팀 실측)
+      클라이언트는 변경을 `final_proposal` 로 받아 **사용자 승인 뒤 로컬에서**
+      적용한다. 그러니 정상 흐름에서도 서버는 쓰기 도구 성공을 볼 수 없다.
+      그 상태에서 "적용" 단어만 보고 경고를 내면 정상 제안이 전부 오탐이 된다.
+
+      실측: 경고 222건 중 153건(69%)이 `final_proposal` 에 붙은 오탐이었다.
+      이 분기를 넣으면 정밀도가 31% → 99% 가 된다. 계획형("적용하겠습니다")을
+      주장에서 제외한 것과 같은 이유다 — 아직 하지 않았다고 말하는 것은 거짓
+      주장이 아니고, 제안은 완료 선언이 아니다.
+
+    구조화 출력(JSON)일 때만 판별할 수 있다. 평문이면 False 를 돌려주어 기존
+    검사를 그대로 받게 한다(무회귀).
+    """
+    if not answer:
+        return False
+    try:
+        obj = json.loads(answer)
+    except ValueError:
+        return False
+    return isinstance(obj, dict) and obj.get("type") == "final_proposal"
+
+
 def find_apply_claims(answer: str) -> list[str]:
     """답변에서 "변경을 적용했다"는 완료형 주장 문장을 찾는다.
 

@@ -127,7 +127,14 @@ def build_structured_warnings(answer: str, messages: list) -> list[str]:
             build_apply_claim_warning,
             collect_client_tool_results,
             find_apply_claims,
+            is_change_proposal,
         )
+
+        # 변경안 제출(final_proposal)은 완료 선언이 아니다. 클라이언트가 사용자
+        # 승인 뒤 로컬에서 적용하므로 정상 흐름에서도 서버는 쓰기 성공을 못 본다.
+        # 이 분기가 없으면 정상 제안이 전부 오탐이 된다(실측 222건 중 153건).
+        if is_change_proposal(answer):
+            return []
 
         warning = build_apply_claim_warning(
             find_apply_claims(answer), collect_client_tool_results(messages)

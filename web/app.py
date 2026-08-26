@@ -3338,9 +3338,26 @@ async def chat_completions(
         content, engine._messages[dl_start_idx:]
     )
     # 숫자 인용 검증 — 문서에서 옮긴 금액·수량의 자릿수가 원문과 다르면 경고를 덧붙인다.
-    content += _answer_warnings_for(content, engine._messages[dl_start_idx:])
-    # 표준 클라이언트도 링크를 볼 수 있게 content 끝에 마크다운으로 덧붙인다.
-    content += _downloads_markdown(downloads)
+    _warn_md = _answer_warnings_for(content, engine._messages[dl_start_idx:])
+    if structured_output is not None:
+        # ★구조화 출력에서는 본문에 덧붙이지 않는다 (2026-08-26)★
+        #   본문이 JSON 계약이라, 마크다운 경고를 이어 붙이면 그 순간 깨진다.
+        #   그리고 그 깨진 결과를 바로 아래에서 우리가 다시 검사해 "유효한 JSON이
+        #   아닙니다"로 판정했다 — 모델은 정상 JSON을 냈는데 서버가 부순 것이다.
+        #   실측(2026-08-25 야간 9시간): 19,620 요청 중 32건이 이 경로였고,
+        #   전부 finish_reason=stop(=모델은 정상 종료)이었다. 클라이언트는
+        #   손쓸 방법이 없다.
+        #   신호 자체는 버리지 않고 `warnings` 배열로 옮긴다.
+        if _warn_md.strip():
+            response_warnings.append(
+                "ANSWER_WARNING: " + " ".join(_warn_md.split())[:400]
+            )
+        # 다운로드 링크도 같은 이유로 본문에 붙이지 않는다. 응답의 `downloads`
+        # 필드로 이미 구조화되어 나가므로 정보 손실이 없다.
+    else:
+        content += _warn_md
+        # 표준 클라이언트도 링크를 볼 수 있게 content 끝에 마크다운으로 덧붙인다.
+        content += _downloads_markdown(downloads)
 
     # 토큰 한도로 잘렸으면 "length"로 정직하게 알린다(하드코딩 "stop" 제거).
     finish_reason = _map_finish_reason(last_stop_reason)
