@@ -98,6 +98,9 @@ _SUMMARY_TARGET_CHARS = 1_500
 # 목표를 넘기는 일이 흔해(실측 2,172자 = 약 1,740 토큰) 1,536 으로는 문장
 # 중간에서 잘렸다. 요약의 끝은 "진행 중인 작업"이 놓이는 자리라 손실이 크다.
 _SUMMARY_MAX_TOKENS = 2_560
+# 요약을 만들 값이 있는가 — "버리는 것이 붙이는 것의 몇 배는 돼야 한다".
+# 총량 비례(예: 전체의 20%)로 잡으면 대화가 커질수록 과도하게 보수적이 된다.
+_SUMMARY_WORTH_RATIO = 2.0
 
 
 class ContextManager:
@@ -182,6 +185,9 @@ class ContextManager:
         # ── 압축 상태(인스턴스에 걸쳐 누적) ──
         # _compact_boundary: 이 인덱스보다 앞선 메시지는 이미 요약으로 대체됨.
         self._compact_boundary: int = 0
+        # _compact_boundary_id: 경계 지점(=보존한 첫 메시지)의 Message.id.
+        # 인덱스만으로는 다른 리스트에 잘못 적용된다 — _resolve_boundary 주석 참조.
+        self._compact_boundary_id: str | None = None
         # _compact_summary: 경계 이전 대화를 압축한 텍스트(없으면 None).
         self._compact_summary: str | None = None
         # _total_compactions: 지금까지 수행한 총 압축 횟수(통계/디버깅용).
@@ -290,6 +296,7 @@ class ContextManager:
         if not self._result_replaced:
             return
         self._compact_boundary = 0
+        self._compact_boundary_id = None
         self._compact_summary = None
         # 리스트가 교체됐으면 옛 메시지 개수를 기준으로 잡은 latch 는 무조건 무효다.
         self._useless_compact_at = None
@@ -321,9 +328,9 @@ class ContextManager:
         if self._passthrough:
             return messages
 
-        # 이전에 압축한 적이 있다면 그 경계(_compact_boundary) 이후만 "활성"으로 본다.
+        # 이전에 압축한 적이 있다면 그 경계 이후만 "활성"으로 본다.
         # 경계 이전은 이미 _compact_summary 한 덩어리로 대체됐기 때문이다.
-        active = messages[self._compact_boundary :]
+        active = messages[self._resolve_boundary(messages) :]
 
         # 과거 요약이 있으면, 잘린 맥락을 모델이 알 수 있도록 맨 앞에 시스템 메시지로 붙인다.
         result: list[Message] = []
@@ -429,12 +436,18 @@ class ContextManager:
                 # 커지는데 force 는 무효 검증(new_count >= token_count)을 건너뛰므로
                 # 그 커진 결과가 그대로 나간다. 무게를 먼저 재고, 가벼우면 요약
                 # 왕복을 아예 하지 않고 본문 절단으로 간다.
-                if split > 0 and self._estimate_tokens(messages[:split]) < token_count * 0.2:
+                #
+                # 기준은 총량 비례가 아니라 **버리는 것이 붙이는 것보다 큰가**다
+                # (2026-08-27 3차 검증). 총량 비례로 잡으면 대화가 커질수록
+                # 과도하게 보수적이 된다 — 84만 토큰에서 4만을 버릴 수 있는데도
+                # "20% 미만"이라 건너뛰었다. 요약이 차지할 자리(_SUMMARY_MAX_TOKENS)
+                # 의 배수로 잡으면 상수를 바꿔도 자동으로 따라온다.
+                dropped_tokens = self._estimate_tokens(messages[:split]) if split else 0
+                if split > 0 and dropped_tokens < _SUMMARY_MAX_TOKENS * _SUMMARY_WORTH_RATIO:
                     logger.warning(
-                        "Auto-compact(force) — 버릴 구간이 전체의 20%% 미만이라 "
-                        "요약해도 줄지 않는다. 도구 결과 본문 절단으로 간다(%d 토큰 중 %d).",
-                        token_count,
-                        self._estimate_tokens(messages[:split]),
+                        "Auto-compact(force) — 버릴 구간(%d 토큰)이 요약이 차지할 "
+                        "자리보다 작다. 도구 결과 본문 절단으로 간다.",
+                        dropped_tokens,
                     )
                     split = 0
 
@@ -512,7 +525,10 @@ class ContextManager:
                 return messages
 
             # 경계를 "최근 턴 시작 지점"으로 옮기고, 그 앞은 요약으로 대체한다.
+            # 인덱스와 함께 **보존한 첫 메시지의 id** 를 남긴다. 다음 턴에는 다른
+            # 리스트가 들어오므로 id 로 다시 찾아야 한다(_resolve_boundary).
             self._compact_boundary = len(messages) - len(recent)
+            self._compact_boundary_id = recent[0].id if recent else None
             self._compact_summary = summary
             self._total_compactions += 1
             # 압축이 성공했으니 무효 latch 를 푼다. 안 풀면 성공 압축이 리스트를
@@ -572,8 +588,10 @@ class ContextManager:
         summary = self._rule_based_summary(messages)
 
         # 다음 apply_all이 이 경계 이후만 다루도록 상태를 갱신한다.
+        # 인덱스와 함께 보존한 첫 메시지의 id 를 남긴다(_resolve_boundary 참조).
         self._compact_summary = summary
         self._compact_boundary = len(messages) - len(recent)
+        self._compact_boundary_id = recent[0].id if recent else None
 
         # 컨텍스트가 터지기 직전의 가장 공격적인 축소 — 표시 문구를 남긴다.
         self._last_compaction = "긴급 압축 — 최근 대화만 보존"
@@ -827,6 +845,51 @@ class ContextManager:
         ascii_words = len(text.encode("ascii", "ignore").split())
         return int(ascii_words * 1.3 + korean_chars * 2.0 + len(text) * 0.1)
 
+    def _resolve_boundary(self, messages: list[Message]) -> int:
+        """경계를 **이번에 넘어온 리스트 기준**으로 다시 찾는다.
+
+        ■ 왜 인덱스만으로는 안 되는가 (2026-08-27 3차 검증)
+          `_compact_boundary` 는 `auto_compact_if_needed` 에 넘어온 리스트 기준
+          인덱스다. 그런데 `query_loop.py:837-838` 은 이렇게 부른다.
+
+              api_messages = context_manager.apply_all(state.messages)
+              api_messages = await context_manager.auto_compact_if_needed(api_messages)
+
+          즉 경계는 **apply_all 출력** 기준으로 잡히는데, 다음 턴의 apply_all 은
+          그 인덱스를 **state.messages** 에 적용한다. 두 리스트는 길이가 다르다 —
+          apply_all 이 요약을 앞에 붙이고 snip 이 여러 턴을 마커 하나로 접기
+          때문이다. 실측(운영과 같은 흐름).
+
+              턴2  state= 9  apply_all→7  boundary=1
+              턴5  state=18  apply_all→7  boundary=4  → state[4] 는 assistant
+
+          경계 앞의 user 질문이 요약에도 없이 조용히 잘려 나간다. 08-24·08-25 에
+          관측된 입력 유실과 같은 계열이다.
+
+        ■ 그래서 메시지 id 로 잡는다
+          압축 시점에 "보존한 첫 메시지"의 id 를 같이 기억해 두고, 여기서 그 id 를
+          이번 리스트에서 찾는다. 리스트가 달라도 같은 메시지를 가리킨다.
+
+          못 찾으면 **자르지 않는다**(0). 맥락이 중복될 수는 있어도 입력이 사라지지는
+          않는다 — 둘 중에는 중복이 낫다. 다음 압축에서 경계가 새로 잡힌다.
+        """
+        if not self._compact_boundary_id:
+            # id 를 모르는 상태(구버전 상태 복원 등)에서는 종전 인덱스를 쓰되,
+            # 범위를 벗어나면 자르지 않는다.
+            return self._compact_boundary if self._compact_boundary < len(messages) else 0
+
+        for i, msg in enumerate(messages):
+            if msg.id == self._compact_boundary_id:
+                return i
+
+        logger.debug(
+            "압축 경계 메시지를 이번 리스트에서 찾지 못했다(id=%s, 메시지 %d개). "
+            "자르지 않는다 — 입력 유실보다 맥락 중복이 낫다.",
+            self._compact_boundary_id,
+            len(messages),
+        )
+        return 0
+
     def _message_level_split(self, messages: list[Message]) -> int:
         """턴 경계로 못 자를 때 쓸 **메시지 단위** 분할 지점을 찾는다.
 
@@ -859,7 +922,11 @@ class ContextManager:
         쓴다. 메시지를 버리면 짝이 깨지므로, 짝을 건드리지 않고 줄일 수 있는
         유일한 방법이 본문 절단이다.
         """
-        hard_budget = 1_500  # 글자. 앞 2/3 + 뒤 1/3 로 남긴다.
+        # 1단계(도구 결과 예산)보다 **반드시 공격적이어야** 한다 — 1단계를 이미
+        # 거치고도 넘쳤기 때문에 여기까지 온 것이다. 그래서 같은 설정값에서
+        # 유도한다(1단계는 tool_result_budget * 3 글자, 여기는 그 1/4).
+        # 하드코딩하면 YAML 을 바꿔도 이 경로만 따로 놀아 관계가 깨진다.
+        hard_budget = max(500, self.tool_result_budget * 3 // 4)  # 글자. 앞 2/3 + 뒤 1/3.
         result: list[Message] = []
         truncated = 0
         for msg in messages:
@@ -901,9 +968,14 @@ class ContextManager:
         self._total_compactions += 1
         self._useless_compact_at = None
         self._last_compaction = "긴급 절단 — 도구 결과 본문 축약"
-        # 메시지 개수·순서가 그대로라 경계는 옮기지 않는다. 호출부가 리스트를
-        # 교체해도 경계가 0이므로 그대로 유효하다.
-        self._result_replaced = True
+        # ── 여기서는 "교체"를 표시하지 않는다 (2026-08-27 3차 검증 N4) ──
+        # 이 경로는 리스트를 **교체한 것이 아니라 내용만 줄인 것**이다. 메시지
+        # 개수·순서가 그대로라 기존 경계는 여전히 유효하고, 반환 리스트에는
+        # 기존 _compact_summary 가 들어 있지 않다. 그런데 _result_replaced 를
+        # 세우면 호출부의 mark_result_adopted() 가 경계와 요약을 지운다 —
+        # 누적된 압축 상태가 사라져 다음 턴에 경계 이전 원문이 되살아난다.
+        # 복구 자리에서 컨텍스트를 되돌리는 셈이라 재초과를 부른다.
+        self._result_replaced = False
         return result
 
     def _summary_input_budget(self) -> int:

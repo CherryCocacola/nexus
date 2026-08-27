@@ -485,7 +485,12 @@ async def test_user_compact_does_not_destroy_a_short_conversation(monkeypatch):
 
     monkeypatch.setattr(mgr, "_get_model_summary", _summary)
 
-    messages = _long_conversation(3, 10)  # 6개, 임계치 한참 아래
+    # ★픽스처 크기가 핵심이다 (2026-08-27 3차 검증)★
+    # 45토큰짜리로 재면 요약(1,500자)이 원본보다 커서 **두 번째 안전망**(force 에서
+    # 요약이 더 크면 본문 절단으로 대체)에 걸린다. 그래서 oversized 게이트를
+    # 제거해도 테스트가 통과했다 — 고정하려던 수정을 고정하지 못했다.
+    # 게이트가 유일한 방어인 구간은 "임계치 미만이면서 요약보다는 큰" 크기다.
+    messages = _long_conversation(3, 3000)  # 6개, 약 37,800토큰 (임계치 55,296 미만)
     before = mgr._estimate_tokens(messages)
     result = await mgr.auto_compact_if_needed(messages, force=True)
 

@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import pytest
 
-from core.message import Message
+from core.message import Message, StreamEvent, StreamEventType
 from core.model.inference import LocalModelProvider
 from core.orchestrator.context_manager import ContextManager
 
@@ -137,3 +137,170 @@ def test_apply_all_result_is_sendable():
     messages = _tool_conversation(6, 20_000)
 
     assert_sendable(_payload(mgr.apply_all(messages)))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("turns", [6, 12])
+async def test_multi_turn_flow_stays_sendable(turns):
+    """★핵심★ 경계가 설정된 뒤 여러 턴을 돌려도 매 턴 보낼 수 있어야 한다.
+
+    `query_loop.py:837-838` 의 실제 흐름을 그대로 재현한다.
+
+        api_messages = context_manager.apply_all(state.messages)
+        api_messages = await context_manager.auto_compact_if_needed(api_messages)
+
+    경계는 **apply_all 출력** 기준으로 잡히는데 다음 턴에는 **state.messages** 에
+    적용된다. 두 리스트는 길이가 다르다 — apply_all 이 요약을 앞에 붙이고 snip 이
+    턴을 접기 때문이다. 신선한 매니저 하나만 보는 테스트로는 이 구간이 안 잡힌다.
+    """
+
+    class _P:
+        async def stream(self, **_kwargs):
+            yield StreamEvent(
+                type=StreamEventType.TEXT_DELTA, text="앞부분 요약: 요구사항과 결정"
+            )
+
+    mgr = _mgr(
+        model_provider=_P(),
+        max_context_tokens=3_000,
+        preserve_recent_turns=2,
+        tool_result_budget=200,
+    )
+
+    state: list[Message] = []
+    for t in range(turns):
+        state.append(Message.user(f"질문{t} " + "가" * 400))
+        state.append(
+            Message.assistant(
+                text=f"답변{t}", tool_uses=[{"id": f"tu{t}", "name": "Read", "input": {}}]
+            )
+        )
+        state.append(Message.tool_result(f"tu{t}", f"결과{t} " + "나" * 400))
+
+        api = mgr.apply_all(state)
+        api = await mgr.auto_compact_if_needed(api)
+
+        assert_sendable(_payload(api))
+        # 경계는 항상 **이번에 넘어온 리스트** 안의 실제 메시지를 가리켜야 한다.
+        resolved = mgr._resolve_boundary(state)
+        assert 0 <= resolved <= len(state), f"턴{t}: 경계가 범위를 벗어났다({resolved})"
+
+
+@pytest.mark.asyncio
+async def test_boundary_points_at_the_same_message_in_the_callers_list():
+    """★불변식★ 경계는 호출부 리스트에서도 **같은 메시지**를 가리켜야 한다.
+
+    `_compact_boundary` 는 `auto_compact_if_needed` 에 넘어온 리스트 기준 인덱스인데,
+    query_loop 은 `apply_all(state.messages)` 의 출력을 넘기고 다음 턴에는 그 인덱스를
+    `state.messages` 에 적용한다. 두 리스트는 길이가 다르다 — apply_all 이 요약을
+    앞에 붙이고 snip 이 턴을 접기 때문이다.
+
+    실측(운영과 같은 흐름). 저장된 인덱스가 가리키는 메시지가 매 턴 어긋났다.
+
+        턴2  state= 9  apply_all→7  저장=1  올바른 위치=3
+        턴5  state=18  apply_all→7  저장=2  올바른 위치=12
+
+    지금은 보존한 첫 메시지의 id 를 같이 기억해 리스트가 달라도 같은 곳을 찾는다.
+    이 테스트가 없으면 인덱스로 되돌려도 아무도 울지 않는다 — 다른 압축 단계가
+    결과를 덮어써 증상이 가려지기 때문이다.
+    """
+
+    class _P:
+        async def stream(self, **_kwargs):
+            yield StreamEvent(type=StreamEventType.TEXT_DELTA, text="앞부분 요약")
+
+    mgr = _mgr(
+        model_provider=_P(),
+        max_context_tokens=3_000,
+        preserve_recent_turns=2,
+        tool_result_budget=200,
+    )
+
+    state: list[Message] = []
+    checked = 0
+    for t in range(6):
+        state.append(Message.user(f"질문{t} " + "가" * 400))
+        state.append(Message.assistant(text=f"답변{t}"))
+        state.append(Message.tool_result(f"tu{t}", f"결과{t} " + "나" * 400))
+
+        api = mgr.apply_all(state)
+        api = await mgr.auto_compact_if_needed(api)
+
+        if not mgr._compact_boundary_id:
+            continue
+        expected = next(
+            (i for i, m in enumerate(state) if m.id == mgr._compact_boundary_id), None
+        )
+        if expected is None:
+            continue
+        checked += 1
+
+        # ★핵심★ apply_all 이 **실제로** 그 자리에서 잘라야 한다. _resolve_boundary 를
+        # 직접 부르면 apply_all 이 그것을 쓰는지 안 쓰는지를 못 본다.
+        again = mgr.apply_all(state)
+        body = [m for m in again if not (m.text_content or "").startswith("[대화 요약]")]
+        dropped_before = {
+            (m.text_content or "")[:8] for m in state[:expected] if m.text_content
+        }
+        leaked = [
+            (m.text_content or "")[:8]
+            for m in body
+            if (m.text_content or "")[:8] in dropped_before
+        ]
+        assert not leaked, (
+            f"턴{t}: 요약으로 대체된 구간이 본문에 다시 나왔다 {leaked} — "
+            f"경계가 어긋났다(저장 {mgr._compact_boundary}, 실제 {expected})"
+        )
+
+    assert checked > 0, "경계가 한 번도 설정되지 않아 아무것도 검증하지 못했다"
+
+
+@pytest.mark.asyncio
+async def test_drifting_boundary_does_not_force_a_summary_every_turn():
+    """★실측★ 경계가 표류하면 압축이 **매 턴** 돈다 — 모델 왕복이 3배가 된다.
+
+    경계는 `apply_all` 출력 기준 인덱스인데 다음 턴에는 `state.messages` 에 적용된다.
+    요약이 앞에 붙어 리스트 길이가 달라지므로 경계가 매 턴 위로 밀리고, 활성 구간이
+    다시 자라지 못해 압축 조건이 계속 참으로 남는다. 14턴 실측.
+
+        옛 방식(인덱스)  턴7부터 매 턴 압축, 경계 10→12→13→15→16→18→19
+        id 방식          3턴마다 한 번, 경계 10 고정
+
+    토큰이나 payload 로는 안 드러난다 — 결과 모양이 같기 때문이다. 드러나는 것은
+    **요약 호출 횟수**다.
+    """
+    calls = {"n": 0}
+
+    class _P:
+        async def stream(self, **_kwargs):
+            calls["n"] += 1
+            yield StreamEvent(type=StreamEventType.TEXT_DELTA, text="앞부분 요약")
+
+    mgr = _mgr(
+        model_provider=_P(),
+        max_context_tokens=6_000,
+        preserve_recent_turns=2,
+        tool_result_budget=100_000,
+    )
+    mgr.snip_threshold = 10.0  # snip 을 끄고 경계 효과만 남긴다
+
+    state: list[Message] = []
+    turns = 14
+    for t in range(turns):
+        state.append(Message.user(f"질문{t} " + "가" * 300))
+        state.append(
+            Message.assistant(
+                text=f"답변{t}", tool_uses=[{"id": f"tu{t}", "name": "Read", "input": {}}]
+            )
+        )
+        state.append(Message.tool_result(f"tu{t}", f"결과{t} " + "나" * 300))
+
+        api = mgr.apply_all(state)
+        api = await mgr.auto_compact_if_needed(api)
+        assert_sendable(_payload(api))
+
+    # 경계가 표류하면 턴7부터 전부(=8회 이상) 돈다. 정상이면 3턴에 한 번꼴이다.
+    assert calls["n"] <= turns // 2, (
+        f"{turns}턴 동안 요약이 {calls['n']}회 돌았다 — 경계가 표류해 압축 조건이 "
+        "계속 참으로 남는다"
+    )
