@@ -761,7 +761,9 @@ class ContextManager:
         per_msg = max(400, _SUMMARY_INPUT_BUDGET // max(1, len(messages)))
         for msg in messages:
             role = msg.role if isinstance(msg.role, str) else msg.role.value
-            content = str(msg.content)
+            # str(msg.content) 를 쓰면 assistant 블록이 파이썬 repr 로 들어간다.
+            # 그 repr 이 요약을 무너뜨렸다 — _readable_text 주석 참조.
+            content = _readable_text(msg)
             if len(content) > per_msg:
                 # 앞뒤를 남긴다. 도구 결과·긴 답변은 결론이 끝에 오는 경우가 많아
                 # 앞만 남기면 "무엇을 하려 했는지"만 남고 "어떻게 됐는지"가 사라진다.
@@ -832,7 +834,7 @@ class ContextManager:
             role = msg.role if isinstance(msg.role, str) else msg.role.value
             if role == "user":
                 # 사용자 메시지는 앞 50자만 주제 후보로 모은다.
-                text = str(msg.content)[:50]
+                text = _readable_text(msg)[:50]
                 user_topics.append(text)
             elif role == "assistant" and isinstance(msg.content, list):
                 # assistant 블록에서 도구 호출을 찾아 이름을 수집한다.
@@ -930,7 +932,7 @@ class ContextManager:
             role = msg.role if isinstance(msg.role, str) else msg.role.value
             if role == "user":
                 # 마지막 user 텍스트가 이 턴의 대표 질문이 된다(앞 40자).
-                user_text = str(msg.content)[:40]
+                user_text = _readable_text(msg)[:40]
             elif role == "assistant" and isinstance(msg.content, list):
                 # assistant 블록에서 도구 호출 이름을 순서대로 모은다.
                 # 도구 블록은 ToolUseBlock 객체 또는 dict 두 형태 모두 가능.
@@ -1077,3 +1079,38 @@ def _is_tool_result(msg: Message) -> bool:
     """
     role = msg.role if isinstance(msg.role, str) else msg.role.value
     return role == "tool_result"
+
+
+def _readable_text(msg: Message) -> str:
+    """
+    Message를 "사람이 읽는 텍스트"로 바꾼다 — 요약 프롬프트에 넣을 때 쓴다.
+
+    ■ 왜 필요한가 (2026-08-27, 실모델 검증에서 발견)
+      `str(msg.content)` 를 쓰면 안 된다. assistant 메시지의 content는 항상
+      `list[ContentBlock]` 이라(`Message.assistant()` 가 그렇게 정규화한다)
+      `str()` 이 **파이썬 repr** 을 만든다.
+
+          [TextBlock(type='text', text='중간 작업 27 결과입니다. ...')]
+
+      이 repr이 그대로 요약 프롬프트에 들어갔다. 실모델(A.X-4.0) 검증에서
+      모델이 요약 대신 이 구조를 그대로 되뱉었고, 앞부분의 파일 경로·식별자는
+      요약에 하나도 살아남지 못했다. 요약 품질 저하의 실제 원인 중 하나다.
+
+      텍스트만 뽑으면 도구 호출 사실이 사라지므로, 도구 이름은 한 줄로 덧붙인다
+      ("진행 중인 작업"은 요약이 반드시 담아야 할 항목이다).
+    """
+    text = msg.text_content
+
+    # 도구 호출 이름 수집 — 역직렬화 시점에 따라 dict 형태일 수도 있다.
+    names: list[str] = []
+    if isinstance(msg.content, list):
+        for block in msg.content:
+            if isinstance(block, ToolUseBlock):
+                names.append(block.name)
+            elif isinstance(block, dict) and block.get("type") == "tool_use":
+                names.append(block.get("name", ""))
+
+    if names:
+        marker = f"(도구 호출: {', '.join(n for n in names if n)})"
+        return "\n".join([text, marker]) if text else marker
+    return text

@@ -33,8 +33,8 @@ from __future__ import annotations
 
 import pytest
 
-from core.message import Message
-from core.orchestrator.context_manager import ContextManager
+from core.message import Message, StreamEvent, StreamEventType
+from core.orchestrator.context_manager import ContextManager, _readable_text
 
 
 def _mgr(**kw) -> ContextManager:
@@ -177,3 +177,59 @@ async def test_effective_compaction_still_works(monkeypatch):
     assert mgr._compact_boundary > 0
     # 마지막 턴의 원문은 반드시 살아 있어야 한다.
     assert "질문19" in " ".join(m.text_content or "" for m in result)
+
+
+# ── ④ 요약 프롬프트에 파이썬 repr 이 섞이지 않는다 ─────────────
+
+
+@pytest.mark.asyncio
+async def test_summary_prompt_has_no_python_repr():
+    """★실모델 검증에서 발견★ str(msg.content) 는 repr 을 만든다.
+
+    `Message.assistant()` 는 content 를 항상 list[ContentBlock] 로 정규화한다.
+    그래서 `str(msg.content)` 가 다음을 만들어 요약 프롬프트에 그대로 들어갔다.
+
+        [TextBlock(type='text', text='...')]
+
+    실제 A.X-4.0 호출에서 모델이 요약 대신 이 구조를 되뱉었고, 앞부분의 파일
+    경로·식별자가 요약에 하나도 살아남지 못했다.
+    """
+    seen = {}
+
+    class _Capture:
+        async def stream(self, **kwargs):
+            seen["prompt"] = kwargs["messages"][0].text_content
+            yield StreamEvent(type=StreamEventType.TEXT_DELTA, text="요약")
+
+    mgr = _mgr(model_provider=_Capture(), preserve_recent_turns=1)
+    messages = [
+        Message.user("파일은 backend/services/koje_stats.py 입니다"),
+        Message.assistant("확인했습니다. 그 파일을 고치겠습니다"),
+        Message.user("최근 질문"),
+        Message.assistant("최근 답변"),
+    ]
+    await mgr.auto_compact_if_needed(messages, force=True)
+
+    prompt = seen["prompt"]
+    assert "TextBlock(" not in prompt, "파이썬 repr 이 요약 프롬프트에 들어갔다"
+    assert "확인했습니다" in prompt, "assistant 본문이 프롬프트에서 사라졌다"
+    assert "backend/services/koje_stats.py" in prompt
+
+
+def test_readable_text_keeps_tool_names():
+    """도구 호출은 이름만 남긴다 — '진행 중인 작업'을 요약이 알아야 한다."""
+    msg = Message.assistant(
+        text="파일을 읽겠습니다",
+        tool_uses=[{"id": "t1", "name": "Read", "input": {"path": "a.py"}}],
+    )
+
+    out = _readable_text(msg)
+
+    assert "TextBlock(" not in out
+    assert "파일을 읽겠습니다" in out
+    assert "Read" in out
+
+
+def test_readable_text_plain_string_unchanged():
+    """content 가 문자열이면 그대로 돌려준다(도구 결과 등)."""
+    assert _readable_text(Message.tool_result("t1", "결과 본문")) == "결과 본문"
