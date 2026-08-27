@@ -132,6 +132,10 @@ class ContextManager:
         """
         self.model_provider = model_provider
         self.max_tokens = max_context_tokens
+        # 설정값 원본. GPU OOM 복구가 max_tokens 를 0.7배로 줄이는데 복원 코드가
+        # 없어, CLI 처럼 관리자가 프로세스 수명 내내 사는 표면에서는 0.7ⁿ 로 계속
+        # 작아졌다(2026-08-26 리뷰 지적). 되돌릴 기준값을 들고 있는다.
+        self._configured_max_tokens = max_context_tokens
         self.tool_result_budget = tool_result_budget
         self.snip_threshold = snip_threshold
         self.auto_compact_threshold = auto_compact_threshold
@@ -164,6 +168,11 @@ class ContextManager:
         # take_last_compaction()으로 꺼내(consume) CONTEXT_COMPACT 이벤트 발생 여부를
         # 판단한다. no-op 통과에서는 계속 None이라 매 턴 표시가 뜨지 않는다.
         self._last_compaction: str | None = None
+        # 무효 압축 latch(2026-08-26 리뷰 지적). 자동 압축이 "줄지 않았다"로 끝나면
+        # 토큰 수는 임계치 위에 그대로 남고, query_loop 은 매 턴 압축을 다시 시도한다.
+        # 그러면 대화가 끝날 때까지 **턴마다 모델 요약 왕복이 한 번씩 버려진다.**
+        # 무효였던 시점의 메시지 수를 기억해, 대화가 그보다 늘기 전에는 건너뛴다.
+        self._useless_compact_at: int | None = None
 
     def for_session(self) -> ContextManager:
         """설정은 그대로 두고 **압축 상태만 새로 만든** 인스턴스를 돌려준다.
@@ -193,7 +202,10 @@ class ContextManager:
         """
         return ContextManager(
             model_provider=self.model_provider,
-            max_context_tokens=self.max_tokens,
+            # **현재값이 아니라 설정값**을 넘긴다. GPU OOM 복구가 max_tokens 를
+            # 줄여 놓은 상태에서 clone 하면 그 축소가 새 세션까지 따라간다
+            # (2026-08-27). 새 요청은 설정값에서 시작해야 한다.
+            max_context_tokens=self._configured_max_tokens,
             tool_result_budget=self.tool_result_budget,
             snip_threshold=self.snip_threshold,
             auto_compact_threshold=self.auto_compact_threshold,
@@ -201,6 +213,21 @@ class ContextManager:
             preserve_recent_tool_results=self.preserve_recent_tool_results,
             tier=self._tier,
         )
+
+    def restore_max_tokens(self) -> None:
+        """GPU OOM 복구가 줄여 놓은 컨텍스트 상한을 설정값으로 되돌린다.
+
+        복구 경로(`query_loop` 의 OOM 처리)는 다음 시도에서 메모리를 확보하려고
+        `max_tokens` 를 0.7배로 줄인다. 그런데 **되돌리는 코드가 없었다.**
+
+        웹은 이제 요청마다 새 인스턴스를 만들어(for_session) 자연히 초기화되지만,
+        CLI 는 관리자가 프로세스 수명 내내 살아 있어 OOM 이 날 때마다 0.7ⁿ 로
+        누적 축소됐다. 한 번 줄면 되돌릴 수단이 없어, 이후 모든 대화가 좁아진
+        창에서 돌았다.
+
+        축소의 목적은 "이번 요청을 통과시키는 것"이므로 요청 경계에서 되돌린다.
+        """
+        self.max_tokens = self._configured_max_tokens
 
     def mark_result_adopted(self) -> None:
         """압축 **결과로 메시지 리스트를 교체한** 호출부가 부른다.
@@ -311,6 +338,23 @@ class ContextManager:
         if not force and token_count < self.max_tokens * self.auto_compact_threshold:
             return messages
 
+        # ── 무효 압축 latch (2026-08-26) ──
+        # 직전에 "줄지 않아서 포기"로 끝났다면, 대화가 그때보다 늘기 전에는 다시
+        # 시도해도 같은 결과다. 그런데 토큰 수는 임계치 위에 남아 있으므로
+        # query_loop 은 매 턴 여기로 들어온다 → 턴마다 모델 요약 왕복이 버려진다.
+        # 메시지가 늘면 요약 재료가 달라지므로 latch 를 푼다.
+        if (
+            not force
+            and self._useless_compact_at is not None
+            and len(messages) <= self._useless_compact_at
+        ):
+            logger.debug(
+                "Auto-compact 건너뜀 — 직전 시도가 무효였고 대화가 늘지 않았다 "
+                "(메시지 %d개)",
+                len(messages),
+            )
+            return messages
+
         logger.warning(
             f"Auto-compact 시작: {token_count} 토큰 "
             f"(임계치: {self.max_tokens * self.auto_compact_threshold:.0f}, "
@@ -350,6 +394,8 @@ class ContextManager:
                     token_count,
                     new_count,
                 )
+                # 대화가 늘기 전에는 같은 낭비를 반복하지 않는다.
+                self._useless_compact_at = len(messages)
                 return messages
 
             # 경계를 "최근 턴 시작 지점"으로 옮기고, 그 앞은 요약으로 대체한다.

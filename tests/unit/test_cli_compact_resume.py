@@ -34,6 +34,9 @@ class _FakeCM:
         self.forced.append(force)
         return [Message.user("요약본")]
 
+    def restore_max_tokens(self) -> None:
+        """실물과 시그니처를 맞춘다."""
+
     def mark_result_adopted(self) -> None:
         """/compact 는 결과로 리스트를 교체하므로 경계를 되돌려야 한다(2026-08-26).
 

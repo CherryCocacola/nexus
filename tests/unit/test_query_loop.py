@@ -186,6 +186,10 @@ class SpyContextManager:
         self.emergency_compact_calls += 1
         return messages
 
+    def restore_max_tokens(self) -> None:
+        """요청 경계에서 OOM 축소를 되돌린다 — 실물과 시그니처를 맞춘다."""
+        self.max_tokens = 4000
+
     def mark_result_adopted(self) -> None:
         """압축 결과로 리스트를 교체한 호출부가 부른다.
 

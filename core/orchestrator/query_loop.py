@@ -771,6 +771,15 @@ async def query_loop(
     # state: 턴 카운트·토큰 누적·각종 재시도 카운터를 한 객체에 모아 관리한다.
     # stop_resolver: 매 턴 끝에서 "도구 호출이 남았는지"를 판정해 계속/종료를 결정한다.
     state = LoopState(messages=messages)
+
+    # GPU OOM 복구가 줄여 놓은 컨텍스트 상한을 요청 경계에서 되돌린다(2026-08-26).
+    # 축소(max_tokens *= 0.7)에는 복원 코드가 없어, CLI 처럼 관리자가 프로세스
+    # 수명 내내 사는 표면에서는 OOM 이 날 때마다 0.7ⁿ 로 누적 축소됐다. 축소의
+    # 목적은 "이번 요청을 통과시키는 것"이므로 다음 요청은 설정값에서 시작한다.
+    # hasattr 로 방어하지 않는다 — 메서드가 없으면 복원이 조용히 건너뛰어져 고치려던
+    # 버그가 그대로 남는다. 없으면 시끄럽게 실패하는 편이 낫다.
+    if context_manager is not None:
+        context_manager.restore_max_tokens()
     stop_resolver = StopResolver()
 
     # ── 자기일관성(SC) 활성 여부 (Point 4.3) ──────────────────────────────
