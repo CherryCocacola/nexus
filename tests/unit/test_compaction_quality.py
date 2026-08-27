@@ -27,6 +27,10 @@
 
 그리고 -262/-333 은 세 번째 형태다 — 보존 대상이 전체라 버릴 것이 없는데도 요약을
 만들어 붙여 오히려 커졌다.
+
+네 번째는 실모델 검증에서 나왔다 — 요약 프롬프트에 파이썬 repr 이 들어갔다(④).
+다섯 번째부터는 코드 리뷰가 찾았다(⑤) — force 경로가 원본을 돌려주는 것, 총량
+절단이 경계 직전 구간을 통째로 버리는 것, 성공 압축이 무효 latch 를 안 푸는 것.
 """
 
 from __future__ import annotations
@@ -124,11 +128,36 @@ async def test_summary_input_is_not_capped_at_4000_chars(monkeypatch):
     assert seen["chars"] > 20_000, f"요약 대상이 {seen['chars']}자뿐이다"
 
 
-def test_long_messages_keep_head_and_tail():
-    """긴 메시지는 앞만 자르지 않는다 — 결론이 끝에 오는 경우가 많다."""
-    from core.orchestrator.context_manager import _SUMMARY_INPUT_BUDGET
+@pytest.mark.asyncio
+async def test_long_messages_keep_head_and_tail():
+    """긴 메시지는 앞만 자르지 않는다 — 결론이 끝에 오는 경우가 많다.
 
-    assert _SUMMARY_INPUT_BUDGET >= 20_000, "입력 예산이 너무 작다"
+    예전에는 이 테스트가 `_SUMMARY_INPUT_BUDGET >= 20_000` 상수 비교만 했다.
+    이름은 head/tail 보존인데 `…(중략)…` 로직은 **한 줄도 실행되지 않았다**
+    (2026-08-27 리뷰 지적). 실제 프롬프트를 받아 확인한다.
+    """
+    seen = {}
+
+    class _Capture:
+        async def stream(self, **kwargs):
+            seen["prompt"] = kwargs["messages"][0].text_content
+            yield StreamEvent(type=StreamEventType.TEXT_DELTA, text="요약")
+
+    mgr = _mgr(model_provider=_Capture(), max_context_tokens=61440, preserve_recent_turns=1)
+    # 메시지 하나가 per_msg 예산을 크게 넘도록 만든다.
+    messages = [
+        Message.user("시작표식 " + "가" * 30_000 + " 끝표식"),
+        Message.user("최근 질문"),
+        Message.assistant("최근 답변"),
+    ]
+    await mgr.auto_compact_if_needed(messages, force=True)
+
+    prompt = seen["prompt"]
+    assert "시작표식" in prompt, "앞부분이 잘렸다"
+    assert "끝표식" in prompt, "끝부분이 잘렸다 — 결론이 사라진다"
+    # 메시지 단위 중략과 총량 단위 중략 둘 다 "중략"으로 표기한다. 어느 쪽이
+    # 걸렸든 가운데가 접혔다는 사실만 확인하면 된다.
+    assert "중략" in prompt, "중략 로직이 실행되지 않았다"
 
 
 # ── ③ 이득 없는 압축을 미리 피한다 ───────────────────────────
@@ -140,6 +169,10 @@ async def test_nothing_to_drop_skips_summary_entirely(monkeypatch):
 
     보존 대상이 전체인데 요약을 만들어 붙이면 결과가 원본보다 커진다.
     실측 두 건이 정확히 그 형태였다.
+
+    force 는 쓰지 않는다 — 실측 사고 2건이 모두 force=False(임계치 자동 압축)였고,
+    force 는 오류 복구 경로라 반대로 **반드시 줄여야** 한다
+    (test_force_never_returns_the_original_list 가 그쪽을 본다).
     """
     mgr = _mgr(preserve_recent_turns=10)  # 보존 요구가 대화보다 크다
     calls = {"n": 0}
@@ -151,7 +184,7 @@ async def test_nothing_to_drop_skips_summary_entirely(monkeypatch):
     monkeypatch.setattr(mgr, "_get_model_summary", _summary)
 
     messages = _long_conversation(2, 300)  # 4개 — 전부 보존 대상
-    result = await mgr.auto_compact_if_needed(messages, force=True)
+    result = await mgr.auto_compact_if_needed(messages)
 
     assert calls["n"] == 0, "버릴 게 없는데 요약 모델을 불렀다"
     assert result == messages, "원본을 그대로 돌려줘야 한다"
@@ -233,3 +266,148 @@ def test_readable_text_keeps_tool_names():
 def test_readable_text_plain_string_unchanged():
     """content 가 문자열이면 그대로 돌려준다(도구 결과 등)."""
     assert _readable_text(Message.tool_result("t1", "결과 본문")) == "결과 본문"
+
+
+# ── ⑤ 리뷰가 찾은 것 (2026-08-27) ────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_force_never_returns_the_original_list(monkeypatch):
+    """★H1 재현★ force 경로가 원본을 돌려주면 오류 복구가 영구 실패한다.
+
+    force 호출부(query_loop 의 "prompt is too long" 복구, CLI /compact)는 반환값으로
+    리스트를 교체하고 **무조건** mark_result_adopted() 를 부른다. 원본이 돌아오면
+    압축은 안 된 채 이전 경계·요약만 지워져, 다음 apply_all 이 경계 이전 원문을
+    전부 되살린다. 줄이러 온 자리에서 오히려 늘어난다.
+
+    조건은 흔하다 — 질문 하나에 도구 결과가 길게 이어지면 user 메시지가
+    preserve_recent_turns 보다 적어 _extract_recent_turns 가 전체를 돌려준다.
+    컨텍스트가 터지는 것도 대개 그 형태다.
+    """
+    mgr = _mgr(preserve_recent_turns=6)
+
+    async def _summary(_messages):
+        return "짧은 요약"
+
+    monkeypatch.setattr(mgr, "_get_model_summary", _summary)
+
+    # user 1개 + 도구 결과 다수 — 턴 경계로는 자를 것이 없다.
+    messages = [Message.user("질문 하나")]
+    for i in range(20):
+        messages.append(Message.tool_result(f"tu{i}", f"결과{i} " + "가" * 2000))
+
+    before = mgr._estimate_tokens(messages)
+    result = await mgr.auto_compact_if_needed(messages, force=True)
+
+    assert result is not messages, "force 가 원본 객체를 그대로 돌려줬다"
+    assert mgr._estimate_tokens(result) < before, "force 가 줄이지 못했다"
+    # 마지막 메시지 원문은 살아 있어야 한다.
+    assert "결과19" in " ".join(m.text_content or "" for m in result)
+
+
+@pytest.mark.asyncio
+async def test_auto_path_still_returns_original_when_nothing_to_drop(monkeypatch):
+    """자동 경로는 종전대로 원본을 돌려준다(무회귀) — force 만 달라야 한다."""
+    mgr = _mgr(preserve_recent_turns=10)
+    calls = {"n": 0}
+
+    async def _summary(_messages):
+        calls["n"] += 1
+        return "요" * 3000
+
+    monkeypatch.setattr(mgr, "_get_model_summary", _summary)
+
+    messages = _long_conversation(2, 300)
+    result = await mgr.auto_compact_if_needed(messages)
+
+    assert calls["n"] == 0
+    assert result is messages
+
+
+@pytest.mark.asyncio
+async def test_summary_prompt_keeps_the_last_dropped_message():
+    """★H2 재현★ 총량 절단이 앞만 남기면 경계 바로 앞 구간이 통째로 빠진다.
+
+    개별 메시지에는 "앞만 자르지 않는다"를 적용해 놓고 합친 뒤에는 앞만 남기면,
+    사라지는 것은 이후 턴이 가장 많이 참조할 구간이다. 요약을 버릴 구간으로 옮긴
+    수정의 취지가 거기서 절반 무효화된다.
+    """
+    seen = {}
+
+    class _Capture:
+        async def stream(self, **kwargs):
+            seen["prompt"] = kwargs["messages"][0].text_content
+            yield StreamEvent(type=StreamEventType.TEXT_DELTA, text="요약")
+
+    mgr = _mgr(model_provider=_Capture(), max_context_tokens=61440, preserve_recent_turns=2)
+    # 메시지 수를 충분히 늘려 per_msg 하한(400) × n 이 예산을 넘게 만든다.
+    messages = _long_conversation(40, 800)
+    await mgr.auto_compact_if_needed(messages, force=True)
+
+    prompt = seen["prompt"]
+    # 보존 2턴을 뺀 마지막 버림 대상은 질문37/답변37 이다.
+    assert "질문37" in prompt or "답변37" in prompt, (
+        "경계 바로 앞 구간이 프롬프트에서 빠졌다 — 앞에서만 잘랐다"
+    )
+    assert "질문0" in prompt, "앞부분도 남아 있어야 한다"
+
+
+@pytest.mark.asyncio
+async def test_successful_compaction_releases_the_latch(monkeypatch):
+    """★M2 재현★ 성공 압축이 latch 를 안 풀면 이후 자동 압축이 계속 막힌다.
+
+    성공 압축은 리스트를 크게 줄이므로 len(messages) 가 옛 latch 값 아래에 오래
+    머문다. 그동안 토큰은 도구 결과로 얼마든지 늘 수 있다.
+    """
+    mgr = _mgr(max_context_tokens=100, preserve_recent_turns=2)
+
+    async def _huge(_messages):
+        return "요" * 5000  # 무효 판정을 유도한다
+
+    monkeypatch.setattr(mgr, "_get_model_summary", _huge)
+    messages = _long_conversation(10, 200)
+    await mgr.auto_compact_if_needed(messages)
+    assert mgr._useless_compact_at is not None, "무효 latch 가 안 걸렸다"
+
+    async def _short(_messages):
+        return "짧은 요약"
+
+    monkeypatch.setattr(mgr, "_get_model_summary", _short)
+    await mgr.auto_compact_if_needed(messages, force=True)
+
+    assert mgr._useless_compact_at is None, "성공 압축이 latch 를 풀지 않았다"
+
+
+def test_summary_input_budget_follows_the_window():
+    """★M3★ 좁은 창에서는 요약 입력도 같이 줄어야 한다.
+
+    고정 24,000자를 쓰면 h200(16,384)·h100(8,192) 프로파일에서 요약 호출 자체가
+    창을 넘는다. 그 호출이 일어나는 자리가 컨텍스트 초과에서 회복하려는 자리다.
+    """
+    assert _mgr(max_context_tokens=61440)._summary_input_budget() == 24_000
+    assert _mgr(max_context_tokens=16384)._summary_input_budget() == 8_192
+    assert _mgr(max_context_tokens=8192)._summary_input_budget() == 4_096
+
+
+def test_readable_text_falls_back_to_thinking():
+    """★L1★ thinking 만 있는 메시지가 요약 입력에서 통째로 사라지면 안 된다."""
+    from core.message import Role, ThinkingBlock
+
+    msg = Message(role=Role.ASSISTANT, content=[ThinkingBlock(thinking="내부 추론 내용")])
+
+    out = _readable_text(msg)
+
+    assert out == "내부 추론 내용"
+    assert "ThinkingBlock(" not in out
+
+
+def test_readable_text_prefers_text_over_thinking():
+    """text 가 있으면 thinking 은 쓰지 않는다 — 프롬프트가 두 배로 불면 안 된다."""
+    from core.message import Role, TextBlock, ThinkingBlock
+
+    msg = Message(
+        role=Role.ASSISTANT,
+        content=[ThinkingBlock(thinking="내부 추론"), TextBlock(text="사용자에게 한 말")],
+    )
+
+    assert _readable_text(msg) == "사용자에게 한 말"

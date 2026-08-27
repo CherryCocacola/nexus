@@ -60,6 +60,7 @@ from typing import TYPE_CHECKING, Any
 #   Message.system()/user()/tool_result() 같은 팩토리 메서드로만 생성한다.
 from core.message import (
     Message,
+    ThinkingBlock,
     ToolUseBlock,
 )
 
@@ -81,12 +82,22 @@ logger = logging.getLogger("nexus.orchestrator.context_manager")
 # 요약은 대화의 3% 만 보고 나머지를 대표해야 한다. 실측에서 6~8만 토큰이 234~1,061
 # 토큰으로 떨어진 것은 요약 품질 문제가 아니라 **입력 자체가 없었던 것**이다.
 #
-# 입력 예산은 요약 모델의 창(65,536)에 여유를 두고 잡는다. 한글 기준 대략
-# 0.42 토큰/자이므로 24,000자 ≈ 1만 토큰 — 프롬프트·출력을 더해도 충분히 안전하다.
+# 입력 예산의 **상한**이다. 실제로는 창 크기에 맞춰 더 줄인다
+# (`_summary_input_budget()`). 한글은 실측 약 0.8 토큰/자이므로 24,000자는
+# 약 19,000 토큰이다 — 운영 창(61,440)에서는 안전하지만, 좁은 창 프로파일
+# (model_profiles.yaml 의 h200 16,384 / h100 8,192)에서는 요약 호출 자체가
+# 창을 넘는다. 그런데 그 호출이 일어나는 자리가 바로 컨텍스트 초과에서
+# 회복하려는 자리라, 고정값으로 두면 복구가 복구를 막는다.
 _SUMMARY_INPUT_BUDGET = 24_000
+# 입력 예산이 창의 몇 배(글자/토큰 환산 포함)까지 차지해도 되는가.
+# 한글 최악 1.25자/토큰을 가정해 max_tokens 의 절반(글자)까지만 쓴다.
+_SUMMARY_INPUT_WINDOW_RATIO = 0.5
 # 출력도 늘린다. 버리는 양이 많을수록 요약이 담아야 할 것도 많다.
 _SUMMARY_TARGET_CHARS = 1_500
-_SUMMARY_MAX_TOKENS = 1_536
+# 목표 1,500자를 한글 0.8 토큰/자로 환산하면 약 1,200 토큰이다. 그런데 모델이
+# 목표를 넘기는 일이 흔해(실측 2,172자 = 약 1,740 토큰) 1,536 으로는 문장
+# 중간에서 잘렸다. 요약의 끝은 "진행 중인 작업"이 놓이는 자리라 손실이 크다.
+_SUMMARY_MAX_TOKENS = 2_560
 
 
 class ContextManager:
@@ -382,15 +393,36 @@ class ContextManager:
             dropped = messages[: len(messages) - len(recent)]
 
             if not dropped:
-                # 버릴 것이 없다 = 전부 보존 대상이다. 요약해도 얻을 게 없고,
-                # 오히려 요약 한 덩어리가 더 붙어 커진다(실측 -262/-333 의 형태).
-                logger.warning(
-                    "Auto-compact 생략 — 보존 대상이 전체다(메시지 %d개). "
-                    "요약해도 줄지 않는다.",
-                    len(messages),
-                )
-                self._useless_compact_at = len(messages)
-                return messages
+                # ── force 는 오류 복구 경로다 — 여기서 원본을 돌려주면 안 된다 ──
+                # 호출부(query_loop 의 "prompt is too long" 복구, CLI /compact)는
+                # 반환값으로 리스트를 교체하고 **무조건** mark_result_adopted() 를
+                # 부른다. 원본을 돌려주면 압축은 안 된 채 이전 압축 경계·요약만
+                # 지워져, 다음 apply_all 이 경계 이전 원문을 전부 되살린다.
+                # 즉 "줄이러 온 자리에서 오히려 늘어난다"(2026-08-27 리뷰 지적).
+                #
+                # 턴 경계로 못 자르는 형태가 실제로 흔하다 — 질문 하나에 도구
+                # 결과가 길게 이어진 대화는 user 메시지가 preserve_recent_turns
+                # 보다 적어 _extract_recent_turns 가 전체를 돌려준다. 컨텍스트가
+                # 터지는 것도 대개 그 형태다. 그래서 메시지 단위로 내려간다.
+                if force and len(messages) > 1:
+                    recent = messages[-1:]
+                    dropped = messages[:-1]
+                    logger.warning(
+                        "Auto-compact(force) — 턴 경계로 자를 수 없어 메시지 단위로 "
+                        "내려간다(%d개 중 마지막 1개만 보존).",
+                        len(messages),
+                    )
+                else:
+                    # 자동 경로: 버릴 것이 없다 = 전부 보존 대상이다. 요약해도 얻을
+                    # 게 없고, 오히려 요약 한 덩어리가 더 붙어 커진다
+                    # (실측 -262/-333 의 형태).
+                    logger.warning(
+                        "Auto-compact 생략 — 보존 대상이 전체다(메시지 %d개). "
+                        "요약해도 줄지 않는다.",
+                        len(messages),
+                    )
+                    self._useless_compact_at = len(messages)
+                    return messages
 
             # 모델에게 **버려질 앞부분**을 요약해 달라고 요청한다(비동기 스트림).
             summary = await self._get_model_summary(dropped)
@@ -429,6 +461,10 @@ class ContextManager:
             self._compact_boundary = len(messages) - len(recent)
             self._compact_summary = summary
             self._total_compactions += 1
+            # 압축이 성공했으니 무효 latch 를 푼다. 안 풀면 성공 압축이 리스트를
+            # 크게 줄인 뒤 len(messages) 가 옛 latch 값 아래에 오래 머물러,
+            # 그동안 자동 압축이 계속 건너뛰어진다(2026-08-27 리뷰 지적).
+            self._useless_compact_at = None
 
             # 얼마나 줄었는지 로깅해 두면 나중에 압축 효과를 추적하기 쉽다.
             logger.info(
@@ -731,6 +767,20 @@ class ContextManager:
         ascii_words = len(text.encode("ascii", "ignore").split())
         return int(ascii_words * 1.3 + korean_chars * 2.0 + len(text) * 0.1)
 
+    def _summary_input_budget(self) -> int:
+        """요약 프롬프트에 넣을 수 있는 글자 수 — 창 크기에 맞춰 정한다.
+
+        상한 24,000자를 고정으로 쓰면 좁은 창 프로파일에서 요약 호출 자체가 창을
+        넘는다(model_profiles.yaml 의 h200 16,384 / h100 8,192 토큰). 그런데 그
+        호출이 일어나는 자리가 바로 컨텍스트 초과에서 회복하려는 자리다 — 넘치면
+        예외로 떨어져 `_force_snip` 폴백을 타고, 그 폴백은 같은 형태의 입력에서
+        줄이지 못한다. 복구가 복구를 막는 구조라 창에 종속시킨다.
+
+        한글 최악 1.25자/토큰을 가정해 창의 절반(글자 환산)까지만 쓴다.
+        """
+        by_window = int(self.max_tokens * _SUMMARY_INPUT_WINDOW_RATIO)
+        return max(2_000, min(_SUMMARY_INPUT_BUDGET, by_window))
+
     async def _get_model_summary(self, messages: list[Message]) -> str:
         """
         [4단계 실동작] 모델(GPU 서버)에 실제로 요청해 대화를 짧게 요약한다.
@@ -756,9 +806,10 @@ class ContextManager:
             messages: 요약 대상. 압축에서 **버려질 구간**을 넘겨야 한다.
         """
         conversation_text: list[str] = []
-        # 메시지 하나에 줄 예산. 총 예산(_SUMMARY_INPUT_BUDGET)을 개수로 나누되,
-        # 너무 잘게 쪼개지지 않도록 하한을 둔다.
-        per_msg = max(400, _SUMMARY_INPUT_BUDGET // max(1, len(messages)))
+        budget = self._summary_input_budget()
+        # 메시지 하나에 줄 예산. 총 예산을 개수로 나누되, 너무 잘게 쪼개지지
+        # 않도록 하한을 둔다.
+        per_msg = max(400, budget // max(1, len(messages)))
         for msg in messages:
             role = msg.role if isinstance(msg.role, str) else msg.role.value
             # str(msg.content) 를 쓰면 assistant 블록이 파이썬 repr 로 들어간다.
@@ -773,8 +824,15 @@ class ContextManager:
             conversation_text.append(f"[{role}]: {content}")
 
         joined = "\n".join(conversation_text)
-        if len(joined) > _SUMMARY_INPUT_BUDGET:
-            joined = joined[:_SUMMARY_INPUT_BUDGET] + "\n…(이하 생략)…"
+        if len(joined) > budget:
+            # ── 앞에서만 자르면 안 된다 (2026-08-27 리뷰 지적) ──
+            # 메시지 하나에는 "앞만 자르지 않는다"를 적용해 놓고 합친 뒤에는 앞만
+            # 남기면, 빠지는 것은 **보존 구간 바로 앞** 구간이다. 이후 턴이 가장
+            # 많이 참조할 자리이고, 요약을 버릴 구간으로 옮긴 이번 수정의 취지가
+            # 거기서 절반 무효화된다. 개별 메시지와 같은 규칙으로 가운데를 접는다.
+            head = budget * 2 // 3
+            tail = budget - head
+            joined = f"{joined[:head]}\n…(중략 — 분량 초과로 일부 생략)…\n{joined[-tail:]}"
 
         prompt = (
             f"다음은 대화의 앞부분이며, 이제 원문 대신 이 요약으로 대체됩니다.\n"
@@ -787,6 +845,7 @@ class ContextManager:
         # 모델 스트림에서 텍스트 조각(text_delta)만 모아 요약을 조립한다.
         # temperature=0.3으로 낮춰 사실적이고 안정적인 요약을 유도한다.
         summary_parts: list[str] = []
+        truncated = False
         async for event in self.model_provider.stream(
             messages=[Message.user(prompt)],
             system_prompt="당신은 대화 요약 전문가입니다. 간결하고 사실적으로 요약하세요.",
@@ -798,9 +857,24 @@ class ContextManager:
             event_type = event.type if isinstance(event.type, str) else event.type.value
             if event_type == "text_delta" and event.text:
                 summary_parts.append(event.text)
+            elif event_type == "message_stop":
+                stop = event.stop_reason
+                truncated = (stop.value if hasattr(stop, "value") else stop) == "max_tokens"
+
+        summary = "".join(summary_parts)
+        # 상한에 물려 문장 중간에서 잘렸으면 남긴다. 요약의 끝은 "진행 중인 작업"이
+        # 놓이는 자리라 조용히 잘리면 손실이 크다 — 예전에는 stop_reason 을 아예
+        # 보지 않아 잘려도 알 수 없었다(2026-08-27 리뷰 지적).
+        if truncated:
+            logger.warning(
+                "요약이 출력 상한(%d 토큰)에 물려 잘렸다 — %d자 생성. "
+                "_SUMMARY_MAX_TOKENS 를 올리거나 목표 길이를 줄여야 한다.",
+                _SUMMARY_MAX_TOKENS,
+                len(summary),
+            )
 
         # 조각이 하나도 없으면(스트림 비정상 등) 실패 표시를 반환한다.
-        return "".join(summary_parts) or "[요약 생성 실패]"
+        return summary or "[요약 생성 실패]"
 
     def _force_snip(self, messages: list[Message]) -> list[Message]:
         """
@@ -1103,12 +1177,23 @@ def _readable_text(msg: Message) -> str:
 
     # 도구 호출 이름 수집 — 역직렬화 시점에 따라 dict 형태일 수도 있다.
     names: list[str] = []
+    thinking: list[str] = []
     if isinstance(msg.content, list):
         for block in msg.content:
             if isinstance(block, ToolUseBlock):
                 names.append(block.name)
+            elif isinstance(block, ThinkingBlock):
+                thinking.append(block.thinking)
             elif isinstance(block, dict) and block.get("type") == "tool_use":
                 names.append(block.get("name", ""))
+            elif isinstance(block, dict) and block.get("type") == "thinking":
+                thinking.append(block.get("thinking", ""))
+
+    # thinking 만 있는 메시지는 text_content 가 빈 문자열이라 요약 입력에서
+    # 통째로 사라진다. 현재 배선에서는 도달 불가지만(core/thinking/ 미배선),
+    # TIER_S 재사용 시 되살아나므로 폴백을 둔다. text 가 있으면 쓰지 않는다.
+    if not text and thinking:
+        text = "\n".join(t for t in thinking if t)
 
     if names:
         marker = f"(도구 호출: {', '.join(n for n in names if n)})"
