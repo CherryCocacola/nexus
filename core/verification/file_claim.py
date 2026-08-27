@@ -26,6 +26,8 @@ import logging
 import re
 from typing import Any
 
+from core.verification._markers import PATH_OR_FILENAME
+
 logger = logging.getLogger("nexus.verification.file_claim")
 
 # 파일을 만들었다고 **단정**하는 완료형 표현. 안내·계획형("작성하겠습니다",
@@ -43,9 +45,8 @@ _CLAIM_RE = re.compile("|".join(_CLAIM_PATTERNS))
 #   "작성했습니다"로 맺는 것은 정상이다(쓰기 도구 0건이 맞다). 파일을 지목하지
 #   않은 완료형까지 잡으면 그 흔한 정상 케이스가 전부 오탐이 된다.
 _FILE_MARKER_RE = re.compile(
-    r"파일|디렉[터토]리|폴더"
-    r"|[\w./\-]+\.(?:md|txt|py|js|ts|json|yaml|yml|csv|sql|html|css|docx|xlsx|pptx|hwpx?)"
-    r"|[\w-]+/[\w./-]+"
+    # 확장자 목록은 apply_claim 과 공유한다 — 따로 두면 조용히 갈라진다(_markers 참조).
+    rf"파일|디렉[터토]리|폴더|{PATH_OR_FILENAME}"
 )
 
 # 코드 블록은 검사 대상이 아니다 — 모델이 **작성한 코드** 안의 문자열은 주장이

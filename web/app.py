@@ -1605,8 +1605,13 @@ class OpenAIChatCompletionResponse(BaseModel):
     model: str
     choices: list[OpenAIChoice]
     usage: OpenAIUsage = Field(default_factory=OpenAIUsage)
-    # 비표준 확장 필드 — 문서 생성 도구의 다운로드 정보를 표준 클라이언트가 무시해도
-    # 되도록 별도 배열로도 노출한다(표준 클라이언트는 content의 마크다운 링크를 본다).
+    # 비표준 확장 필드 — 문서 생성 도구의 다운로드 정보.
+    #
+    # 주의(2026-08-27 정정): 예전 주석은 "표준 클라이언트는 content 의 마크다운
+    # 링크를 본다"였는데, **구조화 출력에서는 거짓이 됐다.** 그 경로에서는 content
+    # 가 JSON 스키마를 지켜야 해서 마크다운 링크를 덧붙이지 않는다(붙이면 서버가
+    # 자기 JSON 을 깨뜨린다 — 실측 32건). 즉 구조화 출력 클라이언트는 이 필드를
+    # 읽어야만 링크를 얻는다. 평문 응답에서는 종전대로 content 끝에도 붙는다.
     downloads: list[dict[str, str]] = Field(default_factory=list)
     # 비표준 확장 필드 — 요청을 처리하며 **버린 것**을 알린다(현재는 제외된 클라이언트
     # 도구). 표준 클라이언트는 모르는 필드를 무시하고, 우리 플러그인은 읽어서 개발자에게

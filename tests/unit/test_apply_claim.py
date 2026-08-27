@@ -243,3 +243,91 @@ def test_verify_tools_are_not_write():
     """검증 도구는 쓰기가 아니다 — 프로토콜 문서의 VERIFY 분류와 일치해야 한다."""
     for name in ("run_diagnostics", "run_tests"):
         assert has_write_evidence([(name, True)]) is False, f"{name} 이 쓰기로 잡혔다"
+
+
+# ── 구조화 출력에서 인용문이 JSON 원문이 되면 안 된다 (2026-08-27) ──
+
+
+def test_structured_answer_quotes_prose_not_json():
+    """★L4 재현★ 한 줄 JSON 은 문장 분리가 안 돼 통째로 인용됐다.
+
+        주장: "{"type":"chat_response","message":"backend/x.py 에 주석을 추가했…
+
+    사람이 읽을 수 없고, 90자 상한에 걸려 정작 주장 문장이 잘려 나간다.
+    """
+    answer = json.dumps(
+        {
+            "type": "chat_response",
+            "message": (
+                "backend/services/koje_stats.py 파일의 aggregate_stats 함수에 "
+                "주석을 추가했습니다. 확인해 주세요."
+            ),
+        },
+        ensure_ascii=False,
+    )
+
+    claims = find_apply_claims(answer)
+
+    assert claims, "구조화 출력에서 주장을 찾지 못했다"
+    assert not claims[0].startswith("{"), f"JSON 원문이 인용됐다: {claims[0][:40]}"
+    assert "aggregate_stats" in claims[0]
+
+    warning = build_apply_claim_warning(claims, [("read_file", True)])
+    assert '"type"' not in warning, "경고에 JSON 키가 새어 나왔다"
+    assert "aggregate_stats" in warning
+
+
+def test_nested_structured_fields_are_searched():
+    """필드 이름을 열거하지 않는다 — 중첩 값도 본다.
+
+    플러그인이 필드를 하나 바꾸면 조용히 빠져나가는 것을 막기 위함이다
+    (도구 이름을 어간으로 잡은 것과 같은 이유).
+    """
+    answer = json.dumps(
+        {
+            "type": "chat_response",
+            "payload": {"detail": ["src/main.py 파일을 수정했습니다."]},
+        },
+        ensure_ascii=False,
+    )
+
+    claims = find_apply_claims(answer)
+
+    assert claims and "src/main.py" in claims[0]
+
+
+def test_plain_text_answer_is_unchanged():
+    """평문 답변(웹 UI 표면)은 종전과 똑같아야 한다(무회귀)."""
+    assert find_apply_claims("src/a.py 파일에 주석을 추가했습니다.") == [
+        "src/a.py 파일에 주석을 추가했습니다."
+    ]
+
+
+# ── 확장자 목록은 file_claim 과 공유한다 (2026-08-27) ──
+
+
+def test_document_extensions_are_recognized():
+    """★L5 재현★ apply_claim 에만 문서 확장자가 빠져 있었다.
+
+    두 검증기가 같은 목적으로 각자 목록을 들고 갈라져, 한쪽에만 있는 확장자는
+    그쪽에서만 잡히는 조용한 구멍이 됐다.
+    """
+    for name in ("report.xlsx", "deck.pptx", "spec.docx", "data.csv", "old.hwp"):
+        assert find_apply_claims(f"{name} 를 수정했습니다."), f"{name} 이 안 잡혔다"
+
+
+def test_code_extensions_are_recognized():
+    """반대 방향도 본다 — file_claim 에 없던 확장자들."""
+    from core.verification.file_claim import find_file_claims
+
+    for name in ("App.jsx", "main.tsx", "Foo.java", "server.go", "lib.rs"):
+        assert find_file_claims(f"{name} 파일을 작성했습니다."), f"{name} 이 안 잡혔다"
+
+
+def test_both_verifiers_share_one_extension_list():
+    """목록이 다시 갈라지지 않게 고정한다."""
+    from core.verification import apply_claim, file_claim
+    from core.verification._markers import PATH_OR_FILENAME
+
+    assert PATH_OR_FILENAME in apply_claim._FILE_MARKER_RE.pattern
+    assert PATH_OR_FILENAME in file_claim._FILE_MARKER_RE.pattern

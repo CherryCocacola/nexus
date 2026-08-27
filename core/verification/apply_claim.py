@@ -45,6 +45,8 @@ import logging
 import re
 from typing import Any
 
+from core.verification._markers import PATH_OR_FILENAME
+
 logger = logging.getLogger("nexus.verification.apply_claim")
 
 # 변경을 **가했다고 단정**하는 완료형 표현. 계획형("적용하겠습니다", "추가하면")은
@@ -59,9 +61,8 @@ _CLAIM_RE = re.compile("|".join(_CLAIM_PATTERNS))
 # 파일 표지가 문장 안에 있어야 발화한다. file_claim.py 와 같은 이유 —
 # "설명을 추가했습니다" 같은 대화형 완료까지 잡으면 전부 오탐이 된다.
 _FILE_MARKER_RE = re.compile(
-    r"파일|디렉[터토]리|폴더|함수|클래스|주석"
-    r"|[\w./\-]+\.(?:md|txt|py|js|jsx|ts|tsx|json|yaml|yml|sql|html|css|java|go|rs)"
-    r"|[\w-]+/[\w./-]+"
+    # 확장자 목록은 file_claim 과 공유한다 — 따로 두면 조용히 갈라진다(_markers 참조).
+    rf"파일|디렉[터토]리|폴더|함수|클래스|주석|{PATH_OR_FILENAME}"
 )
 
 # 코드 블록 안의 문자열은 주장이 아니다(file_claim.py 와 동일한 실측 근거).
@@ -80,7 +81,9 @@ _WRITE_HINTS = ("write", "edit", "apply", "create", "delete", "remove", "rename"
 # 쓰기인 도구가 읽기로 뒤집힌다(2026-08-26 리뷰 지적).
 _READ_HINTS = ("read", "search", "list", "get", "find", "symbol", "grep", "stat", "open")
 
-_MAX_QUOTES = 3
+# 이 모듈의 경고는 한 문장만 인용하고 나머지는 "(외 N건)"으로 접는다
+# (`warnings` 배열에 실리는 한 줄짜리 신호라 file_claim 처럼 여러 줄을 뽑지 않는다).
+# 그래서 _MAX_QUOTES 는 두지 않는다 — 한때 있었으나 어디서도 쓰이지 않았다.
 _QUOTE_CHARS = 90
 
 
@@ -141,6 +144,45 @@ def is_change_proposal(answer: str) -> bool:
     return isinstance(obj, dict) and obj.get("type") == "final_proposal"
 
 
+def _prose_of(answer: str) -> str:
+    """구조화 출력이면 사람이 읽는 문장만 뽑는다. 평문이면 그대로.
+
+    ■ 왜 필요한가 (2026-08-27)
+      구조화 출력에서 `answer` 는 JSON 한 줄이다. 문장 분리가 개행·마침표 기준이라
+      한 줄 JSON 은 **통째로 한 문장**이 되고, 경고 인용문에 JSON 원문이 그대로
+      실렸다.
+
+          주장: "{"type":"chat_response","message":"backend/x.py 에 주석을 추가했…
+
+      사람이 읽을 수 없고, 90자 상한에 걸려 정작 주장 문장은 잘려 나간다.
+
+      필드 이름을 지정하지 않고 **모든 문자열 값**을 모으는 이유는 도구 이름을
+      열거하지 않은 것과 같다 — 플러그인이 필드를 하나 바꾸면 조용히 빠져나간다.
+      키 이름("chat_response" 등)이 섞여도 주장 동사가 없어 무해하다.
+    """
+    try:
+        obj = json.loads(answer)
+    except (ValueError, TypeError):
+        return answer
+    if not isinstance(obj, dict | list):
+        return answer
+
+    texts: list[str] = []
+
+    def walk(node: Any) -> None:
+        if isinstance(node, str):
+            texts.append(node)
+        elif isinstance(node, dict):
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+
+    walk(obj)
+    return "\n".join(texts)
+
+
 def find_apply_claims(answer: str) -> list[str]:
     """답변에서 "변경을 적용했다"는 완료형 주장 문장을 찾는다.
 
@@ -153,7 +195,7 @@ def find_apply_claims(answer: str) -> list[str]:
     if not answer:
         return []
 
-    prose = _INLINE_CODE.sub(" ", _FENCED_BLOCK.sub("\n", answer))
+    prose = _INLINE_CODE.sub(" ", _FENCED_BLOCK.sub("\n", _prose_of(answer)))
 
     found: list[str] = []
     seen: set[str] = set()
