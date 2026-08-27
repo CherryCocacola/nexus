@@ -107,13 +107,15 @@ def test_snip_compact_sets_turn_summary_notice() -> None:
 @pytest.mark.asyncio
 async def test_auto_compact_force_sets_model_summary_notice() -> None:
     """force=True 모델 요약 성공 시 '대화 요약 생성(모델 호출)' 문구."""
-    cm = _mk(model_provider=_FakeProvider())
-    msgs = [
-        Message.user("첫 질문"),
-        Message.assistant("첫 답변"),
-        Message.user("둘째 질문"),
-        Message.assistant("둘째 답변"),
-    ]
+    # preserve_recent_turns 보다 턴이 많아야 **버릴 앞부분**이 생긴다. 그래야
+    # 요약이 실제로 만들어지고 알림 문구가 남는다(2026-08-27).
+    # 버릴 것이 없으면 요약은 순수 추가라 어떤 경우에도 줄일 수 없으므로,
+    # auto_compact 가 요약을 만들지 않고 조기 반환한다.
+    cm = _mk(model_provider=_FakeProvider(), preserve_recent_turns=1)
+    msgs = []
+    for i in range(4):
+        msgs.append(Message.user(f"질문{i}"))
+        msgs.append(Message.assistant(f"답변{i}"))
     await cm.auto_compact_if_needed(msgs, force=True)
     phrase = cm.take_last_compaction()
     assert phrase is not None

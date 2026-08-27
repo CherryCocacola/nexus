@@ -45,6 +45,15 @@ def _mgr(**kw) -> ContextManager:
     return ContextManager(**defaults)
 
 
+def _conversation_with_droppable_head() -> list[Message]:
+    """버릴 앞부분이 확실히 생기는 대화(preserve_recent_turns=6 보다 턴이 많다)."""
+    out: list[Message] = []
+    for i in range(10):
+        out.append(Message.user(f"질문{i} " + "가" * 200))
+        out.append(Message.assistant(f"답변{i} " + "나" * 200))
+    return out
+
+
 # ── ① 웹 배선 ────────────────────────────────────────────────
 
 
@@ -169,7 +178,9 @@ async def test_useless_compaction_is_not_retried_every_turn(monkeypatch):
         return "요" * 5000  # 원본보다 커서 무효 처리된다
 
     monkeypatch.setattr(mgr, "_get_model_summary", _huge_summary)
-    messages = [Message.user("질문 " * 200), Message.assistant("답 " * 200)]
+    # 버릴 구간이 있어야 latch 경로를 탄다. 보존 대상이 전체면 요약을 아예 부르지
+    # 않고 조기 반환한다(그쪽은 test_compaction_quality.py 가 따로 본다).
+    messages = _conversation_with_droppable_head()
 
     await mgr.auto_compact_if_needed(messages)   # 1회차 — 무효 판정
     await mgr.auto_compact_if_needed(messages)   # 2회차 — 건너뛰어야 한다
@@ -189,10 +200,12 @@ async def test_latch_releases_when_conversation_grows(monkeypatch):
         return "요" * 5000
 
     monkeypatch.setattr(mgr, "_get_model_summary", _huge_summary)
-    messages = [Message.user("질문 " * 200), Message.assistant("답 " * 200)]
+    # 버릴 구간이 있어야 latch 경로를 탄다. 보존 대상이 전체면 요약을 아예 부르지
+    # 않고 조기 반환한다(그쪽은 test_compaction_quality.py 가 따로 본다).
+    messages = _conversation_with_droppable_head()
 
     await mgr.auto_compact_if_needed(messages)
-    messages = [*messages, Message.user("새 질문 " * 200)]
+    messages = [*messages, Message.user("새 질문 " * 200), Message.assistant("새 답 " * 200)]
     await mgr.auto_compact_if_needed(messages)
 
     assert calls["n"] == 2, "대화가 늘었는데도 건너뛰었다"
@@ -209,7 +222,7 @@ async def test_force_ignores_the_latch(monkeypatch):
         return "요" * 5000
 
     monkeypatch.setattr(mgr, "_get_model_summary", _summary)
-    messages = [Message.user("질문 " * 200), Message.assistant("답 " * 200)]
+    messages = _conversation_with_droppable_head()
 
     await mgr.auto_compact_if_needed(messages)
     await mgr.auto_compact_if_needed(messages, force=True)

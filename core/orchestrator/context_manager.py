@@ -75,6 +75,19 @@ if TYPE_CHECKING:
 # 모듈 전용 로거. 규칙상 "nexus.{모듈경로}" 네임스페이스를 사용한다.
 logger = logging.getLogger("nexus.orchestrator.context_manager")
 
+# ─── 요약 예산 (2026-08-27) ───────────────────────────────
+# 예전 값은 "최근 20개 × 200자 = 4,000자 입력, 500자 출력, max_tokens=512" 였다.
+# 압축은 55,296 토큰(≈13만 자 이상)에서 걸리는데 요약이 볼 수 있는 것이 4,000자면,
+# 요약은 대화의 3% 만 보고 나머지를 대표해야 한다. 실측에서 6~8만 토큰이 234~1,061
+# 토큰으로 떨어진 것은 요약 품질 문제가 아니라 **입력 자체가 없었던 것**이다.
+#
+# 입력 예산은 요약 모델의 창(65,536)에 여유를 두고 잡는다. 한글 기준 대략
+# 0.42 토큰/자이므로 24,000자 ≈ 1만 토큰 — 프롬프트·출력을 더해도 충분히 안전하다.
+_SUMMARY_INPUT_BUDGET = 24_000
+# 출력도 늘린다. 버리는 양이 많을수록 요약이 담아야 할 것도 많다.
+_SUMMARY_TARGET_CHARS = 1_500
+_SUMMARY_MAX_TOKENS = 1_536
+
 
 class ContextManager:
     """
@@ -362,11 +375,25 @@ class ContextManager:
         )
 
         try:
-            # 모델에게 지금까지의 대화를 짧게 요약해 달라고 요청한다(비동기 스트림).
-            summary = await self._get_model_summary(messages)
-
             # 최근 preserve_recent_turns개 턴은 요약하지 않고 원본으로 지킨다.
+            # **요약보다 먼저 계산한다** — 요약이 대상으로 삼아야 하는 것은 지켜지는
+            # 최근 구간이 아니라 **사라지는 앞부분**이기 때문이다(2026-08-27).
             recent = self._extract_recent_turns(messages, self.preserve_recent_turns)
+            dropped = messages[: len(messages) - len(recent)]
+
+            if not dropped:
+                # 버릴 것이 없다 = 전부 보존 대상이다. 요약해도 얻을 게 없고,
+                # 오히려 요약 한 덩어리가 더 붙어 커진다(실측 -262/-333 의 형태).
+                logger.warning(
+                    "Auto-compact 생략 — 보존 대상이 전체다(메시지 %d개). "
+                    "요약해도 줄지 않는다.",
+                    len(messages),
+                )
+                self._useless_compact_at = len(messages)
+                return messages
+
+            # 모델에게 **버려질 앞부분**을 요약해 달라고 요청한다(비동기 스트림).
+            summary = await self._get_model_summary(dropped)
 
             # 최종 형태: [요약 시스템 메시지] + [보존한 최근 턴들].
             result = [
@@ -708,22 +735,51 @@ class ContextManager:
         """
         [4단계 실동작] 모델(GPU 서버)에 실제로 요청해 대화를 짧게 요약한다.
 
-        요약 입력 자체도 컨텍스트 제한을 받으므로, 최근 20개 메시지만 넣고
-        각 메시지는 200자로 잘라 프롬프트를 만든다. 스트림으로 받은 text_delta를
-        이어 붙여 최종 요약 문자열을 반환한다. 아무것도 못 받으면 실패 표시를 낸다.
+        ■ 무엇을 요약해야 하는가 (2026-08-27 수정)
+          예전에는 `messages[-20:]` 을 각 200자로 잘라 넣었다. 두 가지가 잘못이었다.
+
+          ① **버려질 부분이 아니라 보존될 부분을 요약했다.** 압축은 앞쪽을 요약으로
+             바꾸고 최근 턴은 원본으로 지킨다. 그런데 요약 입력이 "최근 20개"라,
+             어차피 원본으로 남는 구간과 겹쳤다. 정작 사라지는 앞부분에 대해서는
+             요약이 아무 말도 하지 않았다 — 요약의 존재 이유가 사라진 구조다.
+
+          ② **입력이 대화의 3% 였다.** 압축은 55,296 토큰(≈13만 자 이상)에서
+             걸리는데 요약 입력 상한은 20×200=4,000자였다. 실측에서 6~8만 토큰이
+             234~1,061 토큰으로 떨어진 것은 "요약이 성기다"가 아니라 **요약이 볼
+             수 있는 내용 자체가 없었다**는 뜻이다.
+
+          그래서 호출부가 **버릴 구간만** 넘기고(dropped), 여기서는 문자 예산 안에서
+          가능한 한 많이 담는다. 긴 메시지는 앞만 자르지 않고 앞뒤를 남긴다 —
+          도구 결과는 끝부분에 결론이 오는 경우가 많다.
+
+        Args:
+            messages: 요약 대상. 압축에서 **버려질 구간**을 넘겨야 한다.
         """
-        # 최근 20개 메시지를 "[역할]: 내용(최대 200자)" 형태의 줄로 만든다.
         conversation_text: list[str] = []
-        for msg in messages[-20:]:
-            # role은 Enum일 수도 문자열일 수도 있어 양쪽을 모두 처리한다.
+        # 메시지 하나에 줄 예산. 총 예산(_SUMMARY_INPUT_BUDGET)을 개수로 나누되,
+        # 너무 잘게 쪼개지지 않도록 하한을 둔다.
+        per_msg = max(400, _SUMMARY_INPUT_BUDGET // max(1, len(messages)))
+        for msg in messages:
             role = msg.role if isinstance(msg.role, str) else msg.role.value
-            content = str(msg.content)[:200]
+            content = str(msg.content)
+            if len(content) > per_msg:
+                # 앞뒤를 남긴다. 도구 결과·긴 답변은 결론이 끝에 오는 경우가 많아
+                # 앞만 남기면 "무엇을 하려 했는지"만 남고 "어떻게 됐는지"가 사라진다.
+                head = per_msg * 2 // 3
+                tail = per_msg - head
+                content = f"{content[:head]}\n…(중략)…\n{content[-tail:]}"
             conversation_text.append(f"[{role}]: {content}")
 
+        joined = "\n".join(conversation_text)
+        if len(joined) > _SUMMARY_INPUT_BUDGET:
+            joined = joined[:_SUMMARY_INPUT_BUDGET] + "\n…(이하 생략)…"
+
         prompt = (
-            "다음 대화를 500자 이내로 요약해주세요.\n"
-            "핵심 사실, 결정사항, 진행 중인 작업만 포함하세요.\n"
-            "도구 실행 결과의 세부 내용은 생략하세요.\n\n" + "\n".join(conversation_text)
+            f"다음은 대화의 앞부분이며, 이제 원문 대신 이 요약으로 대체됩니다.\n"
+            f"{_SUMMARY_TARGET_CHARS}자 이내로 요약하세요.\n"
+            "포함할 것: 사용자의 요구사항, 확정된 결정과 그 이유, 진행 중인 작업,\n"
+            "  파일 경로·식별자처럼 뒤에서 다시 참조될 구체값.\n"
+            "생략할 것: 도구 실행 결과의 원문, 반복된 확인 대화.\n\n" + joined
         )
 
         # 모델 스트림에서 텍스트 조각(text_delta)만 모아 요약을 조립한다.
@@ -733,7 +789,7 @@ class ContextManager:
             messages=[Message.user(prompt)],
             system_prompt="당신은 대화 요약 전문가입니다. 간결하고 사실적으로 요약하세요.",
             tools=None,
-            max_tokens=512,
+            max_tokens=_SUMMARY_MAX_TOKENS,
             temperature=0.3,
         ):
             # StreamEvent.type도 Enum/문자열 양쪽일 수 있으므로 정규화한다.
