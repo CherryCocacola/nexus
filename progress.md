@@ -492,6 +492,79 @@ dropped 로 사라진다. `inference` 가 이를 `{"role":"tool", ...}` 로 변�
 
 ---
 
+---
+
+## ★ 세션 인수인계 (2026-08-27 종료 시점)
+
+다음 세션은 여기부터 읽으면 된다.
+
+### 현재 상태
+
+- 브랜치 `feature/b200-bakeoff` — **origin 동기 완료**(`8fc4eb1..1a00437`, 11커밋 push)
+- unit **2,620 passed**. 실패 2건은 로컬 `.venv_pc` 에 hwpx/hwp5 파서 라이브러리가
+  없어서 나는 **기존** 실패다(`test_document_tool_formats.py`, 코드 문제 아님)
+- 112 `nexus-web` 배포 완료 — 리포와 운영 서버가 같은 코드
+- 배포 후 확인: HTTP 200, `prompt_tokens=10,871`(기준선 유지), `warnings=[]`
+
+### 이번 세션에 한 것 — 압축 결함 15가지
+
+`core/orchestrator/context_manager.py` 의 압축이 관측 6회 중 **정상 동작이 한 번도
+없었다.** 원인 15가지를 찾아 고쳤다. 상세는 위 "2026-08-26~27" 절.
+
+    8fc4eb1  요약이 '버려지는 부분'을 보게 (요약 대상·입력 예산)
+    a8813bc  요약 프롬프트의 파이썬 repr 제거 (_readable_text)
+    2707325  1차 리뷰 5건 (force 조기반환·총량 절단·출력 상한·latch·예산)
+    94603dd  2차 리뷰 3건 (고아 tool_result·/compact 파괴·상태 삭제) + payload 계약
+    4b76eb6  3차 리뷰 2건 (요약 삭제·경계 표류) — 경계를 메시지 id 로
+    ae100d8  검증기 사소 3건 (인용문·확장자·죽은 상수) + downloads 주석
+
+실모델(A.X-4.0, 터널 18001) 최종 검증: 75,331 → 3,058 토큰, 앵커 3/3 보존,
+repr 없음, 최근 턴 원문 보존.
+
+### 다음 세션이 반드시 알아야 할 것
+
+**★수정이 새 결함을 3회 연속 만들었다.** 전부 "안전해 보이는 추가"가 다른 계약을
+깬 것이다. `ContextManager` 를 다시 손댈 때는 **반환값을 호출부가 어떻게 쓰는지**를
+먼저 볼 것 — `mark_result_adopted()`, `messages[:] = compacted`,
+`inference._convert_messages()`. `tests/unit/test_compaction_payload_validity.py`
+가 그 계약을 지킨다.
+
+**★지표가 실해와 안 맞으면 테스트가 통과하면서 아무것도 안 지킨다.** 경계 표류는
+토큰·payload·경계값 어느 것으로도 안 갈렸고 **요약 호출 횟수**로만 갈렸다. 수정을
+되돌려 테스트가 실제로 실패하는지 매번 확인할 것.
+
+**★`ruff` 를 디렉토리 단위로 돌리지 말 것.** `core/` 전체에 기존 위반 60건,
+`web/app.py` 에 7건이 있다. 변경 파일만 지정한다.
+
+**★배포 스크립트에 신규 파일을 넣을 것.** `scratchpad/deploy_fixes.py` 의 `FILES`
+와 `IMPORT_CHECK` 양쪽. 빠뜨리면 부트스트랩 실패로 전 요청 401 이 된다(08-25 에
+12분 20초 장애 실적 있음). 부트스트랩 로그 확인은 `--since 2m` 이 아니라
+`docker inspect .State.StartedAt` 기준이어야 한다 — 직전 부팅 Traceback 을 이번
+배포 오류로 오독한 적이 두 번 있다.
+
+### 다음 착수점
+
+서버 측 열린 항목은 **전부 닫혔다.** 남은 둘은 외부 의존이다.
+
+1. **플러그인 종료 게이트** — 명세는 전달 완료
+   (`user_mig/design/PLUGIN_PROTOCOL_HARDENING_2026-08-25.md`). 플러그인 팀 작업이라
+   여기서 진행할 것이 없다. 반영되면 회귀 측정 결과를 받아 재평가한다.
+2. **라우팅 조정** — 405/405 거짓 완료가 qwen3-coder 편중인 것은 확정. 다만 종료
+   게이트가 모델과 무관하게 고치므로 **먼저 게이트를 반영하고 재측정**한다.
+3. (이전 세션 이월) IIS 프런트 배포 — 자동 불가, 자격증명 필요.
+   `[[project_front_split_iis]]` 참조.
+
+### 검증 도구 (재사용 가능)
+
+세션 스크래치패드에 있다. 다시 필요하면 같은 내용을 재작성하면 된다.
+
+- `verify_compaction.py` — 실모델로 압축을 돌려 앵커 보존·repr 혼입·축소율을 잰다.
+  ★검증 대화를 `"가나다라마"*400` 같은 반복 문자열로 만들면 모델이 요약을 포기하고
+  에코한다. 실제 개발 대화 형태여야 코드 탓과 데이터 탓이 갈린다.
+- `deploy_fixes.py` — 10파일 배포 + import 검사 + 부트스트랩 로그 + 인증 요청 확인
+- `repro_boundary_drift.py`, `boundary_ab.py`, `off_by_one.py` — 경계 표류 A/B 측정
+
+
 ## 참고 문서
 
 - `user_mig/design/PLUGIN_PROTOCOL_HARDENING_2026-08-25.md` — 플러그인 팀 전달용
