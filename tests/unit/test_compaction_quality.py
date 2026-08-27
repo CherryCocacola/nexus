@@ -384,9 +384,12 @@ def test_summary_input_budget_follows_the_window():
     고정 24,000자를 쓰면 h200(16,384)·h100(8,192) 프로파일에서 요약 호출 자체가
     창을 넘는다. 그 호출이 일어나는 자리가 컨텍스트 초과에서 회복하려는 자리다.
     """
+    # 값은 (창 − 출력 상한) 의 절반이다. 출력 차감은
+    # test_summary_budget_leaves_room_for_the_output 이 따로 본다.
     assert _mgr(max_context_tokens=61440)._summary_input_budget() == 24_000
-    assert _mgr(max_context_tokens=16384)._summary_input_budget() == 8_192
-    assert _mgr(max_context_tokens=8192)._summary_input_budget() == 4_096
+    assert _mgr(max_context_tokens=16384)._summary_input_budget() == 6_912
+    assert _mgr(max_context_tokens=8192)._summary_input_budget() == 2_816
+    assert _mgr(max_context_tokens=4096)._summary_input_budget() == 768
 
 
 def test_readable_text_falls_back_to_thinking():
@@ -411,3 +414,210 @@ def test_readable_text_prefers_text_over_thinking():
     )
 
     assert _readable_text(msg) == "사용자에게 한 말"
+
+
+# ── ⑥ 2차 검증이 찾은 것 (2026-08-27) ────────────────────────
+
+
+def _tool_conversation(n_results: int, chars: int) -> list[Message]:
+    """질문 하나 + 도구 호출 + 거대한 도구 결과들 — 컨텍스트가 터지는 실제 형태."""
+    calls = [{"id": f"tu{i}", "name": "Read", "input": {}} for i in range(n_results)]
+    msgs = [
+        Message.user("이 파일들을 분석해 주세요"),
+        Message.assistant(text="파일을 읽겠습니다", tool_uses=calls),
+    ]
+    for i in range(n_results):
+        msgs.append(Message.tool_result(f"tu{i}", f"결과{i} " + "가" * chars))
+    return msgs
+
+
+def _roles(msgs: list[Message]) -> list[str]:
+    out = []
+    for m in msgs:
+        r = m.role if isinstance(m.role, str) else m.role.value
+        out.append(r)
+    return out
+
+
+@pytest.mark.asyncio
+async def test_force_fallback_never_orphans_a_tool_result(monkeypatch):
+    """★N1 재현★ 마지막 1개만 남기면 짝이 되는 assistant 가 사라진다.
+
+    이 폴백이 발동하는 상황에서 마지막 메시지는 실전에서 대개 tool_result 다 —
+    도구를 실행해 결과를 붙인 직후 프롬프트가 넘치기 때문이다. 짝이 되는
+    assistant(tool_calls) 가 dropped 로 사라지면 inference 가 선행 assistant 없이
+    `role:"tool"` 만 있는 payload 를 만든다 — OpenAI 규약상 무효한 순서다.
+    하필 컨텍스트 초과 복구 자리라 컨텍스트 오류가 템플릿 오류로 바뀐다.
+    """
+    mgr = _mgr(max_context_tokens=61440, preserve_recent_turns=6)
+
+    async def _summary(_messages):
+        return "짧은 요약"
+
+    monkeypatch.setattr(mgr, "_get_model_summary", _summary)
+
+    messages = _tool_conversation(1, 60_000)
+    result = await mgr.auto_compact_if_needed(messages, force=True)
+
+    # 남은 tool_result 각각에 대해 짝이 되는 tool_use 가 앞에 있어야 한다.
+    seen_ids: set[str] = set()
+    for m in result:
+        for b in m.tool_use_blocks:
+            seen_ids.add(b.id)
+        if (m.role if isinstance(m.role, str) else m.role.value) == "tool_result":
+            assert m.tool_use_id in seen_ids, (
+                f"고아 tool_result({m.tool_use_id}) — 짝이 되는 assistant 가 없다"
+            )
+
+
+@pytest.mark.asyncio
+async def test_user_compact_does_not_destroy_a_short_conversation(monkeypatch):
+    """★N2 재현★ `/compact` 는 force=True 지만 오류 복구가 아니다.
+
+    턴이 preserve_recent_turns(운영 6)보다 적은 대화에서 폴백까지 내려가면
+    질문·답변이 통째로 사라지는데 줄지도 않는다(실측 6개 45토큰 → 2개 54토큰).
+    cli/repl 의 `messages[:] = compacted` 는 세션 안에서 되돌릴 수 없다.
+    """
+    mgr = _mgr(max_context_tokens=61440, preserve_recent_turns=6)
+
+    async def _summary(_messages):
+        return "요" * 1500
+
+    monkeypatch.setattr(mgr, "_get_model_summary", _summary)
+
+    messages = _long_conversation(3, 10)  # 6개, 임계치 한참 아래
+    before = mgr._estimate_tokens(messages)
+    result = await mgr.auto_compact_if_needed(messages, force=True)
+
+    assert len(result) == len(messages), "짧은 대화가 파괴됐다"
+    assert mgr._estimate_tokens(result) <= before, "줄지도 않으면서 커졌다"
+    assert "질문0" in " ".join(m.text_content or "" for m in result)
+
+
+@pytest.mark.asyncio
+async def test_hard_truncation_when_messages_cannot_be_dropped(monkeypatch):
+    """메시지 단위로도 못 자르면 도구 결과 **본문**을 잘라 실제로 줄인다.
+
+    짝을 지키면서 줄일 수 있는 유일한 수단이다. 메시지를 버리면 짝이 깨진다.
+    """
+    mgr = _mgr(max_context_tokens=61440, preserve_recent_turns=6)
+
+    async def _summary(_messages):
+        raise AssertionError("본문 절단 경로는 모델을 부르지 않는다")
+
+    monkeypatch.setattr(mgr, "_get_model_summary", _summary)
+
+    # user 를 빼서 메시지 단위 분할도 불가능하게 만든다(전부 assistant+tool_result).
+    calls = [{"id": f"tu{i}", "name": "Read", "input": {}} for i in range(3)]
+    messages = [Message.assistant(text="읽겠습니다", tool_uses=calls)]
+    for i in range(3):
+        messages.append(Message.tool_result(f"tu{i}", f"결과{i} " + "가" * 40_000))
+
+    before = mgr._estimate_tokens(messages)
+    result = await mgr.auto_compact_if_needed(messages, force=True)
+
+    assert mgr._estimate_tokens(result) < before, "본문 절단이 줄이지 못했다"
+    assert len(result) == len(messages), "메시지를 버리면 짝이 깨진다"
+    assert _roles(result) == _roles(messages)
+
+
+@pytest.mark.asyncio
+async def test_mark_result_adopted_is_a_noop_when_nothing_was_compacted():
+    """★N3★ 압축이 안 일어났으면 경계·요약을 지우면 안 된다.
+
+    호출부 세 곳 모두 무조건 mark_result_adopted() 를 부른다. 원본이 그대로
+    돌아온 경우까지 지우면 다음 apply_all 이 경계 이전 원문을 전부 되살린다.
+    """
+    mgr = _mgr(max_context_tokens=61440, preserve_recent_turns=6)
+    mgr._compact_boundary = 5
+    mgr._compact_summary = "이전 요약"
+
+    messages = _long_conversation(1, 10)  # 임계치 미달 → 압축 없음
+    result = await mgr.auto_compact_if_needed(messages)
+    mgr.mark_result_adopted()
+
+    assert result is messages
+    assert mgr._compact_boundary == 5, "압축도 안 했는데 경계를 지웠다"
+    assert mgr._compact_summary == "이전 요약", "압축도 안 했는데 요약을 버렸다"
+
+
+@pytest.mark.asyncio
+async def test_mark_result_adopted_still_clears_after_a_real_compaction(monkeypatch):
+    """반대로 실제 압축 뒤에는 종전대로 지워야 한다(무회귀)."""
+    mgr = _mgr(preserve_recent_turns=2)
+
+    async def _summary(_messages):
+        return "짧은 요약"
+
+    monkeypatch.setattr(mgr, "_get_model_summary", _summary)
+
+    await mgr.auto_compact_if_needed(_long_conversation(20, 500), force=True)
+    assert mgr._compact_boundary > 0
+    mgr.mark_result_adopted()
+
+    assert mgr._compact_boundary == 0
+    assert mgr._compact_summary is None
+    assert mgr._useless_compact_at is None
+
+
+@pytest.mark.asyncio
+async def test_emergency_compact_releases_the_latch(monkeypatch):
+    """★M2 잔여★ 긴급 압축도 리스트를 최대로 줄인다 — latch 를 남기면 안 된다."""
+    mgr = _mgr(max_context_tokens=100, preserve_recent_turns=2)
+
+    async def _huge(_messages):
+        return "요" * 5000
+
+    monkeypatch.setattr(mgr, "_get_model_summary", _huge)
+    messages = _long_conversation(10, 200)
+    await mgr.auto_compact_if_needed(messages)
+    assert mgr._useless_compact_at is not None
+
+    await mgr.emergency_compact(messages)
+
+    assert mgr._useless_compact_at is None, "긴급 압축이 latch 를 풀지 않았다"
+
+
+@pytest.mark.asyncio
+async def test_summary_truncation_is_logged(caplog):
+    """★M1★ 출력 상한에 물려 잘리면 조용히 넘어가면 안 된다.
+
+    요약의 끝은 "진행 중인 작업"이 놓이는 자리다. 예전에는 stop_reason 을 아예
+    보지 않아 잘려도 알 수 없었다.
+    """
+    import logging
+
+    from core.message import StopReason
+
+    class _Truncating:
+        async def stream(self, **_kwargs):
+            yield StreamEvent(type=StreamEventType.TEXT_DELTA, text="요약 앞부분")
+            yield StreamEvent(
+                type=StreamEventType.MESSAGE_STOP, stop_reason=StopReason.MAX_TOKENS
+            )
+
+    mgr = _mgr(model_provider=_Truncating(), preserve_recent_turns=1)
+    messages = _long_conversation(4, 200)
+
+    with caplog.at_level(logging.WARNING, logger="nexus.orchestrator.context_manager"):
+        await mgr.auto_compact_if_needed(messages, force=True)
+
+    assert any("출력 상한" in r.message for r in caplog.records), (
+        "요약이 잘렸는데 아무 기록도 남지 않았다"
+    )
+
+
+def test_summary_budget_leaves_room_for_the_output():
+    """★리뷰 지적★ 요약 호출도 입력 + 출력이 같은 창을 쓴다.
+
+    출력 토큰을 빼지 않으면 좁은 창에서 요약 호출 자체가 창을 넘는다 —
+    그 자리가 바로 컨텍스트 초과에서 회복하려는 자리다.
+    """
+    from core.orchestrator.context_manager import _SUMMARY_MAX_TOKENS
+
+    for window in (61440, 16384, 8192, 4096):
+        budget = _mgr(max_context_tokens=window)._summary_input_budget()
+        # 한글 최악 0.8 토큰/자로 잡아도 출력까지 창 안에 들어와야 한다.
+        assert budget * 0.8 + _SUMMARY_MAX_TOKENS < window, (
+            f"창 {window} 에서 요약 호출이 창을 넘는다(예산 {budget}자)"
+        )

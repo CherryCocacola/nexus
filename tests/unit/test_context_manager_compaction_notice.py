@@ -111,11 +111,13 @@ async def test_auto_compact_force_sets_model_summary_notice() -> None:
     # 요약이 실제로 만들어지고 알림 문구가 남는다(2026-08-27).
     # 버릴 것이 없으면 요약은 순수 추가라 어떤 경우에도 줄일 수 없으므로,
     # auto_compact 가 요약을 만들지 않고 조기 반환한다.
+    # 대화가 요약보다 커야 한다. 짧으면 요약이 순수 추가가 되어 결과가 커지고,
+    # force 라도 그 결과는 채택하지 않는다(2026-08-27) — 그러면 표시 문구도 없다.
     cm = _mk(model_provider=_FakeProvider(), preserve_recent_turns=1)
     msgs = []
     for i in range(4):
-        msgs.append(Message.user(f"질문{i}"))
-        msgs.append(Message.assistant(f"답변{i}"))
+        msgs.append(Message.user(f"질문{i} " + "가" * 500))
+        msgs.append(Message.assistant(f"답변{i} " + "나" * 500))
     await cm.auto_compact_if_needed(msgs, force=True)
     phrase = cm.take_last_compaction()
     assert phrase is not None

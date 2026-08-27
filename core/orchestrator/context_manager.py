@@ -197,6 +197,12 @@ class ContextManager:
         # 그러면 대화가 끝날 때까지 **턴마다 모델 요약 왕복이 한 번씩 버려진다.**
         # 무효였던 시점의 메시지 수를 기억해, 대화가 그보다 늘기 전에는 건너뛴다.
         self._useless_compact_at: int | None = None
+        # _result_replaced: 직전 압축 호출이 **새 리스트**를 돌려줬는가.
+        # 호출부는 반환값으로 리스트를 교체한 뒤 mark_result_adopted() 를 부르는데,
+        # 압축이 일어나지 않아 원본이 그대로 돌아온 경우까지 부르면 경계·요약만
+        # 지워져 다음 apply_all 이 경계 이전 원문을 전부 되살린다(2026-08-27).
+        # 호출부를 고치는 대신 여기서 알고 있게 해 어느 호출부에서도 안전하게 한다.
+        self._result_replaced: bool = False
 
     def for_session(self) -> ContextManager:
         """설정은 그대로 두고 **압축 상태만 새로 만든** 인스턴스를 돌려준다.
@@ -274,9 +280,20 @@ class ContextManager:
           그래서 "리스트를 교체했는가"를 아는 호출부가 직접 알려 주는 형태로 둔다.
 
         요약은 버리지 않는다 — 채택된 리스트의 첫 원소로 이미 들어가 있다.
+
+        ■ 압축이 안 일어났으면 아무것도 하지 않는다 (2026-08-27 리뷰 지적)
+          호출부 세 곳 모두 **무조건** 이 메서드를 부른다. 압축이 일어나지 않아
+          원본이 그대로 돌아온 경우까지 경계·요약을 지우면, 다음 apply_all 이
+          경계 이전 원문을 전부 되살린다 — 줄이러 온 자리에서 오히려 늘어난다.
+          호출부를 하나씩 고치는 대신 여기서 막아 어느 호출부에서도 안전하게 한다.
         """
+        if not self._result_replaced:
+            return
         self._compact_boundary = 0
         self._compact_summary = None
+        # 리스트가 교체됐으면 옛 메시지 개수를 기준으로 잡은 latch 는 무조건 무효다.
+        self._useless_compact_at = None
+        self._result_replaced = False
 
     # ═══════════════════════════════════════════
     # Public API
@@ -353,6 +370,7 @@ class ContextManager:
             요약 1건 + 최근 턴으로 재구성된(또는 폴백으로 스니핑된) 메시지 리스트.
         """
         if self._passthrough:
+            self._result_replaced = False
             return messages
 
         # 현재 대화의 대략적 토큰 수를 추정한다(정확한 토크나이저 없이 휴리스틱).
@@ -360,6 +378,7 @@ class ContextManager:
 
         # 아직 임계치에 못 미치고 강제도 아니면 압축할 필요가 없으므로 그대로 반환.
         if not force and token_count < self.max_tokens * self.auto_compact_threshold:
+            self._result_replaced = False
             return messages
 
         # ── 무효 압축 latch (2026-08-26) ──
@@ -377,6 +396,7 @@ class ContextManager:
                 "(메시지 %d개)",
                 len(messages),
             )
+            self._result_replaced = False
             return messages
 
         logger.warning(
@@ -393,25 +413,46 @@ class ContextManager:
             dropped = messages[: len(messages) - len(recent)]
 
             if not dropped:
-                # ── force 는 오류 복구 경로다 — 여기서 원본을 돌려주면 안 된다 ──
-                # 호출부(query_loop 의 "prompt is too long" 복구, CLI /compact)는
-                # 반환값으로 리스트를 교체하고 **무조건** mark_result_adopted() 를
-                # 부른다. 원본을 돌려주면 압축은 안 된 채 이전 압축 경계·요약만
-                # 지워져, 다음 apply_all 이 경계 이전 원문을 전부 되살린다.
-                # 즉 "줄이러 온 자리에서 오히려 늘어난다"(2026-08-27 리뷰 지적).
-                #
-                # 턴 경계로 못 자르는 형태가 실제로 흔하다 — 질문 하나에 도구
-                # 결과가 길게 이어진 대화는 user 메시지가 preserve_recent_turns
-                # 보다 적어 _extract_recent_turns 가 전체를 돌려준다. 컨텍스트가
-                # 터지는 것도 대개 그 형태다. 그래서 메시지 단위로 내려간다.
-                if force and len(messages) > 1:
-                    recent = messages[-1:]
-                    dropped = messages[:-1]
+                # ── force 라도 "실제로 넘칠 때"만 더 내려간다 ──
+                # force 는 두 자리에서 온다. query_loop 의 컨텍스트 초과 복구는
+                # "무슨 수를 써서라도 줄여라"이지만, CLI `/compact` 는 사용자가
+                # 정리를 요청한 것이라 "줄일 수 있으면 줄여라"다. 둘을 같은 플래그로
+                # 묶어 두고 무조건 내려가면, 짧은 대화에서 `/compact` 한 번이
+                # 질문·답변을 통째로 날린다(실측 6개 45토큰 → 2개 54토큰: 줄지도
+                # 않으면서 5개가 사라졌다). 그래서 임계치 초과를 조건에 넣는다.
+                oversized = token_count >= int(self.max_tokens * self.auto_compact_threshold)
+                split = self._message_level_split(messages) if (force and oversized) else 0
+
+                # 짝을 지키느라 버릴 것이 껍데기만 남는 경우가 있다 — 질문 하나 +
+                # assistant(tool_calls) + 거대한 도구 결과들이면 split 이 1이라
+                # 버리는 것이 user 메시지 하나뿐이다. 그러면 요약이 붙어 오히려
+                # 커지는데 force 는 무효 검증(new_count >= token_count)을 건너뛰므로
+                # 그 커진 결과가 그대로 나간다. 무게를 먼저 재고, 가벼우면 요약
+                # 왕복을 아예 하지 않고 본문 절단으로 간다.
+                if split > 0 and self._estimate_tokens(messages[:split]) < token_count * 0.2:
+                    logger.warning(
+                        "Auto-compact(force) — 버릴 구간이 전체의 20%% 미만이라 "
+                        "요약해도 줄지 않는다. 도구 결과 본문 절단으로 간다(%d 토큰 중 %d).",
+                        token_count,
+                        self._estimate_tokens(messages[:split]),
+                    )
+                    split = 0
+
+                if split > 0:
+                    recent = messages[split:]
+                    dropped = messages[:split]
                     logger.warning(
                         "Auto-compact(force) — 턴 경계로 자를 수 없어 메시지 단위로 "
-                        "내려간다(%d개 중 마지막 1개만 보존).",
+                        "내려간다(%d개 중 뒤 %d개 보존).",
                         len(messages),
+                        len(recent),
                     )
+                elif force and oversized:
+                    # 메시지 단위로도 못 자른다 = 도구 결과 하나하나가 크다는 뜻이다.
+                    # 메시지를 버리는 대신 **본문만** 잘라 낸다. 짝(assistant
+                    # tool_calls ↔ tool_result)을 건드리지 않으면서 실제로 줄어드는
+                    # 유일한 수단이다.
+                    return self._hard_truncate_tool_results(messages, token_count)
                 else:
                     # 자동 경로: 버릴 것이 없다 = 전부 보존 대상이다. 요약해도 얻을
                     # 게 없고, 오히려 요약 한 덩어리가 더 붙어 커진다
@@ -422,6 +463,7 @@ class ContextManager:
                         len(messages),
                     )
                     self._useless_compact_at = len(messages)
+                    self._result_replaced = False
                     return messages
 
             # 모델에게 **버려질 앞부분**을 요약해 달라고 요청한다(비동기 스트림).
@@ -446,7 +488,18 @@ class ContextManager:
             # 초과)에서 "무슨 수를 써서라도 줄여라"로 부르는 자리다. 여기서 원본을
             # 돌려주면 호출자가 같은 초과로 다시 실패한다. 실측 사고 2건은 모두
             # force=False(임계치 자동 압축)였다.
-            if not force and new_count >= token_count:
+            if new_count >= token_count:
+                if force:
+                    # force 는 원본을 돌려줄 수 없다 — 호출자가 같은 초과로 다시
+                    # 실패한다. 대신 짝을 건드리지 않는 본문 절단으로 내려간다.
+                    logger.warning(
+                        "Auto-compact(force) 무효 — 요약이 더 크다: %d → %d 토큰. "
+                        "도구 결과 본문 절단으로 대체한다.",
+                        token_count,
+                        new_count,
+                    )
+                    return self._hard_truncate_tool_results(messages, token_count)
+
                 logger.warning(
                     "Auto-compact 무효 — 결과가 더 크거나 같다: %d → %d 토큰. "
                     "원본을 유지하고 압축 상태를 남기지 않는다.",
@@ -455,6 +508,7 @@ class ContextManager:
                 )
                 # 대화가 늘기 전에는 같은 낭비를 반복하지 않는다.
                 self._useless_compact_at = len(messages)
+                self._result_replaced = False
                 return messages
 
             # 경계를 "최근 턴 시작 지점"으로 옮기고, 그 앞은 요약으로 대체한다.
@@ -476,6 +530,7 @@ class ContextManager:
             # (앞 단계(예산/스닙)가 남긴 문구가 있어도 이걸로 덮어쓴다).
             self._last_compaction = "대화 요약 생성(모델 호출)"
 
+            self._result_replaced = True
             return result
 
         except Exception as e:
@@ -502,10 +557,15 @@ class ContextManager:
             [긴급 요약 한 줄] + [최근 1개 턴]으로 구성된 최소 메시지 리스트.
         """
         if self._passthrough:
+            self._result_replaced = False
             return self._extract_recent_turns(messages, 1)
 
         logger.warning("긴급 압축: 최근 1개 턴만 보존")
         self._total_compactions += 1
+        # 리스트를 최대로 줄이는 경로다. latch 는 옛 메시지 개수 기준이라 무효다
+        # (성공 경로에만 해제를 넣어 두면 긴급 압축 뒤 자동 압축이 오래 막힌다).
+        self._useless_compact_at = None
+        self._result_replaced = True
 
         # 직전 턴 1개만 원본 보존, 나머지 전체는 도구·주제만 뽑은 한 줄 요약으로 압축.
         recent = self._extract_recent_turns(messages, 1)
@@ -767,6 +827,85 @@ class ContextManager:
         ascii_words = len(text.encode("ascii", "ignore").split())
         return int(ascii_words * 1.3 + korean_chars * 2.0 + len(text) * 0.1)
 
+    def _message_level_split(self, messages: list[Message]) -> int:
+        """턴 경계로 못 자를 때 쓸 **메시지 단위** 분할 지점을 찾는다.
+
+        ■ 짝을 깨면 안 된다 (2026-08-27 리뷰 지적 N1)
+          단순히 `messages[-1:]` 만 남기면, 마지막이 tool_result 일 때 짝이 되는
+          assistant(tool_calls) 가 dropped 로 사라져 **고아 tool_result** 가 남는다.
+          `inference.py` 가 이를 `{"role":"tool", "tool_call_id":...}` 로 변환하므로
+          선행 assistant 없이 `role:"tool"` 만 있는 payload 가 나간다 — OpenAI 규약상
+          무효한 순서다. 하필 컨텍스트 초과 복구 자리라, 컨텍스트 오류를 템플릿
+          오류로 바꿔 버린다.
+
+          그리고 이 폴백이 발동하는 상황에서 마지막 메시지는 실전에서 대개
+          tool_result 다 — 도구를 실행해 결과를 붙인 직후 프롬프트가 넘치기 때문이다.
+
+        Returns:
+            dropped/recent 경계 인덱스. 0이면 "메시지 단위로도 자를 수 없다".
+        """
+        split = len(messages) - 1
+        # 뒤에서부터 tool_result 를 지나 짝이 되는 assistant 까지 끌어온다.
+        while split > 0 and _is_tool_result(messages[split]):
+            split -= 1
+        return max(0, split)
+
+    def _hard_truncate_tool_results(
+        self, messages: list[Message], token_count: int
+    ) -> list[Message]:
+        """최후 수단 — 메시지는 그대로 두고 **도구 결과 본문만** 잘라 낸다.
+
+        메시지 단위로도 자를 수 없는 형태(질문 하나 + 거대한 도구 결과들)에서
+        쓴다. 메시지를 버리면 짝이 깨지므로, 짝을 건드리지 않고 줄일 수 있는
+        유일한 방법이 본문 절단이다.
+        """
+        hard_budget = 1_500  # 글자. 앞 2/3 + 뒤 1/3 로 남긴다.
+        result: list[Message] = []
+        truncated = 0
+        for msg in messages:
+            content = str(msg.content) if isinstance(msg.content, str) else msg.text_content
+            if _is_tool_result(msg) and len(content) > hard_budget:
+                head = hard_budget * 2 // 3
+                tail = hard_budget - head
+                result.append(
+                    Message.tool_result(
+                        msg.tool_use_id or "",
+                        f"{content[:head]}\n\n... ({len(content):,}자 전체, "
+                        f"긴급 절단) ...\n\n{content[-tail:]}",
+                        msg.is_error or False,
+                    )
+                )
+                truncated += 1
+            else:
+                result.append(msg)
+
+        new_count = self._estimate_tokens(result)
+        if truncated == 0 or new_count >= token_count:
+            # 줄일 것이 없었다. 원본을 그대로 둔다 — 호출부가 상태를 지우지
+            # 않도록 "교체 안 함"을 남긴다.
+            logger.warning(
+                "Auto-compact(force) — 도구 결과 절단으로도 줄지 않았다: %d → %d 토큰.",
+                token_count,
+                new_count,
+            )
+            self._result_replaced = False
+            return messages
+
+        logger.warning(
+            "Auto-compact(force) — 메시지 단위로도 못 잘라 도구 결과 %d개를 "
+            "본문 절단했다: %d → %d 토큰.",
+            truncated,
+            token_count,
+            new_count,
+        )
+        self._total_compactions += 1
+        self._useless_compact_at = None
+        self._last_compaction = "긴급 절단 — 도구 결과 본문 축약"
+        # 메시지 개수·순서가 그대로라 경계는 옮기지 않는다. 호출부가 리스트를
+        # 교체해도 경계가 0이므로 그대로 유효하다.
+        self._result_replaced = True
+        return result
+
     def _summary_input_budget(self) -> int:
         """요약 프롬프트에 넣을 수 있는 글자 수 — 창 크기에 맞춰 정한다.
 
@@ -776,10 +915,16 @@ class ContextManager:
         예외로 떨어져 `_force_snip` 폴백을 타고, 그 폴백은 같은 형태의 입력에서
         줄이지 못한다. 복구가 복구를 막는 구조라 창에 종속시킨다.
 
-        한글 최악 1.25자/토큰을 가정해 창의 절반(글자 환산)까지만 쓴다.
+        출력 토큰을 **먼저 뺀다** — 요약 호출도 입력 + 출력이 같은 창을 쓴다.
+        빼지 않으면 rtx5090 프로파일(4,096)에서 하한 2,000자(≈1,600토큰)에
+        출력 2,560을 더해 창을 넘는다(2026-08-27 리뷰 지적).
+        그 뒤 한글 최악 1.25자/토큰을 가정해 남은 창의 절반(글자)까지만 쓴다.
         """
-        by_window = int(self.max_tokens * _SUMMARY_INPUT_WINDOW_RATIO)
-        return max(2_000, min(_SUMMARY_INPUT_BUDGET, by_window))
+        usable = max(0, self.max_tokens - _SUMMARY_MAX_TOKENS)
+        by_window = int(usable * _SUMMARY_INPUT_WINDOW_RATIO)
+        # 하한은 두되, 창이 정말 좁으면 하한도 창을 넘지 않도록 같이 눌러 준다.
+        floor = min(2_000, max(0, by_window))
+        return max(floor, min(_SUMMARY_INPUT_BUDGET, by_window))
 
     async def _get_model_summary(self, messages: list[Message]) -> str:
         """
@@ -888,6 +1033,8 @@ class ContextManager:
         summary = self._rule_based_summary(messages)
         # 모델 요약 실패 폴백도 실제로 대화를 줄이는 압축 — 표시 문구를 남긴다.
         self._last_compaction = "대화 압축(요약 폴백)"
+        self._useless_compact_at = None
+        self._result_replaced = True
         return [
             Message.system(f"[강제 스닙 요약] {summary}"),
             *recent,

@@ -112,6 +112,10 @@ def test_mark_result_adopted_clears_state():
     mgr = _mgr()
     mgr._compact_boundary = 40
     mgr._compact_summary = "이전 요약"
+    # 압축이 실제로 일어나 리스트가 교체됐다는 전제를 완성한다. 압축 없이 부르면
+    # mark_result_adopted() 는 아무것도 하지 않는다(2026-08-27) — 원본이 돌아온
+    # 경우까지 경계를 지우면 다음 apply_all 이 경계 이전 원문을 되살린다.
+    mgr._result_replaced = True
 
     mgr.mark_result_adopted()
 
@@ -126,6 +130,7 @@ def test_stale_boundary_would_truncate_the_adopted_list():
     """
     mgr = _mgr()
     mgr._compact_boundary = 40
+    mgr._result_replaced = True  # 압축이 일어나 리스트가 교체됐다는 전제
     adopted = [Message.system("[대화 요약]…"), Message.user("현재 질문")]
 
     assert adopted[mgr._compact_boundary :] == [], "옛 경계가 채택 리스트를 통째로 자른다"
@@ -138,6 +143,7 @@ def test_adopted_summary_is_not_prepended_twice():
     """요약은 채택 리스트 0번에 이미 있다 — 상태에 남기면 두 번 붙는다."""
     mgr = _mgr()
     mgr._compact_summary = "이전 요약"
+    mgr._result_replaced = True  # 압축이 일어나 리스트가 교체됐다는 전제
     adopted = [Message.system("[대화 요약]\n이전 요약\n[요약 끝]"), Message.user("현재 질문")]
 
     mgr.mark_result_adopted()
